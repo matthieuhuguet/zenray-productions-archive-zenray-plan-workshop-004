@@ -1,0 +1,52 @@
+// 4 October 2026: GamesIndustry.biz jobs, a public job board read through its own search pages.
+// FR : l'espace emploi de GamesIndustry.biz, lu par ses pages de recherche publiques.
+import { ROLE_PATTERN, offerId } from '../lib/Offer.mjs'
+import { mapLimited } from '../lib/Http.mjs'
+import { clean, decodeEntities, jobPosting } from '../lib/Text.mjs'
+
+export const KEY = 'gamesindustry'
+
+export function parseSearch(html, baseUrl) {
+  return [...html.matchAll(/<article id="node-(\d+)"[\s\S]*?<\/article>/g)].map((match) => {
+    const card = match[0]
+    const title = decodeEntities((card.match(/<h2 class="node__title">[\s\S]*?title="([^"]+)"/) || [])[1] || '')
+    const url = (card.match(/<h2 class="node__title">[\s\S]*?href="([^"]+)"/) || [])[1] || ''
+    const company = clean((card.match(/recruiter-company-profile-job-organization"><a[^>]*>([\s\S]*?)<\/a>/) || [])[1] || '')
+    const companyUrl = (card.match(/recruiter-company-profile-job-organization"><a href="([^"]+)/) || [])[1] || ''
+    return { id: match[1], title, url: url.startsWith('http') ? url : baseUrl + url, company, companyUrl, location: clean((card.match(/<div class="location">([\s\S]*?)<\/div>/) || [])[1] || ''), trade: clean((card.match(/<div class="terms">([\s\S]*?)<\/div>/) || [])[1] || '') }
+  }).filter((row) => row.id && row.title && row.url)
+}
+
+export function parseDetail(row, body, baseUrl) {
+  const posting = jobPosting(body)
+  if (!posting) throw new Error('No JobPosting in the current job page')
+  const address = Array.isArray(posting.jobLocation) ? posting.jobLocation[0]?.address || {} : posting.jobLocation?.address || {}
+  const contract = Array.isArray(posting.employmentType) ? posting.employmentType.join(', ') : posting.employmentType || ''
+  return {
+    sourceKey: KEY, sourceLabel: 'GamesIndustry.biz', evidence: 'GamesIndustry.biz, annonce déposée par le studio', name: posting.hiringOrganization?.name || row.company, title: row.title, url: row.url,
+    applyUrl: `${baseUrl}/node/${row.id}/apply-external`, sourceId: `gamesindustry:${row.id}`, location: row.location || [address.addressLocality, address.addressRegion].filter(Boolean).join(', '),
+    country: address.addressCountry || '', contract, workplace: /remote/i.test(`${row.location} ${posting.description || ''}`.slice(0, 800)) ? 'Remote' : 'Voir conditions de la fiche',
+    published: posting.datePosted || '', validThrough: posting.validThrough || '', text: posting.description || '', careersUrl: row.companyUrl ? (row.companyUrl.startsWith('http') ? row.companyUrl : baseUrl + row.companyUrl) : '',
+  }
+}
+
+export async function collect({ http, config }) {
+  const settings = config.sources.gamesindustry
+  const found = new Map()
+  const errors = []
+  let complete = true
+  for (const query of settings.queries) {
+    const url = `${settings.baseUrl}/jobs?keywords=${encodeURIComponent(query)}`
+    try {
+      const rows = parseSearch(await http.text(url), settings.baseUrl)
+      for (const row of rows.slice(0, settings.maxPerQuery)) if (ROLE_PATTERN.test(row.title)) found.set(row.id, row)
+    } catch (error) { complete = false; errors.push({ source: url, error: error.message }) }
+  }
+  const selected = [...found.values()]
+  const details = await mapLimited(selected, config.http.workers, async (row) => parseDetail(row, await http.text(row.url), settings.baseUrl))
+  const listings = []
+  details.forEach((result, index) => { if (result.ok) listings.push(result.value); else errors.push({ source: selected[index].url, error: result.error.message }) })
+  // A search page lists a relevance window, never the whole board: absence from it proves nothing, so it never closes a vacancy.
+  // FR : une page de recherche n'est qu'une fenetre de pertinence, l'absence n'y prouve rien et ne ferme jamais une annonce.
+  return [{ key: KEY, label: settings.label, listings, seenIds: selected.map((row) => offerId(`gamesindustry:${row.id}`)), listed: selected.length, matched: listings.length, errors, complete: false, partial: complete }]
+}

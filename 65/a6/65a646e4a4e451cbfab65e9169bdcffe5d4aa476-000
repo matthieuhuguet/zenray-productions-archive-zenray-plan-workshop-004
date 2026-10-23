@@ -1,0 +1,139 @@
+// Sert la CLÉ AES-128 de déchiffrement HLS, depuis le repo PRIVÉ zenray-data, AVEC un garde-fou.
+//
+// EN CLAIR (pour tout le monde) :
+//   Les morceaux de vidéo (segments) sont publics mais CHIFFRÉS : sans la clé, c'est du bruit illisible.
+//   La clé, elle, n'est JAMAIS publique. Elle vit dans un dépôt privé. Quand le lecteur du site veut lire
+//   la vidéo, hls.js demande la clé à CETTE adresse. Le serveur va la chercher dans le dépôt privé avec son
+//   token secret, vérifie que la demande vient bien du site (et pas d'un pillard externe), puis la renvoie.
+//
+// CE QU'IL FAIT :
+//   GET /api/hls-key?v=<base|path>
+//     - <base>  : nom de la vidéo (ex "MonFilm")        -> clé lue dans pages/Videos/<base>/.hlskey.bin
+//     - <path>  : chemin complet de la clé dans le repo  -> doit rester sous pages/Videos/ et finir par .hlskey.bin
+//   Renvoie les 16 octets bruts en application/octet-stream.
+//
+// LE GARDE-FOU (gate) — honnêteté sur la LIMITE :
+//   On n'a PAS de système de login. On ne peut donc pas authentifier un utilisateur. Le seul rempart possible
+//   sans login est de vérifier l'EN-TÊTE Origin/Referer de la requête : un navigateur honnête envoie l'origine
+//   de la page qui fait le fetch. On n'accepte que les origines du site (ALLOWED_ORIGINS) OU le même domaine
+//   que la requête (same-origin), plus le localhost de dev. CORS est renvoyé en miroir pour que hls.js du site
+//   puisse lire la réponse.
+//   LIMITE RÉELLE : Origin/Referer est posé par le navigateur, pas infalsifiable hors navigateur (un curl peut
+//   mentir). Ce gate bloque l'usage de la clé par un AUTRE SITE dans un vrai navigateur (le cas courant du vol
+//   de bande passante / hotlinking), pas un attaquant déterminé en ligne de commande. Pour un vrai secret, il
+//   faudrait un login + clé signée à durée de vie courte. Ici l'objectif est : segments publics anonymisés +
+//   clé non énumérable + non hotlinkable depuis un autre site. C'est le bon compromis sans backend d'auth.
+import { verifyToken } from './hls-token.js'
+
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const VIDEOS_PREFIX = 'pages/'
+const KEY_FILE = '.hlskey.bin'
+
+// Domaines autorisés à fetcher la clé. Le domaine de prod du site est ajoutable via SITE_ORIGINS (CSV).
+// localhost couvre le dev (local-server.mjs sur n'importe quel port).
+function allowedOrigins() {
+  const fromEnv = (process.env.SITE_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean)
+  return new Set([...fromEnv])
+}
+const isLocalhost = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin || '')
+
+// Résout le param ?v= en chemin de clé dans le repo. Refuse tout ce qui sort de pages/Videos/.
+function keyPathFor(v) {
+  if (!v || typeof v !== 'string') return null
+  if (v.includes('..') || v.startsWith('/')) return null
+  // cas 1 : chemin complet déjà fourni (doit pointer la clé sous pages/Videos/)
+  if (v.startsWith(VIDEOS_PREFIX)) {
+    if (!v.endsWith(KEY_FILE)) return null
+    return v
+  }
+  // cas 2 : base name simple (ou sous-dossier relatif sous Videos) -> on compose le chemin canonique
+  if (/[\\:]/.test(v)) return null
+  return `${VIDEOS_PREFIX}${v}/${KEY_FILE}`
+}
+
+// Origine effective de la requête (Origin sinon dérivée du Referer).
+function requestOrigin(req) {
+  const o = req.headers.origin
+  if (o) return o
+  const ref = req.headers.referer || req.headers.referrer
+  if (ref) { try { const u = new URL(ref); return `${u.protocol}//${u.host}` } catch { /* ignore */ } }
+  return null
+}
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(500).end()
+  if (req.method === 'OPTIONS') {
+    // préflight CORS éventuel
+    const o = requestOrigin(req)
+    if (o) res.setHeader('Access-Control-Allow-Origin', o)
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Range')
+    return res.status(204).end()
+  }
+  if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return res.status(405).end() }
+
+  // --- VOIE 1 : token de download (plan §12) -----------------------------------------------------
+  //   ffmpeg/VLC en ligne de commande n'envoient pas d'Origin. On les laisse passer s'ils présentent un
+  //   token signé valide et non expiré (?token=...). Le token est lié à UNE vidéo et à durée limitée ; la
+  //   clé n'est de toute façon utile qu'avec les segments de cette vidéo. Si pas de token -> gate Origin.
+  const dlToken = (req.query.token || '').toString()
+  let tokenOk = false
+  if (dlToken) {
+    const v = verifyToken(dlToken)
+    // un token valide doit viser une fiche média ; la clé demandée doit rester sous pages/Videos/.
+    if (v.ok && typeof v.path === 'string' && v.path.startsWith('pages/') && v.path.endsWith('.media.json')) tokenOk = true
+    else if (!v.ok && v.reason === 'expired') return res.status(410).end()
+  }
+
+  // --- VOIE 2 : gate Origin/Referer : refuse les fetch venant d'un autre site (anti-hotlinking) ----
+  const origin = requestOrigin(req)
+  const allow = allowedOrigins()
+  if (!tokenOk) {
+    // Pas d'Origin/Referer du tout : navigation directe / certains clients. On l'AUTORISE seulement si
+    // aucune liste de domaines n'est configurée (mode dev permissif) ; sinon on exige une origine connue.
+    const sameSite = origin && (allow.has(origin) || isLocalhost(origin) || (req.headers.host && origin === `https://${req.headers.host}`) || (req.headers.host && origin === `http://${req.headers.host}`))
+    if (origin) {
+      if (!sameSite) return res.status(403).end()
+      res.setHeader('Access-Control-Allow-Origin', origin)
+      res.setHeader('Vary', 'Origin')
+    } else if (allow.size > 0) {
+      // domaines configurés mais requête sans origine et sans token -> on refuse (probable accès hors navigateur).
+      return res.status(403).end()
+    }
+  } else if (origin) {
+    // token valide ET origine présente (cas navigateur authentifié par token) : on renvoie le CORS miroir.
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+  }
+
+  const keyPath = keyPathFor((req.query.v || '').toString())
+  if (!keyPath) return res.status(400).end()
+
+  try {
+    // LECTURE DU BINAIRE — POURQUOI EN DEUX TEMPS :
+    //   La Contents API de GitHub CORROMPT le binaire (elle traite le contenu comme du texte : les octets
+    //   hauts deviennent U+FFFD, un blob de 16 octets ressort à ~30 octets), que ce soit en mode raw OU en
+    //   JSON base64. La SEULE lecture fiable d'un binaire est la git/blobs API. On l'utilise donc :
+    //     1) Contents API juste pour récupérer le SHA du fichier (la métadonnée .sha est fiable) ;
+    //     2) git/blobs/<sha> pour récupérer le contenu base64 INTACT, qu'on décode nous-mêmes.
+    const meta = await fetch(`https://api.github.com/repos/${REPO}/contents/${encodeURI(keyPath)}?ref=${BRANCH}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress' },
+    })
+    if (!meta.ok) return res.status(meta.status === 404 ? 404 : 502).end()
+    const sha = (await meta.json()).sha
+    if (!sha) return res.status(502).end()
+    const r = await fetch(`https://api.github.com/repos/${REPO}/git/blobs/${sha}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress' },
+    })
+    if (!r.ok) return res.status(502).end()
+    const j = await r.json()
+    const buf = Buffer.from(j.content || '', j.encoding === 'base64' ? 'base64' : 'utf8')
+    if (buf.length !== 16) return res.status(502).end() // une clé AES-128 fait exactement 16 octets
+    res.setHeader('Content-Type', 'application/octet-stream')
+    res.setHeader('Cache-Control', 'no-store') // la clé ne se met jamais en cache CDN
+    res.setHeader('Content-Length', String(buf.length))
+    return res.status(200).send(buf)
+  } catch { return res.status(500).end() }
+}

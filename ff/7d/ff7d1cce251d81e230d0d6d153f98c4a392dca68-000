@@ -1,0 +1,517 @@
+// cmaf-packaging.mjs (11 October 2026): CMAF DASH + HLS packaging that keeps EVERY audio track of the source.
+// FR : empaquetage CMAF qui garde TOUTES les pistes audio de la source, une entree HLS et un AdaptationSet DASH par piste.
+import fs from 'node:fs'
+import path from 'node:path'
+import { execFileSync, spawnSync, spawn } from 'node:child_process'
+import { CDN_CHUNK } from '../../src/config/chunkPolicy.js'
+
+// 11 October 2026: every tunable value of the packaging in one place.
+export const CMAF = {
+  ffmpeg: fs.existsSync('/opt/homebrew/bin/ffmpeg') ? '/opt/homebrew/bin/ffmpeg' : 'ffmpeg',
+  ffprobe: fs.existsSync('/opt/homebrew/bin/ffprobe') ? '/opt/homebrew/bin/ffprobe' : 'ffprobe',
+  // 13 October 2026: single source of truth is chunkPolicy.js (jsDelivr limit per file, with margin).
+  // FR : source unique = chunkPolicy.js.
+  cdnChunkBytes: CDN_CHUNK,
+  audioGroupId: 'audio',
+  audioReencode: { channels: '2', rate: '48000', bitrate: '160k' },
+  // 12 October 2026 (D4): the order of the modes tried and the video codecs a stream copy may keep.
+  // FR : l'ordre des modes essayes et les codecs video qu'une copie peut conserver.
+  modeOrder: ['copy4', 'copy2', 'transcode'],
+  copyableVideoCodecs: ['hevc', 'h264', 'av1'],
+  // Segment duration per mode, in seconds (ffmpeg -seg_duration).
+  // FR : duree de segment par mode, en secondes.
+  segmentSeconds: { copy4: 4, copy2: 0.5, transcode: 4 },
+  // 4K class: width OR height at or above these values (a 3840x1600 scope film is 4K class).
+  // FR : classe 4K : largeur OU hauteur au moins egale a ces valeurs (un film scope 3840x1600 est en classe 4K).
+  fourKClass: { minWidth: 3000, minHeight: 2000 },
+  // Bitrate ladder of the transcode fallback, in Mbit/s (1 Mbit/s = kbitPerMbit kbit/s). First rung first; the next rung
+  // is tried when a segment still exceeds the CDN limit.
+  // FR : echelle de debits du repli par transcodage, en Mbit/s ; le palier suivant est essaye si un segment depasse encore la limite.
+  bitrateLadderMbit: { fourK: [16, 8, 4, 2], other: [8, 4, 2] },
+  kbitPerMbit: 1000,
+  // 13 October 2026: the transcode starts at the first rung NOT above sourceBitrateCapRatio x the source bitrate (never
+  // larger than the source), the lowest rung when the source is below all of them.
+  // FR : le transcodage demarre au premier palier qui ne depasse pas ratio x le debit de la source.
+  sourceBitrateCapRatio: 1,
+  // 13 October 2026: a transcode rung moves to the next (lower) rung only for these failure reason prefixes; any other
+  // failure (encoder crash, missing manifests) would fail identically at every rung and stops the ladder.
+  // FR : un palier de transcodage ne passe au suivant que pour ces raisons ; toute autre panne s'arrete.
+  ladderAdvanceReasons: ['segment_too_large'],
+  // Early abort: the output directory is polled while ffmpeg runs; the first segment above the limit kills the pass.
+  // FR : abandon precoce : le dossier est surveille pendant ffmpeg ; le premier segment trop gros tue la passe.
+  watch: { pollMs: 2000 },
+  rateFactors: { maxrate: 1.45, bufsize: 2 }, // maxrate = 1.45 x bitrate, bufsize = 2 x maxrate
+  transcode: { hwaccel: 'videotoolbox', encoder: 'h264_videotoolbox', prioSpeed: '1', pixFmt: 'yuv420p', profile: 'high', gop: '48', scThreshold: '0' },
+  // Packet-scan prediction (an optimisation, never a gate): overheads model the fMP4 boxes around the payload, and a copy
+  // mode is skipped only when its predicted largest segment exceeds the limit by more than skipToleranceRatio.
+  // FR : prediction par balayage des paquets (une optimisation, jamais une barriere) ; un mode copie n'est saute que si
+  // son plus gros segment predit depasse la limite de plus de skipToleranceRatio.
+  prediction: { enabled: true, perPacketOverheadBytes: 16, perSegmentOverheadBytes: 512, skipToleranceRatio: 0.02, scanMaxBufferBytes: 512 * 1024 * 1024, epsilonSeconds: 1e-6 },
+  labels: { fre: 'Français', fra: 'Français', fr: 'Français', jpn: '日本語', ja: '日本語', eng: 'English', en: 'English',
+    spa: 'Español', ger: 'Deutsch', deu: 'Deutsch', ita: 'Italiano', por: 'Português', kor: '한국어', chi: '中文', zho: '中文', und: 'Audio' },
+}
+
+export function probeStreams(sourcePath) {
+  const raw = execFileSync(CMAF.ffprobe, [
+    '-v', 'error',
+    '-show_entries', 'stream=index,codec_type,codec_name,channels,width,height,bit_rate:stream_tags=language,title:stream_disposition=default:format=duration,bit_rate',
+    '-of', 'json',
+    sourcePath,
+  ], { encoding: 'utf8' })
+  const info = JSON.parse(raw)
+  const streams = info.streams || []
+  const video = streams.find((s) => s.codec_type === 'video') || null
+  const audios = collectAudioTracks(streams)
+  const duration = Number(info.format?.duration || 0) || 0
+  const sourceBitrateBps = Number(video?.bit_rate) || Number(info.format?.bit_rate) || 0
+  return { video, audio: audios[0] ? streams.find((s) => s.index === audios[0].index) : null, audios, duration, sourceBitrateBps }
+}
+
+// Every audio stream, in file order, with the language the player will show.
+// 12 October 2026: the label is the LANGUAGE ("日本語", "Français"), never the technical source title ("DTS-HD Master Audio 5.1",
+// "audio_1" told nothing). Two tracks of one language are told apart by their source title, else by a number.
+export function collectAudioTracks(streams) {
+  const tracks = streams.filter((s) => s.codec_type === 'audio').map((s, order) => {
+    const lang = String(s.tags?.language || 'und').toLowerCase()
+    const title = String(s.tags?.title || '').trim()
+    return {
+      order, index: s.index, codec: String(s.codec_name || '').toLowerCase(), channels: Number(s.channels) || 2,
+      lang, title, label: CMAF.labels[lang] || lang.toUpperCase(), default: order === 0,
+    }
+  })
+  const perLang = new Map()
+  for (const track of tracks) perLang.set(track.lang, (perLang.get(track.lang) || 0) + 1)
+  const seen = new Map()
+  for (const track of tracks) {
+    if (perLang.get(track.lang) < 2) continue
+    const n = (seen.get(track.lang) || 0) + 1
+    seen.set(track.lang, n)
+    track.label = track.title && !/^audio[_-]?\d+$/i.test(track.title) ? `${track.label} (${track.title})` : `${track.label} ${n}`
+  }
+  return tracks
+}
+
+// ffmpeg arguments: one -map per audio stream, copy when it is already AAC, otherwise AAC stereo.
+export function audioArgs(tracks, mode) {
+  const args = []
+  tracks.forEach((track, i) => {
+    args.push('-map', `0:${track.index}`)
+    if ((mode === 'copy4' || mode === 'copy2') && track.codec === 'aac') args.push(`-c:a:${i}`, 'copy')
+    else args.push(`-c:a:${i}`, 'aac', `-ac:a:${i}`, CMAF.audioReencode.channels, `-ar:a:${i}`, CMAF.audioReencode.rate, `-b:a:${i}`, CMAF.audioReencode.bitrate)
+    args.push(`-metadata:s:a:${i}`, `language=${track.lang}`)
+  })
+  return args
+}
+
+// One DASH AdaptationSet for the video (output stream 0) and one per audio (output streams 1..n).
+export function adaptationSetsArg(audioCount) {
+  const sets = ['id=0,streams=0']
+  for (let i = 0; i < audioCount; i += 1) sets.push(`id=${i + 1},streams=${i + 1}`)
+  return sets.join(' ')
+}
+
+// HLS wants all renditions of one kind in a SINGLE group; ffmpeg gives each AdaptationSet its own group.
+export function mergeAudioGroups(masterText, tracks) {
+  const lines = masterText.split('\n')
+  let audioSeen = 0
+  const out = lines.map((line) => {
+    if (line.startsWith('#EXT-X-MEDIA:') && /TYPE=AUDIO/.test(line)) {
+      const track = tracks[audioSeen] || { lang: 'und', label: `Audio ${audioSeen + 1}` }
+      const uri = /URI="([^"]+)"/.exec(line)?.[1] || ''
+      const channels = /CHANNELS="([^"]+)"/.exec(line)?.[1] || String(track.channels || 2)
+      const name = track.label || `Audio ${audioSeen + 1}`
+      const result = `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="${CMAF.audioGroupId}",NAME="${name.replace(/"/g, "'")}",LANGUAGE="${track.lang}",DEFAULT=${audioSeen === 0 ? 'YES' : 'NO'},AUTOSELECT=YES,CHANNELS="${channels}",URI="${uri}"`
+      audioSeen += 1
+      return result
+    }
+    if (line.startsWith('#EXT-X-STREAM-INF:')) return line.replace(/AUDIO="[^"]*"/, `AUDIO="${CMAF.audioGroupId}"`)
+    return line
+  })
+  return { text: out.join('\n'), audioRenditions: audioSeen }
+}
+
+// 12 October 2026 (D4): a missing or invalid parameter raises an error that names it, never a silent default.
+// FR : un parametre manquant ou invalide leve une erreur qui le nomme, jamais une valeur par defaut silencieuse.
+const PARAM_CHECKS = {
+  positive: (v) => typeof v === 'number' && Number.isFinite(v) && v > 0,
+  nonNegative: (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0,
+  text: (v) => typeof v === 'string' && v.length > 0,
+  list: (v) => Array.isArray(v) && v.length > 0 && v.every((item) => typeof item === 'string' && item.length > 0),
+  // a ladder is a non-empty list of positive Mbit/s values, strictly descending (next rung = lower bitrate)
+  ladder: (v) => Array.isArray(v) && v.length > 0 && v.every((x, i) => typeof x === 'number' && Number.isFinite(x) && x > 0 && (i === 0 || x < v[i - 1])),
+}
+const PARAM_SPEC = [
+  ['cdnChunkBytes', 'positive'], ['modeOrder', 'list'], ['copyableVideoCodecs', 'list'],
+  ['segmentSeconds.copy4', 'positive'], ['segmentSeconds.copy2', 'positive'], ['segmentSeconds.transcode', 'positive'],
+  ['fourKClass.minWidth', 'positive'], ['fourKClass.minHeight', 'positive'],
+  ['sourceBitrateCapRatio', 'positive'], ['ladderAdvanceReasons', 'list'], ['watch.pollMs', 'positive'],
+  ['bitrateLadderMbit.fourK', 'ladder'], ['bitrateLadderMbit.other', 'ladder'], ['kbitPerMbit', 'positive'],
+  ['rateFactors.maxrate', 'positive'], ['rateFactors.bufsize', 'positive'],
+  ['transcode.hwaccel', 'text'], ['transcode.encoder', 'text'], ['transcode.prioSpeed', 'text'], ['transcode.pixFmt', 'text'],
+  ['transcode.profile', 'text'], ['transcode.gop', 'text'], ['transcode.scThreshold', 'text'],
+  ['prediction.perPacketOverheadBytes', 'nonNegative'], ['prediction.perSegmentOverheadBytes', 'nonNegative'],
+  ['prediction.skipToleranceRatio', 'nonNegative'], ['prediction.scanMaxBufferBytes', 'positive'], ['prediction.epsilonSeconds', 'nonNegative'],
+]
+
+function readParam(config, dotted) {
+  return dotted.split('.').reduce((acc, key) => (acc === undefined || acc === null ? undefined : acc[key]), config)
+}
+
+export function validateCmafConfig(config = CMAF) {
+  for (const [dotted, kind] of PARAM_SPEC) {
+    if (!PARAM_CHECKS[kind](readParam(config, dotted))) throw new Error(`CMAF parameter missing or invalid: ${dotted} (${kind})`)
+  }
+  if (typeof config.prediction.enabled !== 'boolean') throw new Error('CMAF parameter missing or invalid: prediction.enabled (boolean)')
+  return config
+}
+
+// Environment overrides, one variable per parameter that a human may want to change without editing the code.
+// FR : surcharges par l'environnement, une variable par parametre qu'on peut vouloir changer sans toucher au code.
+//   ZR_CMAF_LADDER_4K=16,8,4,2   ZR_CMAF_LADDER_OTHER=8,4,2   ZR_CMAF_4K_MIN_WIDTH=3000   ZR_CMAF_4K_MIN_HEIGHT=2000
+//   ZR_CMAF_PREDICTION=0 (disables the packet-scan prediction; the real segment check always runs)
+export function cmafConfigFromEnv(env = process.env, base = CMAF) {
+  const config = JSON.parse(JSON.stringify(base))
+  const mbitList = (name) => {
+    const values = String(env[name]).split(',').map((item) => Number(item.trim()))
+    if (!PARAM_CHECKS.ladder(values)) throw new Error(`${name} must be a strictly descending list of Mbit/s, got "${env[name]}"`)
+    return values
+  }
+  const positive = (name) => {
+    const value = Number(env[name])
+    if (!PARAM_CHECKS.positive(value)) throw new Error(`${name} must be a positive number, got "${env[name]}"`)
+    return value
+  }
+  if (env.ZR_CMAF_LADDER_4K) config.bitrateLadderMbit.fourK = mbitList('ZR_CMAF_LADDER_4K')
+  if (env.ZR_CMAF_LADDER_OTHER) config.bitrateLadderMbit.other = mbitList('ZR_CMAF_LADDER_OTHER')
+  if (env.ZR_CMAF_4K_MIN_WIDTH) config.fourKClass.minWidth = positive('ZR_CMAF_4K_MIN_WIDTH')
+  if (env.ZR_CMAF_4K_MIN_HEIGHT) config.fourKClass.minHeight = positive('ZR_CMAF_4K_MIN_HEIGHT')
+  if (env.ZR_CMAF_PREDICTION === '0') config.prediction.enabled = false
+  return validateCmafConfig(config)
+}
+
+export function isCopyMode(mode, config = CMAF) {
+  return mode !== 'transcode' && config.modeOrder.includes(mode)
+}
+
+// 4K class: width at or above fourKClass.minWidth OR height at or above fourKClass.minHeight (3840x1600 is 4K class).
+// FR : classe 4K ; une dimension inconnue compte pour zero, donc la source retombe dans la classe standard.
+export function isFourKClass(video, config = CMAF) {
+  const width = Number(video?.width) || 0
+  const height = Number(video?.height) || 0
+  return width >= config.fourKClass.minWidth || height >= config.fourKClass.minHeight
+}
+
+// The bitrate ladder of a source: the starting rung is the first value, the next rungs follow in descending order.
+export function ladderFor(video, config = CMAF, sourceBitrateBps = 0) {
+  const fourK = isFourKClass(video, config)
+  let rungs = (fourK ? config.bitrateLadderMbit.fourK : config.bitrateLadderMbit.other).slice()
+  // 13 October 2026: never start above the source bitrate (unknown bitrate = no cap).
+  if (sourceBitrateBps > 0) {
+    const capMbit = (sourceBitrateBps / 1e6) * config.sourceBitrateCapRatio
+    const kept = rungs.filter((mbit) => mbit <= capMbit)
+    rungs = kept.length ? kept : [rungs[rungs.length - 1]]
+  }
+  return { sourceClass: fourK ? 'fourK' : 'other', rungsMbit: rungs }
+}
+const ladderForProbe = (probe, config) => ladderFor(probe.video, config, probe.sourceBitrateBps || 0)
+
+// bitrate, maxrate and bufsize in kbit/s for one rung: maxrate = maxrateFactor x bitrate, bufsize = bufsizeFactor x maxrate.
+export function rateControl(mbit, config = CMAF) {
+  const bitrateKbit = Math.round(mbit * config.kbitPerMbit)
+  const maxrateKbit = Math.round(bitrateKbit * config.rateFactors.maxrate)
+  const bufsizeKbit = Math.round(maxrateKbit * config.rateFactors.bufsize)
+  return { bitrateKbit, maxrateKbit, bufsizeKbit }
+}
+
+// The whole ffmpeg argument list of one packaging pass (pure, so the ladder is testable without running ffmpeg).
+// FR : la liste complete des arguments ffmpeg d'une passe (pure, donc testable sans lancer ffmpeg).
+export function buildFfmpegArgs(sourcePath, probe, mode, { bitrateMbit, config = CMAF, progressFile = '' } = {}) {
+  const audios = probe.audios || []
+  const vCodec = String(probe.video?.codec_name || '').toLowerCase()
+  const copyVideo = isCopyMode(mode, config) && config.copyableVideoCodecs.includes(vCodec)
+  const args = ['-y', '-v', 'error']
+  // 14 October 2026: ffmpeg writes its progress (out_time_us=...) to this file; the watched runner turns it into a percentage.
+  // FR : ffmpeg ecrit sa progression dans ce fichier ; le lanceur surveille en fait un pourcentage.
+  if (progressFile) args.push('-progress', progressFile, '-nostats')
+  if (!copyVideo) args.push('-hwaccel', config.transcode.hwaccel)
+  args.push('-i', sourcePath, '-map', '0:v:0')
+  if (copyVideo) {
+    args.push('-c:v', 'copy')
+    if (vCodec === 'hevc') args.push('-tag:v', 'hvc1')
+  } else {
+    const mbit = bitrateMbit ?? ladderForProbe(probe, config).rungsMbit[0]
+    const rate = rateControl(mbit, config)
+    args.push('-c:v', config.transcode.encoder, '-b:v', `${rate.bitrateKbit}k`, '-maxrate', `${rate.maxrateKbit}k`, '-bufsize', `${rate.bufsizeKbit}k`,
+      '-prio_speed', config.transcode.prioSpeed, '-pix_fmt', config.transcode.pixFmt, '-profile:v', config.transcode.profile,
+      '-g', config.transcode.gop, '-sc_threshold', config.transcode.scThreshold)
+  }
+  args.push(...audioArgs(audios, mode))
+  args.push(
+    '-f', 'dash',
+    '-seg_duration', String(config.segmentSeconds[mode] ?? config.segmentSeconds.transcode),
+    '-use_template', '0',
+    '-hls_playlist', '1',
+    '-init_seg_name', 'init_$RepresentationID$.m4s',
+    '-media_seg_name', 'chunk_$RepresentationID$_$Number%05d$.m4s',
+    '-adaptation_sets', adaptationSetsArg(audios.length),
+    'manifest.mpd',
+  )
+  return args
+}
+
+// Every .m4s must stay under the CDN limit.
+export function checkSegmentsUnderLimit(workDir, limitBytes = CMAF.cdnChunkBytes) {
+  if (!fs.existsSync(path.join(workDir, 'manifest.mpd')) || !fs.existsSync(path.join(workDir, 'master.m3u8'))) {
+    return { ok: false, reason: 'missing_manifests' }
+  }
+  const names = fs.readdirSync(workDir).filter((name) => name.endsWith('.m4s')).sort()
+  if (!names.length) return { ok: false, reason: 'no_segments' }
+  let maxBytes = 0
+  let totalBytes = 0
+  for (const name of names) {
+    const size = fs.statSync(path.join(workDir, name)).size
+    if (size > maxBytes) maxBytes = size
+    totalBytes += size
+    if (size > limitBytes) return { ok: false, reason: `segment_too_large:${name}:${size}`, maxBytes, totalBytes, names }
+  }
+  return { ok: true, maxBytes, totalBytes, names }
+}
+
+// One packaging pass. 12 October 2026: `options.bitrateMbit` is the rung of a transcode (default: the first rung of the
+// source class), `options.limitBytes` the CDN limit; the result carries the mode and the bitrate actually used.
+// FR : une passe d'empaquetage ; le resultat porte le mode et le debit reellement utilises.
+export function packageCmafDashHls(sourcePath, workDir, probe, mode = 'copy4', options = {}) {
+  const config = options.config || CMAF
+  const limitBytes = options.limitBytes ?? config.cdnChunkBytes
+  const vCodec = String(probe.video?.codec_name || '').toLowerCase()
+  if (isCopyMode(mode, config) && !config.copyableVideoCodecs.includes(vCodec)) {
+    // a stream copy of a codec that cannot be copied used to transcode silently while labelled "copy"
+    return { ok: false, reason: `codec_not_copyable:${vCodec || 'unknown'}`, mode, bitrateMbit: null }
+  }
+  const bitrateMbit = isCopyMode(mode, config) ? null : (options.bitrateMbit ?? ladderForProbe(probe, config).rungsMbit[0])
+  fs.rmSync(workDir, { recursive: true, force: true })
+  fs.mkdirSync(workDir, { recursive: true })
+  const args = buildFfmpegArgs(sourcePath, probe, mode, { bitrateMbit, config })
+  const res = spawnSync(config.ffmpeg, args, { cwd: workDir, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+  if (res.status !== 0) return { ok: false, reason: `ffmpeg_exit_${res.status}:${(res.stderr || '').slice(-300)}`, mode, bitrateMbit }
+  return { ...checkSegmentsUnderLimit(workDir, limitBytes), mode, bitrateMbit }
+}
+
+// 13 October 2026: same pass as packageCmafDashHls but asynchronous, with an EARLY ABORT. VideoToolbox does not enforce
+// -maxrate, so a segment can exceed the limit; the output directory is polled while ffmpeg runs and the first .m4s above
+// the limit kills the pass (a rung that overshoots no longer costs a whole film). The final real check still runs.
+// FR : meme passe, asynchrone, avec abandon precoce : le premier segment trop gros tue ffmpeg ; le controle final reste.
+export function findOversizedSegment(workDir, limitBytes) {
+  let names
+  try { names = fs.readdirSync(workDir) } catch { return null }
+  for (const name of names) {
+    if (!name.endsWith('.m4s')) continue
+    let size
+    try { size = fs.statSync(path.join(workDir, name)).size } catch { continue }
+    if (size > limitBytes) return { name, size }
+  }
+  return null
+}
+
+/** Parses an ffmpeg `-progress` file: the LAST out_time_us (microseconds) and whether the pass ended. */
+export function parseFfmpegProgress(text) {
+  let outSeconds = null
+  let ended = false
+  for (const line of String(text || '').split('\n')) {
+    const found = /^out_time_(?:us|ms)=(\d+)$/.exec(line.trim())
+    if (found) outSeconds = Number(found[1]) / 1e6
+    if (line.trim() === 'progress=end') ended = true
+  }
+  return { outSeconds, ended }
+}
+
+/** Percentage 0 to 100 of the pass, never 100 before ffmpeg says "progress=end" (the segments are still being closed). */
+export function progressPercent({ outSeconds, ended }, durationSeconds) {
+  if (ended) return 100
+  if (!Number.isFinite(outSeconds) || !(durationSeconds > 0)) return null
+  return Math.max(0, Math.min(99, Math.round((outSeconds / durationSeconds) * 100)))
+}
+
+export async function packageCmafDashHlsWatched(sourcePath, workDir, probe, mode = 'copy4', options = {}) {
+  const config = options.config || CMAF
+  const limitBytes = options.limitBytes ?? config.cdnChunkBytes
+  const vCodec = String(probe.video?.codec_name || '').toLowerCase()
+  if (isCopyMode(mode, config) && !config.copyableVideoCodecs.includes(vCodec)) {
+    return { ok: false, reason: `codec_not_copyable:${vCodec || 'unknown'}`, mode, bitrateMbit: null }
+  }
+  const bitrateMbit = isCopyMode(mode, config) ? null : (options.bitrateMbit ?? ladderForProbe(probe, config).rungsMbit[0])
+  fs.rmSync(workDir, { recursive: true, force: true })
+  fs.mkdirSync(workDir, { recursive: true })
+  const progressFile = options.progressFile || ''
+  if (progressFile) fs.rmSync(progressFile, { force: true })
+  const args = buildFfmpegArgs(sourcePath, probe, mode, { bitrateMbit, config, progressFile })
+  const spawner = options.spawner || spawn
+  const outcome = await new Promise((resolve) => {
+    const child = spawner(config.ffmpeg, args, { cwd: workDir, stdio: ['ignore', 'ignore', 'pipe'] })
+    let stderr = ''
+    let oversize = null
+    child.stderr?.on('data', (chunk) => { stderr = (stderr + chunk).slice(-2000) })
+    const timer = setInterval(() => {
+      const found = findOversizedSegment(workDir, limitBytes)
+      if (found && !oversize) { oversize = found; child.kill('SIGKILL') }
+      if (progressFile && options.onProgress) {
+        try { options.onProgress({ percent: progressPercent(parseFfmpegProgress(fs.readFileSync(progressFile, 'utf8')), probe.duration), mode, bitrateMbit }) } catch { /* the progress never breaks a pass */ }
+      }
+    }, config.watch.pollMs)
+    child.on('error', (error) => { clearInterval(timer); resolve({ status: -1, stderr: String(error.message), oversize }) })
+    child.on('close', (status) => { clearInterval(timer); resolve({ status, stderr, oversize }) })
+  })
+  if (outcome.oversize) return { ok: false, reason: `segment_too_large:${outcome.oversize.name}:${outcome.oversize.size}`, mode, bitrateMbit, abortedEarly: true }
+  if (outcome.status !== 0) return { ok: false, reason: `ffmpeg_exit_${outcome.status}:${outcome.stderr.slice(-300)}`, mode, bitrateMbit }
+  return { ...checkSegmentsUnderLimit(workDir, limitBytes), mode, bitrateMbit }
+}
+
+// ---- Packet-scan prediction (12 October 2026, D4) ----
+// ffprobe lists the video packets (headers only, 1 to 5 s for a 150 minute film); the cuts ffmpeg will make are simulated:
+// a segment ends at the first key frame whose time is at least one segment duration after the start of the current one
+// (measured on ffmpeg 8.1.2: the cut is relative to the previous cut, not to a fixed grid). The prediction is an
+// optimisation only: the real segment check stays the final gate and always runs on what is written.
+// FR : ffprobe liste les paquets video (en-tetes seuls) ; on simule les coupes de ffmpeg. La prediction n'est qu'une
+// optimisation : le controle reel des segments reste la barriere finale et s'execute toujours sur ce qui est ecrit.
+
+// Parse `ffprobe -of compact=p=0` packet lines: "pts_time=0.000000|dts_time=-0.083417|size=1234|flags=K__".
+export function parsePacketScan(text) {
+  const toTime = (value) => (value && value !== 'N/A' && Number.isFinite(Number(value)) ? Number(value) : null)
+  const packets = []
+  for (const line of String(text).split('\n')) {
+    if (!line) continue
+    const fields = {}
+    for (const part of line.split('|')) {
+      const eq = part.indexOf('=')
+      if (eq > 0) fields[part.slice(0, eq)] = part.slice(eq + 1)
+    }
+    const time = toTime(fields.pts_time) ?? toTime(fields.dts_time)
+    const size = Number.parseInt(fields.size, 10)
+    if (time === null || !Number.isFinite(size) || size < 0) continue
+    packets.push({ time, size, key: String(fields.flags || '').includes('K') })
+  }
+  return packets
+}
+
+// null when the scan is impossible: the caller then simply tries the modes for real.
+export function scanVideoPackets(sourcePath, { config = CMAF, spawn = spawnSync } = {}) {
+  const res = spawn(config.ffprobe, [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'packet=pts_time,dts_time,size,flags',
+    '-of', 'compact=p=0',
+    sourcePath,
+  ], { encoding: 'utf8', maxBuffer: config.prediction.scanMaxBufferBytes })
+  if (res.status !== 0 || res.error) return null
+  const packets = parsePacketScan(res.stdout)
+  return packets.length ? packets : null
+}
+
+// Sizes of the segments one mode would write, from the packet list: { segments, maxBytes, totalBytes }.
+export function predictSegmentSizes(packets, segmentSeconds, config = CMAF) {
+  const { perPacketOverheadBytes, perSegmentOverheadBytes, epsilonSeconds } = config.prediction
+  // 13 October 2026: packets stay in DECODE order (ffprobe order), the order ffmpeg's segmenter sees: the leading B frames of an
+  // open GOP (pts before their key frame, listed after it) belong to the NEW segment. Sorting by pts put them in the previous one.
+  // FR : ordre de decodage conserve : les B de tete d'un GOP ouvert appartiennent au nouveau segment.
+  const sorted = packets
+  let start = null
+  let bytes = 0
+  let count = 0
+  let segments = 0
+  let maxBytes = 0
+  let totalBytes = 0
+  const close = () => {
+    const size = bytes + count * perPacketOverheadBytes + perSegmentOverheadBytes
+    segments += 1
+    totalBytes += size
+    if (size > maxBytes) maxBytes = size
+  }
+  for (const packet of sorted) {
+    if (packet.key && (start === null || packet.time - start >= segmentSeconds - epsilonSeconds)) {
+      if (start !== null) { close(); bytes = 0; count = 0 }
+      start = packet.time
+    }
+    bytes += packet.size
+    count += 1
+  }
+  if (count > 0) close()
+  return { segments, maxBytes, totalBytes }
+}
+
+// Which mode the source should end in, before any ffmpeg pass.
+//   predictedMode: strict reading (largest predicted segment <= limit), what the statistics compare with the final mode.
+//   perMode[m].skip: the copy mode is skipped only when the prediction exceeds the limit by more than skipToleranceRatio,
+//   so a borderline case is still tried for real and a prediction that is a little pessimistic never costs a transcode.
+// FR : le mode strict sert aux statistiques ; un mode copie n'est saute que s'il depasse la limite avec une marge.
+export function predictPackagingMode(packets, probe, { limitBytes, config = CMAF } = {}) {
+  const limit = limitBytes ?? config.cdnChunkBytes
+  const vCodec = String(probe.video?.codec_name || '').toLowerCase()
+  const copyable = config.copyableVideoCodecs.includes(vCodec)
+  const perMode = {}
+  let predictedMode = 'transcode'
+  for (const mode of config.modeOrder.filter((m) => isCopyMode(m, config))) {
+    if (!copyable) { perMode[mode] = { applicable: false, skip: true }; continue }
+    const sizes = predictSegmentSizes(packets, config.segmentSeconds[mode], config)
+    const overLimit = sizes.maxBytes > limit
+    perMode[mode] = { applicable: true, segments: sizes.segments, maxBytes: sizes.maxBytes, overLimit, skip: sizes.maxBytes > limit * (1 + config.prediction.skipToleranceRatio) }
+    if (!overLimit && predictedMode === 'transcode') predictedMode = mode
+  }
+  return { predictedMode, perMode, limitBytes: limit }
+}
+
+// ---- The whole fallback: copy4, copy2, then the transcode bitrate ladder (12 October 2026, D4) ----
+// FR : tout le repli : copy4, copy2, puis l'echelle de debits du transcodage ; un echec de copie passe au mode suivant,
+// un echec de transcodage ne passe au palier suivant que s'il s'agit d'un depassement de taille.
+// options: { config, limitBytes, runner, scanner, onAttempt }. runner and scanner are injectable for tests.
+export async function packageWithFallback(sourcePath, workDir, probe, options = {}) {
+  const config = validateCmafConfig(options.config || CMAF)
+  const limitBytes = options.limitBytes ?? config.cdnChunkBytes
+  const runner = options.runner || packageCmafDashHlsWatched
+  const scanner = options.scanner || scanVideoPackets
+  const onAttempt = options.onAttempt || (() => {})
+  const { sourceClass, rungsMbit } = ladderForProbe(probe, config)
+
+  const steps = []
+  for (const mode of config.modeOrder) {
+    if (isCopyMode(mode, config)) steps.push({ mode, bitrateMbit: null })
+  }
+  for (const bitrateMbit of rungsMbit) steps.push({ mode: 'transcode', bitrateMbit })
+
+  const skipped = []
+  let prediction = null
+  if (config.prediction.enabled) {
+    const packets = scanner(sourcePath, { config })
+    if (packets) prediction = predictPackagingMode(packets, probe, { limitBytes, config })
+  }
+  const vCodec = String(probe.video?.codec_name || '').toLowerCase()
+  const runnable = steps.filter((step) => {
+    if (!isCopyMode(step.mode, config)) return true
+    if (!config.copyableVideoCodecs.includes(vCodec)) { skipped.push({ mode: step.mode, reason: `codec_not_copyable:${vCodec || 'unknown'}` }); return false }
+    if (prediction && prediction.perMode[step.mode]?.skip) { skipped.push({ mode: step.mode, reason: 'predicted_over_limit', maxBytes: prediction.perMode[step.mode].maxBytes }); return false }
+    return true
+  })
+
+  const attempts = []
+  for (const step of runnable) {
+    const result = await runner(sourcePath, workDir, probe, step.mode, { bitrateMbit: step.bitrateMbit, limitBytes, config, progressFile: options.progressFile, onProgress: options.onProgress })
+    const attempt = { mode: step.mode, bitrateMbit: step.bitrateMbit, ok: Boolean(result.ok), reason: result.ok ? null : String(result.reason || 'unknown') }
+    attempts.push(attempt)
+    onAttempt(attempt)
+    if (result.ok) {
+      return {
+        ...result,
+        mode: step.mode,
+        bitrateMbit: step.bitrateMbit,
+        sourceClass,
+        predictedMode: prediction ? prediction.predictedMode : null,
+        prediction,
+        skipped,
+        attempts,
+      }
+    }
+    // 13 October 2026: a transcode failure that is not a size overshoot would repeat at every lower rung: stop the ladder.
+    // FR : une panne de transcodage qui n'est pas un depassement de taille se repeterait a chaque palier : on s'arrete.
+    if (!isCopyMode(step.mode, config) && !config.ladderAdvanceReasons.some((prefix) => attempt.reason.startsWith(prefix))) break
+  }
+  const last = attempts[attempts.length - 1]
+  return { ok: false, reason: last ? `all_modes_failed:${last.mode}:${last.reason}` : 'no_mode_runnable', sourceClass, predictedMode: prediction ? prediction.predictedMode : null, prediction, skipped, attempts }
+}

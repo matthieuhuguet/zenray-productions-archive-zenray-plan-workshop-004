@@ -1,0 +1,111 @@
+#!/usr/bin/env node
+// PublishStagedBatch.mjs (14 October 2026): publish SEVERAL staged films (CmafStaged/, made by AttachVideoCmafDashHls.mjs --stage-only)
+// with every git push filled to the push batch policy (up to 1 900 MiB), whatever the film boundaries.
+//   node scripts/PublishStagedBatch.mjs --plan <plan.json> [--manifest-clone <dir>] [--stage-root <dir>] [--dry-run]
+// The plan is the worker plan: [{ "src": "<film.mkv>", "name": "<film>.mkv", "dest": "pages/.../<folder>" }, ...].
+// Why: one call per film cut the list at each film end, a last push of ~1.5 GB per film. Here the list of a whole repository bin
+// (4.2 GiB) is ONE list, the policy cuts it; then each film is attached (playlists, manifest, subtitles stay as before).
+// FR : plusieurs films reserves, chaque push rempli a la taille de la politique, quelles que soient les frontieres de films.
+import fs from 'node:fs'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { openVideoGitShard } from './lib/video-git-shard.mjs'
+import { PUBLIC_SHARD, allocatePublicShard, resolveToken } from './lib/public-shard.mjs'
+import { canonicalRel } from './lib/canonical-rel.mjs'
+import { acquireDirectoryLock, directoryLockOptions } from './lib/directory-lock.mjs'
+import { FILM_POSTER } from './lib/film-poster.mjs'
+import { readStage } from './lib/cmaf-stage.mjs'
+
+const GH_OWNER = 'matthieuhuguet'
+const here = path.dirname(fileURLToPath(import.meta.url))
+
+function parseArgs(argv) {
+  const out = {}
+  for (let i = 2; i < argv.length; i += 1) {
+    if (!argv[i].startsWith('--')) continue
+    const next = argv[i + 1]
+    if (!next || next.startsWith('--')) out[argv[i].slice(2)] = true
+    else { out[argv[i].slice(2)] = next; i += 1 }
+  }
+  return out
+}
+
+/** Greedy groups that each fit one repository bin. / Groupes qui tiennent chacun dans un depot. */
+export function groupByBin(items, binBytes = PUBLIC_SHARD.binBytes) {
+  const groups = []
+  let current = { items: [], bytes: 0 }
+  for (const item of items) {
+    if (current.items.length && current.bytes + item.bytes > binBytes) { groups.push(current); current = { items: [], bytes: 0 } }
+    current.items.push(item)
+    current.bytes += item.bytes
+  }
+  if (current.items.length) groups.push(current)
+  return groups
+}
+
+async function main() {
+  const args = parseArgs(process.argv)
+  const plan = JSON.parse(fs.readFileSync(path.resolve(args.plan || ''), 'utf8'))
+  const manifestClone = path.resolve(args['manifest-clone'] || '/Users/zenray/.claude/tmp/tmp-movies-series-upload/ManifestClone')
+  const stageRoot = path.resolve(args['stage-root'] || process.env.ZR_CMAF_STAGE_ROOT || '/Users/zenray/.claude/tmp/tmp-movies-series-upload/CmafStaged')
+  const shardCacheRoot = path.resolve(args['shard-cache-root'] || '/Users/zenray/.claude/tmp/tmp-movies-series-upload/GitShards')
+  const ready = []
+  const missing = []
+  for (const task of plan) {
+    const manifestPath = path.join(manifestClone, task.dest, `${task.name}.media.json`)
+    if (!fs.existsSync(manifestPath) || !fs.existsSync(task.src)) { missing.push({ name: task.name, why: 'manifest or source missing' }); continue }
+    const rel = canonicalRel(manifestClone, manifestPath)
+    const key = crypto.createHash('sha1').update(rel).digest('hex').slice(0, 12)
+    const stage = readStage(path.join(stageRoot, key), task.src)
+    if (!stage) { missing.push({ name: task.name, why: 'no valid stage' }); continue }
+    const slug = path.basename(manifestPath, '.media.json').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 48)
+    const posterBytes = fs.statSync(stage.posterFile).size
+    ready.push({ task, manifestPath, stage, vidId: `${slug}-${key}`, posterBytes, bytes: stage.packaged.totalBytes + posterBytes })
+  }
+  const groups = groupByBin(ready)
+  console.log(JSON.stringify({ films: ready.length, missing, groups: groups.map((g) => ({ films: g.items.map((i) => i.task.name), bytes: g.bytes })) }, null, 2))
+  if (args['dry-run']) return
+
+  const token = resolveToken()
+  const results = []
+  for (const group of groups) {
+    const lock = await acquireDirectoryLock(`${shardCacheRoot}.shard-lock`, directoryLockOptions('long', `cmaf batch publish ${group.items.length} films`))
+    let repo, commit
+    try {
+      ;({ repo } = await allocatePublicShard(manifestClone, group.bytes, token, { persist: false }))
+      const shard = await openVideoGitShard({ owner: GH_OWNER, repo, token, workDir: shardCacheRoot })
+      try {
+        const files = []
+        for (const item of group.items) {
+          files.push({ path: `${item.vidId}/${FILM_POSTER.fileName}`, sourcePath: item.stage.posterFile, size: item.posterBytes })
+          for (const name of item.stage.packaged.names) {
+            const abs = path.join(item.stage.filesDir, name)
+            files.push({ path: `${item.vidId}/${name}`, sourcePath: abs, size: fs.statSync(abs).size })
+          }
+        }
+        const pushed = await shard.pushFiles(files, { message: `cmaf batch: ${group.items.length} films, ${files.length} files` })
+        commit = pushed.commit
+      } finally { fs.rmSync(shard.directory, { recursive: true, force: true }) }
+    } finally { await lock.release() }
+
+    let first = true
+    for (const item of group.items) {
+      const run = spawnSync('node', [
+        path.join(here, 'AttachVideoCmafDashHls.mjs'),
+        '--source', item.task.src, '--manifest', item.manifestPath, '--manifest-clone', manifestClone,
+        '--work-root', path.join(shardCacheRoot, '..', 'HlsDashWork', `batch-${item.vidId}`), '--stage-root', stageRoot,
+        '--pushed-repo', repo, '--pushed-commit', commit, '--shard-add-bytes', String(first ? group.bytes : 0),
+      ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+      first = false
+      results.push({ name: item.task.name, ok: run.status === 0, repo, commit, error: run.status === 0 ? undefined : String(run.stderr || run.stdout).slice(-400) })
+    }
+  }
+  console.log(JSON.stringify({ results }, null, 2))
+  process.exit(results.every((r) => r.ok) ? 0 : 1)
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch((error) => { console.error(error?.stack || error); process.exit(1) })
+}

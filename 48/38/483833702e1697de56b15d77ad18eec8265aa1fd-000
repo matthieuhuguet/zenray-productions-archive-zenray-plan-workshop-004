@@ -1,0 +1,95 @@
+// Remplit les vignettes ENCORE manquantes (image:null) de la Shelf en dé-slugifiant les titres mal formés
+// (camelCase / snake_case / suffixes Sxx, année, "Manga", parenthèses) puis en cherchant sur TMDB (films/anime)
+// et RAWG (jeux). Télécharge les posters trouvés dans Scripts/_fill/<id>.<ext> + écrit _fill/_map.json.
+// Étape suivante (push-fill) : copier ces fichiers dans le repo public zenray-shelf-img, push, repointer les refs.
+// Clés en env : TMDB_KEY / RAWG_KEY (jamais commitées). Idempotent (ne touche que image:null).
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import { createWriteStream } from 'node:fs'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+
+const ROOT = new URL('../public/shelf/', import.meta.url)
+const OUT = new URL('./_fill/', import.meta.url)
+const TMDB = process.env.TMDB_KEY, RAWG = process.env.RAWG_KEY
+const IMG = (p) => (p ? `https://image.tmdb.org/t/p/w500${p}` : null)
+
+// dé-slugifie : snake/kebab -> espaces ; camelCase/PascalCase -> espaces ; nettoie.
+const deslug = (s) => String(s || '').trim()
+  .replace(/[_]+/g, ' ')
+  .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+  .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+  .replace(/\s+/g, ' ').trim()
+// version « recherche » : enlève année, Sxx/Exx/Season, "Manga", sous-titre après ":", parenthèses.
+const stripSearch = (s) => s
+  .replace(/\((\d+|[^)]*)\)/g, ' ')
+  .replace(/\b(19|20)\d{2}\b/g, ' ')
+  .replace(/\bS\d{1,2}\b|\bE\d{1,3}\b|\bSeason\s*\d+\b|\bSaison\s*\d+\b|\bPart\s*\d+\b/gi, ' ')
+  .replace(/\bManga\b|\bAnime\b/gi, ' ')
+  .replace(/[:|–—].*$/, ' ')
+  .replace(/\s+/g, ' ').trim()
+const candidates = (name) => {
+  const d = deslug(name)
+  const beforeSeason = d.replace(/\s+(s\d{1,2}|e\d{1,3}|season|saison|part)\b.*$/i, '').trim()
+  const out = [d, stripSearch(d), beforeSeason, d.split(/[:|–—]| - /)[0].trim()]
+  return [...new Set(out.filter((x) => x && x.length >= 2))]
+}
+
+async function jget(u) { try { const r = await fetch(u); return r.ok ? await r.json() : null } catch { return null } }
+const firstPoster = (j) => { const h = j && j.results && j.results.find((r) => r.poster_path); return h ? IMG(h.poster_path) : null }
+
+async function tmdbAny(name) {
+  for (const q of candidates(name)) {
+    const p = firstPoster(await jget(`https://api.themoviedb.org/3/search/multi?api_key=${TMDB}&query=${encodeURIComponent(q)}&include_adult=false`))
+      || firstPoster(await jget(`https://api.themoviedb.org/3/search/movie?api_key=${TMDB}&query=${encodeURIComponent(q)}`))
+      || firstPoster(await jget(`https://api.themoviedb.org/3/search/tv?api_key=${TMDB}&query=${encodeURIComponent(q)}`))
+    if (p) return p
+  }
+  return null
+}
+async function rawgGame(name) {
+  for (const q of candidates(name)) {
+    const j = await jget(`https://api.rawg.io/api/games?key=${RAWG}&search=${encodeURIComponent(q)}&search_precise=true&page_size=1`)
+    const img = j && j.results && j.results[0] && j.results[0].background_image
+    if (img) return img
+  }
+  return null
+}
+async function pool(items, limit, fn) { let i = 0; await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => { while (i < items.length) { const idx = i++; await fn(items[idx]) } })) }
+
+const extOf = (url, ct) => {
+  const m = String(url).toLowerCase().match(/\.(jpe?g|png|webp|avif)(\?|$)/)
+  if (m) return m[1] === 'jpeg' ? 'jpg' : m[1]
+  if (/png/.test(ct || '')) return 'png'; if (/webp/.test(ct || '')) return 'webp'; return 'jpg'
+}
+async function dl(url, id) {
+  const r = await fetch(url); if (!r.ok || !r.body) return null
+  const ext = extOf(url, r.headers.get('content-type'))
+  const file = `${id}.${ext}`
+  await pipeline(Readable.fromWeb(r.body), createWriteStream(new URL(file, OUT)))
+  return file
+}
+
+await mkdir(OUT, { recursive: true })
+const PLAN = [
+  { file: 'games.json', fetch: rawgGame, conc: 6 },
+  { file: 'anime-manga.json', fetch: tmdbAny, conc: 8 },
+  { file: 'movies.json', fetch: tmdbAny, conc: 8 },
+]
+const map = {}
+for (const { file, fetch: fetcher, conc } of PLAN) {
+  const path = new URL(file, ROOT)
+  const data = JSON.parse(await readFile(path, 'utf8'))
+  const todo = data.items.filter((it) => !it.image)
+  let filled = 0, miss = []
+  await pool(todo, conc, async (it) => {
+    const url = await fetcher(it.name)
+    if (!url) { miss.push(it.name); return }
+    const f = await dl(url, it.id)
+    if (f) { map[it.id] = { file: f, cat: data.category, name: it.name }; filled++ }
+    else miss.push(it.name)
+  })
+  console.log(`${file}: trouvé+téléchargé ${filled}/${todo.length} — restent ${miss.length}`)
+  if (miss.length) console.log('   non trouvés:', miss.map((m) => m.slice(0, 32)).join(' · '))
+}
+await writeFile(new URL('_map.json', OUT), JSON.stringify(map, null, 2))
+console.log(`\nFILL DONE — ${Object.keys(map).length} posters dans Scripts/_fill/ (voir _map.json)`)

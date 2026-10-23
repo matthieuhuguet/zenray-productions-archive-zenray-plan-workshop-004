@@ -1,0 +1,156 @@
+// @vitest-environment node
+// 14 October 2026, 12:10 CEST: real approved content, atomic chronology and adverse concurrent commits.
+import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { createJapaneseHandler, requireStudyApproval } from './japanese.js'
+import { STUDY_CONFIG, emptyStudyState, nextStudyStage } from '../src/learn/japaneseStudyModel.js'
+const catalogue = JSON.parse(readFileSync(new URL('../src/learn/fixtures/JapaneseReviewedFixtures.json', import.meta.url), 'utf8'))
+const record = catalogue.cards.find(card => card.id === 'grammar-copula')
+const response = (value, status = 200) => ({ ok: status < 400, status, json: async () => value, text: async () => JSON.stringify(value) })
+function fixture({ collision = false, fail = false } = {}) {
+  let head = 'head0', counter = 0, refs = 0
+  const versions = new Map([[head, {
+    [STUDY_CONFIG.historyPath]: '# Chronologie\n\n## L111 : historique\n\nTexte ancien intact.\n',
+    [STUDY_CONFIG.trackerPath]: '# Tracker\n\nErreur historique intacte.\n',
+    [STUDY_CONFIG.indexPath]: JSON.stringify({ lecons: [{ id: 'L111', ligne: 3, fin: 5 }] }),
+    [STUDY_CONFIG.cataloguePath]: JSON.stringify(catalogue),
+  }]])
+  const blobs = new Map(), trees = new Map(), commits = new Map()
+  const request = async (path, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null
+    if (path === 'git/ref/heads/main') {
+      refs++
+      if (collision && refs === 2) { const next = { ...versions.get(head), [STUDY_CONFIG.historyPath]: versions.get(head)[STUDY_CONFIG.historyPath] + '\nAjout concurrent conservé.\n' }; head = 'other'; versions.set(head, next) }
+      return response({ object: { sha: head } })
+    }
+    if (path.startsWith('contents/')) {
+      const [file, query] = path.slice(9).split('?')
+      const ref = new URLSearchParams(query).get('ref')
+      const text = versions.get(ref === 'main' ? head : ref)?.[decodeURI(file)]
+      return text == null ? response({}, 404) : response({ sha: 'blob', encoding: 'base64', content: Buffer.from(text).toString('base64') })
+    }
+    if (path === 'git/blobs') { if (fail) return response({}, 500); const sha = 'b' + counter++; blobs.set(sha, body.content); return response({ sha }) }
+    if (path.startsWith('git/commits/')) return response({ tree: { sha: path.split('/').at(-1) } })
+    if (path === 'git/trees') { const sha = 't' + counter++; const files = { ...versions.get(body.base_tree) }; for (const entry of body.tree) files[entry.path] = blobs.get(entry.sha); trees.set(sha, files); return response({ sha }) }
+    if (path === 'git/commits') { const sha = 'c' + counter++; commits.set(sha, body); versions.set(sha, trees.get(body.tree)); return response({ sha }) }
+    if (path === 'git/refs/heads/main') { if (commits.get(body.sha).parents[0] !== head) return response({}, 409); head = body.sha; return response({ ok: true }) }
+    throw new Error('Unexpected Git call: ' + path)
+  }
+  let now = Date.now()
+  const handler = createJapaneseHandler({ request, clock: () => now })
+  return { files: () => versions.get(head), advance: ms => { now += ms }, call: async body => {
+    let code, value
+    const res = { setHeader() {}, status(status) { code = status; return this }, json(payload) { value = payload } }
+    await handler({ method: body ? 'POST' : 'GET', body }, res)
+    return { code, value }
+  } }
+}
+const expose = { action: 'expose', eventId: 'exposure-test-0001', recordId: record.id }
+describe('Japanese study source and persistence', () => {
+  it('starts with zero mastery, then commits exposure, chronology, tracker and lesson index together', async () => {
+    const test = fixture()
+    expect((await test.call()).value.state.progress).toEqual({})
+    const result = await test.call(expose)
+    expect(result.code).toBe(200)
+    expect(result.value.state.progress[record.id].stage).toBe('red')
+    expect(test.files()[STUDY_CONFIG.historyPath]).toContain('Texte ancien intact.')
+    expect(test.files()[STUDY_CONFIG.historyPath]).toContain('## L112')
+    expect(test.files()[STUDY_CONFIG.trackerPath]).toContain('Erreur historique intacte.')
+    const index = JSON.parse(test.files()[STUDY_CONFIG.indexPath])
+    expect(test.files()[STUDY_CONFIG.historyPath].split('\n')[index.lecons.at(-1).ligne - 1]).toContain('## L112')
+    expect((await test.call(expose)).value.duplicate).toBe(true)
+    expect(test.files()[STUDY_CONFIG.historyPath].match(/japanese-study-event/g)).toHaveLength(1)
+  })
+  it('rebases an append on concurrent Memory content without overwriting it', async () => {
+    const test = fixture({ collision: true })
+    expect((await test.call(expose)).code).toBe(200)
+    expect(test.files()[STUDY_CONFIG.historyPath]).toContain('Ajout concurrent conservé.')
+  })
+  it('leaves all files unchanged if the Git write fails', async () => {
+    const test = fixture({ fail: true }), before = structuredClone(test.files())
+    expect((await test.call(expose)).code).toBe(400)
+    expect(test.files()).toEqual(before)
+  })
+  it('records oral self-assessment and refuses premature or repeated reviews', async () => {
+    const test = fixture()
+    await test.call(expose)
+    const review = { action: 'review', eventId: 'review-test-0001', recordId: record.id, grades: ['fluent'], elapsed: [1000], expectedReviews: 0 }
+    const result = await test.call(review)
+    expect(result.value.state.progress[record.id].stage).toBe('orange')
+    expect(test.files()[STUDY_CONFIG.historyPath]).toContain('sans reconnaissance vocale')
+    expect((await test.call({ ...review, eventId: 'review-test-0002', expectedReviews: 1 })).code).toBe(400)
+    test.advance(STUDY_CONFIG.srs.orangeMs)
+    expect((await test.call({ ...review, eventId: 'review-test-0003', expectedReviews: 1 })).value.state.progress[record.id].stage).toBe('green')
+  })
+  it('requires all exercises, rejects a locked lesson and validates modified content', async () => {
+    const test = fixture()
+    expect((await test.call({ ...expose, recordId: 'grammar-condition-ba' })).code).toBe(400)
+    const changed = structuredClone(record); changed.examples[0].fr = 'False translation'
+    expect(() => requireStudyApproval(changed)).toThrow('bloquée')
+    const missing = structuredClone(record); delete missing.lessonValidation
+    expect(() => requireStudyApproval(missing)).toThrow('bloquée')
+  })
+  it('requires two separated green successes for mastery and demotes hesitation', () => {
+    const row = { stage: 'green', greenSuccesses: 0, reviews: 2 }
+    const first = nextStudyStage(row, ['fluent'], [2000], 1000)
+    expect(first.stage).toBe('green')
+    expect(first.due).toBe(1000 + STUDY_CONFIG.srs.greenMs)
+    expect(nextStudyStage(first, ['fluent'], [2000], first.due).stage).toBe('mastered')
+    expect(nextStudyStage(row, ['fluent'], [6000], 1000).stage).toBe('orange')
+  })
+  it('tests existing knowledge without inventing mastery or forcing a restart from N5', async () => {
+    const test = fixture()
+    const diagnostic = { action: 'placement', eventId: 'diagnostic-test-1', recordId: record.id, grades: ['fluent'], elapsed: [1000] }
+    const result = await test.call(diagnostic)
+    expect(result.code).toBe(200)
+    expect(result.value.state.progress[record.id]).toMatchObject({ stage: 'orange', placementPassed: true, reviews: 1 })
+    expect((await test.call({ action: 'expose', eventId: 'after-diagnostic', recordId: 'grammar-topic' })).code).toBe(200)
+    const failed = nextStudyStage(result.value.state.progress[record.id], ['failed'], [1000], Date.now())
+    expect(failed.placementPassed).toBe(false)
+  })
+  it('saves bounded parameters and missing notions without writing a second session chronology', async () => {
+    const test = fixture()
+    const before = test.files()[STUDY_CONFIG.historyPath]
+    expect((await test.call({ action: 'preferences', eventId: 'parameters-test', updates: { batch: 8, scale: 19 } })).value.state.preferences.batch).toBe(8)
+    expect((await test.call({ action: 'gap', eventId: 'research-test-01', query: 'Lecture longue N1' })).value.state.gaps).toHaveLength(1)
+    expect(test.files()[STUDY_CONFIG.historyPath]).toBe(before)
+  })
+})
+
+// 16 October 2026 14:20 Europe/Paris: metadata is saved atomically and cannot overwrite another editor.
+describe('Japanese personal categories', () => {
+  it('persists categories without rewriting chronology or mastery and rejects stale revisions', async () => {
+    const test = fixture(), before = structuredClone(test.files())
+    const event = {action:'annotate',eventId:'category-test-0001',recordId:record.id,category:'À revoir',favorite:true,expectedRevision:0}
+    const saved = await test.call(event)
+    expect(saved.code).toBe(200)
+    expect(saved.value.state.annotations[record.id]).toMatchObject({category:'À revoir',favorite:true,revision:1})
+    expect(saved.value.state.progress).toEqual({})
+    expect(test.files()[STUDY_CONFIG.historyPath]).toBe(before[STUDY_CONFIG.historyPath])
+    expect((await test.call(event)).value.duplicate).toBe(true)
+    expect((await test.call({...event,eventId:'category-test-0002',category:'Autre'})).code).toBe(400)
+    expect((await test.call({...event,eventId:'category-test-0003',recordId:'constructor'})).code).toBe(400)
+  })
+})
+
+// 16 October 2026 14:35 Europe/Paris: notes survive reloads and concurrent edits cannot silently replace text.
+describe('Japanese personal notebook', () => {
+  it('saves and reloads a note, archives reversibly and preserves chronology', async () => {
+    const test=fixture(), history=test.files()[STUDY_CONFIG.historyPath]
+    const event={action:'note',eventId:'notebook-test-0001',noteId:'note-0001',title:'Voyage',text:'Une question sur 京都',topic:'japan',archived:false,expectedRevision:0}
+    expect((await test.call(event)).code).toBe(200)
+    expect((await test.call()).value.state.notes['note-0001'].text).toBe(event.text)
+    expect((await test.call({...event,eventId:'notebook-test-0002',text:'Écrasement périmé'})).code).toBe(400)
+    expect((await test.call({...event,eventId:'notebook-test-0003',expectedRevision:1,archived:true})).code).toBe(200)
+    expect((await test.call({...event,eventId:'notebook-test-0004',expectedRevision:2,archived:false})).code).toBe(200)
+    expect((await test.call()).value.state.notes['note-0001'].text).toBe(event.text)
+    expect(test.files()[STUDY_CONFIG.historyPath]).toBe(history)
+  })
+  it('rejects oversized or malformed notes without changing the stored state',async()=>{
+    const test=fixture()
+    for(const fields of [{title:''},{text:'x'.repeat(10001)},{topic:'invalid'},{noteId:'__proto__'}]) {
+      expect((await test.call({action:'note',eventId:'invalid-note-0001',noteId:'note-valid',title:'Titre',text:'Texte',topic:'japanese',archived:false,expectedRevision:0,...fields})).code).toBe(400)
+    }
+    expect((await test.call()).value.state.notes).toBeUndefined()
+  })
+})

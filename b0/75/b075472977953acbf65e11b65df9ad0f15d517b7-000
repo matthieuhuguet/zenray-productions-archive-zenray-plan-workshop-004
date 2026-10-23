@@ -1,0 +1,82 @@
+import { fileToWebp } from '../api.js'
+
+// Vercel reçoit du JSON/base64 (≈ 4/3 du binaire). Garder le WebP sous 3 MiB
+// laisse une marge sûre sous la limite de requête tout en conservant une image
+// 4K et une qualité élevée dans le cas normal.
+export const EDITOR_IMAGE_MAX_BYTES = 3 * 1024 * 1024
+export const EDITOR_IMAGE_ATTEMPTS = Object.freeze([
+  { quality: 0.95, max: 4096 },
+  { quality: 0.92, max: 3840 },
+  { quality: 0.89, max: 3200 },
+  { quality: 0.86, max: 2560 },
+  { quality: 0.82, max: 2048 },
+])
+
+export function dataUrlByteLength(value) {
+  if (typeof value !== 'string') return 0
+  const comma = value.indexOf(',')
+  if (comma < 0) return 0
+  const header = value.slice(0, comma)
+  const payload = value.slice(comma + 1)
+  if (!/;base64(?:;|$)/i.test(header)) {
+    try { return new TextEncoder().encode(decodeURIComponent(payload)).byteLength } catch { return Infinity }
+  }
+  const clean = payload.replace(/\s/g, '')
+  const padding = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0
+  return Math.max(0, Math.floor(clean.length * 3 / 4) - padding)
+}
+
+export async function prepareEditorImage(file, convert = fileToWebp) {
+  for (const attempt of EDITOR_IMAGE_ATTEMPTS) {
+    const dataUrl = await convert(file, attempt.quality, attempt.max).catch(() => null)
+    if (!dataUrl) continue
+    const bytes = dataUrlByteLength(dataUrl)
+    if (bytes > 0 && bytes <= EDITOR_IMAGE_MAX_BYTES) return { dataUrl, bytes, ...attempt }
+  }
+  return null
+}
+
+// COTE CLIENT AUSSI, mais pour une autre panne que celle du serveur. `server/github-retry.js`
+// rattrape les echecs de GitHub ; ce filet-ci rattrape ce qui casse AVANT d'y arriver, c'est-a-dire
+// le trajet navigateur vers serveur : un wifi qui saute, un reveil de machine, une fonction
+// serverless qui demarre a froid et coupe. La route rend alors soit une exception de `fetch`, soit
+// une reponse serveur dont l'erreur est `github` ou `fetch`, ce qui veut dire « je n'ai pas pu »,
+// pas « ton image est mauvaise ».
+//
+// LES REFUS DEFINITIFS SORTENT DU PREMIER COUP, et c'est la moitie de l'interet : un 413 dit que
+// l'image est trop lourde, `bad` que le format n'est pas reconnu, `no-token` qu'il manque une
+// configuration. Recommencer ne changerait rien et ferait attendre Matthieu pour le meme echec.
+export const ERREURS_DEFINITIVES = Object.freeze(['bad', 'no-token', 'editor-image-too-large'])
+export const STATUTS_DEFINITIFS = Object.freeze([400, 401, 403, 404, 413, 422])
+export const PERSIST_TENTATIVES = 3
+
+const estDefinitif = (status, erreur) =>
+  STATUTS_DEFINITIFS.includes(status) || ERREURS_DEFINITIVES.includes(erreur)
+
+export async function persistEditorImage(dataUrl, fetchImpl = fetch, options = {}) {
+  const tentatives = options.tentatives || PERSIST_TENTATIVES
+  const attente = options.attente || ((i) => 500 * (i + 1))
+  let derniere = null
+
+  for (let i = 0; i < tentatives; i++) {
+    let response = null
+    let result = null
+    try {
+      response = await fetchImpl('/api/img', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ dataUrl }),
+      })
+      try { result = await response.json() } catch {}
+      if (response.ok && result?.url && result?.path) return result
+      derniere = new Error(result?.error || `image-upload-${response.status || 'failed'}`)
+      derniere.status = response.status || 0
+    } catch (e) {
+      derniere = e instanceof Error ? e : new Error('image-upload-network')
+      derniere.status = derniere.status || 0
+    }
+    if (estDefinitif(derniere.status, derniere.message)) throw derniere
+    if (i < tentatives - 1) await new Promise((r) => setTimeout(r, attente(i)))
+  }
+  throw derniere
+}

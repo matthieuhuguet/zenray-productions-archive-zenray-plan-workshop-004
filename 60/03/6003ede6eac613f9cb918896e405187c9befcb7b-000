@@ -1,0 +1,113 @@
+// gmapsLink.js — création de nœuds .media.json {type:'gmaps'} à partir de liens Google Maps (2026-07-04,
+// demande explicite de Matthieu : intégrer des liens Google Maps EXACTEMENT comme les liens YouTube — même
+// architecture, mêmes points d'intégration (Space/Quick Look, double-clic, New menu, tuile Finder).
+//
+// ARCHITECTURE (même principe que youtubeLink.js) : le nœud reste un .media.json ORDINAIRE, juste un 5e
+// discriminant `type:'gmaps'` en plus de video-raw/dash/hls/youtube. Zéro nouveau type de fichier, zéro
+// dispatch dupliqué — MediaViewer.jsx et QuickLookOverlay.jsx lisent déjà `m.type` pour choisir le lecteur.
+//
+// RÉSOLUTION DE LIEN : Google Maps a deux formes d'URL utilisables ici —
+//   1. Longue (« /maps/place/Nom/@lat,lng,zoom... » ou « /maps?q=... ») : on peut extraire coordonnées/nom
+//      DIRECTEMENT depuis l'URL, sans requête réseau.
+//   2. Raccourcie (maps.app.goo.gl/...) : aucune info exploitable dans l'URL elle-même — on la fait résoudre
+//      par /api/unfurl (endpoint déjà existant, suit les redirections en SSRF-safe côté serveur, cf.
+//      server/unfurl.js) qui renvoie `finalUrl` (l'URL longue résolue) + `title` (le nom du lieu, extrait du
+//      <title>/og:title de la page Google Maps). On appelle systématiquement /api/unfurl (même pour les liens
+//      déjà longs) : un seul chemin de code, le titre réel du lieu est un bonus gratuit dans les deux cas.
+//
+// EMBED : le vieux truc sans clé (`maps.google.com/maps?q=...&output=embed`) est MORT — vérifié en test réel
+// (2026-07-04) : Google renvoie 404 sur cette route et sur son équivalent www.google.com depuis quelque temps.
+// La SEULE façon officielle et actuellement fonctionnelle d'intégrer une vraie carte Google Maps interactive
+// est l'Embed API (`google.com/maps/embed/v1/place?key=...&q=...`) — GRATUITE et sans facturation (contrairement
+// aux autres API Google Maps), mais elle EXIGE une clé (Google Cloud Console > Maps Embed API > Create
+// credentials, restreinte par domaine HTTP referrer, 2 minutes). Le manifeste stocke donc les composants BRUTS
+// (query/lat/lng/zoom), PAS une URL figée — GmapsViewer.jsx construit l'URL d'intégration AU RENDU, en lisant
+// la clé depuis VITE_GMAPS_EMBED_KEY : un nœud déjà créé se mettra à afficher la vraie carte automatiquement dès
+// que la clé sera ajoutée, sans avoir à recréer le lien.
+import { saveJson } from '../ref/content.js'
+
+const sanitize = (s = '') => (s || 'lieu').replace(/[/\\]/g, '_').replace(/[^\w.\- ]+/g, '').trim().slice(0, 80) || 'lieu'
+const rand = () => Math.random().toString(36).slice(2, 8)
+
+// Extrait {lat,lng,zoom} ou {query} d'une URL Google Maps LONGUE (après résolution éventuelle des raccourcis).
+// Extrait TOUJOURS les deux quand disponibles (bug trouvé en test réel, 2026-07-04) : un lien /maps/place/<Nom>/
+// contient QUASI TOUJOURS aussi un @lat,lng,zoom (le pin centré) — un premier jet qui retournait dès le premier
+// match trouvé (coordonnées EN PREMIER dans le pathname) ne voyait jamais le nom de lieu, pourtant présent juste
+// avant dans la même URL. Coordonnées = plus précises pour centrer la carte ; nom de lieu = bien plus lisible
+// pour le titre affiché ("Tokyo Tower" plutôt que "35.6585805, 139.7432952").
+export function parseGoogleMapsUrl(url) {
+  try {
+    const u = new URL(url)
+    const hostname = u.hostname.toLowerCase().replace(/\.$/, '')
+    const isGoogleOwned = hostname === 'google.com' || hostname.endsWith('.google.com') || hostname === 'maps.app.goo.gl'
+    if (!isGoogleOwned) return null
+    const at = u.pathname.match(/@(-?\d+\.\d+),(-?\d+\.\d+)(?:,(\d+(?:\.\d+)?)z)?/)
+    const place = u.pathname.match(/\/maps\/place\/([^/@]+)/)
+    const q = u.searchParams.get('q') || u.searchParams.get('query')
+    const query = place ? decodeURIComponent(place[1].replace(/\+/g, ' ')) : (q || null)
+    if (at) return { lat: at[1], lng: at[2], zoom: at[3] ? Math.round(Number(at[3])) : 15, query }
+    if (query) return { query }
+    return null
+  } catch { return null }
+}
+
+// Résout un lien Google Maps (court ou long) via /api/unfurl -> {query, lat, lng, zoom, name, sourceUrl} ou
+// null si non reconnu. Renvoie les composants BRUTS (pas d'URL d'intégration figée, cf. commentaire plus haut).
+async function resolveGmaps(rawUrl) {
+  let finalUrl = rawUrl, title = null
+  try {
+    const j = await fetch(`/api/unfurl?url=${encodeURIComponent(rawUrl)}`).then((r) => r.json())
+    if (j && !j.error) { finalUrl = j.finalUrl || rawUrl; title = j.title || null }
+  } catch {}
+  const parsed = parseGoogleMapsUrl(finalUrl) || parseGoogleMapsUrl(rawUrl)
+  if (!parsed) return null
+  // Titre : le nom de lieu EXTRAIT DE L'URL (parsed.query) en priorité — bug trouvé en test réel (2026-07-04) :
+  // Google Maps est une SPA cliente ; un simple fetch HTML (sans exécution JS, ce que fait /api/unfurl) ne voit
+  // QUE le <title> générique de la coquille de page ("Google Maps"), jamais le nom du lieu réel qui n'est peuplé
+  // qu'après chargement JS côté navigateur. Le titre unfurlé n'est donc utile QUE quand parsed.query est absent
+  // (lien uniquement en coordonnées @lat,lng, sans nom de lieu dans l'URL elle-même) ET qu'il n'est pas
+  // lui-même le générique "Google Maps".
+  const cleanTitle = title && title.replace(/\s*-\s*Google Maps$/i, '').trim()
+  const usableTitle = cleanTitle && !/^google\s*maps$/i.test(cleanTitle) ? cleanTitle : null
+  const name = parsed.query || usableTitle || `${parsed.lat}, ${parsed.lng}`
+  return { query: parsed.query || null, lat: parsed.lat || null, lng: parsed.lng || null, zoom: parsed.zoom || null, name, sourceUrl: finalUrl }
+}
+
+// Construit le manifest .media.json {type:'gmaps'} pour UN lien. Ne fait AUCUNE écriture (pur, testable).
+export async function buildGmapsManifest(rawUrl) {
+  const resolved = await resolveGmaps(rawUrl)
+  if (!resolved) return null
+  return {
+    type: 'gmaps', v: 1,
+    url: rawUrl,
+    query: resolved.query, lat: resolved.lat, lng: resolved.lng, zoom: resolved.zoom,
+    name: resolved.name, title: resolved.name,
+    addedAt: new Date().toISOString(),
+  }
+}
+
+// Crée le nœud .media.json dans `folder`. Renvoie {ok, name, nodePath} ou {ok:false, error, url}.
+export async function createGmapsLinkNode(rawUrl, folder) {
+  const m = await buildGmapsManifest(rawUrl)
+  if (!m) return { ok: false, error: 'lien Google Maps non reconnu', url: rawUrl }
+  const dest = String(folder || 'pages').replace(/\/$/, '')
+  const nodePath = `${dest}/${sanitize(m.name)}.${rand()}.media.json`
+  const res = await saveJson(nodePath, m)
+  if (!res.ok) return { ok: false, error: res.error || "échec d'écriture", url: rawUrl }
+  return { ok: true, name: m.name, nodePath }
+}
+
+// BATCH (même geste que Liens YouTube… : un lien par ligne, coller un lot d'un coup).
+export async function createGmapsLinkNodesBatch(text, folder, onProgress) {
+  const urls = String(text || '').split('\n').map((s) => s.trim()).filter(Boolean)
+  const results = []
+  for (let i = 0; i < urls.length; i++) {
+    results.push(await createGmapsLinkNode(urls[i], folder))
+    onProgress && onProgress((i + 1) / urls.length)
+  }
+  const nodePaths = results.filter((r) => r.ok).map((r) => r.nodePath)
+  if (nodePaths.length) {
+    try { await fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'index-add', paths: nodePaths }) }) } catch {}
+  }
+  return results
+}

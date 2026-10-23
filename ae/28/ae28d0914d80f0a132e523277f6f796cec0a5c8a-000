@@ -1,0 +1,142 @@
+// Résolution + promotion des médias PRIVÉS vers des assets PUBLICS autonomes.
+// Entrée : un brouillon (mediaRefs + blocks pouvant contenir /api/img?path=...).
+// Sortie : { files: [{ path, base64 }], rewriteMap, assetMeta }.
+//   - files   : binaires à écrire dans ZenRayWebsite sous public/articles/<slug>/...
+//   - rewriteMap : (nodePath OU url privée) -> chemin PUBLIC du site (/articles/<slug>/...)
+//   - assetMeta  : chemin public -> { type, w, h }
+// Règles : noms ANONYMISÉS (asset-id séquentiel, jamais le nom humain du fichier), WebP/H264 seulement,
+// aucune URL privée propagée. On réutilise le plumbing existant (token serveur, GitHub raw) sans cloner.
+
+import { parseShard } from './shard-naming.js'
+const OWNER = process.env.CONTENT_OWNER || (process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data').split('/')[0]
+const CONTENT_REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const CONTENT_BRANCH = process.env.CONTENT_BRANCH || 'main'
+// Le binaire d'un asset privé vit sur un shard PRIVÉ : legacy zenray-media-NN OU nouveau zenray-img-private-NN.
+// parseShard accepte les deux ; on n'accepte que les shards privés pour la promotion d'article.
+const isPrivateShard = (repo) => { const p = parseShard(repo); return !!p && p.vis === 'private' }
+
+const b64d = (s) => Buffer.from(s || '', 'base64').toString('utf8')
+
+function ghJson(token, repo, path) {
+  return fetch(`https://api.github.com/repos/${repo}/contents/${encodeURI(path)}?ref=${CONTENT_BRANCH}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress' },
+  })
+}
+function ghRaw(token, repo, path) {
+  return fetch(`https://api.github.com/repos/${repo}/contents/${encodeURI(path)}?ref=${CONTENT_BRANCH}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zenray-progress' },
+  })
+}
+
+// Extensions web publiques autorisées (WebP/H264 strategy du site). Rejette AVIF/AV1/HLS.
+const PUBLIC_IMG = new Set(['webp', 'png', 'jpg', 'jpeg', 'gif', 'svg'])
+const PUBLIC_VID = new Set(['mp4', 'm4v'])
+const extOf = (p) => (p.split('.').pop() || '').toLowerCase()
+
+// Lit un manifest .img.json et renvoie le binaire (base64) + meta. Refuse AVIF (préfère la dérivée .webp).
+async function resolveImgManifest(token, nodePath) {
+  const r = await ghJson(token, CONTENT_REPO, nodePath)
+  if (!r.ok) throw new Error('img-manifest-404:' + nodePath)
+  const m = JSON.parse(b64d((await r.json()).content))
+  if (!m.repo || !isPrivateShard(m.repo) || !m.path) throw new Error('img-manifest-bad:' + nodePath)
+  // AVIF interdit côté site -> on récupère la dérivée .webp (convention thumb/même chemin .webp).
+  let path = m.path
+  if (extOf(path) === 'avif') path = m.thumb || path.replace(/\.[^./]+$/, '.webp')
+  if (!PUBLIC_IMG.has(extOf(path))) throw new Error('img-format-rejected:' + extOf(path))
+  const br = await ghRaw(token, m.repo, path)
+  if (!br.ok) throw new Error('img-blob-404:' + path)
+  const buf = Buffer.from(await br.arrayBuffer())
+  return { base64: buf.toString('base64'), ext: extOf(path), type: 'image', w: m.w || null, h: m.h || null }
+}
+
+// Lit un manifest .media.json chunké, reconstitue le binaire complet. Refuse tout sauf mp4/h264.
+async function resolveMediaManifest(token, nodePath) {
+  const r = await ghJson(token, CONTENT_REPO, nodePath)
+  if (!r.ok) throw new Error('media-manifest-404:' + nodePath)
+  const m = JSON.parse(b64d((await r.json()).content))
+  if (m.type === 'hls') throw new Error('media-hls-rejected') // HLS = segments chiffrés privés, jamais promu tel quel
+  const mime = m.mime || ''
+  const isImg = mime.startsWith('image/')
+  const isVid = mime.startsWith('video/')
+  if (!Array.isArray(m.parts) || !m.dir) throw new Error('media-manifest-bad')
+  const repo = (typeof m.repo === 'string' && isPrivateShard(m.repo)) ? m.repo : CONTENT_REPO
+  // Reconstitue tous les chunks (.bin) en ordre -> binaire complet.
+  const buffers = []
+  for (const part of m.parts) {
+    const cr = await ghRaw(token, repo, `${m.dir}/${part}.bin`)
+    if (!cr.ok) throw new Error('media-chunk-404:' + part)
+    buffers.push(Buffer.from(await cr.arrayBuffer()))
+  }
+  const buf = Buffer.concat(buffers)
+  if (isImg) {
+    const ext = mime.includes('webp') ? 'webp' : mime.includes('png') ? 'png' : mime.includes('gif') ? 'gif' : (mime.includes('jpeg') || mime.includes('jpg')) ? 'jpg' : null
+    if (!ext || ext === null || mime.includes('avif')) throw new Error('media-img-format-rejected:' + mime)
+    return { base64: buf.toString('base64'), ext, type: 'image', w: m.w || null, h: m.h || null }
+  }
+  if (isVid) {
+    // Site = stratégie H.264/mp4. On accepte mp4/h264, refuse av1/webm.
+    if (!(mime.includes('mp4') || mime.includes('h264') || mime.includes('avc'))) throw new Error('media-vid-format-rejected:' + mime)
+    return { base64: buf.toString('base64'), ext: 'mp4', type: 'video', w: m.w || null, h: m.h || null }
+  }
+  throw new Error('media-type-rejected:' + mime)
+}
+
+// Récupère un binaire référencé par /api/img?path=uploads/x.webp (image BlockNote inline, repo zenray-data).
+async function resolveApiImg(token, url) {
+  const m = /[?&]path=([^&]+)/.exec(url)
+  if (!m) throw new Error('apiimg-bad-url')
+  const path = decodeURIComponent(m[1])
+  if (path.includes('..') || !PUBLIC_IMG.has(extOf(path))) throw new Error('apiimg-format-rejected:' + path)
+  const br = await ghRaw(token, CONTENT_REPO, path)
+  if (!br.ok) throw new Error('apiimg-404:' + path)
+  const buf = Buffer.from(await br.arrayBuffer())
+  return { base64: buf.toString('base64'), ext: extOf(path), type: 'image' }
+}
+
+// Collecte toutes les URLs /api/img présentes dans les blocks (à promouvoir comme assets inline).
+function collectInlineApiImg(blocks) {
+  const found = new Set()
+  const walk = (v) => {
+    if (typeof v === 'string') { if (/\/api\/img\?/.test(v)) found.add(v) }
+    else if (Array.isArray(v)) v.forEach(walk)
+    else if (v && typeof v === 'object') Object.values(v).forEach(walk)
+  }
+  walk(blocks)
+  return [...found]
+}
+
+// API principale. Promeut mediaRefs + images inline. Lève à la première erreur (publish atomique).
+export async function resolveAndPromote(token, draft, slug) {
+  if (!token) throw new Error('no-token')
+  const files = []
+  const rewriteMap = {}
+  const assetMeta = {}
+  let n = 0
+
+  for (const ref of (draft.mediaRefs || [])) {
+    const np = ref.nodePath
+    if (!np) continue
+    let res
+    if (np.endsWith('.img.json')) res = await resolveImgManifest(token, np)
+    else if (np.endsWith('.media.json')) res = await resolveMediaManifest(token, np)
+    else throw new Error('ref-unsupported:' + np)
+    const id = ref.role === 'hero' ? 'hero' : (ref.id || `a${++n}`)
+    const sub = ref.role === 'hero' ? `hero.${res.ext}` : `media/${id}.${res.ext}`
+    const publicSrc = `/articles/${slug}/${sub}`
+    files.push({ path: `public/articles/${slug}/${sub}`, base64: res.base64 })
+    rewriteMap[np] = publicSrc
+    assetMeta[publicSrc] = { type: res.type, ...(res.w ? { w: res.w } : {}), ...(res.h ? { h: res.h } : {}) }
+  }
+
+  for (const url of collectInlineApiImg(draft.blocks)) {
+    const res = await resolveApiImg(token, url)
+    const id = `i${++n}`
+    const sub = `media/${id}.${res.ext}`
+    const publicSrc = `/articles/${slug}/${sub}`
+    files.push({ path: `public/articles/${slug}/${sub}`, base64: res.base64 })
+    rewriteMap[url] = publicSrc
+    assetMeta[publicSrc] = { type: 'image' }
+  }
+
+  return { files, rewriteMap, assetMeta }
+}

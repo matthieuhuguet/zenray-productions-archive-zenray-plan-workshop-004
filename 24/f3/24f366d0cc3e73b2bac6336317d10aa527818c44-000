@@ -1,0 +1,132 @@
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// MÉTHODE CANONIQUE — INTÉGRER DES IMAGES DANS LE DRIVE (public + chiffré + jsDelivr + index)
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// POURQUOI CE FICHIER EXISTE : on a réinventé ce flux plusieurs fois (et on s'est trompé : avif en clair
+// sur repos PRIVÉS = MAUVAIS état final). Cette lib FIGE la bonne méthode, une fois pour toutes, pour que
+// toute future ingestion d'images (Eagle, upload batch, import tiers) la RÉUTILISE au lieu de la re-deviner.
+// Doc longue : docs/image-backup-canonical.md. Schéma chiffrement : src/media/crypto.js + universalCapture.js.
+//
+// ── LE MODÈLE EN UNE PHRASE ───────────────────────────────────────────────────────────────────────
+//   Une image finit CHIFFRÉE (AES-GCM, clé maître) sur un dépôt GitHub PUBLIC zenray-img-public-NN,
+//   servie par le CDN jsDelivr (gratuit, illimité, hors quota GitHub) via une URL PINNÉE sur le commit
+//   (cache immuable). Le manifeste .img.json porte cdnRepo/cdnPath/cdnCommit/alg/iv/thumbIv. Le serveur
+//   déchiffre à la volée avec la clé maître (/api/media-key). Public = octets lisibles mais inutiles
+//   sans la clé. Aucun nom humain (P0 anti-fuite) : chemins = hash du contenu ab/cd/<sha256>.<ext>.
+//
+// ── LES 2 PASSES (workflow éprouvé du projet) ──────────────────────────────────────────────────────
+//   Passe 1 — INGESTION (privé/clair) : convertir l'image en AVIF CRF25 (+ vignette .webp), la pousser
+//             en CLAIR sur un shard PRIVÉ zenray-img-private-NN, écrire le manifeste .img.json
+//             {type:image, repo, path, name, ext, w, h, size, tags, addedAt, eagleId}. Voir
+//             Scripts/eagle-pngjpg-backup.mjs (API) ou eagle-img-gitpush.mjs (git push, plus rapide).
+//   Passe 2 — PUBLICATION : Scripts/migrate-encrypt-public.mjs --apply lit le clair du shard privé,
+//             CHIFFRE (cette lib), pousse le ciphertext sur le shard PUBLIC (git push, 1 commit/shard),
+//             réécrit le manifeste avec vis:public + cdnRepo/cdnPath/cdnCommit. Idempotent, non destructif.
+//   Passe 3 — INDEX : Scripts/build-search-index.mjs --apply régénère pages/.zr-search-index.json
+//             (liste de chemins + carte "thumbs" jsDelivr). Recherche par nom/métadonnées immédiate.
+//
+//   NB : on peut fusionner passe 1+2 en ingérant DIRECTEMENT en public chiffré (chiffrer ICI puis git push
+//        sur zenray-img-public-NN + manifeste public complet). C'est l'évolution recommandée — voir
+//        buildPublicImgManifest() ci-dessous, qui produit le manifeste final attendu par ImageNodeViewer.
+//
+// ── POURQUOI GIT PUSH ET PAS L'API REST ────────────────────────────────────────────────────────────
+//   L'API REST GitHub plafonne à 5000 req/h : pousser des milliers d'images blob-par-blob crame le quota
+//   ET hang (secondary rate limit). Le TRANSPORT GIT (clone/push) n'est PAS soumis à cette limite.
+//   RÈGLE : push par INCRÉMENTS (~600 fichiers / <1 Go par commit). Un push unique de plusieurs Go HANG
+//   (git attend, 0% CPU). Toujours GIT_TERMINAL_PROMPT=0 (jamais de prompt d'auth = jamais de hang) +
+//   timeout dur + retries. Cap dur 4,3–4,5 Go par shard (< 5 Go GitHub) avec rollover sur NN+1.
+//
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+import { createHash, createCipheriv } from 'node:crypto'
+// Réglage vignette : SEUL fichier source, partagé Node + navigateur + worker (src/config/thumbnail.js).
+// Ré-exporté ici pour que les consommateurs Node existants (img-ingest.mjs, regen-thumbs-*.mjs)
+// n'aient rien à changer — ne jamais redéfinir THUMB_MAX_SHORT/THUMB_QUALITY ailleurs.
+// ATTENTION UNITÉ : magick/cwebp (Node) veulent un entier 0-100 -> c'est THUMB_QUALITY_PCT du fichier
+// source, renommé ici THUMB_QUALITY. Le navigateur (canvas.toBlob) veut du 0-1 -> importer THUMB_QUALITY
+// (sans suffixe) directement depuis src/config/thumbnail.js, jamais depuis ce ré-export Node.
+export { THUMB_MAX_SHORT, THUMB_QUALITY_PCT as THUMB_QUALITY } from '../../src/config/thumbnail.js'
+
+// ── CHIFFREMENT (doit reproduire octet-pour-octet WebCrypto côté client) ────────────────────────────
+// IV DÉTERMINISTE = 12 premiers octets du SHA-256 du CLAIR. Même clair -> même IV -> même ciphertext ->
+// même sha de blob -> GitHub dédoublonne -> IDEMPOTENT. L'IV n'est pas secret (juste unique par fichier).
+export const sha256Hex = (buf) => createHash('sha256').update(buf).digest('hex')
+export const ivFromHash = (hashHex) => Buffer.from(hashHex.slice(0, 24), 'hex') // 12 octets
+
+// Chiffre un Buffer clair -> { cipher, iv(base64) }. cipher = body||authTag (WebCrypto concatène le tag).
+// `key` = clé maître AES-256 (32 octets), lue via loadMasterKey() — JAMAIS générée.
+export function encryptDeterministic(clearBuf, key, hashHex = null) {
+  const hh = hashHex || sha256Hex(clearBuf)
+  const iv = ivFromHash(hh)
+  const c = createCipheriv('aes-256-gcm', key, iv)
+  const body = Buffer.concat([c.update(clearBuf), c.final()])
+  return { cipher: Buffer.concat([body, c.getAuthTag()]), iv: iv.toString('base64'), hash: hh }
+}
+
+// Clé maître : env ZENRAY_MEDIA_KEY (base64 32o) puis fichier <repo>/.zenray-media-key. JAMAIS générée
+// (une nouvelle clé rendrait tout le média indéchiffrable). Renvoie Buffer(32) ou null.
+export function loadMasterKey(repoRoot, fs) {
+  const env = process.env.ZENRAY_MEDIA_KEY
+  if (env && /^[A-Za-z0-9+/=]{40,}$/.test(env.trim())) { const b = Buffer.from(env.trim(), 'base64'); if (b.length === 32) return b }
+  try { const v = fs.readFileSync(`${repoRoot}/.zenray-media-key`, 'utf8').trim(); const b = Buffer.from(v, 'base64'); if (b.length === 32) return b } catch {}
+  return null
+}
+
+// ── CHEMINS & SHARDS ────────────────────────────────────────────────────────────────────────────────
+// Adresse de contenu : ab/cd/<sha256(clair)>.<ext>. Identique privé/public/migration. Aucun nom humain.
+export const shardPathFor = (hashHex, ext) => `${hashHex.slice(0, 2)}/${hashHex.slice(2, 4)}/${hashHex}.${ext}`
+export const PUBLIC_SHARD_BASE = 'zenray-img-public-'   // famille PUBLIQUE (jsDelivr) — état final des images
+export const PRIVATE_SHARD_BASE = 'zenray-img-private-' // famille privée — staging passe 1 uniquement
+export const SHARD_CAP_BYTES = 4.3 * 1073741824         // cap dur par shard (< 5 Go GitHub)
+export const shardName = (base, i, width = 2) => base + String(i).padStart(width, '0')
+export const jsDelivrUrl = (owner, repo, commit, hashedPath) => `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${commit}/${hashedPath}`
+
+// ── DÉCOUPAGE EN MORCEAUX ≤19 Mo (2026-07-07, remplace le dérivé recompressé dispPath) ────────────────
+// POURQUOI : jsDelivr refuse de SERVIR un fichier > ~20 Mo (même limite empirique que la vidéo, voir
+// video-dash-lib.mjs). L'ANCIEN modèle générait un DEUXIÈME fichier (JPEG recompressé <19,5 Mo, dispPath)
+// pour l'affichage, EN PLUS de l'original entier servi par raw.github pour le téléchargement — stockage
+// doublé pour rien, et l'original ne passait jamais par jsDelivr (quota raw.github consommé à CHAQUE vue).
+// Ici on découpe le CIPHERTEXT (après chiffrement — un seul IV/tag GCM pour tout le fichier, le découpage
+// est un pur détail de STOCKAGE, jamais de la crypto) en morceaux ≤19 Mo, chacun son propre fichier git.
+// Le client reconstitue en concaténant les morceaux DANS L'ORDRE avant de déchiffrer : l'image reconstituée
+// EST l'original bit-exact, jamais recompressée, et sert TOUJOURS via jsDelivr (pas de limite de taille
+// totale, seulement par fichier). LOGIQUE UNIFORME (décision Matthieu 2026-07-07) : toute image, quelle que
+// soit sa taille, porte `cdnChunks[]` — même une image de 2 Mo produit un tableau à 1 seul élément. Un seul
+// chemin de lecture côté client, aucun cas particulier par taille.
+// La taille (19 Mo) vient de la SOURCE UNIQUE src/config/chunkPolicy.js (CDN_CHUNK) : upload Node et upload
+// navigateur partagent EXACTEMENT le même nombre, impossible de diverger. Ré-exporté sous CHUNK_BYTES pour
+// que img-ingest.mjs et les regen-thumbs n'aient rien à changer.
+export { CDN_CHUNK as CHUNK_BYTES } from '../../src/config/chunkPolicy.js'
+import { CDN_CHUNK } from '../../src/config/chunkPolicy.js'
+// Découpe un Buffer en morceaux ≤chunkSize, dans l'ordre. Renvoie toujours au moins 1 morceau.
+export function splitIntoChunks(buf, chunkSize = CDN_CHUNK) {
+  const chunks = []
+  for (let off = 0; off < buf.length; off += chunkSize) chunks.push(buf.subarray(off, Math.min(off + chunkSize, buf.length)))
+  return chunks.length ? chunks : [buf]
+}
+// Chemin d'un morceau : adressé par le hash du FICHIER ENTIER (pas du morceau) + index -> déterministe/
+// idempotent, même convention que archive-folder.mjs (chunkPath). Extension neutre 'bin' : le ciphertext
+// n'a pas d'extension utile, seul le manifeste sait comment le réassembler et le déchiffrer.
+export const shardChunkPathFor = (hashHex, i) => `${hashHex.slice(0, 2)}/${hashHex.slice(2, 4)}/${hashHex}-${String(i).padStart(3, '0')}.bin`
+
+// ── MANIFESTE PUBLIC (.img.json) — forme EXACTE lue par ImageNodeViewer / build-search-index ─────────
+// Produit le manifeste FINAL d'une image publique chiffrée. `cdnCommit` PIN l'URL jsDelivr (immuable).
+// `cdnChunks` = liste ORDONNÉE des chemins de morceaux, TOUJOURS présente pour tout nouvel upload (remplace
+// `cdnPath`, l'ancien schéma mono-fichier — encore lu en LECTURE seule pour les images déjà en ligne, jamais
+// migrées : décision Matthieu 2026-07-07 « les anciennes ce n'est pas grave, à l'avenir tout passe par ça »).
+export function buildPublicImgManifest({ name, ext, w, h, clearSize, tags = [], addedAt, eagleId, cdnRepo, cdnChunks, cdnCommit, iv, thumbIv = null, thumbW = null, thumbH = null }) {
+  return {
+    type: 'image', v: 1, name, ext, w, h, size: clearSize, tags,
+    addedAt: addedAt || new Date().toISOString(), ...(eagleId ? { eagleId } : {}),
+    vis: 'public', cdnRepo, cdnChunks, cdnCommit, alg: 'AES-GCM', iv, ...(thumbIv ? { thumbIv } : {}),
+    ...(thumbW && thumbH ? { thumbW, thumbH } : {}),
+  }
+}
+
+// ── GIT PUSH INCRÉMENTAL (anti-hang) — patron à réutiliser ──────────────────────────────────────────
+// const GENV = { ...process.env, GIT_TERMINAL_PROMPT:'0', GIT_ASKPASS:'/usr/bin/true', GCM_INTERACTIVE:'never' }
+// const cloneUrl = (repo) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`
+// spawnSync('git', ['-C', dir, 'push', 'origin', 'HEAD:main'], { env: GENV, timeout: 240000, killSignal:'SIGKILL' })
+// Pousser tous les ~600 fichiers / <1 Go (jamais un pack de plusieurs Go d'un coup -> hang garanti).
+export const GIT_ENV = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/usr/bin/true', GCM_INTERACTIVE: 'never' }
+export const PUSH_TIMEOUT_MS = 240000
+export const PUSH_EVERY_FILES = 600

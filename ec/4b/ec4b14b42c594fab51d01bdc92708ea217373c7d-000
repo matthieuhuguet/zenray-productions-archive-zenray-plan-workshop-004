@@ -1,0 +1,173 @@
+// /api/share-og/<watch|view|folder> — sert l'app (dist/index.html intact) avec les balises Open Graph
+// RÉÉCRITES pour pointer vers la miniature/titre du média réellement partagé, au lieu du titre/logo
+// génériques de l'app. Sans ça, coller un lien /watch, /view ou /folder dans WhatsApp/Notion/iMessage
+// affichait toujours "ZenRayProgress — Matthieu Huguet" + l'icône Z (capture d'écran Matthieu 2026-07-01).
+//
+// PRINCIPE : les crawlers de prévisualisation (WhatsApp, Notion, iMessage, Slack…) ne exécutent PAS de
+// JavaScript — ils lisent juste le HTML brut renvoyé pour l'URL. Une SPA classique (index.html statique
+// identique pour toutes les routes) ne peut donc JAMAIS avoir de preview dynamique SANS un point d'entrée
+// serveur comme celui-ci. On lit le VRAI dist/index.html (mêmes balises <script>, React boot pareil pour
+// un vrai visiteur) et on y injecte/remplace juste les 4 balises meta pertinentes avant de le renvoyer —
+// 0 impact sur le fonctionnement normal de l'app, juste un aperçu de lien correct.
+import { readAsset } from './_platform.js'
+import { resolveShareToken } from './share-token.js'
+import { collectSubtreeBlobPaths } from './repoSubtree.js'
+
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const OWNER = 'matthieuhuguet'
+
+const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+async function readManifest(token, p) {
+  try {
+    const r = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(p)}`, { headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' } })
+    if (!r.ok) return null
+    return await r.json()
+  } catch { return null }
+}
+// L'APERÇU LIT LE SOUS-ARBRE DU DOSSIER, jamais l'arbre entier du dépôt (2026-08-29).
+//
+// Cette fonction demandait `git/trees/main?recursive=1` puis filtrait par préfixe. Sur ce dépôt cet
+// appel est TRONQUÉ par GitHub, et un dossier tombé après la coupure rendait zéro fichier : l'aperçu
+// WhatsApp affichait « Galerie ZenRay — 0 élément » avec l'icône générique, pour un dossier de 749
+// photos. Même cause exacte que le « Empty folder » de la page partagée, corrigé le même jour dans
+// `page.js` — d'où le module commun, qui porte le détail du piège et son historique.
+const ghHeaders = (token) => ({ Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress' })
+async function treeUnder(token, dir) {
+  try {
+    const readTreeish = async (root) => {
+      const r = await fetch(`https://api.github.com/repos/${REPO}/git/trees/${encodeURIComponent(BRANCH + ':' + root)}?recursive=1`, { headers: ghHeaders(token) })
+      if (!r.ok) return { ok: false }
+      const j = await r.json()
+      return { ok: true, tree: j.tree || [], truncated: !!j.truncated }
+    }
+    const readDirContents = async (sub) => {
+      const r = await fetch(`https://api.github.com/repos/${REPO}/contents/${encodeURI(sub)}?ref=${BRANCH}`, { headers: ghHeaders(token) })
+      if (!r.ok) return []
+      const j = await r.json()
+      return Array.isArray(j) ? j : []
+    }
+    const { paths } = await collectSubtreeBlobPaths(readTreeish, readDirContents, dir)
+    // L'appelant attend des chemins ABSOLUS (il les repasse à readManifest et aux URLs de partage).
+    return paths.map((p) => `${dir}/${p}`)
+  } catch { return [] }
+}
+const baseName = (p) => { const n = p.split('/').pop(); return n.replace(/\.(mp4|mov|m4v|avi|mkv)\.media\.json$/i, '').replace(/\.[^.]+\.(img|media|file)\.json$/i, '').replace(/\.[^.]+$/, '') }
+
+// Construit { title, description, image, url } pour le type de partage demandé. `image` doit être une URL
+// ABSOLUE (les crawlers ne résolvent pas les chemins relatifs) et directement fetchable sans JS/auth.
+// A gallery without images (videos only): the first video poster, a public clear URL; nothing to compose.
+async function firstPoster(token, children) {
+  for (const c of children) {
+    if (!c.endsWith('.media.json')) continue
+    const m = await readManifest(token, c)
+    if (m && m.poster) return m.poster
+  }
+  return null
+}
+
+async function metaFor(token, origin, type, q) {
+  const DEFAULT = { title: 'ZenRayProgress — Matthieu Huguet', description: 'ZenRayProgress — LifeOS de Matthieu Huguet : objectifs, séquence de cartes et agenda hebdomadaire, persistant.', image: `${origin}/favicon.png`, url: origin }
+  try {
+    if (type === 'watch') {
+      const rawToken = (q.v || '').toString()
+      const p = (await resolveShareToken(rawToken, { expectedKind: 'video' })).path
+      if (!p) return DEFAULT
+      const m = await readManifest(token, p)
+      if (!m) return DEFAULT
+      const title = m.title || baseName(p)
+      return { title, description: `Vidéo ZenRay${m.duration ? ` · ${Math.floor(m.duration / 60)}:${String(Math.round(m.duration % 60)).padStart(2, '0')}` : ''}`, image: m.poster || DEFAULT.image, url: `${origin}/watch?v=${encodeURIComponent(q.v)}` }
+    }
+    if (type === 'view') {
+      const rawToken = (q.v || '').toString()
+      const p = (await resolveShareToken(rawToken, { expectedKind: 'image' })).path
+      if (!p) return DEFAULT
+      const m = await readManifest(token, p)
+      if (!m) return DEFAULT
+      const title = baseName(p)
+      const image = m.thumb ? `${origin}/api/shared-media?path=${encodeURIComponent(p)}&kind=thumb&share=${encodeURIComponent(rawToken)}` : DEFAULT.image
+      return { title, description: 'Image partagée sur ZenRay', image, url: `${origin}/view?v=${encodeURIComponent(q.v)}` }
+    }
+    if (type === 'folder') {
+      const rawToken = (q.d || '').toString()
+      const dir = (await resolveShareToken(rawToken, { expectedKind: 'folder' })).path
+      if (!dir) return DEFAULT
+      const title = dir.split('/').pop()
+      const children = await treeUnder(token, dir)
+      // JUSQU'À QUATRE VIGNETTES, PAS UNE SEULE (2026-08-05, demande de Matthieu).
+      //
+      // Le protocole Open Graph accepte PLUSIEURS `og:image` : la première est celle que tout le
+      // monde affiche, les suivantes servent aux plateformes qui savent montrer une galerie. C'est
+      // la seule façon honnête de donner « les quatre premières » ici, et il faut dire pourquoi :
+      // une vraie mosaïque deux par deux demanderait de DÉCODER quatre webp puis de réencoder une
+      // image, or un Worker n'a ni canvas ni encodeur, et le redimensionnement d'images de
+      // Cloudflare est une option payante. Quatre balises coûtent zéro octet et ne mentent pas.
+      //
+      // On s'arrête à quatre lectures de manifeste : chacune est une sous-requête, et une
+      // invocation n'en a que cinquante.
+      const nMedia = children.filter((c) => c.endsWith('.img.json') || c.endsWith('.media.json')).length
+
+      // THE PREVIEW IS COMPOSED ON REQUEST (2 October 2026). Whenever the folder shows at least one image the preview
+      // is `/api/share-cover` — a 2x2 mosaic of images spread over the gallery (Eagle links followed to their targets),
+      // built by the Worker with WebAssembly and edge-cached; it falls back to the cover stored at link creation, then to
+      // a 404 (handled below by the first poster / site icon). It used to depend on a cover file written by the browser
+      // at creation, which a gallery of links never had: the preview showed the site icon « Z ».
+      const nImages = children.filter((c) => c.endsWith('.img.json')).length
+      return {
+        title,
+        description: `Galerie ZenRay — ${nMedia} élément${nMedia > 1 ? 's' : ''}`,
+        image: nImages ? `${origin}/api/share-cover?d=${encodeURIComponent(q.d)}` : (await firstPoster(token, children) || DEFAULT.image),
+        url: `${origin}/folder?d=${encodeURIComponent(q.d)}`,
+      }
+    }
+  } catch {}
+  return DEFAULT
+}
+
+function injectMeta(html, meta) {
+  const tags = [
+    `<meta property="og:title" content="${esc(meta.title)}" />`,
+    `<meta property="og:description" content="${esc(meta.description)}" />`,
+    // La PREMIÈRE image reste en tête : c'est elle que WhatsApp, iMessage et Slack retiennent,
+    // aucun d'eux ne lisant les suivantes. Les trois autres ne coûtent rien et servent aux
+    // plateformes qui savent afficher une galerie.
+    ...(Array.isArray(meta.images) && meta.images.length
+      ? meta.images.map((u) => `<meta property="og:image" content="${esc(u)}" />`)
+      : [`<meta property="og:image" content="${esc(meta.image)}" />`]),
+    `<meta property="og:url" content="${esc(meta.url)}" />`,
+    `<meta property="og:type" content="website" />`,
+    `<meta name="twitter:card" content="summary_large_image" />`,
+    `<meta name="twitter:title" content="${esc(meta.title)}" />`,
+    `<meta name="twitter:image" content="${esc(meta.image)}" />`,
+  ].join('\n    ')
+  let out = html.replace(/<title>[^<]*<\/title>/, `<title>${esc(meta.title)}</title>`)
+  out = out.replace(/<meta name="description"[^>]*>/, `<meta name="description" content="${esc(meta.description)}" />`)
+  out = out.replace('</head>', `    ${tags}\n  </head>`)
+  return out
+}
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  // BUG TROUVÉ EN PROD (2026-07-01) : un rewrite vercel.json vers un chemin catch-all À 2 SEGMENTS
+  // (/api/share-og/watch) renvoyait 404 NOT_FOUND côté Vercel (le catch-all [...route].js ne le résolvait
+  // QUE pour 1 segment, ex. /api/share-og seul, fonctionnait). Fix : le type voyage en QUERY PARAM
+  // (?shareType=watch), fusionné par Vercel avec la query d'origine (?v=...) -> un seul segment /api/share-og.
+  const type = (req.query.shareType || '').toString() || null
+  const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0]
+  const origin = `${proto}://${req.headers.host}`
+
+  // Passe par `_platform` : c'est la SEULE lecture de fichier livré du projet, et donc le seul
+  // endroit où Vercel et Cloudflare diffèrent réellement. Vercel expose `dist/index.html` par
+  // `includeFiles` dans vercel.json ; Cloudflare le sert par son service d'assets, sous un chemin
+  // sans le préfixe de construction. Le reste du handler ignore où il tourne.
+  let html
+  try { html = await readAsset('dist/index.html') } catch {
+    res.setHeader('Content-Type', 'text/plain'); return res.status(500).end('dist/index.html introuvable')
+  }
+  const meta = token && type ? await metaFor(token, origin, type, req.query) : { title: 'ZenRayProgress', description: '', image: `${origin}/favicon.png`, url: origin }
+  const out = injectMeta(html, meta)
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate') // même politique que index.html
+  return res.status(200).end(out)
+}

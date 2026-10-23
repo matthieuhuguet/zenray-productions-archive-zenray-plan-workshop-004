@@ -1,0 +1,119 @@
+// 4 October 2026, 10:40 CEST: opening, safe formatting and asynchronous navigation are verified with real reader responses.
+import React from 'react'
+import { afterEach, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor, act } from '@testing-library/react'
+import ConversationView from './ConversationView.jsx'
+import { CONVERSATION_SETTINGS } from '../../lib/assetsConversations.js'
+afterEach(cleanup)
+const conversation = { id: 'claude:one', provider: 'claude', title: 'Original discussion', readable: true, localPath: '/source/one.jsonl' }
+it('opens original messages, renders safe Markdown and expands full user prompts', async () => {
+  const text = '9 October 2026: Actual long prompt '.repeat(100)
+  const read = vi.fn().mockResolvedValue({ messages: [{ id: 'p', kind: 'prompt', text }, { id: 'a', kind: 'response', text: '## Result\n\n- Actual answer\n\n| Step | Result |\n| --- | --- |\n| Build | 100% |\n\n```js\nconst value = 1\n```\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1))' }], nextBefore: null })
+  const { container } = render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText('Actual answer')
+  expect(read).toHaveBeenCalledWith(conversation.id)
+  expect(container.querySelector('pre code').textContent).toContain('const value = 1')
+  expect(container.querySelector('script')).toBeNull()
+  expect(container.querySelector('a[href^="javascript:"]')).toBeNull()
+  expect(container.querySelector('[data-role="user"] .assets-chat-message-body')).toBeTruthy()
+  expect(container.querySelector('[data-role="assistant"] .assets-chat-message-body')).toBeTruthy()
+  expect(container.querySelector('.assets-chat-markdown table th').textContent).toBe('Step')
+  expect(container.querySelector('[data-role="user"] .assets-number').textContent).toBe('9')
+  expect(container.querySelector('[data-role="assistant"] .assets-number').textContent).toBe('100%')
+  expect(container.querySelector('pre code .assets-number')).toBeNull()
+  expect(container.querySelector('[data-role="user"] [data-collapsed="true"]')).not.toBeNull()
+  fireEvent.click(screen.getByText('Afficher tout le message'))
+  expect(container.querySelector('[data-role="user"] [data-collapsed="true"]')).toBeNull()
+  expect(container.querySelector('[data-role="user"] .assets-chat-message-body p').textContent).toBe(text)
+  fireEvent.click(screen.getByText('Emplacements et sauvegarde'))
+  expect(screen.getByText('/source/one.jsonl')).toBeDefined()
+})
+// 9 October 2026, 11:38 CEST: Browser context injected by the host is removed from display and copying, without losing the authored prompt.
+it('hides host-only prompt context while preserving the user request that follows it', async () => {
+  const read = vi.fn().mockResolvedValue({ messages: [
+    { id: 'host-route', kind: 'prompt', text: '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>' },
+    { id: 'request', kind: 'prompt', text: '<in-app-browser-context source="ambient-ui-state">Current URL is internal.</in-app-browser-context>\n\n## My request:\nFind 2026 files.' },
+  ], nextBefore: null })
+  const { container } = render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText('Find', { exact: false })
+  expect(container.querySelectorAll('.assets-chat-message[data-role="user"]')).toHaveLength(1)
+  expect(container.textContent).not.toContain('ambient-ui-state')
+  expect(container.textContent).not.toContain('external_codex_apps_open_page')
+  expect(container.querySelector('[data-role="user"] .assets-number').textContent).toBe('2026')
+})
+it('ignores older-page responses after selecting another conversation', async () => {
+  let resolveOlder
+  const read = vi.fn((id, before) => before ? new Promise(resolve => { resolveOlder = resolve }) : Promise.resolve({ messages: [{ id, kind: 'response', text: id === conversation.id ? 'First discussion' : 'Second discussion' }], nextBefore: id === conversation.id ? { source: 20 } : null }))
+  const { rerender } = render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText('First discussion')
+  fireEvent.click(screen.getByText('Charger les messages précédents'))
+  rerender(<ConversationView conversation={{ ...conversation, id: 'claude:two' }} readConversation={read} connected />)
+  await screen.findByText('Second discussion')
+  await act(async () => resolveOlder({ messages: [{ id: 'old', kind: 'response', text: 'Wrong discussion older message' }], nextBefore: null }))
+  expect(screen.queryByText('Wrong discussion older message')).toBeNull()
+})
+it('skips empty transcript windows until one click finds readable messages', async () => {
+  const read = vi.fn((id, before) => before
+    ? before.offset < 4
+      ? Promise.resolve({ messages: [], nextBefore: { offset: before.offset + 1 } })
+      : Promise.resolve({ messages: [{ id: 'found', kind: 'response', text: 'Message after large transcript blocks' }], nextBefore: { offset: 5 } })
+    : Promise.resolve({ messages: [], nextBefore: { offset: 1 } }))
+  render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText(/Le bloc récent ne contient pas de message/)
+  fireEvent.click(screen.getByText('Charger les messages précédents'))
+  await screen.findByText('Message after large transcript blocks')
+  expect(read).toHaveBeenCalledTimes(5)
+})
+// 9 October 2026, 11:33 CEST: One click skips no more than the shared empty-window limit, then resumes at the saved cursor.
+it('bounds empty transcript scans and continues from the saved cursor', async () => {
+  const read = vi.fn((id, before) => {
+    if (!before) return Promise.resolve({ messages: [], nextBefore: { offset: 1 } })
+    if (before.offset <= CONVERSATION_SETTINGS.emptyPageScanLimit) return Promise.resolve({ messages: [], nextBefore: { offset: before.offset + 1 } })
+    return Promise.resolve({ messages: [{ id: 'found-after-cap', kind: 'response', text: 'Message found after the scan cap' }], nextBefore: null })
+  })
+  render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText(/Le bloc récent ne contient pas de message/)
+  fireEvent.click(screen.getByText('Charger les messages précédents'))
+  await screen.findByText(new RegExp(`${CONVERSATION_SETTINGS.emptyPageScanLimit} blocs sans message visibles ignorés`))
+  expect(read).toHaveBeenCalledTimes(CONVERSATION_SETTINGS.emptyPageScanLimit + 1)
+  fireEvent.click(screen.getByText('Continuer la recherche'))
+  await screen.findByText('Message found after the scan cap')
+  expect(read).toHaveBeenCalledTimes(CONVERSATION_SETTINGS.emptyPageScanLimit + 2)
+})
+// 9 October 2026, 14:27 CEST: count reader-side empty windows toward the same per-click limit.
+it('does not multiply the empty-window scan limit across API requests', async () => {
+  const read = vi.fn((_id, before) => Promise.resolve({
+    messages: [],
+    nextBefore: { offset: before ? before.offset + CONVERSATION_SETTINGS.emptyPageScanLimit : 1 },
+    emptyPagesScanned: CONVERSATION_SETTINGS.emptyPageScanLimit,
+  }))
+  render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText(/Le bloc récent ne contient pas de message/)
+  fireEvent.click(screen.getByText('Charger les messages précédents'))
+  await screen.findByText(new RegExp(`${CONVERSATION_SETTINGS.emptyPageScanLimit} blocs sans message visibles ignorés`))
+  expect(read).toHaveBeenCalledTimes(2)
+})
+// 9 October 2026, 14:46 CEST: explain when the bounded initial read has not found the user's prompt yet.
+it('labels an answer without its prompt and clears the note when older messages find it', async () => {
+  const read = vi.fn((_id, before) => before
+    ? Promise.resolve({ messages: [{ id: 'prompt', kind: 'prompt', text: 'The request before the long tool chain.' }], nextBefore: null })
+    : Promise.resolve({ messages: [{ id: 'answer', kind: 'response', text: 'The latest answer is visible.' }], nextBefore: { offset: 1 }, promptAnchorFound: false }))
+  render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText('The latest answer is visible.')
+  const notice = 'Les derniers échanges n’incluent pas leur prompt. Chargez les messages précédents pour le chercher.'
+  expect(screen.getByText(notice)).toBeDefined()
+  fireEvent.click(screen.getByText('Charger les messages précédents'))
+  await screen.findByText('The request before the long tool chain.')
+  expect(screen.queryByText(notice)).toBeNull()
+})
+it('retries a failed opening and labels missing originals without inventing messages', async () => {
+  const read = vi.fn().mockRejectedValueOnce(new Error('Read failed')).mockResolvedValue({ messages: [{ id: 'ok', kind: 'response', text: 'Recovered response' }], nextBefore: null })
+  const { rerender } = render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText('Read failed')
+  fireEvent.click(screen.getByText('Réessayer'))
+  await screen.findByText('Recovered response')
+  expect(read).toHaveBeenLastCalledWith(conversation.id, undefined)
+  rerender(<ConversationView conversation={{ ...conversation, id: 'missing', readable: false, unavailableReason: 'transcript-missing' }} readConversation={read} connected />)
+  await waitFor(() => expect(screen.queryByText('Recovered response')).toBeNull())
+  expect(screen.getByText(/son texte original manque/)).toBeDefined()
+})

@@ -1,0 +1,38 @@
+// ÉCRITURE JSON SÛRE SOUS CONCURRENCE (anti-perte-de-données).
+//
+// Problème (audit B) : les vues à manifeste (Gallery, SFX, Databases, Articles) faisaient read -> modifie en
+// mémoire -> save(full list, sha). Si un autre onglet / l'auto-sync committait entre-temps, le `sha` devenait
+// périmé -> 409 -> le client AVALAIT le conflit en silence -> écriture perdue.
+//
+// Solution = read-modify-write AVEC RETRY par IDENTITÉ. On n'envoie pas une liste figée mais une FONCTION
+// `mutate(currentObj) -> nextObj` ré-appliquée sur l'état FRAIS du drive en cas de conflit. Le serveur (page.js
+// action save) renvoie maintenant `{conflict, sha, markdown}` (le contenu courant) : on ré-applique `mutate`
+// dessus et on re-save. Aucune lecture supplémentaire dans le cas sans conflit (on part du sha/données connus).
+
+export async function readJson(path) {
+  const r = await fetch(`/api/page?action=read&path=${encodeURIComponent(path)}`, { cache: 'no-store' }).then((x) => x.json()).catch(() => null)
+  if (!r || r.missing || r.markdown == null) return { sha: null, data: null, missing: !!(r && r.missing) }
+  let data = null; try { data = JSON.parse(r.markdown) } catch {}
+  return { sha: r.sha || null, data }
+}
+
+// Sauvegarde `mutate` appliqué à l'état courant. opts.sha/opts.data = état déjà connu de l'appelant (évite une
+// lecture). Renvoie { ok, sha, data } ou { ok:false, error }. JAMAIS d'écrasement aveugle : sur conflit, on
+// ré-applique mutate sur le contenu frais renvoyé par le serveur, puis on retente (jusqu'à `tries`).
+export async function saveJsonWithRetry(path, mutate, opts = {}) {
+  let sha = opts.sha ?? null
+  let cur = opts.data ?? null
+  const tries = opts.tries || 5
+  for (let i = 0; i < tries; i++) {
+    if (cur === null && sha === null && i === 0) { const r0 = await readJson(path); sha = r0.sha; cur = r0.data }
+    const next = mutate(cur || {})
+    // keepalive : best-effort pour que le commit survive a un refresh/navigation en plein vol (limite ~64 Ko de
+    // body ; au-dela le navigateur l'ignore, mais le write-through localStorage cote Shelf garantit deja le filet).
+    const body = JSON.stringify({ action: 'save', path, markdown: JSON.stringify(next), sha })
+    const j = await fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body, keepalive: body.length < 60000 }).then((r) => r.json()).catch(() => null)
+    if (j && j.ok) return { ok: true, sha: j.sha, data: next }
+    if (j && j.conflict) { sha = j.sha || null; if (j.markdown != null) { try { cur = JSON.parse(j.markdown) } catch {} } else { const r0 = await readJson(path); sha = r0.sha; cur = r0.data } continue }
+    return { ok: false, error: (j && (j.error || j.detail)) || 'save-failed' }
+  }
+  return { ok: false, error: 'conflict-max-retries' }
+}

@@ -1,0 +1,63 @@
+// 21 October 2026: appendPublicDelta must not commit a delta that changes nothing. Each commit is a fresh 37 MB encrypted blob (random IV, so Git
+// cannot deduplicate): "index delta +0" commits grew zenray-index-public to 105 GB, and GitHub then refused every write ("above its size quota").
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { randomBytes } from 'node:crypto'
+import { appendPublicDelta, publicDeltaLastError } from './page.js'
+
+const reply = (value, status = 200) => new Response(JSON.stringify(value), { status })
+beforeEach(() => vi.stubEnv('ZENRAY_MEDIA_KEY', randomBytes(32).toString('base64')))
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs() })
+
+// A tiny stateful stand-in for the index repository: it keeps the last blob committed to delta.json.
+function fakeIndexRepository() {
+  const state = { delta: null, head: 'head-0', blobs: new Map(), posts: 0, commits: 0 }
+  const fetchImpl = vi.fn(async (url, init = {}) => {
+    const path = new URL(url).pathname.split('/repos/matthieuhuguet/zenray-index-public/')[1]
+    const method = init.method || 'GET'
+    if (path === 'git/ref/heads/main' && method === 'GET') return reply({ object: { sha: state.head } })
+    if (path.startsWith('contents/delta.json')) return state.delta ? new Response(state.delta, { status: 200 }) : reply({}, 404)
+    if (path.startsWith('git/commits/') && method === 'GET') return reply({ tree: { sha: 'tree-base' } })
+    if (path === 'git/blobs' && method === 'POST') { state.posts++; const sha = `blob-${state.posts}`; state.blobs.set(sha, Buffer.from(JSON.parse(init.body).content, 'base64').toString('utf8')); return reply({ sha }, 201) }
+    if (path === 'git/trees' && method === 'POST') return reply({ sha: `tree-${state.posts}` }, 201)
+    if (path === 'git/commits' && method === 'POST') { state.commits++; return reply({ sha: `commit-${state.commits}` }, 201) }
+    if (path === 'git/refs/heads/main' && method === 'PATCH') {
+      state.head = JSON.parse(init.body).sha; state.delta = [...state.blobs.values()].at(-1); return reply({}, 200)
+    }
+    return reply({ message: `unexpected ${method} ${path}` }, 500)
+  })
+  return { state, fetchImpl }
+}
+
+describe('appendPublicDelta', () => {
+  it('writes once for new paths, then writes nothing when the same paths and thumbnails come again', async () => {
+    const { state, fetchImpl } = fakeIndexRepository(); vi.stubGlobal('fetch', fetchImpl)
+    expect(await appendPublicDelta('t', ['pages/a.file.json', 'pages/b.file.json'], { 'pages/a.file.json': 'thumb-a' })).toBe(true)
+    expect(state.commits).toBe(1)
+    expect(await appendPublicDelta('t', ['pages/a.file.json', 'pages/b.file.json'], { 'pages/a.file.json': 'thumb-a' })).toBe(true)
+    expect(state.commits).toBe(1)          // nothing changed: no new 37 MB blob, no new commit
+    expect(await appendPublicDelta('t', [], {})).toBe(true)
+    expect(state.commits).toBe(1)
+  })
+  it('still writes when a path is new, a thumbnail changed, or a path is removed', async () => {
+    const { state, fetchImpl } = fakeIndexRepository(); vi.stubGlobal('fetch', fetchImpl)
+    await appendPublicDelta('t', ['pages/a.file.json'], { 'pages/a.file.json': 'thumb-a' })
+    await appendPublicDelta('t', ['pages/a.file.json', 'pages/c.file.json'], {}); expect(state.commits).toBe(2)       // new path
+    await appendPublicDelta('t', ['pages/a.file.json'], { 'pages/a.file.json': 'thumb-new' }); expect(state.commits).toBe(3) // thumbnail changed
+    await appendPublicDelta('t', [], {}, ['pages/c.file.json']); expect(state.commits).toBe(4)                              // removal
+  })
+  // 21 October 2026: a quota refusal cannot be cured by retrying; it used to re-read the 37 MB delta five times and report nothing.
+  it('stops at a quota refusal after one attempt and says why', async () => {
+    const { state, fetchImpl } = fakeIndexRepository()
+    let deltaReads = 0
+    vi.stubGlobal('fetch', vi.fn(async (url, init = {}) => {
+      if (new URL(url).pathname.includes('/git/blobs') && init.method === 'POST') return reply({ message: 'Repository is above its size quota' }, 403)
+      if (new URL(url).pathname.includes('/contents/delta.json')) deltaReads++
+      return fetchImpl(url, init)
+    }))
+    expect(await appendPublicDelta('t', ['pages/a.file.json'], {})).toBe(false)
+    expect(deltaReads).toBe(1)
+    expect(state.commits).toBe(0)
+    expect(publicDeltaLastError()).toContain('403')
+    expect(publicDeltaLastError()).toContain('size quota')
+  })
+})

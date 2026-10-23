@@ -1,0 +1,177 @@
+// REORG des shards publics : scinde un shard public TROP GROS (> ~5 Go) en plusieurs shards <= CAP, en
+// RE-UTILISANT les blobs chiffrés DÉJÀ présents en local (.migrate-encrypt-tmp) -> aucun re-chiffrement.
+//
+// POURQUOI : la migration a laissé zenray-img-public-01 gonfler à 8,38 Go (cap rollover non respecté).
+// GitHub recommande < 5 Go/repo et envoie des avertissements au-delà. On rééquilibre PROPREMENT.
+//
+// COMMENT : chaque image migrée a un manifest dans zenray-data avec {cdnRepo, cdnPath, cdnCommit}. Le blob
+// principal vit à cdnPath dans cdnRepo ; la vignette au MÊME chemin en .webp. Le ciphertext est déterministe
+// (IV dérivé du hash) -> le déplacer = recopier le fichier au même chemin dans un autre repo, puis re-pin le
+// manifest (cdnRepo + cdnCommit). On reconstruit chaque shard cible en UN commit orphelin (historique purgé
+// -> taille minimale) et on force-push. Puis on réécrit les manifests et on pousse zenray-data (résilient).
+//
+// SÉCURITÉ : dry-run par défaut (--apply pour exécuter). Les sources privées ne sont jamais touchées.
+// USAGE :
+//   GITHUB_TOKEN=$(gh auth token) node scripts/reorg-public-shards.mjs --source=zenray-img-public-01
+//   GITHUB_TOKEN=$(gh auth token) node scripts/reorg-public-shards.mjs --source=zenray-img-public-01 --apply
+
+import { execFileSync } from 'node:child_process'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, copyFileSync, readdirSync, statSync } from 'node:fs'
+import path from 'node:path'
+
+const args = Object.fromEntries(process.argv.slice(2).map((a) => { const m = a.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [a, true] }))
+const APPLY = !!args.apply
+const SOURCE = String(args.source || 'zenray-img-public-01')
+const OWNER = process.env.OWNER || 'matthieuhuguet'
+const TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN manquant'); process.exit(1) }
+const CAP = Math.floor(4.3 * 1024 * 1024 * 1024) // cible <= 4,3 Go par shard (marge sous les 5 Go GitHub)
+const WORK = path.resolve(args.workdir || '.migrate-encrypt-tmp')
+const DATA = path.join(WORK, 'zenray-data')
+const SRC = path.join(WORK, SOURCE)
+const cloneUrl = (repo) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`
+const human = (b) => (b / 1073741824).toFixed(2) + ' Go'
+const git = (cwd, ...a) => execFileSync('git', a, { cwd, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 30 }).toString().trim()
+
+if (!existsSync(path.join(SRC, '.git'))) { console.error('clone local absent :', SRC); process.exit(1) }
+if (!existsSync(path.join(DATA, '.git'))) { console.error('clone local absent :', DATA); process.exit(1) }
+
+// --- 1. lire les manifests publics pointant sur SOURCE ----------------------
+console.log('• lecture des manifests zenray-data pointant sur', SOURCE, '…')
+function walk(dir, out = []) { for (const e of readdirSync(dir, { withFileTypes: true })) { const p = path.join(dir, e.name); if (e.isDirectory()) walk(p, out); else if (e.name.endsWith('.img.json')) out.push(p) } return out }
+const pagesDir = path.join(DATA, 'pages')
+const manifestFiles = existsSync(pagesDir) ? walk(pagesDir) : []
+const thumbRelOf = (rel) => rel.replace(/\.[^./]+$/, '.webp')
+const sizeOf = (rel) => { const f = path.join(SRC, rel); try { return statSync(f).size } catch { return -1 } }
+
+const images = [] // { file, cdnPath, thumbRel, bytes, missing }
+let missingMain = 0
+for (const f of manifestFiles) {
+  let m; try { m = JSON.parse(readFileSync(f, 'utf8')) } catch { continue }
+  if (m.vis !== 'public' || m.cdnRepo !== SOURCE || !m.cdnPath) continue
+  const main = m.cdnPath, thumb = thumbRelOf(main)
+  const sMain = sizeOf(main), sThumb = sizeOf(thumb)
+  if (sMain < 0) missingMain++
+  images.push({ file: f, cdnPath: main, thumbRel: sThumb >= 0 ? thumb : null, bytes: Math.max(0, sMain) + Math.max(0, sThumb), missingMain: sMain < 0 })
+}
+const total = images.reduce((s, x) => s + x.bytes, 0)
+console.log('  manifests sur', SOURCE, ':', images.length, '| octets blobs (local) :', human(total), '| blobs principaux introuvables en local :', missingMain)
+if (missingMain) console.log('  ⚠️ des blobs principaux manquent dans le clone local -> NE PAS appliquer tant que ce n\'est pas 0 (re-fetch le clone source).')
+
+// --- 2. bin-packing FFD en bins <= CAP -------------------------------------
+images.sort((a, b) => b.bytes - a.bytes)
+const bins = [] // [{ bytes, items:[] }]
+for (const img of images) {
+  let bin = bins.find((bn) => bn.bytes + img.bytes <= CAP)
+  if (!bin) { bin = { bytes: 0, items: [] }; bins.push(bin) }
+  bin.bytes += img.bytes; bin.items.push(img)
+}
+// TOUS les bins vont vers des repos NEUFS (public-05, public-06…). SOURCE sera VIDÉ à la fin (orphan vide).
+// Pourquoi pas réutiliser SOURCE : force-pusher un orphan sur un repo existant de 8 Go fait renvoyer tout le
+// pack -> HTTP 500. Des repos neufs poussés par LOTS incrémentaux = petits packs, jamais de 500.
+// SÉCURITÉ CRITIQUE : ne JAMAIS cibler un shard qui EXISTE déjà (un force-push orphelin l'ÉCRASERAIT =
+// perte de toutes ses images). L'ancienne liste {1,2,3,4} était périmée (05-08 existent désormais). On
+// SONDE GitHub (ls-remote, hors quota REST) pour chaque candidat et on ne retient QUE des repos inexistants.
+const repoExistsRemote = (name) => { try { execFileSync('git', ['ls-remote', cloneUrl(name), 'HEAD'], { stdio: 'ignore', timeout: 60000 }); return true } catch { return false } }
+const usedNums = new Set()
+const nextFree = () => { let n = 0; for (;;) { n++; if (usedNums.has(n)) continue; if (repoExistsRemote(`zenray-img-public-${String(n).padStart(2, '0')}`)) { usedNums.add(n); continue } usedNums.add(n); return n } }
+const targets = bins.map((bn) => ({ name: `zenray-img-public-${String(nextFree()).padStart(2, '0')}`, bytes: bn.bytes, items: bn.items }))
+
+console.log('\n=== PLAN REORG (' + (APPLY ? 'APPLY' : 'DRY-RUN') + ') ===')
+console.log('CAP par shard :', human(CAP), '| shards résultants :', targets.length, '(neufs) ; SOURCE', SOURCE, 'sera VIDÉ')
+for (const t of targets) console.log('   ->', t.name, ':', t.items.length, 'images,', human(t.bytes), '(NOUVEAU, push par lots)')
+
+if (!APPLY) { console.log('\n— DRY-RUN : aucun push, aucune réécriture. Relance avec --apply. —'); process.exit(0) }
+if (missingMain) { console.error('\nABANDON : blobs manquants en local.'); process.exit(1) }
+
+// --- 3. ensure repos + build chaque shard en commit orphelin + push -f ------
+function ensureRepo(name) {
+  try { execFileSync('git', ['ls-remote', cloneUrl(name), 'HEAD'], { stdio: 'ignore', timeout: 60000 }); return }
+  catch { console.log('• création du dépôt public', name, '…'); execFileSync('gh', ['repo', 'create', `${OWNER}/${name}`, '--public', '-d', 'ZenRay drive — shard PUBLIC chiffré (reorg)'], { stdio: 'inherit' }) }
+}
+// Push avec retry (les 500 GitHub sur gros volume sont transitoires ; on retente plusieurs fois).
+function pushRetry(dir, ...a) {
+  for (let i = 0; i < 5; i++) { try { git(dir, 'push', ...a); return } catch (e) { if (i === 4) throw e; console.log('   push retry', i + 1, '(', String(e.message).split('\n')[0].slice(-60), ')'); } }
+}
+// Construit un repo NEUF et pousse par LOTS (~1500 images/commit) -> chaque push reste petit -> pas de HTTP 500.
+const BATCH = 1500
+function buildAndPushIncremental(t) {
+  const dir = path.join(WORK, 'reorg-' + t.name)
+  rmSync(dir, { recursive: true, force: true }); mkdirSync(dir, { recursive: true })
+  git(dir, 'init', '-q'); git(dir, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+  writeFileSync(path.join(dir, 'README.md'), `# ${t.name}\n\nShard PUBLIC d'images chiffrées (AES-GCM), servi via jsDelivr. Noms hashés, aucun nom humain.\n`)
+  try { git(dir, 'remote', 'remove', 'origin') } catch {}
+  git(dir, 'remote', 'add', 'origin', cloneUrl(t.name))
+  const items = t.items
+  let pushed = 0
+  for (let b = 0; b < items.length; b += BATCH) {
+    const slice = items.slice(b, b + BATCH)
+    for (const img of slice) for (const rel of [img.cdnPath, img.thumbRel].filter(Boolean)) {
+      const src = path.join(SRC, rel), dst = path.join(dir, rel)
+      mkdirSync(path.dirname(dst), { recursive: true }); copyFileSync(src, dst)
+    }
+    git(dir, 'add', '-A'); git(dir, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-q', '-m', `reorg ${t.name} lot ${b / BATCH + 1}`)
+    pushed += slice.length
+    console.log('• push', t.name, 'lot', (b / BATCH + 1), '->', pushed + '/' + items.length, 'images…')
+    pushRetry(dir, 'origin', 'main')
+  }
+  const sha = git(dir, 'rev-parse', 'HEAD')
+  console.log('  commit final', t.name, '=', sha)
+  return sha
+}
+for (const t of targets) { ensureRepo(t.name); t.commit = buildAndPushIncremental(t) }
+
+// --- 4. réécriture des manifests (re-pin cdnRepo + cdnCommit) ---------------
+// On REFETCH zenray-data au plus frais, on réapplique nos re-pins, puis push résilient (l'app écrit en parallèle).
+console.log('\n• refetch zenray-data + re-pin des manifests…')
+git(DATA, 'fetch', 'origin', 'main'); git(DATA, 'reset', '--hard', 'origin/main')
+// Map content-addressed cdnPath -> {repo, commit} d'après le plan. On re-scanne les manifests FRAIS (post-reset)
+// et on re-pin TOUT manifest encore sur SOURCE selon sa cdnPath -> robuste aux fichiers déplacés/renommés par
+// l'app pendant l'opération. Un manifest sur SOURCE dont la cdnPath est inconnue du plan (image uploadée sur
+// public-01 PENDANT la reorg) est signalé : son ancien commit a disparu (force-push) -> à re-migrer.
+const pinOf = new Map()
+for (const t of targets) for (const img of t.items) pinOf.set(img.cdnPath, { repo: t.name, commit: t.commit })
+const freshManifests = existsSync(pagesDir) ? walk(pagesDir) : []
+let rewritten = 0, orphanNew = 0
+for (const f of freshManifests) {
+  let m; try { m = JSON.parse(readFileSync(f, 'utf8')) } catch { continue }
+  if (m.vis !== 'public' || m.cdnRepo !== SOURCE || !m.cdnPath) continue
+  const pin = pinOf.get(m.cdnPath)
+  if (!pin) { orphanNew++; continue }
+  m.cdnRepo = pin.repo; m.cdnCommit = pin.commit
+  writeFileSync(f, JSON.stringify(m))
+  rewritten++
+}
+console.log('  manifests re-pinés :', rewritten, orphanNew ? `| ⚠️ ${orphanNew} manifest(s) sur ${SOURCE} hors plan (uploadés pendant la reorg ?) -> à re-migrer` : '')
+git(DATA, 'add', '-A')
+if (git(DATA, 'status', '--porcelain')) {
+  git(DATA, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-q', '-m', `reorg public shards: re-pin ${rewritten} manifests (${SOURCE} -> ${targets.map((t) => t.name).join(', ')})`)
+  for (let i = 0; i < 6; i++) {
+    try { git(DATA, 'push', 'origin', 'HEAD:main'); console.log('• zenray-data poussé.'); break }
+    catch (e) { if (i === 5) throw e; console.log('• push rejeté, fetch+rebase+retry…'); git(DATA, 'fetch', 'origin', 'main'); try { git(DATA, 'rebase', 'origin/main') } catch { try { git(DATA, 'rebase', '--abort') } catch {} git(DATA, 'rebase', '-X', 'theirs', 'origin/main') } }
+  }
+} else console.log('• aucun manifest à réécrire (déjà à jour).')
+
+// Un manifeste arrivé sur SOURCE après l'inventaire n'a pas été copié vers les nouveaux shards.
+// Les re-pins connus sont déjà sûrs, mais SOURCE doit rester intact tant que ces nouveaux objets ne sont
+// pas inclus dans une passe suivante. Sortie non-zéro explicite : aucune exécution ne peut atteindre le -f.
+if (orphanNew > 0) {
+  console.error(`\nABANDON SÉCURITÉ : ${orphanNew} manifeste(s) référencent encore ${SOURCE} hors du plan.`)
+  console.error(`SOURCE RESTE INTACT. Rafraîchis son clone local, puis relance la reorg pour migrer ces objets avant tout vidage.`)
+  process.exit(2)
+}
+
+// --- 5. VIDER SOURCE (plus aucun manifest ne le référence) : orphan vide = push minuscule, pas de 500 -------
+console.log('\n• vidage de', SOURCE, '(orphan vide)…')
+const ed = path.join(WORK, 'empty-' + SOURCE)
+rmSync(ed, { recursive: true, force: true }); mkdirSync(ed, { recursive: true })
+git(ed, 'init', '-q'); git(ed, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+writeFileSync(path.join(ed, 'README.md'), `# ${SOURCE}\n\nVidé par reorg : son contenu a été rééquilibré sur ${targets.map((t) => t.name).join(', ')}.\nNe rien committer ici.\n`)
+git(ed, 'add', '-A'); git(ed, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-q', '-m', 'reorg: vidé (contenu redistribué)')
+try { git(ed, 'remote', 'remove', 'origin') } catch {}
+git(ed, 'remote', 'add', 'origin', cloneUrl(SOURCE))
+pushRetry(ed, '-f', 'origin', 'main')
+console.log('  ', SOURCE, 'vidé (taille GitHub recompactée après GC serveur).')
+
+console.log('\n✅ REORG TERMINÉE. Nouveaux shards :', targets.map((t) => `${t.name}=${human(t.bytes)}`).join(' · '), '| ' + SOURCE + ' vidé.')
+console.log('ℹ️  Vérifie l\'affichage des images (jsDelivr) puis recharge l\'app (vider le cache Create).')

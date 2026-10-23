@@ -1,0 +1,80 @@
+// regen-thumbs-oriented.mjs — corrige les VIGNETTES couchées (EXIF non appliqué) des images DÉJÀ en ligne.
+// Pour chaque image source dont l'orientation EXIF ≠ TopLeft/Undefined : régénère la .webp auto-orientée,
+// la rechiffre + pousse sur un shard NEUF, et met à jour SEULEMENT m.thumb + m.thumbIv du manifeste en ligne.
+// L'ORIGINAL et tout le reste du manifeste sont INTACTS. Démarre sur un shard neuf (ZR_START_SHARD).
+//
+// Usage : GITHUB_TOKEN=.. ZR_START_SHARD=NN node Scripts/regen-thumbs-oriented.mjs "<racine>" "<préfixe dest>"
+
+import { makeImgShardCtx, regenThumbAt, thumbUrlForRegen } from './img-ingest.mjs'
+import { pushBlobs } from './video-mse-lib.mjs'
+import { execFileSync } from 'node:child_process'
+import { readdir } from 'node:fs/promises'
+import path from 'node:path'
+
+const token = process.env.GITHUB_TOKEN
+const OWNER = 'matthieuhuguet'
+const DATA = 'zenray-data'
+const REPO = '/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress'
+const ROOT = process.argv[2]
+const DESTPREFIX = (process.argv[3] || 'pages/Photos/DJI').replace(/\/+$/, '')
+if (!token || !ROOT) { console.error('usage: GITHUB_TOKEN=.. ZR_START_SHARD=NN node regen-thumbs-oriented.mjs <racine> [destPrefix]'); process.exit(1) }
+
+const IMGEXT = /\.(jpg|jpeg|png|heic|webp|tif|tiff)$/i
+const relOf = (f) => path.relative(ROOT, f)
+const destOf = (f) => `${DESTPREFIX}/${path.dirname(relOf(f))}`.replace(/\/\.$/, '')
+const manifestPathOf = (f) => `${destOf(f)}/${path.basename(f)}.img.json`
+
+async function walk(dir) {
+  const out = []
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (e.name.startsWith('.')) continue
+    const p = path.join(dir, e.name)
+    if (e.isDirectory()) out.push(...await walk(p))
+    else if (IMGEXT.test(e.name)) out.push(p)
+  }
+  return out
+}
+function orientationOf(f) {
+  // pas de suffixe [0] : casse cette version d'ImageMagick dès qu'il est combiné à identify/-resize
+  // (« no decode delegate » sur un fichier temporaire interne, cf. img-ingest.mjs) — inutile de toute
+  // façon pour un JPEG/PNG mono-frame.
+  try { return execFileSync('magick', ['identify', '-format', '%[orientation]', f], { encoding: 'utf8', timeout: 30000 }).trim() } catch { return 'Undefined' }
+}
+async function fetchManifest(mp) {
+  const enc = encodeURIComponent(mp).replace(/%2F/g, '/')
+  const r = await fetch(`https://api.github.com/repos/${OWNER}/${DATA}/contents/${enc}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zr' } })
+  if (r.status !== 200) return null
+  try { return JSON.parse(await r.text()) } catch { return null }
+}
+
+const all = (await walk(ROOT)).sort()
+console.log(`\n=== ${all.length} images sous ${ROOT} ; filtrage des PIVOTÉES (EXIF) ===`)
+const rotated = all.filter((f) => { const o = orientationOf(f); return o && o !== 'TopLeft' && o !== 'Undefined' })
+console.log(`=== ${rotated.length} image(s) pivotée(s) -> régénération vignette seule ===\n`)
+
+const ctx = makeImgShardCtx({ token, work: process.env.HOME + '/.zr-archive-work-thumb', repoRoot: REPO, log: (...a) => console.log('   ', ...a) })
+await ctx.openShard()
+
+const pend = []   // { mp, m, repo, thumbPath }
+let done = 0
+for (const f of rotated) {
+  try {
+    const mp = manifestPathOf(f)
+    const m = await fetchManifest(mp)
+    if (!m) { console.log(`  ⏭ pas en ligne : ${relOf(f)}`); continue }
+    // regenThumbAt = standard 1080px/q60 (l'ancien regenThumbOnly 384px a été supprimé le 2026-07-13)
+    const r = await regenThumbAt(f, ctx)
+    if (!r) { console.log(`  ✗ vignette KO : ${relOf(f)}`); continue }
+    m.thumbIv = r.thumbIv
+    m.thumbW = r.thumbW
+    m.thumbH = r.thumbH
+    pend.push({ mp, m, repo: r.repo, thumbPath: r.thumbPath })
+    done++
+    if (done % 20 === 0) console.log(`  ${done}/${rotated.length} régénérées`)
+  } catch (e) { console.log(`  ✗ ÉCHEC ${relOf(f)} : ${(e && e.message || e).toString().slice(0, 120)}`) }
+}
+await ctx.flush()
+// résoudre les URLs jsDelivr (commit connu) + pousser les manifestes mis à jour
+const blobs = pend.map((p) => { p.m.thumb = thumbUrlForRegen(ctx, p.repo, p.thumbPath); return { path: p.mp, content: JSON.stringify(p.m) } })
+for (let i = 0; i < blobs.length; i += 150) await pushBlobs(token, DATA, blobs.slice(i, i + 150), `regen thumb oriented`, () => {})
+console.log(`\n✓✓ REGEN THUMB COMPLET — ${blobs.length} vignettes corrigées (original intact).`)

@@ -1,0 +1,95 @@
+// 14 October 2026, 11:40 CEST: actual reviewed cards, hidden answers and failed-write retry.
+import React from 'react'
+import { webcrypto } from 'node:crypto'
+import realCatalogue from './fixtures/JapaneseReviewedFixtures.json'
+import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import JapaneseStudy from './JapaneseStudy.jsx'
+import { emptyStudyState } from './japaneseStudyModel.js'
+import { applyStudyEvent } from '../../server/japanese.js'
+const root = realCatalogue.cards.find(card => card.id === 'grammar-copula')
+const head = { ...realCatalogue, cards: [root], counts: { grammar: 1 } }
+afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+function fixture({ fail = false, corrupted = false, progress = false, stale = false } = {}) {
+  vi.stubGlobal('crypto', webcrypto)
+  let state = emptyStudyState(); state.preferences.level = 'N5'
+  if (progress) state = applyStudyEvent(state, root, { action: 'expose', recordId: root.id, eventId: 'fixture-exposure' }, Date.now(), head.cards).state
+  if (stale) state.progress[root.id] = { stage: 'mastered', contentHash: 'old-revision', reviews: 5, greenSuccesses: 2, due: 0 }
+  const sent = []
+  const client = { load: vi.fn(async () => ({ state })), save: vi.fn(async event => {
+    sent.push(event)
+    if (fail && sent.length === 1) throw new Error('Réseau indisponible')
+    const record = head.cards.find(card => card.id === event.recordId)
+    state = applyStudyEvent(state, record, event, Date.now(), head.cards).state
+    return { state }
+  }) }
+  const corpus = { getCatalogue: async () => corrupted ? { ...head, cards: [{ ...root, explanationFr: 'Incorrect' }] } : head }
+  return { client, corpus, sent, state: () => state }
+}
+describe('Japanese progression UI', () => {
+  // 15 October 2026, 10:00 CEST: a changed teaching revision must have a real route back to study.
+  it('restarts a revised card without retaining stale mastery', async () => {
+    const test = fixture({ stale: true }); render(<JapaneseStudy {...test} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Leçons débloquées/ }))
+    await screen.findByRole('button', { name: /Je connais déjà ce point/ })
+    fireEvent.click(screen.getByRole('button', { name: /Ajouter aux révisions/ }))
+    await waitFor(() => expect(test.state().progress[root.id]).toMatchObject({ stage: 'red', contentHash: root.lessonContentHash, reviews: 0, greenSuccesses: 0 }))
+  })
+  it('shows the version guide and verified audit separately from available card counts', async () => {
+    const test = fixture()
+    test.corpus.getCoverage = async () => ({ counts: { covered: 1, open: 1 }, requirements: [{ id: 'covered', status: 'covered', label: 'A' }, { id: 'gap', status: 'open', label: 'Notion absente', sourceUrl: 'https://example.org/grammar' }] })
+    render(<JapaneseStudy {...test} />)
+    await screen.findByText(/Mode d’emploi/)
+    fireEvent.click(screen.getByRole('button', { name: 'Couverture et lacunes' }))
+    await screen.findByRole('heading', { name: 'Audit grammatical N5' })
+    expect(screen.getByRole('link', { name: 'Notion absente' })).toHaveAttribute('href', 'https://example.org/grammar')
+  })
+  it('opens in Learn with zero mastery, then enrolls a real lesson as exposure', async () => {
+    const test = fixture(); render(<JapaneseStudy {...test} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Leçons débloquées/ }))
+    await screen.findByRole('heading', { name: '① Retest' })
+    expect(screen.getAllByText('Réponse du retest')[0].closest('details')).not.toHaveAttribute('open')
+    expect(screen.getByRole('table').querySelectorAll('thead th')).toHaveLength(2)
+    fireEvent.click(screen.getByRole('button', { name: /Ajouter aux révisions/ }))
+    await waitFor(() => expect(test.state().progress[root.id].stage).toBe('red'))
+    expect(test.state().progress[root.id].reviews).toBe(0)
+    expect(screen.getByRole('button', { name: /Révisions dues/ })).toBeEnabled()
+  })
+  it('keeps failed writes visible and retries exactly the same event', async () => {
+    const test = fixture({ fail: true }); render(<JapaneseStudy {...test} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Leçons débloquées/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /Ajouter aux révisions/ }))
+    await screen.findByRole('alert')
+    expect(test.state().progress[root.id]).toBeUndefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Réessayer l’enregistrement' }))
+    await waitFor(() => expect(test.state().progress[root.id].stage).toBe('red'))
+    expect(test.sent[0].eventId).toBe(test.sent[1].eventId)
+  })
+  it('requires reveal before grading and records self-assessment rather than mastery', async () => {
+    const test = fixture({ progress: true }); render(<JapaneseStudy {...test} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Révisions dues/ }))
+    expect(screen.queryByRole('button', { name: 'Raté ou avec aide' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Comparer ma réponse' }))
+    fireEvent.click(screen.getByRole('button', { name: /Juste, sans aide/ }))
+    await waitFor(() => expect(test.state().progress[root.id].stage).toBe('orange'))
+    expect(test.state().progress[root.id].reviews).toBe(1)
+  })
+  it('blocks a modified real card and keeps references available', async () => {
+    const test = fixture({ corrupted: true }); render(<JapaneseStudy {...test} />)
+    await screen.findByText('Référence à consulter')
+    expect(screen.getByRole('button', { name: /Leçons débloquées/ })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: /です et la phrase nominale/ }))
+    await screen.findByRole('alert')
+    expect(screen.queryByRole('button', { name: /Ajouter aux révisions/ })).not.toBeInTheDocument()
+  })
+  it('routes corpus questions and stores an explicit missing notion', async () => {
+    const test = fixture(), onCorpus = vi.fn(); render(<JapaneseStudy {...test} onCorpus={onCorpus} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Interroger le corpus' }))
+    expect(onCorpus).toHaveBeenCalledOnce()
+    fireEvent.click(screen.getByRole('button', { name: 'Couverture et lacunes' }))
+    fireEvent.change(screen.getByLabelText('Notion à compléter'), { target: { value: 'Lecture longue N1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Garder cette demande' }))
+    await screen.findByText('Lecture longue N1 : recherche et validation requises.')
+    expect(test.state().gaps).toHaveLength(1)
+  })
+})

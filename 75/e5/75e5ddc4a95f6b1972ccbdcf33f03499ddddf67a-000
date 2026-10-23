@@ -1,0 +1,140 @@
+// 2026-09-23 19:15 : where the Progress view reads the journal, and the proof that it is current.
+//
+// Two paths, same bytes. On the Mac, the journal relay serves the REAL local ~/.claude/PROGRESS.md
+// on 127.0.0.1 and announces every change by server-sent events: zero delay. Anywhere else, the
+// site reads /api/journal, pinned to the commit the relay pushed seconds after the change.
+// Either way the bytes are hashed in the browser and compared with the sha256 the relay computed on
+// the local file: the view shows "verified" only when both match.
+//
+// FR : sur le Mac, le vrai fichier local en direct ; ailleurs, le commit pousse par le relais.
+// Dans les deux cas, l'empreinte recalculee dans le navigateur doit egaler celle du fichier local.
+
+export const JOURNAL_SOURCE = Object.freeze({
+  localUrl: 'http://127.0.0.1:47831',
+  localProbeMs: 700,
+  remoteUrl: '/api/journal',
+  pollMs: 15000,          // remote: conditional check, only while the tab is visible
+  localSafetyMs: 30000,   // local: re-check even if an event was missed
+})
+
+export async function sha256Hex(bytes) {
+  const d = await crypto.subtle.digest('SHA-256', bytes)
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+export function concatBytes(a, b) {
+  if (!a || a.length === 0) return b
+  if (!b || b.length === 0) return a
+  const out = new Uint8Array(a.length + b.length)
+  out.set(a, 0); out.set(b, a.length)
+  return out
+}
+
+function withTimeout(ms) {
+  const c = new AbortController()
+  const t = setTimeout(() => c.abort(), ms)
+  return { signal: c.signal, done: () => clearTimeout(t) }
+}
+
+export function createJournalSource({ onChange, fetchImpl = (...a) => fetch(...a), EventSourceImpl = globalThis.EventSource, config = JOURNAL_SOURCE } = {}) {
+  let bytes = new Uint8Array(0)
+  let state = { mode: 'connecting', size: 0, declaredSha: '', verified: null, commit: '', pushedAt: '', mtime: '', inSync: null, checkedAt: null, error: '' }
+  let es = null
+  let timer = null
+  let stopped = false
+  let busy = false
+
+  const emit = (patch) => { state = { ...state, ...patch }; onChange && onChange({ state, bytes }) }
+
+  function readHeaders(r) {
+    return {
+      size: Number(r.headers.get('X-Journal-Size') || 0),
+      declaredSha: r.headers.get('X-Journal-Sha256') || '',
+      commit: r.headers.get('X-Journal-Commit') || state.commit,
+      pushedAt: r.headers.get('X-Journal-Pushed-At') || '',
+      mtime: r.headers.get('X-Journal-Mtime') || '',
+      from: Number(r.headers.get('X-Journal-From') || 0),
+    }
+  }
+
+  async function pull(base, since) {
+    const url = since ? `${base}?since=${since}` : base
+    const r = await fetchImpl(url, { cache: 'no-store' })
+    if (!r.ok) throw new Error(`journal ${r.status}`)
+    const h = readHeaders(r)
+    const chunk = new Uint8Array(await r.arrayBuffer())
+    // An append-only file only grows. Anything else means the whole file must be reloaded.
+    // FR : un fichier en ajout seul ne fait que grandir ; sinon on recharge tout.
+    const next = h.from === 0 ? chunk : (h.from === bytes.length ? concatBytes(bytes, chunk) : null)
+    if (!next) return pull(base, 0)
+    bytes = next
+    const verified = h.declaredSha ? (await sha256Hex(bytes)) === h.declaredSha : null
+    emit({ size: bytes.length, declaredSha: h.declaredSha, verified, commit: h.commit, pushedAt: h.pushedAt, mtime: h.mtime, checkedAt: new Date().toISOString(), error: '' })
+  }
+
+  async function syncLocal() {
+    if (busy) return
+    busy = true
+    try {
+      const r = await fetchImpl(`${config.localUrl}/status`, { cache: 'no-store' })
+      const s = await r.json()
+      if (s.size !== bytes.length || s.sha256 !== state.declaredSha) await pull(`${config.localUrl}/journal`, s.size >= bytes.length ? bytes.length : 0)
+      emit({ inSync: s.pushedSha256 === s.sha256, pushedAt: s.pushedAt || state.pushedAt, checkedAt: new Date().toISOString() })
+    } catch (e) {
+      emit({ error: `local: ${e.message}` })
+    } finally { busy = false }
+  }
+
+  async function syncRemote() {
+    if (busy || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return
+    busy = true
+    try {
+      const init = { cache: 'no-store', headers: state.commit ? { 'If-None-Match': `"${state.commit}"` } : {} }
+      const r = await fetchImpl(`${config.remoteUrl}?meta=1`, init)
+      if (r.status === 304) { emit({ checkedAt: new Date().toISOString(), error: '' }); return }
+      if (!r.ok) throw new Error(`meta ${r.status}`)
+      const m = await r.json()
+      if (m.commit !== state.commit || m.size !== bytes.length) await pull(config.remoteUrl, m.size >= bytes.length ? bytes.length : 0)
+      emit({ commit: m.commit, pushedAt: m.pushedAt, inSync: null, error: '' })
+    } catch (e) {
+      emit({ error: `remote: ${e.message}` })
+    } finally { busy = false }
+  }
+
+  async function probeLocal() {
+    const t = withTimeout(config.localProbeMs)
+    try {
+      const r = await fetchImpl(`${config.localUrl}/status`, { cache: 'no-store', signal: t.signal })
+      return r.ok
+    } catch { return false } finally { t.done() }
+  }
+
+  async function start() {
+    stopped = false
+    if (await probeLocal()) {
+      emit({ mode: 'local' })
+      await pull(`${config.localUrl}/journal`, 0)
+      await syncLocal()
+      if (EventSourceImpl) {
+        es = new EventSourceImpl(`${config.localUrl}/events`)
+        es.addEventListener('journal', () => { if (!stopped) syncLocal() })
+        es.onerror = () => { if (!stopped) emit({ error: 'local: events interrupted' }) }
+      }
+      timer = setInterval(syncLocal, config.localSafetyMs)
+    } else {
+      emit({ mode: 'remote' })
+      try { await pull(config.remoteUrl, 0) } catch (e) { emit({ mode: 'offline', error: e.message }) }
+      timer = setInterval(syncRemote, config.pollMs)
+      if (typeof document !== 'undefined') document.addEventListener('visibilitychange', syncRemote)
+    }
+  }
+
+  function stop() {
+    stopped = true
+    clearInterval(timer)
+    if (es) { es.close(); es = null }
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', syncRemote)
+  }
+
+  return { start, stop, refresh: () => (state.mode === 'local' ? syncLocal() : syncRemote()), get state() { return state }, get bytes() { return bytes } }
+}

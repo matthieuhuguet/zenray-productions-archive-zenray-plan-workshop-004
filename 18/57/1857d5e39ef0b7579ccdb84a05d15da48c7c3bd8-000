@@ -1,0 +1,154 @@
+// 4 October 2026: the local service. A scheduler (fixed slots 00:00, 06:00, 12:00, 18:00 Paris, once at start if one was missed), one run at a time, and a loopback bridge
+// so the page can press "search now" and read the progress. Same guards as the Assets bridge: loopback only, allowed origins, client header.
+// FR : le service local. Un planificateur (toutes les 6 h, et au demarrage si en retard), une passe a la fois, et un pont en boucle locale
+// pour que la page puisse lancer la recherche et lire l'avancement. Memes garde-fous que le pont Assets.
+import { timingSafeEqual } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { slotAfter } from './lib/Schedule.mjs'
+import { createApplyBridge } from './lib/ApplyBridge.mjs'
+
+const LOOPBACK = ['127.0.0.1', '::1', '::ffff:127.0.0.1']
+const ID = /^[A-Za-z0-9_-]{1,64}$/
+
+// 14 October 2026: the batch opens its application pages as browser tabs in one go, so no pop-up blocker is involved.
+// Only public https pages are opened; a local, private or malformed address is skipped and reported, never opened.
+// FR : le lot ouvre ses pages de candidature en onglets d'un coup ; seules les pages https publiques s'ouvrent.
+export const OPEN_LINKS = { maxUrls: 60, maxLength: 2000 }
+const PRIVATE_HOST = /^(localhost|.*\.local|.*\.internal|.*\.lan)$|^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.)|^\[|^$/
+export function safeOpenUrls(urls) {
+  if (!Array.isArray(urls) || !urls.length) throw new Error('At least one link required')
+  if (urls.length > OPEN_LINKS.maxUrls) throw new Error(`At most ${OPEN_LINKS.maxUrls} links at once`)
+  const accepted = [], skipped = []
+  for (const raw of urls) {
+    try {
+      if (typeof raw !== 'string' || raw.length > OPEN_LINKS.maxLength) throw new Error('bad')
+      const url = new URL(raw)
+      if (url.protocol !== 'https:' || url.username || url.password || PRIVATE_HOST.test(url.hostname.toLowerCase())) throw new Error('bad')
+      if (!accepted.includes(url.href)) accepted.push(url.href)
+    } catch { skipped.push(typeof raw === 'string' ? raw.slice(0, 120) : String(raw)) }
+  }
+  return { accepted, skipped }
+}
+const defaultOpener = (urls) => new Promise((resolve, reject) => execFile('/usr/bin/open', urls, { timeout: 15000 }, (error) => error ? reject(error) : resolve()))
+
+export function createService({ config, engine, store, notifier = null, now = () => new Date(), log = () => {}, secret = process.env.ZENRAY_API_SECRET || '', opener = defaultOpener, apply = createApplyBridge() }) {
+  const retryMs = config.service.retryMinutes * 60 * 1000
+  let state = { lastStartedAt: null, lastFinishedAt: null, lastOk: null, lastReport: null, lastError: null, nextAttemptAt: null, lastNotifiedAt: null }
+  let running = null
+  let lock = Promise.resolve()
+  const startedAt = now().toISOString()
+
+  const dueAt = () => {
+    if (state.nextAttemptAt) return new Date(state.nextAttemptAt)
+    const last = state.lastStartedAt || state.lastFinishedAt
+    return last ? slotAfter(new Date(last), config.service.schedule) : new Date(0)
+  }
+
+  const publicStatus = () => ({
+    service: { startedAt, intervalHours: config.service.intervalHours }, running: running && { startedAt: running.startedAt, stage: running.stage, trigger: running.trigger },
+    lastStartedAt: state.lastStartedAt, lastFinishedAt: state.lastFinishedAt, lastOk: state.lastOk, lastError: state.lastError, lastReport: state.lastReport, nextRunDue: dueAt().toISOString(), checkedAt: now().toISOString(),
+  })
+
+  async function save() { await store.write(state).catch((error) => log(`state not saved: ${error.message}`)) }
+
+  /** Starts a run unless one is already going. Returns at once; the page polls `status`. */
+  function trigger(source = 'manual', options = {}) {
+    if (running) return { started: false, reason: 'already-running', ...publicStatus() }
+    running = { startedAt: now().toISOString(), stage: 'démarrage', trigger: source }
+    state = { ...state, lastStartedAt: running.startedAt }
+    lock = lock.then(async () => {
+      try {
+        const report = await engine.run({ trigger: source, ...options, onStage: (stage) => { if (running) running.stage = stage } })
+        state = { ...state, lastFinishedAt: now().toISOString(), lastOk: report.ok, lastReport: summarise(report), lastError: null, nextAttemptAt: null }
+        log(`run ok: ${JSON.stringify(summarise(report))}`)
+        // Told only when the finds are really published, and only once per pass; a failing notification never fails the pass.
+        // FR : prevenu seulement quand les trouvailles sont vraiment publiees, une fois par passe ; une notification ratee ne rate jamais la passe.
+        if (notifier && report.committed) {
+          const done = await notifier.notify(report, { lastNotifiedAt: state.lastNotifiedAt }).catch(() => null)
+          if (done && done.sent.length) { state = { ...state, lastNotifiedAt: now().toISOString() }; log(`notified: ${done.sent.join(', ')}`) }
+        }
+      } catch (error) {
+        state = { ...state, lastFinishedAt: now().toISOString(), lastOk: false, lastError: String(error.message).slice(0, 400), nextAttemptAt: new Date(now().getTime() + retryMs).toISOString() }
+        log(`run failed: ${error.message}`)
+      } finally { running = null; await save() }
+    })
+    return { started: true, ...publicStatus() }
+  }
+
+  /** One letter on demand, queued behind a run if one is going, so two commits never race. */
+  function letter(payload) {
+    if (!ID.test(String(payload.studioId || ''))) throw new Error('Invalid studio id')
+    const lang = payload.lang === undefined || payload.lang === null ? null : String(payload.lang)
+    if (lang !== null && !['fr', 'en'].includes(lang)) throw new Error('Unsupported language')
+    const job = lock.then(() => engine.letter({ studioId: payload.studioId, lang }))
+    lock = job.catch(() => {})
+    return job
+  }
+
+  async function tick() {
+    if (running) return
+    if (now() >= dueAt()) trigger('schedule')
+  }
+
+  async function request(action, payload = {}) {
+    if (action === 'status') return publicStatus()
+    if (action === 'run') return trigger('manual', { only: Array.isArray(payload.only) ? payload.only.map(String) : null })
+    if (action === 'letter') return { ...(await letter(payload)), checkedAt: now().toISOString() }
+    if (action === 'open-links') {
+      const { accepted, skipped } = safeOpenUrls(payload.urls)
+      if (!accepted.length) throw new Error('No public https link to open')
+      await opener(accepted)
+      log(`opened ${accepted.length} application page(s)`)
+      return { opened: accepted.length, skipped, checkedAt: now().toISOString() }
+    }
+    // 16 October 2026: ZenRay Apply from the page. Nothing here submits an application; "sent" is recorded only on Matthieu's click.
+    if (action === 'apply-start') return { ...apply.start(payload.size), checkedAt: now().toISOString() }
+    if (action === 'apply-status') return { ...(await apply.status()), checkedAt: now().toISOString() }
+    if (action === 'apply-open') return { ...apply.open(), checkedAt: now().toISOString() }
+    if (action === 'apply-sent') return { ...(await apply.sent(payload.ids ?? null)), checkedAt: now().toISOString() }
+    throw new Error('Unsupported freelance action')
+  }
+
+  async function handleHttp(req, res) {
+    const send = (status, value) => { res.statusCode = status; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(value)) }
+    const remote = req.socket?.remoteAddress || ''
+    if (!LOOPBACK.includes(remote)) return send(403, { error: 'Local bridge accepts loopback clients only', code: 'not-loopback' })
+    const origin = req.headers.origin
+    if (origin && !config.service.allowedOrigins.includes(origin)) return send(403, { error: 'Origin refused', code: 'origin-refused' })
+    if (!origin && req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') return send(403, { error: 'Browser origin required', code: 'origin-required' })
+    if (origin) { res.setHeader('access-control-allow-origin', origin); res.setHeader('vary', 'Origin') }
+    res.setHeader('cache-control', 'no-store')
+    if (req.method === 'OPTIONS') {
+      res.setHeader('access-control-allow-methods', 'POST, OPTIONS')
+      res.setHeader('access-control-allow-headers', 'content-type, x-zr-auth, x-zr-freelance-client')
+      res.setHeader('access-control-allow-private-network', 'true')
+      return send(204, {})
+    }
+    if (req.method !== 'POST') return send(405, { error: 'POST required', code: 'method-refused' })
+    if (!String(req.headers['content-type'] || '').startsWith('application/json') || req.headers['x-zr-freelance-client'] !== '1') return send(403, { error: 'Freelance client header required', code: 'client-required' })
+    if (secret) {
+      const given = Buffer.from(String(req.headers['x-zr-auth'] || '')), expected = Buffer.from(secret)
+      if (given.length !== expected.length || !timingSafeEqual(given, expected)) return send(401, { error: 'Authentication required', code: 'auth-required' })
+    }
+    try {
+      const chunks = []; let bytes = 0
+      for await (const chunk of req) { bytes += chunk.length; if (bytes > config.service.bodyLimitBytes) return send(413, { error: 'Request too large', code: 'body-limit' }); chunks.push(chunk) }
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+      if (!body || typeof body.action !== 'string') throw new Error('Action required')
+      send(200, await request(body.action, body))
+    } catch (error) { send(400, { error: String(error.message).slice(0, 300), code: 'freelance-failed', checkedAt: now().toISOString() }) }
+  }
+
+  async function start() {
+    const saved = await store.read().catch(() => null)
+    if (saved) state = { ...state, ...saved }
+    state.nextAttemptAt = state.nextAttemptAt && new Date(state.nextAttemptAt) > now() ? state.nextAttemptAt : null
+    return { dueAt: dueAt(), startDelayMs: config.service.startDelaySeconds * 1000 }
+  }
+
+  return { trigger, letter, tick, request, handleHttp, status: publicStatus, start }
+}
+
+function summarise(report) {
+  return { ok: report.ok, added: report.added, closed: report.closed, letters: report.letters, details: report.details, prospects: report.prospects, committed: report.committed, commit: report.commit, durationMs: report.durationMs, finishedAt: report.finishedAt }
+}

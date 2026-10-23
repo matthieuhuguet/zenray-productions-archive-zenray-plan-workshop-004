@@ -1,0 +1,563 @@
+import React, { createContext, useContext, useRef, useState, useEffect, useCallback, useReducer } from 'react'
+import { isLoggedIn, getValidToken, forceRefreshToken } from './spotifyAuth.js'
+import { initialPlayerState, playerStateReducer, providerForTrack, trackKey } from './playerState.js'
+import { registerChunkedMediaPath, prefetchMediaPaths } from '../lib/vidStream.js'
+
+// C64/C73 — lecteur audio GLOBAL persistant, DOUBLE SOURCE : fichiers locaux (<audio>) + Spotify (Web Playback SDK, Premium).
+// La musique survit aux changements d'onglet (un seul lecteur monté au-dessus de l'app) et la barre globale la reflète.
+const Ctx = createContext(null)
+export function usePlayer() { return useContext(Ctx) }
+// Source d'un fichier local -- DEUX niveaux depuis le 2026-07-20 (retour Matthieu : "je ne veux pas
+// que mon média soit streamé par Vercel") :
+//  1. VOIE PRINCIPALE (asynchrone, effet localMedia plus bas) : manifeste .media.json PUBLIC chiffré
+//     -> Service Worker range-shim (registerChunkedMediaPath, même pont que la vidéo) : les octets
+//     viennent DIRECTEMENT de jsDelivr, déchiffrés côté client, seek par Range natif. ZÉRO octet ne
+//     transite par une fonction Vercel à la lecture.
+//  2. REPLI legacy (cette fonction) : manifeste privé (vis:'private', proxy obligatoire -- le CDN
+//     public n'a pas ces octets), échec du SW (navigation privée, SW non supporté), ou ancien index
+//     plat. /api/stream (Vercel) est DÉPRÉCIÉ comme chemin par défaut et ne sert plus que ces cas.
+const localSrc = (tr) => {
+  if (!tr) return undefined
+  if (tr.streamPath) return `/api/stream?path=${encodeURIComponent(tr.streamPath)}`
+  if (tr.path && tr.path.endsWith('.media.json')) return `/api/stream?path=${encodeURIComponent(tr.path)}`
+  if (tr.path) return `/api/img?path=${encodeURIComponent(tr.path)}`
+  return undefined
+}
+const manifestPathOf = (tr) => {
+  if (!tr) return null
+  if (tr.streamPath && tr.streamPath.endsWith('.media.json')) return tr.streamPath
+  if (tr.path && tr.path.endsWith('.media.json')) return tr.path
+  return null
+}
+
+export function PlayerProvider({ children }) {
+  const audio = useRef(null)
+  const sp = useRef(null) // instance Spotify SDK
+  const yt = useRef(null)
+  const ytHost = useRef(null)
+  const [source, setSource] = useState('local') // 'local' | 'spotify' | 'youtube'
+  // état local
+  const [queue, setQueue] = useState([])
+  const [idx, setIdx] = useState(-1)
+  // Une commande utilisateur = un requestId monotone. Les callbacks asynchrones d'un ancien
+  // provider ne peuvent ainsi jamais écraser l'état de la piste qui l'a remplacé.
+  const requestSeq = useRef(0)
+  const activeRequests = useRef({ local: null, spotify: null, youtube: null })
+  const localExpectedUrl = useRef('')
+  const youtubeExpectedId = useRef('')
+  const spotifyExpected = useRef({ uri: '', contextUri: '', excludeUri: '' })
+  // Les PUT /me/player/play sont strictement ordonnés. Une commande plus récente
+  // peut invalider une commande encore en attente, mais ne peut jamais la doubler
+  // sur le réseau dans l'ordre inverse.
+  const spotifyPutChain = useRef(Promise.resolve())
+  const spotifyCommandSeq = useRef(0)
+  const [playRequestId, setPlayRequestId] = useState(0)
+  const [transport, dispatchTransport] = useReducer(playerStateReducer, initialPlayerState)
+  const [lPlaying, setLPlaying] = useState(false)
+  const [lTime, setLTime] = useState(0)
+  const [lDur, setLDur] = useState(0)
+  // état spotify
+  const [deviceId, setDeviceId] = useState(null)
+  // Miroirs en ref : lus par des callbacks créés UNE fois (listener SDK, chaîne PUT) qui ne doivent
+  // jamais figer une valeur d'état périmée dans leur closure.
+  const deviceIdRef = useRef(null)
+  const mixedRef = useRef(false)
+  const spLastState = useRef(null)
+  const [sdkReady, setSdkReady] = useState(false)
+  const [spTrack, setSpTrack] = useState(null)
+  const [spPlaying, setSpPlaying] = useState(false)
+  const [spTime, setSpTime] = useState(0)
+  const [spDur, setSpDur] = useState(0)
+  const [vol, setVolState] = useState(0.9)
+  const [rate, setRateState] = useState(1) // vitesse de lecture (fichiers locaux : <audio>.playbackRate)
+  const [shuffle, setShuffle] = useState(false) // C83
+  const [repeat, setRepeat] = useState('off') // 'off' | 'all' | 'one'
+  // L’URL et l’identité de piste sont atomiques. Sinon, pendant un rendu A→B,
+  // React peut exposer brièvement `curKey=B` avec l’ancienne URL de A et lancer
+  // les deux sources successivement.
+  const [localMedia, setLocalMedia] = useState({ trackKey: '', url: undefined })
+  const [mixed, setMixed] = useState(false)
+  const [ytPlaying, setYtPlaying] = useState(false)
+  const [ytTime, setYtTime] = useState(0)
+  const [ytDur, setYtDur] = useState(0)
+  const beginRequest = useCallback((provider, track) => {
+    const requestId = ++requestSeq.current
+    const key = trackKey(track)
+    activeRequests.current[provider] = { requestId, trackKey: key }
+    setPlayRequestId(requestId)
+    dispatchTransport({ type: 'request', requestId, provider, trackKey: key })
+    setLPlaying(false)
+    setSpPlaying(false)
+    setYtPlaying(false)
+    return requestId
+  }, [])
+  const acknowledge = useCallback((type, provider, requestId, error = '', expectedTrackKey = '') => {
+    if (!Number.isInteger(requestId)) return
+    dispatchTransport({ type, provider, requestId, error, trackKey: expectedTrackKey })
+  }, [])
+
+  const localCurrent = idx >= 0 ? queue[idx] : null
+  // Identité de la piste locale courante (pas son index) : pilote la (re)lecture impérative.
+  // Rejouer la MÊME case d'index (ex. playTrack pose toujours idx=0) doit relancer la lecture ;
+  // dépendre de l'index ne re-déclenche pas l'effet quand l'index ne change pas, d'où ce dérivé.
+  const curKey = localCurrent ? (localCurrent.streamPath || localCurrent.path || localCurrent.uri || '') : ''
+  const localUrl = localMedia.trackKey === curKey ? localMedia.url : undefined
+
+  // Résolution de l'URL audio locale. HISTORIQUE : ce commentaire disait "les médias audio chunkés
+  // passent toujours par le endpoint Range du serveur" (le SW était jugé trop fragile pour l'audio).
+  // INVERSÉ le 2026-07-20 (retour Matthieu, dépréciation du streaming Vercel) : le SW range-shim est
+  // devenu la voie PRINCIPALE (jsDelivr direct + déchiffrement client, registerRawMedia gère déjà les
+  // remplacements de controller avec double-ACK) ; /api/stream n'est plus QUE le repli -- manifeste
+  // privé, SW indisponible, ou échec d'enregistrement. Jamais le défaut.
+  useEffect(() => {
+    if (!localCurrent || source !== 'local') { setLocalMedia({ trackKey: '', url: undefined }); return undefined }
+    // Voie principale hors-Vercel (2026-07-20) : manifeste public -> SW range-shim -> jsDelivr.
+    // registerChunkedMediaPath lit le manifeste via raw=1 (HORS quota API) puis enregistre le média
+    // auprès du SW ; l'URL /zr-stream/<id> obtenue est seekable nativement. Toute défaillance
+    // (manifeste privé -> normalizeRawMediaManifest jette faute de cdnRepo, SW absent, premier
+    // chargement sans controller) retombe sur /api/stream -- lecture jamais cassée, juste proxied.
+    // `live` : garde d'annulation, une résolution lente d'une piste précédente ne doit jamais
+    // écraser l'URL de la piste courante.
+    let live = true
+    const key = curKey
+    // Pause explicite AVANT la résolution : sans elle, un play() encore en vol sur l'ancienne piste
+    // était interrompu par le retrait/remplacement de src ("The play() request was interrupted by a
+    // call to pause()", observé sur les .wav fraîchement uploadés dont la résolution SW prend un
+    // instant). Une pause volontaire d'abord = aucun play() pendant le swap de src.
+    try { audio.current?.pause() } catch {}
+    const path = manifestPathOf(localCurrent)
+    if (path) {
+      registerChunkedMediaPath(path)
+        .then(({ manifest, url }) => {
+          if (!live) return
+          // Manifeste privé : le SW saurait proxyfier, mais autant garder le chemin historique
+          // /api/stream (auth serveur), c'est le MÊME transit Vercel dans les deux cas.
+          if (manifest && manifest.vis !== 'public') { setLocalMedia({ trackKey: key, url: localSrc(localCurrent) }); return }
+          setLocalMedia({ trackKey: key, url })
+        })
+        .catch(() => { if (live) setLocalMedia({ trackKey: key, url: localSrc(localCurrent) }) })
+    } else {
+      setLocalMedia({ trackKey: key, url: localSrc(localCurrent) })
+    }
+    return () => { live = false }
+  }, [curKey, source]) // eslint-disable-line
+
+  // PRÉCHARGEMENT DES PISTES À VENIR (2026-07-22) : dès que la piste courante change, on réchauffe le 1er
+  // chunk des ~4 pistes suivantes de la file locale -> transition de piste sans trou ET clic sur une piste
+  // proche instantané. Fenêtre bornée (parts[0] ≈ 19 Mo). Complète le préchargement du dossier (full player) ;
+  // prefetchMediaPaths dédoublonne, donc aucun double transfert. Best-effort, jamais bloquant.
+  useEffect(() => {
+    if (source !== 'local' || idx < 0) return
+    const next = queue.slice(idx + 1, idx + 1 + 4).map(manifestPathOf).filter(Boolean)
+    if (next.length) prefetchMediaPaths(next, { window: 4 }).catch(() => {})
+  }, [idx, source, queue])
+
+  // État loggé Spotify observé en React. L'auth vit dans localStorage (hors React) : on la reflète
+  // ici via l'event 'storage' (autres onglets) ET un sondage léger (même onglet, après login/logout),
+  // pour (re)connecter le Web Playback SDK sans recharger la page après un login tardif.
+  const [spLogged, setSpLogged] = useState(isLoggedIn())
+  useEffect(() => {
+    const sync = () => setSpLogged(isLoggedIn())
+    window.addEventListener('storage', sync)
+    const iv = setInterval(sync, 1500)
+    return () => { window.removeEventListener('storage', sync); clearInterval(iv) }
+  }, [])
+
+  // YouTube audio-only nodes use the official iframe API. The player stays invisible;
+  // metadata/controls are rendered by the same Create player bar as local and Spotify.
+  useEffect(() => {
+    if (source !== 'youtube' || !localCurrent || !localCurrent.videoId) return
+    let cancelled = false
+    let previousReadyHandler
+    let installedReadyHandler
+    youtubeExpectedId.current = localCurrent.videoId
+    const validEvent = (target) => {
+      const expected = youtubeExpectedId.current
+      if (!expected) return false
+      try { return !target?.getVideoData || target.getVideoData()?.video_id === expected } catch { return false }
+    }
+    const ackYoutube = (type, error = '') => {
+      const request = activeRequests.current.youtube
+      if (request) acknowledge(type, 'youtube', request.requestId, error, request.trackKey)
+    }
+    const load = () => {
+      if (cancelled || !window.YT || !window.YT.Player || !ytHost.current) return
+      if (yt.current && yt.current.loadVideoById) { yt.current.loadVideoById(localCurrent.videoId); return }
+      yt.current = new window.YT.Player(ytHost.current, {
+        width: 1, height: 1, videoId: localCurrent.videoId,
+        playerVars: { autoplay: 1, controls: 0, playsinline: 1, origin: window.location.origin },
+        events: {
+          onReady: (e) => {
+            if (!validEvent(e.target)) return
+            ackYoutube('ready')
+            // La durée est nécessaire dès le premier rendu : sans elle la barre restait
+            // désactivée jusqu'au tick de 500 ms, ce qui rendait le seek YouTube aléatoire.
+            try { setYtDur(e.target.getDuration() || 0); setYtTime(e.target.getCurrentTime() || 0) } catch {}
+            e.target.setVolume(Math.round(vol * 100)); e.target.playVideo()
+          },
+          onStateChange: (e) => {
+            if (!validEvent(e.target)) return
+            setYtPlaying(e.data === 1)
+            if (e.data === 1) ackYoutube('playing')
+            else if (e.data === 2) ackYoutube('paused')
+            if (e.data === 0) window.dispatchEvent(new Event('zr:youtube-ended'))
+          },
+          onError: (e) => { if (validEvent(e.target)) ackYoutube('error', 'YouTube a refusé la lecture de cette piste.') },
+        },
+      })
+    }
+    if (window.YT && window.YT.Player) load()
+    else {
+      previousReadyHandler = window.onYouTubeIframeAPIReady
+      installedReadyHandler = () => { if (typeof previousReadyHandler === 'function') previousReadyHandler(); load() }
+      window.onYouTubeIframeAPIReady = installedReadyHandler
+      if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) { const s = document.createElement('script'); s.src = 'https://www.youtube.com/iframe_api'; document.head.appendChild(s) }
+    }
+    return () => {
+      cancelled = true
+      // Ne jamais écraser un handler plus récent installé par un autre composant.
+      if (installedReadyHandler && window.onYouTubeIframeAPIReady === installedReadyHandler) {
+        window.onYouTubeIframeAPIReady = previousReadyHandler
+      }
+    }
+  }, [source, curKey, playRequestId, acknowledge]) // eslint-disable-line
+
+  useEffect(() => {
+    if (source !== 'youtube' || !ytPlaying) return
+    const id = setInterval(() => { try { setYtTime(yt.current.getCurrentTime() || 0); setYtDur(yt.current.getDuration() || 0) } catch {} }, 500)
+    return () => clearInterval(id)
+  }, [source, ytPlaying])
+
+  // ── SDK Spotify ──
+  useEffect(() => {
+    if (!spLogged) return
+    if (sp.current) return // déjà connecté : ne pas ré-instancier le SDK
+    let player
+    const init = () => {
+      if (!window.Spotify) return
+      player = new window.Spotify.Player({ name: 'ZenRay', getOAuthToken: (cb) => getValidToken().then((tk) => tk && cb(tk)), volume: vol })
+      player.addListener('ready', ({ device_id }) => { deviceIdRef.current = device_id; setDeviceId(device_id); setSdkReady(true) })
+      player.addListener('not_ready', () => setSdkReady(false))
+      player.addListener('player_state_changed', (s) => {
+        if (!s) return
+        const tr = s.track_window && s.track_window.current_track
+        if (tr) setSpTrack({ title: tr.name, artist: (tr.artists || []).map((a) => a.name).join(', '), cover: tr.album && tr.album.images && tr.album.images[0] && tr.album.images[0].url, source: 'spotify', uri: tr.uri, id: tr.id })
+        setSpPlaying(!s.paused); setSpTime((s.position || 0) / 1000); setSpDur((s.duration || 0) / 1000)
+        // Fin de piste Spotify (bug réel 2026-07-20 : "à la fin d'une playlist ça rejoue à l'infini le
+        // même track") : en file MIXTE chaque titre Spotify est joué seul (uris:[uri]) -- à sa fin,
+        // Spotify boucle sur son mini-contexte au lieu d'avancer notre file, et rien ne le détectait.
+        // Le SDK n'émet aucun 'ended' : heuristique standard -- on jouait près de la fin, puis état
+        // paused à position 0. L'event fait avancer la file via next(true), comme local et YouTube.
+        const last = spLastState.current
+        spLastState.current = { paused: s.paused, position: s.position || 0, duration: s.duration || 0 }
+        if (mixedRef.current && last && !last.paused && s.paused && (s.position || 0) === 0
+          && last.position > 0 && last.duration > 0 && last.position >= last.duration - 3500) {
+          window.dispatchEvent(new Event('zr:spotify-ended'))
+        }
+        const expected = spotifyExpected.current
+        const leftPreviousTrack = !expected.excludeUri || (tr?.uri && tr.uri !== expected.excludeUri)
+        const sameTrack = leftPreviousTrack && (!expected.uri || tr?.uri === expected.uri)
+        const sameContext = !expected.contextUri || !s.context?.uri || s.context.uri === expected.contextUri
+        const request = activeRequests.current.spotify
+        if (sameTrack && sameContext && request) {
+          acknowledge(s.paused ? 'paused' : 'playing', 'spotify', request.requestId, '', request.trackKey)
+          // Après le premier état corrélé, la piste reçue devient la nouvelle
+          // identité stable pour toggle/seek/next/prev.
+          spotifyExpected.current = { uri: tr?.uri || '', contextUri: s.context?.uri || '', excludeUri: '' }
+        }
+      })
+      player.connect()
+      sp.current = player
+    }
+    if (window.Spotify) init()
+    else { window.onSpotifyWebPlaybackSDKReady = init; const sc = document.createElement('script'); sc.src = 'https://sdk.scdn.co/spotify-player.js'; sc.async = true; document.body.appendChild(sc) }
+    return () => { if (player) { player.disconnect(); if (sp.current === player) sp.current = null } }
+  }, [spLogged, acknowledge]) // eslint-disable-line
+
+  // progression Spotify (le SDK n'émet pas en continu)
+  useEffect(() => {
+    if (source !== 'spotify' || !spPlaying) return
+    const iv = setInterval(() => setSpTime((x) => Math.min(x + 1, spDur)), 1000)
+    return () => clearInterval(iv)
+  }, [source, spPlaying, spDur])
+
+  useEffect(() => { if (audio.current) audio.current.volume = vol; if (sp.current && sp.current.setVolume) sp.current.setVolume(vol); if (yt.current && yt.current.setVolume) yt.current.setVolume(Math.round(vol * 100)) }, [vol])
+  useEffect(() => { if (audio.current) audio.current.playbackRate = rate }, [rate])
+  // Réapplique la vitesse quand une nouvelle piste locale se charge (sinon l'élément repart à 1).
+  useEffect(() => { if (audio.current) audio.current.playbackRate = rate }, [curKey, playRequestId, source]) // eslint-disable-line
+  useEffect(() => {
+    const a = audio.current
+    if (!a || source !== 'local' || idx < 0 || !localCurrent || !localUrl || !playRequestId) return
+    const requestId = playRequestId
+    const request = activeRequests.current.local
+    if (!request || request.requestId !== requestId) return
+    try { localExpectedUrl.current = new URL(localUrl, window.location.href).href } catch { localExpectedUrl.current = localUrl }
+    // Toute demande explicite (playTrack/playQueue/next/prev) rejoue depuis le début.
+    // Si la src est inchangée (re-clic même piste), <audio> ne recharge pas seul : on remet la tête à 0.
+    try { if (a.currentTime > 0) a.currentTime = 0 } catch {}
+    a.play().then(() => { setLPlaying(true); acknowledge('playing', 'local', requestId, '', request.trackKey) }).catch((err) => { setLPlaying(false); acknowledge('error', 'local', requestId, err?.message || 'Lecture audio impossible.', request.trackKey) })
+  }, [curKey, localUrl, playRequestId, source, acknowledge]) // eslint-disable-line
+
+  // ── API unifiée ──
+  const playQueue = useCallback((list, i = 0) => {
+    const safe = Array.isArray(list) ? list : []
+    const at = safe.length ? Math.max(0, Math.min(i, safe.length - 1)) : -1
+    if (at >= 0) beginRequest('local', safe[at])
+    setMixed(false); setSource('local'); if (sp.current) sp.current.pause(); if (yt.current?.pauseVideo) yt.current.pauseVideo(); setQueue(safe); setIdx(at)
+  }, [beginRequest])
+  const playTrack = useCallback((tr) => {
+    if (!tr) return
+    beginRequest('local', tr)
+    setMixed(false); setSource('local'); if (sp.current) sp.current.pause(); if (yt.current?.pauseVideo) yt.current.pauseVideo(); setQueue([tr]); setIdx(0)
+  }, [beginRequest])
+  // Spotify : lecture immédiate d'une ou plusieurs URIs (ou d'un contexte playlist/album)
+  const playSpotify = useCallback(async (uris, contextUri, existingRequestId) => {
+    const requestId = existingRequestId || beginRequest('spotify', { source: 'spotify', uri: uris?.[0], contextUri })
+    const commandSeq = ++spotifyCommandSeq.current
+    spotifyExpected.current = { uri: uris?.[0] || '', contextUri: contextUri || '', excludeUri: '' }
+    const request = activeRequests.current.spotify
+    // Exclusivité des sources : on coupe RÉELLEMENT le <audio> local (pause + drapeau) avant Spotify,
+    // sinon double son possible selon le timing des bascules.
+    // Bug réel corrigé le 2026-07-19 ("cliquer sur une playlist Spotify ne l'affiche/ne la lance pas") :
+    // playSpotify() appelé DIRECTEMENT (clic playlist réelle ou manifeste ZenRay) sans passer par
+    // playMixedQueue ne remettait jamais `mixed` à false. `current` se calcule `mixed ? localCurrent :
+    // spTrack` -- si `mixed` était resté vrai d'une lecture précédente, `current` pointait vers l'ancienne
+    // file locale (souvent vide/périmée) au lieu du vrai morceau Spotify en cours, laissant les panneaux
+    // centre/droite vides malgré une lecture qui démarrait réellement côté Spotify.
+    if (!existingRequestId) setMixed(false)
+    setSource('spotify'); const a = audio.current; if (a) a.pause(); if (yt.current?.pauseVideo) yt.current.pauseVideo(); setYtPlaying(false); setLPlaying(false)
+    const body = contextUri ? { context_uri: contextUri } : { uris }
+    const run = spotifyPutChain.current.catch(() => false).then(async () => {
+      // Si une commande plus récente est arrivée avant même notre tour réseau,
+      // celle-ci est devenue sans effet et peut être supprimée.
+      if (commandSeq !== spotifyCommandSeq.current) return false
+      let tk = await getValidToken()
+      if (!tk) { acknowledge('error', 'spotify', requestId, 'Connecte Spotify pour lire cette piste.', request?.trackKey); return false }
+      // Tout premier clic après chargement de page : le SDK peut mettre quelques secondes à déclarer
+      // son device -- on l'attend (5s max) au lieu d'envoyer un PUT sans device_id voué au
+      // "aucun lecteur actif" (bug réel 2026-07-20, badge play des tuiles Create).
+      // N'attendre QUE si le SDK est réellement en train de se connecter (sp.current existe) : sans
+      // instance SDK, aucun device n'apparaîtra jamais -- envoyer tout de suite (Spotify Connect peut
+      // viser un autre appareil actif), et c'est aussi ce que supposent les tests du transport.
+      let device = deviceIdRef.current
+      for (let waitStep = 0; waitStep < 10 && !device && sp.current; waitStep++) {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        if (commandSeq !== spotifyCommandSeq.current) return false
+        device = deviceIdRef.current
+      }
+      const endpoint = `https://api.spotify.com/v1/me/player/play${device ? '?device_id=' + device : ''}`
+      const send = (token) => fetch(endpoint, { method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => null)
+      let response = await send(tk)
+      if (response?.status === 401) {
+        tk = await forceRefreshToken()
+        response = tk ? await send(tk) : response
+      }
+      // 404 "aucun lecteur actif" : notre device SDK existe mais Spotify ne le considère plus actif
+      // (session dormante, autre appareil) -> transfert de lecture explicite vers lui, puis retry.
+      if (response && !response.ok && (response.status === 404 || response.status === 400) && device && tk) {
+        await fetch('https://api.spotify.com/v1/me/player', { method: 'PUT', headers: { Authorization: 'Bearer ' + tk, 'Content-Type': 'application/json' }, body: JSON.stringify({ device_ids: [device], play: false }) }).catch(() => null)
+        await new Promise((resolve) => setTimeout(resolve, 350))
+        response = await send(tk)
+      }
+      // La réponse d'une ancienne commande ne doit jamais modifier la nouvelle.
+      if (commandSeq !== spotifyCommandSeq.current) return false
+      if (!response?.ok) { acknowledge('error', 'spotify', requestId, response?.status === 403 ? 'Spotify Premium est requis pour contrôler la lecture.' : 'Spotify ne trouve aucun lecteur actif.', request?.trackKey); return false }
+      // repeat off sur notre device, UNIQUEMENT en file mixte : un titre seul (uris:[uri]) avec le
+      // repeat du compte en 'context'/'track' rejouerait EN BOUCLE -- c'est notre file qui gère la
+      // suite. En lecture Spotify native (contexte playlist/album), le repeat reste au choix du compte.
+      if (mixedRef.current) fetch(`https://api.spotify.com/v1/me/player/repeat?state=off${device ? '&device_id=' + device : ''}`, { method: 'PUT', headers: { Authorization: 'Bearer ' + tk } }).catch(() => {})
+      acknowledge('ready', 'spotify', requestId, '', request?.trackKey)
+      return true
+    })
+    spotifyPutChain.current = run.catch(() => false)
+    return run
+  }, [deviceId, beginRequest, acknowledge])
+
+  // A playlist file may freely mix local shards, Spotify URIs and YouTube audio links.
+  const playMixedQueue = useCallback((list, i = 0) => {
+    const safe = list || []
+    setMixed(true)
+    setQueue(safe)
+    const at = safe.length ? Math.max(0, Math.min(i, safe.length - 1)) : -1
+    setIdx(at)
+    if (at >= 0) beginRequest(providerForTrack(safe[at]), safe[at])
+  }, [beginRequest])
+  useEffect(() => { mixedRef.current = mixed }, [mixed])
+  // Pause Spotify "dure" : la pause SDK seule échoue parfois en silence (device plus actif côté
+  // Spotify) et laissait l'ancienne piste jouer SOUS la nouvelle ("deux tracks en même temps",
+  // retour 2026-07-20). Le REST /me/player/pause double le SDK, best-effort.
+  const hardPauseSpotify = useCallback(() => {
+    try { sp.current?.pause() } catch {}
+    setSpPlaying(false)
+    getValidToken().then((tk) => {
+      if (!tk) return
+      fetch(`https://api.spotify.com/v1/me/player/pause${deviceIdRef.current ? '?device_id=' + deviceIdRef.current : ''}`, { method: 'PUT', headers: { Authorization: 'Bearer ' + tk } }).catch(() => {})
+    }).catch(() => {})
+  }, [])
+  useEffect(() => {
+    if (!mixed || !localCurrent) return
+    const kind = providerForTrack(localCurrent)
+    if (kind === 'spotify') { setSource('spotify'); audio.current?.pause(); if (yt.current?.pauseVideo) yt.current.pauseVideo(); playSpotify(localCurrent.uri ? [localCurrent.uri] : null, localCurrent.contextUri, playRequestId) }
+    else if (kind === 'youtube') { setSource('youtube'); audio.current?.pause(); hardPauseSpotify() }
+    else { setSource('local'); hardPauseSpotify(); if (yt.current?.pauseVideo) yt.current.pauseVideo() }
+  }, [mixed, idx, curKey, playRequestId, playSpotify, hardPauseSpotify]) // eslint-disable-line
+
+  const toggle = useCallback(() => {
+    if (source === 'spotify') { if (sp.current) sp.current.togglePlay(); return }
+    if (source === 'youtube') { if (yt.current) { try { ytPlaying ? yt.current.pauseVideo() : yt.current.playVideo() } catch {} } return }
+    const a = audio.current; if (!a || idx < 0) return
+    const request = activeRequests.current.local
+    if (a.paused) { a.play().then(() => { setLPlaying(true); if (request) acknowledge('playing', 'local', request.requestId, '', request.trackKey) }).catch((err) => { setLPlaying(false); if (request) acknowledge('error', 'local', request.requestId, err?.message || 'Lecture audio impossible.', request.trackKey) }) }
+    else { a.pause(); setLPlaying(false); if (request) acknowledge('paused', 'local', request.requestId, '', request.trackKey) }
+  }, [source, idx, ytPlaying, acknowledge])
+
+  const addToQueue = useCallback((tr) => {
+    if (!tr) return
+    setMixed(true)
+    setQueue((before) => before.length ? [...before, tr] : [tr])
+    setIdx((before) => before < 0 ? 0 : before)
+    if (idx < 0) beginRequest(providerForTrack(tr), tr)
+  }, [idx, beginRequest])
+  const playNext = useCallback((tr) => {
+    if (!tr) return
+    setMixed(true)
+    setQueue((before) => {
+      if (!before.length) return [tr]
+      const at = Math.max(0, Math.min(idx + 1, before.length))
+      return [...before.slice(0, at), tr, ...before.slice(at)]
+    })
+    setIdx((before) => before < 0 ? 0 : before)
+    if (idx < 0) beginRequest(providerForTrack(tr), tr)
+  }, [idx, beginRequest])
+  const next = useCallback((auto) => {
+    if (source === 'spotify' && !mixed) {
+      if (sp.current) {
+        beginRequest('spotify', spTrack)
+        if (repeat === 'one' && auto) {
+          spotifyExpected.current = { uri: spTrack?.uri || '', contextUri: '', excludeUri: '' }
+          sp.current.seek(0)
+        } else {
+          spotifyExpected.current = { uri: '', contextUri: '', excludeUri: spTrack?.uri || '' }
+          sp.current.nextTrack()
+        }
+      }
+      return
+    }
+    if (idx < 0 || !queue.length) return
+    let at = idx
+    if (repeat === 'one' && auto) at = idx
+    // Bug réel corrigé le 2026-07-20 ("lecture aléatoire ne fonctionne pas dans le full player") :
+    // la condition !mixed excluait le shuffle des files MIXTES -- or TOUT le lecteur complet (playlists,
+    // liked, dossiers) joue via playMixedQueue (mixed=true), donc le bouton n'avait jamais aucun effet.
+    // Le tirage aléatoire par index fonctionne à l'identique en mixte : beginRequest(queue[at]) route
+    // déjà chaque piste vers son provider.
+    else if (shuffle && queue.length > 1) { while (at === idx) at = Math.floor(Math.random() * queue.length) }
+    else {
+      const candidate = idx + 1
+      if (candidate >= queue.length && repeat !== 'all') {
+        // Une fin de file n'est pas une nouvelle commande de lecture : ne jamais
+        // recréer un requestId qui ferait repartir silencieusement la dernière piste.
+        setLPlaying(false)
+        setYtPlaying(false)
+        const provider = providerForTrack(queue[idx])
+        const request = activeRequests.current[provider]
+        if (request) acknowledge('paused', provider, request.requestId, '', request.trackKey)
+        return
+      }
+      at = candidate >= queue.length ? 0 : candidate
+    }
+    setIdx(at)
+    beginRequest(providerForTrack(queue[at]), queue[at])
+  }, [source, queue, idx, shuffle, repeat, mixed, beginRequest, spTrack, acknowledge])
+  const prev = useCallback(() => {
+    // Comportement Spotify (retour Matthieu 2026-07-20) : au-delà de 3 secondes de lecture, "précédent"
+    // REVIENT AU DÉBUT de la piste en cours ; en dessous, il passe réellement à la piste précédente.
+    const elapsed = source === 'spotify' ? spTime : source === 'youtube' ? ytTime : lTime
+    if (elapsed > 3) {
+      if (source === 'spotify') { try { sp.current?.seek(0) } catch {}; setSpTime(0) }
+      else if (source === 'youtube') { try { yt.current?.seekTo(0, true); setYtTime(0) } catch {} }
+      else if (audio.current) { try { audio.current.currentTime = 0 } catch {}; setLTime(0) }
+      return
+    }
+    if (source === 'spotify' && !mixed) {
+      if (sp.current) {
+        beginRequest('spotify', spTrack)
+        spotifyExpected.current = { uri: '', contextUri: '', excludeUri: spTrack?.uri || '' }
+        sp.current.previousTrack()
+      }
+      return
+    }
+    if (idx < 0 || !queue.length) return
+    const at = (idx - 1 + queue.length) % queue.length
+    setIdx(at)
+    beginRequest(providerForTrack(queue[at]), queue[at])
+  }, [source, queue, idx, mixed, beginRequest, spTrack, spTime, ytTime, lTime])
+  useEffect(() => { const h = () => next(true); window.addEventListener('zr:youtube-ended', h); return () => window.removeEventListener('zr:youtube-ended', h) }, [next])
+  useEffect(() => { const h = () => next(true); window.addEventListener('zr:spotify-ended', h); return () => window.removeEventListener('zr:spotify-ended', h) }, [next])
+  const seek = useCallback((frac) => {
+    const safeFrac = Math.max(0, Math.min(1, Number(frac) || 0))
+    if (source === 'spotify') { if (sp.current && spDur) { Promise.resolve(sp.current.seek(safeFrac * spDur * 1000)).catch(() => {}); setSpTime(safeFrac * spDur) } return }
+    if (source === 'youtube') { if (yt.current && ytDur) { try { yt.current.seekTo(safeFrac * ytDur, true); setYtTime(safeFrac * ytDur) } catch {} } return }
+    const a = audio.current; if (!a) return
+    // lDur peut être Infinity (flux 206) -> on prend la durée du manifest portée par la track.
+    const d = (Number.isFinite(lDur) && lDur > 0) ? lDur : (localCurrent && Number.isFinite(localCurrent.dur) ? localCurrent.dur : 0)
+    if (d) { a.currentTime = safeFrac * d; setLTime(safeFrac * d) }
+  }, [source, spDur, ytDur, lDur, localCurrent])
+  const setVol = useCallback((v) => setVolState(v), [])
+  const setRate = useCallback((r) => setRateState(r), [])
+  // Déverrouillage autoplay (bug réel 2026-07-20 : "si le lecteur n'a jamais été lancé, le badge play
+  // des tuiles ne lance rien") : le badge lit d'abord le manifeste (await réseau) PUIS play() -- au
+  // tout premier clic d'une session, l'activation utilisateur peut être consommée entre-temps et
+  // Chrome rejette play(). primeAudio(), appelé SYNCHRONEMENT dans le geste, joue un WAV silencieux
+  // d'une frame sur l'élément <audio> partagé : l'élément est déverrouillé pour tout le reste de la
+  // session. Ne touche jamais une vraie piste (guard currentSrc + nettoyage conditionné au data:).
+  const primedRef = useRef(false)
+  const primeAudio = useCallback(() => {
+    const a = audio.current
+    if (!a || primedRef.current || a.currentSrc) return
+    primedRef.current = true
+    try {
+      a.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+      const done = () => { if ((a.currentSrc || '').startsWith('data:')) { a.pause(); a.removeAttribute('src'); try { a.load() } catch {} } }
+      a.play().then(done).catch(done)
+    } catch {}
+  }, [])
+
+  const current = source === 'spotify' ? (mixed ? localCurrent : spTrack) : localCurrent
+  const playing = transport.phase === 'playing'
+  const playError = transport.error
+  const time = source === 'spotify' ? spTime : source === 'youtube' ? ytTime : lTime
+  // Sur un flux 206 partiel, audio.duration revient souvent Infinity/NaN -> on retombe sur la durée
+  // déjà connue (probe.duration stockée dans le manifest et portée par la track via .dur). Repli gracieux
+  // si la track ne porte pas de dur (SFX, ancien index) : on garde lDur tel quel (0).
+  const localDur = (Number.isFinite(lDur) && lDur > 0) ? lDur : (localCurrent && Number.isFinite(localCurrent.dur) ? localCurrent.dur : lDur)
+  const dur = source === 'spotify' ? spDur : source === 'youtube' ? ytDur : localDur
+
+  const seekable = source !== 'spotify' || sdkReady
+
+  return (
+    <Ctx.Provider value={{ source, queue, idx, current, playing, time, dur, vol, rate, sdkReady, seekable, deviceId, playError, playerPhase: transport.phase, shuffle, repeat, setShuffle, setRepeat, playQueue, playTrack, playSpotify, playMixedQueue, addToQueue, playNext, toggle, next, prev, seek, setVol, setRate, primeAudio }}>
+      {children}
+      <div aria-hidden="true" style={{ position: 'fixed', width: 1, height: 1, left: -10, bottom: -10, overflow: 'hidden', opacity: 0, pointerEvents: 'none' }}><div ref={ytHost} /></div>
+      <audio ref={audio} preload="auto" src={localCurrent && source === 'local' ? localUrl : undefined}
+        onTimeUpdate={(e) => setLTime(e.target.currentTime)} onLoadedMetadata={(e) => setLDur(e.target.duration)}
+        onEnded={() => next(true)}
+        onLoadedData={(e) => { const request = activeRequests.current.local; if (request && (!localExpectedUrl.current || e.currentTarget.currentSrc === localExpectedUrl.current)) acknowledge('ready', 'local', request.requestId, '', request.trackKey) }}
+        onPlay={() => setLPlaying(true)}
+        onPause={() => setLPlaying(false)}
+        onError={(e) => {
+          const request = activeRequests.current.local
+          const el = e.currentTarget
+          // Repli automatique (2026-07-20) : une URL /zr-stream/ peut échouer si le commit du média
+          // est trop frais pour jsDelivr (propagation CDN, 404 quelques minutes) ou si le SW a été
+          // remplacé. UNE rebascule silencieuse sur /api/stream (legacy) pour CETTE piste -- la
+          // lecture repart, la voie CDN redeviendra effective aux lectures suivantes.
+          if ((el.currentSrc || '').includes('/zr-stream/') && localCurrent) {
+            const fallback = localSrc(localCurrent)
+            if (fallback && fallback !== el.currentSrc) { setLocalMedia({ trackKey: curKey, url: fallback }); return }
+          }
+          if (request && (!localExpectedUrl.current || el.currentSrc === localExpectedUrl.current)) acknowledge('error', 'local', request.requestId, 'Le flux audio n’a pas pu être décodé ou chargé.', request.trackKey)
+        }} />
+    </Ctx.Provider>
+  )
+}

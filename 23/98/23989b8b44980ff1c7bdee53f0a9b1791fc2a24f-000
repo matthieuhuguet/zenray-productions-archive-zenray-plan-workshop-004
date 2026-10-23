@@ -1,0 +1,92 @@
+#!/usr/bin/env node
+// Audit lecture seule : compare les sources DJI aux manifestes zenray-data, même après déplacement.
+import { createHash } from 'node:crypto'
+import { createReadStream } from 'node:fs'
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+
+const args = process.argv.slice(2)
+const outFlag = args.indexOf('--out')
+const out = outFlag >= 0 ? args[outFlag + 1] : null
+const roots = args.filter((x, i) => !x.startsWith('--') && i !== outFlag + 1)
+const clone = process.env.ZR_ZDATA_CLONE || '/Users/zenray/.zr-thumb-bulk/zdata-clone'
+if (!roots.length || !out) throw new Error('usage: node Scripts/audit-dji-upload-state.mjs <source...> --out <report.json>')
+
+const norm = (v) => String(v || '').normalize('NFC').toLocaleLowerCase()
+const stem = (v) => norm(path.basename(v, path.extname(v)))
+const ext = (v) => path.extname(v).slice(1).toLocaleLowerCase()
+const kind = (file) => {
+  const e = ext(file)
+  if (['jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'avif', 'gif', 'tif', 'tiff', 'dng'].includes(e)) return 'image'
+  if (['mp4', 'mov', 'm4v', 'mkv', 'avi', 'webm'].includes(e)) return 'video'
+  if (['mp3', 'm4a', 'aac', 'wav', 'flac', 'aif', 'aiff', 'ogg', 'opus'].includes(e)) return 'audio'
+  return 'other'
+}
+async function walk(dir, out = []) {
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name)
+    if (e.isDirectory()) await walk(p, out)
+    else if (e.isFile()) out.push(p)
+  }
+  return out
+}
+function sha256(file) {
+  return new Promise((resolve, reject) => {
+    const h = createHash('sha256'); const s = createReadStream(file)
+    s.on('data', (c) => h.update(c)); s.on('end', () => resolve(h.digest('hex'))); s.on('error', reject)
+  })
+}
+async function pool(items, limit, fn) {
+  let i = 0
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) { const n = i++; if (n >= items.length) return; await fn(items[n], n) }
+  }))
+}
+function hashFromManifest(m) {
+  const chunk = m.cdnChunks?.[0] || m.path || m.cdnPath || ''
+  const base = String(chunk).split('/').at(-1).replace(/-\d{3}\.bin$/i, '').replace(/\.[^.]+$/, '')
+  return /^[a-f0-9]{64}$/i.test(base) ? base.toLowerCase() : null
+}
+
+const manifests = await walk(path.join(clone, 'pages'))
+const byHash = new Map(), byName = new Map()
+for (const file of manifests) {
+  if (!/\.(img|media)\.json$/i.test(file)) continue
+  let m; try { m = JSON.parse(await readFile(file, 'utf8')) } catch { continue }
+  const remoteType = file.endsWith('.img.json') ? 'image' : m.mime?.startsWith('video/') ? 'video' : m.mime?.startsWith('audio/') ? 'audio' : m.type
+  const remoteName = m.name || path.basename(file).replace(/\.(img|media)\.json$/i, '')
+  const remote = { path: path.relative(clone, file), type: remoteType, name: remoteName, size: m.size, hash: hashFromManifest(m) }
+  if (remote.hash) (byHash.get(remote.hash) || byHash.set(remote.hash, []).get(remote.hash)).push(remote)
+  const key = `${remoteType || 'unknown'}:${stem(remoteName)}`
+  ;(byName.get(key) || byName.set(key, []).get(key)).push(remote)
+}
+
+const local = []
+for (const root of roots) for (const file of await walk(root)) {
+  const s = await stat(file)
+  local.push({ root, file, relative: path.relative(root, file), name: path.basename(file), type: kind(file), size: s.size })
+}
+console.log(`local ${local.length} files, remote ${manifests.length} filesystem entries; hashing locally…`)
+await pool(local, 16, async (item, i) => {
+  item.sha256 = await sha256(item.file)
+  const exact = byHash.get(item.sha256) || []
+  const nameMatches = byName.get(`${item.type}:${stem(item.name)}`) || []
+  if (exact.length === 1) { item.status = 'pushed_exact'; item.remote = exact }
+  else if (exact.length > 1) { item.status = 'ambiguous_hash'; item.remote = exact }
+  else if (nameMatches.length === 1) { item.status = 'pushed_name'; item.remote = nameMatches }
+  else if (nameMatches.length > 1) { item.status = 'ambiguous_name'; item.remote = nameMatches }
+  else { item.status = 'not_found'; item.remote = [] }
+  if ((i + 1) % 500 === 0 || i + 1 === local.length) console.log(`  ${i + 1}/${local.length}`)
+})
+
+const summary = {}
+for (const item of local) {
+  const date = path.basename(item.root)
+  const key = `${date}\t${item.type}\t${item.status}`
+  const row = summary[key] || (summary[key] = { date, type: item.type, status: item.status, files: 0, bytes: 0 })
+  row.files++; row.bytes += item.size
+}
+await mkdir(path.dirname(out), { recursive: true })
+await writeFile(out, JSON.stringify({ generatedAt: new Date().toISOString(), roots, summary: Object.values(summary), items: local }, null, 2))
+console.log(`report ${out}`)
+for (const row of Object.values(summary).sort((a, b) => a.date.localeCompare(b.date) || a.type.localeCompare(b.type) || a.status.localeCompare(b.status))) console.log(`${row.date}\t${row.type}\t${row.status}\t${row.files}\t${row.bytes}`)

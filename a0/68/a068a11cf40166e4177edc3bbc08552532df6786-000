@@ -1,0 +1,81 @@
+// 10 October 2026, 23:01 CEST: a link card takes the image pasted while it is open, and never saves a reference without its image.
+import React from 'react'
+import { render, fireEvent, waitFor, cleanup, act } from '@testing-library/react'
+import { vi, test, expect, afterEach, beforeEach } from 'vitest'
+import GalleryView from './GalleryView.jsx'
+import { useClipboardTarget } from '../clipboard/ClipboardProvider.jsx'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+import { notify } from './Notifications.jsx'
+
+vi.mock('../lib/saveJson.js', () => ({
+  readJson: vi.fn(async () => ({ data: { v: 1, items: [] }, sha: 'one' })),
+  saveJsonWithRetry: vi.fn(async () => ({ ok: true, sha: 'two' })),
+}))
+vi.mock('../clipboard/ClipboardProvider.jsx', () => ({ useClipboardTarget: vi.fn() }))
+vi.mock('./ImageNodeViewer.jsx', () => ({ readImgManifestCached: vi.fn(async () => null), resolveThumbUrl: vi.fn(), resolveFullUrl: vi.fn() }))
+vi.mock('./Notifications.jsx', () => ({ notify: vi.fn() }))
+vi.mock('./LinkedAssetsGallery.jsx', () => ({ default: () => null }))
+vi.mock('../api.js', async (importOriginal) => ({ ...(await importOriginal()), fileToWebp: vi.fn(async () => 'data:image/webp;base64,UklGRg==') }))
+
+const palette = { accent: '#0a84ff', textPrimary: '#fff', textSecondary: '#aaa', surface: '#222' }
+const screenshot = () => new File(['png'], 'shot.png', { type: 'image/png' })
+const galleryPaste = () => useClipboardTarget.mock.calls.at(-1)[1]
+
+// The unfurl preview fails (site blocks bots), so the card opens without an image. The upload succeeds by default.
+beforeEach(() => {
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => ({
+    json: async () => (String(url).startsWith('/api/unfurl')
+      ? { error: 'fetch' }
+      : { url: '/api/img?path=uploads/shot.webp', path: 'uploads/shot.webp' }),
+  }))
+})
+afterEach(() => { cleanup() })
+
+function renderDesign() {
+  return render(<GalleryView galleryKey="design" t={palette} />)
+}
+
+async function openLinkCard(view) {
+  fireEvent.change(view.getByPlaceholderText(/Ajouter une référence/), { target: { value: 'https://example.com/page' } })
+  fireEvent.click(view.getByRole('button', { name: 'Aperçu' }))
+  return waitFor(() => view.getByRole('group', { name: 'Ajouter une référence' }))
+}
+
+test('a link card takes focus when it opens, so a native paste reaches it', async () => {
+  const view = renderDesign()
+  const card = await openLinkCard(view)
+  expect(card.contains(document.activeElement)).toBe(true)
+
+  fireEvent.paste(document.activeElement, {
+    clipboardData: { files: [], items: [{ kind: 'file', type: 'image/png', getAsFile: screenshot }], getData: () => '' },
+  })
+
+  await waitFor(() => expect(view.getByText('Miniature prête')).toBeTruthy())
+  expect(saveJsonWithRetry).not.toHaveBeenCalled()
+})
+
+test('an image pasted while a link card is open attaches to that card, not to the grid', async () => {
+  const view = renderDesign()
+  await openLinkCard(view)
+
+  await act(async () => { await galleryPaste().onPasteImage([screenshot()]) })
+
+  await waitFor(() => expect(view.getByText('Miniature prête')).toBeTruthy())
+  expect(saveJsonWithRetry).not.toHaveBeenCalled()
+})
+
+test('a failed image upload keeps the card open and saves no reference without its image', async () => {
+  globalThis.fetch.mockImplementation(async (url) => ({
+    json: async () => (String(url).startsWith('/api/unfurl') ? { error: 'fetch' } : { url: null, error: 'github' }),
+  }))
+  const view = renderDesign()
+  await openLinkCard(view)
+  await act(async () => { await galleryPaste().onPasteImage([screenshot()]) })
+  await waitFor(() => expect(view.getByText('Miniature prête')).toBeTruthy())
+
+  fireEvent.click(view.getByRole('button', { name: 'Ajouter à Design' }))
+
+  await waitFor(() => expect(notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'error' })))
+  expect(saveJsonWithRetry).not.toHaveBeenCalled()
+  expect(view.getByRole('group', { name: 'Ajouter une référence' })).toBeTruthy()
+})

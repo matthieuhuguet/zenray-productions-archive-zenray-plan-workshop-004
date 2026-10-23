@@ -1,0 +1,157 @@
+// 2 October 2026: stable project IDs resolve the same four source families for local agents and cloud consumers.
+import { SOURCE_NAMESPACES, sourceCloudFolder } from './projectWorkspace.js'
+
+export const PROJECT_CONTEXT_SCHEMA_VERSION = 1
+
+// 3 October 2026, 22:06 CEST: document discovery indexes every mapped Markdown source without copying or interpreting its contents.
+export const PROJECT_DOCUMENT_PREVIEW_LIMIT = 24
+const documentRank = (file) => /^(project1|readme|claude|agents|feedback|skill)\.md$/i.test((file.relativePath || '').split('/').at(-1)) ? 0 : 1
+export function projectDocuments(project, { cloud = false } = {}) {
+  return (project.files || []).filter(file => /\.md$/i.test(file.relativePath || file.name || '')).map(file => ({ fileId: file.id, name: file.name,
+    namespace: file.namespace, sourceId: file.sourceId, relativePath: file.relativePath,
+    ...(!cloud && file.localPath ? { localPath: file.localPath } : {}),
+    cloudPath: file.cloudPath || null, expectedCloudPath: file.expectedCloudPath, status: file.status,
+  })).sort((a, b) => documentRank(a) - documentRank(b) || String(a.relativePath).localeCompare(String(b.relativePath), 'en', { numeric: true }) || String(a.fileId).localeCompare(String(b.fileId)))
+}
+
+// 3 October 2026, 03:38 CEST: new work follows the active loaded copy while the registered source remains stable.
+export function projectWorkshopPath(project) {
+  const source = project.sources?.find((entry) => entry.namespace === 'tmp')
+  if (!source) return null
+  return project.workspace?.state === 'loaded' && project.workspace.path
+    ? `${project.workspace.path}/sources/tmp/${source.id}` : source.localPath || null
+}
+
+// 3 October 2026, 04:33 CEST: dependency identities are shared with the page independently of source-path construction.
+export function projectDependencies(project) {
+  const dependencies = new Set(), dependencyNotes = []
+  for (const dependency of [...(project.dependencies || []), ...(project.sources || []).map((source) => source.sharedProjectId).filter(Boolean)]) {
+    const id = typeof dependency === 'string' ? dependency : dependency?.projectId
+    if (typeof id === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) dependencies.add(id)
+    else if (typeof dependency === 'string') dependencyNotes.push(dependency)
+    else if (dependency?.description) dependencyNotes.push(dependency.description)
+  }
+  return { dependencies: [...dependencies].sort(), dependencyNotes }
+}
+
+export function buildProjectMapping(project, { cloud = false } = {}) {
+  const { dependencies, dependencyNotes } = projectDependencies(project)
+  const locations = Object.fromEntries(SOURCE_NAMESPACES.map((namespace) => [namespace, []]))
+  for (const source of project.sources || []) {
+    locations[source.namespace].push({ sourceId: source.id, namespace: source.namespace,
+      ...(!cloud && source.localPath ? { localPath: source.localPath } : {}),
+      cloudFolder: sourceCloudFolder(project, source), include: source.include || null, exclude: source.exclude || [],
+      optional: !!source.optional, present: cloud ? undefined : source.present, count: source.count, bytes: source.bytes })
+  }
+  for (const entries of Object.values(locations)) entries.sort((a, b) => a.sourceId.localeCompare(b.sourceId))
+  const memoryFiles = (project.files || []).filter((file) => file.namespace === 'memory' && /\.md$/i.test(file.relativePath)).map((file) => ({ fileId: file.id, name: file.name,
+    ...(!cloud && file.localPath ? { localPath: file.localPath } : {}), cloudPath: file.cloudPath || null, expectedCloudPath: file.expectedCloudPath, status: file.status }))
+  const feedback = !cloud ? memoryFiles.find((file) => file.localPath === project.feedbackPath) : memoryFiles.find((file) => file.cloudPath === project.feedbackPath || file.expectedCloudPath === String(project.feedbackPath || '').replace(/\.file\.json$/, ''))
+  return { indexId: project.id, projectId: project.id, name: project.name, cloudFolder: project.folder,
+    locations, dependencies, dependencyNotes,
+    context: { ...(!cloud ? { canonicalFeedbackPath: project.feedbackPath || null, workshopPath: projectWorkshopPath(project), activeWorkspacePath: project.workspace?.state === 'loaded' ? project.workspace.path : null } : {}), feedback: feedback || null, memoryFiles, documents: projectDocuments(project, { cloud }),
+      skills: [...new Set(['zenray-assets', 'zenray-progress', ...(locations.houdini.length ? ['zenray-houdini'] : []), ...(locations.unreal.length || project.dependencies?.length ? ['zrs'] : []), ...(project.skills || [])])],
+      conversations: project.conversations || [],
+      sceneReferences: project.sceneReferences || [],
+      preservedOriginalVersions: (project.files || []).filter((file) => file.preservedOriginalVersion).map((file) => ({ fileId: file.id, ...file.preservedOriginalVersion })),
+      sourceConflicts: (project.files || []).filter((file) => file.sourceConflict).map((file) => ({ fileId: file.id, originalSha256: file.sourceConflict.originalSha256, copySha256: file.sourceConflict.copySha256, reason: file.sourceConflict.reason, detectedAt: file.sourceConflict.detectedAt, ...(!cloud && file.sourceConflict.originalPath ? { originalPath: file.sourceConflict.originalPath } : {}) })),
+      files: { action: 'status', projectId: project.id }, history: { action: 'history', projectId: project.id },
+      snapshotPath: `${project.folder}/.workspace.json`, contextPath: `${project.folder}/.context.md` },
+    coverage: { fileCount: project.files?.length || 0, backedUpCount: project.sync?.backedUpCount || 0, checkedAt: project.checkedAt || null } }
+}
+
+export function buildGlobalProjectIndex(projects, { cloud = false, generatedAt = new Date().toISOString() } = {}) {
+  const entries = Object.fromEntries([...projects].sort((a, b) => a.id.localeCompare(b.id)).map((project) => [project.id, buildProjectMapping(project, { cloud })]))
+  const issues = []
+  const visited = new Set(), visiting = new Set()
+  const visit = (id) => {
+    if (visiting.has(id)) { issues.push({ projectId: id, code: 'dependency-cycle' }); return }
+    if (visited.has(id)) return
+    visiting.add(id)
+    for (const dependency of entries[id].dependencies) {
+      if (!entries[dependency]) issues.push({ projectId: id, dependency, code: 'dependency-missing' })
+      else visit(dependency)
+    }
+    visiting.delete(id); visited.add(id)
+  }
+  for (const id of Object.keys(entries)) visit(id)
+  return { schemaVersion: PROJECT_CONTEXT_SCHEMA_VERSION, generatedAt, projectCount: projects.length, projects: entries, issues }
+}
+
+export function renderProjectContext(index, projectId) {
+  const project = index.projects[projectId]
+  if (!project) throw new Error('Unknown project context')
+  const date = new Intl.DateTimeFormat('en-GB', { dateStyle: 'long', timeZone: 'Europe/Paris' }).format(new Date(index.generatedAt))
+  const lines = [`# ${project.name} (${date})`, '', `Project ID: ${projectId}. (${date})`,
+    `Read canonical feedback first: ${project.context.canonicalFeedbackPath || project.context.feedback?.cloudPath || 'not yet archived'}. (${date})`,
+    `Skills: ${project.context.skills.join(', ')}. (${date})`,
+    `Files and archive proofs: ${project.context.snapshotPath}. (${date})`, '']
+  if (project.context.conversations?.length) {
+    lines.push(`## Linked conversations (${date})`)
+    for (const conversation of project.context.conversations) lines.push(`- ${conversation.provider || 'Agent not indexed yet'}: ${conversation.title}, session ${conversation.sessionId}, reader ${conversation.reader?.conversationId || conversation.id}. (${date})`)
+    lines.push('')
+  }
+  if (project.context.workshopPath) lines.push(`Write new project files in this workshop: ${project.context.workshopPath}. (${date})`, '')
+  // 3 October 2026, 10:09 CEST: both local versions are described before any agent selects a source.
+  if (project.context.sourceConflicts.length) {
+    lines.push(`## Divergent local versions (${date})`)
+    for (const conflict of project.context.sourceConflicts) lines.push(`- ${conflict.fileId}: production source differs from the active copy (${conflict.reason === 'baseline-missing' ? 'LOAD baseline unavailable; change order unknown' : 'original changed after LOAD'}). Original SHA256 ${conflict.originalSha256}; copy SHA256 ${conflict.copySha256}. Automatic archive skips this identity and UNLOAD is blocked; preserve both versions before choosing. Read the snapshot for the original path. (${date})`)
+    lines.push('')
+  }
+  if (project.context.preservedOriginalVersions.length) {
+    lines.push(`## Preserved original versions (${date})`)
+    for (const version of project.context.preservedOriginalVersions) lines.push(`- ${version.fileId}: original version ${version.versionId}, SHA256 ${version.sha256}, verified archive ${version.manifestPath}. Active copy remains the main working identity. (${date})`)
+    lines.push('')
+  }
+  if (project.context.sceneReferences.length) {
+    lines.push(`## Scene resource mapping (${date})`)
+    for (const scene of project.context.sceneReferences) {
+      const counts = Object.entries(scene.references.reduce((summary, reference) => { summary[reference.type] = (summary[reference.type] || 0) + 1; return summary }, {})).map(([type, count]) => `${type}: ${count}`).join(', ')
+      lines.push(`- ${scene.sceneFileId}: ${scene.state}; SHA256 ${scene.sceneSha256}; ${counts || 'audit must be refreshed'}. Runtime portability remains unverified. (${date})`)
+      // 3 October 2026, 09:24 CEST: agents read the narrow preparation proof and its remaining limits with the project context.
+      if (scene.preparation) {
+        const proof = scene.preparation
+        lines.push(`- Preparation for ${scene.sceneFileId}: ${proof.state}; ${proof.inputCount} inputs, ${proof.libraryCount} libraries, ${proof.instanceCount} instances; ${proof.unresolvedReferenceCount} references outside this preparation. No scene was saved or rendered. Read resourceVersions in the snapshot for the exact checked hashes. (${date})`)
+      }
+    }
+    lines.push(`Read sceneReferences in the project snapshot for exact resource projectId/fileId links. (${date})`, '')
+  }
+  for (const [namespace, locations] of Object.entries(project.locations)) {
+    lines.push(`## ${namespace} (${date})`)
+    if (!locations.length) lines.push(`No source linked. (${date})`)
+    for (const source of locations) lines.push(`- ${source.sourceId}: ${source.localPath || source.cloudFolder}; cloud: ${source.cloudFolder}; include: ${JSON.stringify(source.include)}; exclude: ${JSON.stringify(source.exclude)}. (${date})`)
+    lines.push('')
+  }
+  lines.push(`## Shared dependencies (${date})`)
+  for (const id of project.dependencies) lines.push(`- ${id}: ${index.projects[id]?.context.snapshotPath || 'missing mapping'}. Read this host separately; its files are shared. (${date})`)
+  for (const note of project.dependencyNotes) lines.push(`- External dependency note: ${note}. (${date})`)
+  lines.push('', `## Memory entry points (${date})`)
+  for (const file of project.context.memoryFiles) lines.push(`- ${file.fileId}: ${file.localPath || file.cloudPath || file.expectedCloudPath}; status: ${file.status}. (${date})`)
+  const documents = project.context.documents || []
+  lines.push('', `## Project documents across all sources (${date})`,
+    `These are pointers to the original documents, not inferred knowledge or conversation summaries. Read the relevant files before making project decisions. (${date})`)
+  for (const file of documents.slice(0, PROJECT_DOCUMENT_PREVIEW_LIMIT)) lines.push(`- ${file.fileId} [${file.namespace || 'cloud'}]: Mac: ${file.localPath || 'not available in this context'}; cloud: ${file.cloudPath || file.expectedCloudPath || 'not linked'}${file.cloudPath ? '' : ' (not yet archived)'}; status: ${file.status || 'unknown'}. (${date})`)
+  if (documents.length > PROJECT_DOCUMENT_PREVIEW_LIMIT) lines.push(`Showing ${PROJECT_DOCUMENT_PREVIEW_LIMIT} of ${documents.length} documents; the complete list is context.documents in the global project index. (${date})`)
+  lines.push('', `Mapped files: ${project.coverage.fileCount}; verified archive records: ${project.coverage.backedUpCount}. Local inventory does not prove cloud backup or runnable scene dependencies. (${date})`)
+  for (const issue of index.issues.filter((issue) => issue.projectId === projectId)) lines.push(`- Mapping issue: ${issue.code} ${issue.dependency || ''}. (${date})`)
+  return `${lines.join('\n')}\n`
+}
+
+// 5 October 2026, 13:44 CEST: source paths identify a project without inferring identity from folder names.
+export function projectIdFromLocalPath(index, localPath) {
+  const target = localPath.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (!target.startsWith('/')) throw new Error('An absolute local path is required')
+  const matches = []
+  for (const project of Object.values(index.projects || {})) {
+    const roots = [...Object.values(project.locations || {}).flat().map(source => source.localPath), project.context?.workshopPath, project.context?.activeWorkspacePath].filter(Boolean)
+    for (const root of roots) {
+      const normalized = root.replace(/\/+$/, '')
+      if (target === normalized || target.startsWith(normalized + '/')) matches.push({ projectId: project.projectId, length: normalized.length })
+    }
+  }
+  if (!matches.length) throw new Error('No registered project covers this path; link the source explicitly')
+  const longest = Math.max(...matches.map(match => match.length))
+  const ids = [...new Set(matches.filter(match => match.length === longest).map(match => match.projectId))]
+  if (ids.length !== 1) throw new Error('Ambiguous project path: ' + ids.join(', ') + '; use an explicit project ID')
+  return ids[0]
+}

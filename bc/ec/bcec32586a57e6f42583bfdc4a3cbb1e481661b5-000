@@ -1,0 +1,159 @@
+// C46 — déplie une URL (OpenGraph) pour les bookmarks. GET ?url=... -> { title, description, image, favicon, url }.
+// Sécurité SSRF : on bloque les hôtes privés/loopback/métadonnées cloud, ET on suit les redirections
+// À LA MAIN en revalidant chaque saut (un hôte public peut sinon rediriger vers une IP interne).
+const PRIVATE = /^(localhost|.*\.(internal|local|localhost)|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.|169\.254\.|\[?::1\]?|\[?::ffff:)/i
+
+// 10 October 2026, 22:58 CEST: a page body that never finishes must end the request, not hold the link card on "Recherche…".
+// FR : un corps de page qui ne se termine jamais ne doit pas tenir la requête ouverte.
+const BODY_DEADLINE_MS = 8000
+function withDeadline(promise, ms) {
+  let timer
+  const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('deadline')), ms) })
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer))
+}
+
+// 10 October 2026, 22:58 CEST: titles keep their HTML entities (&amp;, &#39;) unless decoded here.
+// FR : sans ce décodage, un titre comme « Studio &amp; Team » s'affiche tel quel dans la carte.
+const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }
+function decodeEntities(text) {
+  if (!text) return text
+  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, name) => {
+    if (name[0] === '#') {
+      const code = name[1] === 'x' || name[1] === 'X' ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10)
+      return code <= 0x10ffff ? String.fromCodePoint(code) : match
+    }
+    return NAMED_ENTITIES[name.toLowerCase()] ?? match
+  })
+}
+
+// Suit jusqu'à 5 redirections, en refusant tout saut vers un hôte privé. Renvoie {res, finalUrl} ou null.
+async function safeFetch(startUrl, headers) {
+  let cur = startUrl
+  for (let i = 0; i < 5; i++) {
+    let u; try { u = new URL(cur) } catch { return null }
+    if (!/^https?:$/.test(u.protocol) || PRIVATE.test(u.hostname)) return null
+    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 5000)
+    const r = await fetch(cur, { signal: ctrl.signal, redirect: 'manual', headers }).catch(() => null)
+    clearTimeout(to)
+    if (!r) return null
+    if (r.status >= 300 && r.status < 400 && r.headers.get('location')) {
+      try { cur = new URL(r.headers.get('location'), cur).href } catch { return null }
+      continue
+    }
+    return { res: r, finalUrl: cur }
+  }
+  return null
+}
+
+const pick = (html, res) => { const re = res.find((r) => r.test(html)); const m = re && html.match(re); return m && m[1] ? m[1].trim() : null }
+function metaContent(html, keys) {
+  for (const k of keys) {
+    let m = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${k}["'][^>]*content=["']([^"']*)["']`, 'i'))
+    if (!m) m = html.match(new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]*(?:property|name)=["']${k}["']`, 'i'))
+    if (m && m[1].trim()) return m[1].trim()
+  }
+  return null
+}
+
+export default async function handler(req, res) {
+  const url = (req.query.url || '').toString()
+  try {
+    const u = new URL(url)
+    if (!/^https?:$/.test(u.protocol) || PRIVATE.test(u.hostname)) return res.status(400).json({ error: 'bad-url' })
+
+    // 1) YouTube (oEmbed + thumbnail déterministe)
+    const ytMatch = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/i)
+    if (ytMatch) {
+      const videoId = ytMatch[1]
+      let oembed = null
+      try {
+        const rYt = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`)
+        if (rYt.ok) oembed = await rYt.json()
+      } catch {}
+      const title = (oembed && oembed.title) || 'Vidéo YouTube'
+      const author = (oembed && oembed.author_name) || ''
+      const image = (oembed && oembed.thumbnail_url) || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+      res.setHeader('Cache-Control', 'public, s-maxage=86400')
+      return res.status(200).json({
+        url,
+        finalUrl: url,
+        title,
+        description: author ? `Par ${author}` : '',
+        image,
+        favicon: 'https://www.youtube.com/s/desktop/2b888666/img/favicon.ico',
+        siteName: 'YouTube',
+        hostname: 'youtube.com'
+      })
+    }
+
+    // 2) Fichier image direct
+    if (/\.(jpe?g|png|webp|gif|svg|avif)(\?.*)?$/i.test(u.pathname)) {
+      const rawName = u.pathname.split('/').pop().split('?')[0].replace(/\.[a-z0-9]+$/i, '')
+      res.setHeader('Cache-Control', 'public, s-maxage=86400')
+      return res.status(200).json({
+        url,
+        finalUrl: url,
+        title: decodeURIComponent(rawName) || u.hostname,
+        image: url,
+        favicon: `${u.origin}/favicon.ico`,
+        siteName: u.hostname.replace(/^www\./, ''),
+        hostname: u.hostname.replace(/^www\./, '')
+      })
+    }
+
+    // 3) ArtStation (détection artwork pour extraction propre)
+    if (u.hostname.includes('artstation.com')) {
+      const m = u.pathname.match(/\/artwork\/([a-zA-Z0-9_-]+)/i)
+      const artId = m ? m[1] : ''
+      let title = artId ? `ArtStation · ${artId}` : 'ArtStation'
+      let image = null
+      let desc = 'Projet ArtStation'
+      if (artId) {
+        try {
+          const r = await fetch(`https://www.artstation.com/projects/${artId}.json`, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', Accept: 'application/json' }
+          })
+          if (r.ok) {
+            const j = await r.json()
+            if (j.title) title = j.title
+            if (j.user && j.user.full_name) desc = `Par ${j.user.full_name}`
+            if (j.cover_url) image = j.cover_url
+            else if (j.assets && j.assets[0] && j.assets[0].image_url) image = j.assets[0].image_url
+          }
+        } catch {}
+      }
+      res.setHeader('Cache-Control', 'public, s-maxage=86400')
+      return res.status(200).json({
+        url,
+        finalUrl: url,
+        title,
+        description: desc,
+        image,
+        favicon: 'https://www.artstation.com/favicon.ico',
+        siteName: 'ArtStation',
+        hostname: 'artstation.com'
+      })
+    }
+
+    const fetched = await safeFetch(url, { 'User-Agent': 'Mozilla/5.0 ZenRayBot', Accept: 'text/html' })
+    const r = fetched && fetched.res
+    if (!r || !r.ok) return res.status(200).json({ url, title: u.hostname, error: 'fetch' })
+    let html
+    try { html = (await withDeadline(r.text(), BODY_DEADLINE_MS)).slice(0, 200000) }
+    catch { return res.status(200).json({ url, title: u.hostname, error: 'fetch' }) }
+    const title = decodeEntities(metaContent(html, ['og:title', 'twitter:title']) || pick(html, [/<title[^>]*>([^<]+)<\/title>/i]) || u.hostname)
+    const description = decodeEntities(metaContent(html, ['og:description', 'twitter:description', 'description']))
+    const abs = (v) => { if (!v) return v; try { return new URL(v, u.origin).href } catch { return v } }
+    let image = abs(metaContent(html, ['og:image', 'twitter:image', 'og:image:url']))
+    let favicon = pick(html, [/<link[^>]+rel=["'][^"']*icon[^"']*["'][^>]*href=["']([^"']+)["']/i])
+    favicon = favicon ? abs(favicon) : u.origin + '/favicon.ico'
+    const siteName = decodeEntities(metaContent(html, ['og:site_name']) || u.hostname.replace(/^www\./, ''))
+    res.setHeader('Cache-Control', 'public, s-maxage=86400')
+    // finalUrl (2026-07-04) : l'URL RÉELLE après redirections (safeFetch les suit déjà à la main). Utile pour
+    // résoudre des liens raccourcis (ex. maps.app.goo.gl) vers leur URL canonique exploitable côté client
+    // (extraction de coordonnées/nom de lieu pour l'intégration Google Maps).
+    return res.status(200).json({ url, finalUrl: fetched.finalUrl, title, description, image, favicon, siteName, hostname: u.hostname.replace(/^www\./, '') })
+  } catch {
+    return res.status(400).json({ error: 'bad-url' })
+  }
+}

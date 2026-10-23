@@ -1,0 +1,174 @@
+// 4 October 2026: the scheduler runs when due and never twice at once, retries after a failure, and the bridge refuses strangers.
+import { describe, expect, it } from 'vitest'
+import { Readable } from 'node:stream'
+import config from './FreelanceConfig.json'
+import { createService, safeOpenUrls } from './Service.mjs'
+
+const memoryStore = () => { let value = null; return { read: async () => value, write: async (next) => { value = JSON.parse(JSON.stringify(next)) } } }
+const clock = (start = '2026-10-04T10:00:00Z') => { let t = new Date(start).getTime(); return { now: () => new Date(t), advance: (ms) => { t += ms } } }
+const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b }); return { promise, resolve, reject } }
+
+function request({ method = 'POST', headers = {}, body = {}, remote = '127.0.0.1' } = {}) {
+  const stream = Readable.from([Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))])
+  return Object.assign(stream, { method, headers: { 'content-type': 'application/json', 'x-zr-freelance-client': '1', ...headers }, socket: { remoteAddress: remote } })
+}
+function response() {
+  const out = { statusCode: 0, headers: {}, body: '' }
+  return Object.assign(out, { setHeader: (k, v) => { out.headers[k.toLowerCase()] = v }, end: (text) => { out.body = text || '' }, json: () => JSON.parse(out.body || '{}') })
+}
+
+describe('scheduler', () => {
+  it('runs at once when it never ran, then waits six hours', async () => {
+    const time = clock(); let runs = 0
+    const service = createService({ config, engine: { run: async () => { runs += 1; return { ok: true, added: 2, closed: 0, letters: 1, details: 2, committed: true, commit: 'abc', durationMs: 5, finishedAt: 'x' } } }, store: memoryStore(), now: time.now })
+    await service.start(); await service.tick()
+    await new Promise((r) => setTimeout(r, 5))
+    expect(runs).toBe(1)
+    expect(service.status().lastReport).toMatchObject({ added: 2, committed: true })
+    time.advance(5 * 3600 * 1000); await service.tick(); await new Promise((r) => setTimeout(r, 5))
+    expect(runs).toBe(1)
+    time.advance(1.1 * 3600 * 1000); await service.tick(); await new Promise((r) => setTimeout(r, 5))
+    expect(runs).toBe(2)
+  })
+
+  it('never starts two runs at once', async () => {
+    const gate = deferred(); let runs = 0
+    const service = createService({ config, engine: { run: async () => { runs += 1; await gate.promise; return { ok: true } } }, store: memoryStore() })
+    expect(service.trigger('manual').started).toBe(true)
+    const second = service.trigger('manual')
+    expect(second).toMatchObject({ started: false, reason: 'already-running' })
+    expect(service.status().running.trigger).toBe('manual')
+    gate.resolve(); await new Promise((r) => setTimeout(r, 5))
+    expect(runs).toBe(1)
+    expect(service.status().running).toBeNull()
+  })
+
+  it('records a failure, keeps the last good report and retries after thirty minutes, not at once', async () => {
+    const time = clock(); let fail = true
+    const service = createService({ config, engine: { run: async () => { if (fail) throw new Error('network down'); return { ok: true, added: 1 } } }, store: memoryStore(), now: time.now })
+    await service.start(); service.trigger('manual'); await new Promise((r) => setTimeout(r, 5))
+    expect(service.status()).toMatchObject({ lastOk: false, lastError: 'network down' })
+    time.advance(10 * 60 * 1000); await service.tick(); await new Promise((r) => setTimeout(r, 5))
+    expect(service.status().running).toBeNull()
+    fail = false; time.advance(25 * 60 * 1000); await service.tick(); await new Promise((r) => setTimeout(r, 5))
+    expect(service.status()).toMatchObject({ lastOk: true, lastError: null })
+  })
+
+  it('survives a restart: the saved state keeps the schedule', async () => {
+    const store = memoryStore(); const time = clock()
+    const first = createService({ config, engine: { run: async () => ({ ok: true }) }, store, now: time.now })
+    await first.start(); first.trigger('manual'); await new Promise((r) => setTimeout(r, 5))
+    const second = createService({ config, engine: { run: async () => { throw new Error('must not run') } }, store, now: time.now })
+    await second.start(); time.advance(3600 * 1000)
+    await second.tick()
+    expect(second.status().running).toBeNull()
+  })
+
+  it('queues a letter behind a running pass and validates its input', async () => {
+    const gate = deferred(); const order = []
+    const service = createService({ config, engine: { run: async () => { order.push('run'); await gate.promise; return { ok: true } }, letter: async ({ studioId, lang }) => { order.push(`letter:${studioId}:${lang}`); return { letterPath: 'x' } } }, store: memoryStore() })
+    service.trigger('manual')
+    const pending = service.letter({ studioId: 'job_1', lang: 'en' })
+    await new Promise((r) => setTimeout(r, 5)); expect(order).toEqual(['run'])
+    gate.resolve(); await pending
+    expect(order).toEqual(['run', 'letter:job_1:en'])
+    expect(() => service.letter({ studioId: '../etc/passwd' })).toThrow(/Invalid studio id/)
+    expect(() => service.letter({ studioId: 'job_1', lang: 'de' })).toThrow(/Unsupported language/)
+  })
+})
+
+describe('bridge', () => {
+  const make = () => createService({ config, engine: { run: async () => ({ ok: true }), letter: async () => ({}) }, store: memoryStore(), secret: '' })
+  it('answers status to the page origin with the private network header', async () => {
+    const service = make(); const res = response()
+    await service.handleHttp(request({ headers: { origin: 'https://zenray-progress.pages.dev' }, body: { action: 'status' } }), res)
+    expect(res.statusCode).toBe(200)
+    expect(res.headers['access-control-allow-origin']).toBe('https://zenray-progress.pages.dev')
+    expect(res.json()).toHaveProperty('nextRunDue')
+    const preflight = response()
+    await service.handleHttp(request({ method: 'OPTIONS', headers: { origin: 'https://zenray-progress.pages.dev' } }), preflight)
+    expect(preflight.statusCode).toBe(204)
+    expect(preflight.headers['access-control-allow-private-network']).toBe('true')
+  })
+  it('refuses a stranger origin, a missing client header, a remote address, GET and a big body', async () => {
+    const service = make()
+    const cases = [
+      [request({ headers: { origin: 'https://evil.example' }, body: { action: 'status' } }), 403, 'origin-refused'],
+      [request({ headers: { 'x-zr-freelance-client': '0' }, body: { action: 'status' } }), 403, 'client-required'],
+      [request({ remote: '192.168.1.5', body: { action: 'status' } }), 403, 'not-loopback'],
+      [request({ method: 'GET' }), 405, 'method-refused'],
+      [request({ body: 'x'.repeat(config.service.bodyLimitBytes + 10) }), 413, 'body-limit'],
+    ]
+    for (const [req, status, code] of cases) { const res = response(); await service.handleHttp(req, res); expect([res.statusCode, res.json().code]).toEqual([status, code]) }
+    const unknown = response(); await service.handleHttp(request({ body: { action: 'format-disk' } }), unknown)
+    expect(unknown.statusCode).toBe(400)
+  })
+  it('asks for the secret when one is configured', async () => {
+    const service = createService({ config, engine: {}, store: memoryStore(), secret: 'letmein' })
+    const refused = response(); await service.handleHttp(request({ body: { action: 'status' } }), refused)
+    expect(refused.statusCode).toBe(401)
+    const allowed = response(); await service.handleHttp(request({ headers: { 'x-zr-auth': 'letmein' }, body: { action: 'status' } }), allowed)
+    expect(allowed.statusCode).toBe(200)
+  })
+})
+
+describe('notifications (7 October 2026)', () => {
+  const report = (extra = {}) => ({ ok: true, added: 3, closed: 0, letters: 0, details: 0, committed: true, commit: 'abc', addedSummary: [], ...extra })
+  const wait = () => new Promise((r) => setTimeout(r, 10))
+  it('tells him once per published pass, remembers when, and never on a pass that published nothing', async () => {
+    const calls = []; const time = clock()
+    const notifier = { notify: async (r, o) => { calls.push(o.lastNotifiedAt); return { sent: ['macos'] } } }
+    let next = report()
+    const service = createService({ config, engine: { run: async () => next }, notifier, store: memoryStore(), now: time.now })
+    await service.start(); service.trigger('manual'); await wait()
+    expect(calls).toEqual([null])
+    time.advance(7 * 3600 * 1000); next = report({ committed: false }); service.trigger('manual'); await wait()
+    expect(calls).toHaveLength(1)
+    next = report(); service.trigger('manual'); await wait()
+    expect(calls).toHaveLength(2); expect(calls[1]).toBeTruthy()
+  })
+  it('a notifier that throws or answers nothing does not fail the pass', async () => {
+    const service = createService({ config, engine: { run: async () => report() }, notifier: { notify: async () => { throw new Error('boom') } }, store: memoryStore() })
+    await service.start(); service.trigger('manual'); await wait()
+    expect(service.status().lastOk).toBe(true); expect(service.status().lastError).toBeNull()
+  })
+})
+
+describe('open links (14 October 2026)', () => {
+  it('keeps public https pages only, once each, and reports what it skipped', () => {
+    const { accepted, skipped } = safeOpenUrls(['https://jobs.lever.co/studio/1', 'https://jobs.lever.co/studio/1', 'http://plain.example/x', 'https://localhost:3100/a',
+      'https://192.168.1.4/a', 'https://user:pass@secure.example/a', 'javascript:alert(1)', 'not a url', 'https://boards.greenhouse.io/studio/jobs/2'])
+    expect(accepted).toEqual(['https://jobs.lever.co/studio/1', 'https://boards.greenhouse.io/studio/jobs/2'])
+    expect(skipped).toHaveLength(6)
+  })
+  it('refuses an empty list and more than sixty links', () => {
+    expect(() => safeOpenUrls([])).toThrow(/At least one/)
+    expect(() => safeOpenUrls(Array.from({ length: 61 }, (_, i) => `https://a.example/${i}`))).toThrow(/At most 60/)
+  })
+  it('hands the accepted links to the opener through the bridge action', async () => {
+    const opened = []
+    const service = createService({ config, engine: {}, store: memoryStore(), secret: '', opener: async (urls) => { opened.push(urls) } })
+    const res = response()
+    await service.handleHttp(request({ body: { action: 'open-links', urls: ['https://a.example/1', 'https://b.example/2', 'http://nope.example'] } }), res)
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({ opened: 2, skipped: ['http://nope.example'] })
+    expect(opened).toEqual([['https://a.example/1', 'https://b.example/2']])
+    const none = response()
+    await service.handleHttp(request({ body: { action: 'open-links', urls: ['http://nope.example'] } }), none)
+    expect(none.statusCode).toBe(400)
+  })
+})
+
+// 16 October 2026: the page's ZenRay Apply actions reach the bridge; a bad size is refused, nothing is submitted by the service itself.
+describe('apply actions', () => {
+  it('starts, reports and records through the apply bridge', async () => {
+    const calls = []
+    const apply = { start: (size) => { calls.push(['start', size]); return { started: true, size } }, status: async () => ({ running: false }), open: () => ({ opened: true }), sent: async (ids) => { calls.push(['sent', ids]); return { recorded: 1 } } }
+    const service = createService({ config, engine: {}, store: memoryStore(), secret: '', apply })
+    expect(await service.request('apply-start', { size: 10 })).toMatchObject({ started: true, size: 10 })
+    expect(await service.request('apply-status')).toMatchObject({ running: false })
+    expect(await service.request('apply-open')).toMatchObject({ opened: true })
+    expect(await service.request('apply-sent', { ids: ['job_abc123'] })).toMatchObject({ recorded: 1 })
+    expect(calls).toEqual([['start', 10], ['sent', ['job_abc123']]])
+  })
+})

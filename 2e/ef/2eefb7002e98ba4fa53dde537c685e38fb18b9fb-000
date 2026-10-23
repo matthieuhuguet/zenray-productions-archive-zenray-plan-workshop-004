@@ -1,0 +1,1678 @@
+// ARCHIVE UNIVERSELLE « zenray-productions-archive » (feature validée Matthieu 2026-06-11).
+//
+// BUT : archiver N'IMPORTE QUEL dossier local sur GitHub + le rendre consultable dans Create (arborescence
+// MIROIR) + re-téléchargeable à 100% (bit à bit). Permet de décharger le disque local après vérification.
+//
+// RÈGLES (corrections Matthieu, priment sur tout plan antérieur) :
+//   - Shard nommé zenray-productions-archive-<NomDuDossier> ; suffixe -NN UNIQUEMENT si >5 Go (multi-shards).
+//     Jamais « arc », jamais « slug » dans le nom.
+//   - MODÈLE DE SÉCURITÉ (refacto 2026-06-11) : repo PUBLIC (comme les segments vidéo, servi vite par raw/CDN)
+//     mais TOUS les fichiers sont découpés en chunks de 19 Mo BINAIRES, nommés par HASH (aa/bb/<fid>-NNN, sans
+//     nom ni extension d'origine). Conséquence : un visiteur GitHub ne voit que des morceaux binaires anonymes,
+//     rien n'est directement consultable ni téléchargeable utilement (même logique d'obfuscation que les segments
+//     fMP4 : réassemblable seulement par un effort délibéré, pas une protection cryptographique). Les vrais noms,
+//     l'arborescence et le mapping chunks->fichier vivent dans le manifeste PRIVÉ (zenray-data), jamais en clair.
+//   - Chaque fichier : chunks de 19 Mo dans l'ordre + sha256 du fichier ENTIER + taille + mime + chemin d'origine
+//     (dans le manifeste privé). Re-télécharger = concaténer les chunks = identique bit à bit.
+//   - Le hash de chemin (aa/bb) évite aussi le plafond GitHub de 1000 entrées/dossier sur les gros dossiers.
+//   - README PUBLIC neutre lié au projet + à la version de clonage (commit), sans aucun nom de fichier d'origine.
+//   - Un manifeste .file.json par fichier dans zenray-data (pages/<dest>/<chemin>.file.json) -> nœud Create.
+//   - Push par lots ~150 Mo (RAM git bornée, HTTP/1.1 anti-coupure réseau), flush du shard avant ~4 Go
+//     (GitHub rejette les pushes amenant un repo à ~4 Go — appris pendant la migration vidéo).
+//   - Vérif 200 (raw.githubusercontent, parallèle x16) sur TOUT avant de proposer la purge locale. Jamais auto.
+//
+// Usage : GITHUB_TOKEN=$(gh auth token) node Scripts/archive-folder.mjs <dossierSource> [destCreate]
+//   destCreate défaut : pages/Archives/<NomDuDossier>. Flags : --dry (inventaire seul), --reindex (lance
+//   build-search-index.mjs --apply à la fin).
+import { readdir, readFile, writeFile, mkdir, rm, stat, copyFile, open, rename } from 'node:fs/promises'
+import { Worker } from 'node:worker_threads'
+import { cpus } from 'node:os'
+import { createReadStream, createWriteStream, readFileSync } from 'node:fs'
+import { spawnSync, execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+// ROUTAGE UNIFIÉ (refactor unified-ingest) : la classification vit dans le module PUR partagé classify.js
+// (même décision que l'app et le mobile). img-ingest / media-ingest sortent images/vidéos/audios du chunk
+// binaire vers leurs pipelines STREAMABLES (image inline, vidéo exacte, chunked-media). Le chunk ne sert plus QUE les
+// formats non ouvrables (projets, zip, RAW, propriétaires) -> protège les 130 Go .file.json existants intacts.
+import { classify } from '../src/capture/classify.js'
+import { makeImgShardCtx, ingestImageBulk, resolveImgManifest } from './img-ingest.mjs'
+import { makeMediaCtx, ingestVideoBulk, ingestMediaBulk } from './media-ingest.mjs'
+import { RAW_THRESHOLD, CDN_CHUNK, storageChunkFor } from '../src/config/chunkPolicy.js' // source unique 95 / 19 Mo
+import { acquireDirectoryLock, directoryLockOptions } from './lib/directory-lock.mjs'
+import { claimDataClone } from './lib/warm-data-clone.mjs'
+import { belongsToPartition } from './lib/path-partition.mjs'
+import { canAdoptSourceHash, enrichStreamManifest, parseLatestGitChanges, sourceOfStreamManifest } from './lib/stream-manifest.mjs'
+import { archiveRepoName, bornerRailMemoire, classifyPermanentPushRejection, isPermanentPushRejection, normaliserRailArchive, shouldFlushChunkBatch, shouldFlushStreamBatch } from './lib/archive-route.mjs'
+import { canReuseFingerprint, canUseInventoryFingerprint, fileChangeToken, fingerprintCacheEntry } from './lib/fingerprint-cache.mjs'
+import { mergePreviousStateCards, stateCardFromManifest } from './lib/state-index.mjs'
+import { classifyRepoProbe } from './lib/repo-probe.mjs'
+import { classifyCommitResult, requireCommitSha } from './lib/git-result.mjs'
+import { loadPushPolicyConfig, repoCapBytes, createPushMetrics, sharedBatchAdapter } from './lib/push-batch-policy.mjs'
+
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN requis'); process.exit(1) }
+const OWNER = 'matthieuhuguet', DATA = 'zenray-data', BRANCH = 'main'
+const RAW_MAX = RAW_THRESHOLD           // < 95 Mo = brut (GitHub refuse >100 Mo, marge) -- source unique
+const CHUNK = CDN_CHUNK                 // valeur par défaut ; la taille RÉELLE se décide par fichier, voir ci-dessous.
+// LA TAILLE DE MORCEAU SE DÉCIDE PAR FICHIER, comme le prescrit `chunkPolicy.js` : 19 Mo sous le seuil de 95 Mo,
+// 95 Mo au-dessus. Ce script coupait TOUT en 19 Mo, y compris un zip de six gigaoctets, ce qui fabriquait trois
+// cent trente-cinq objets git là où soixante-sept suffisent. Même volume d'octets envoyés, cinq fois moins
+// d'objets à indexer, à committer et à pousser. Le lecteur route déjà chaque part vers le bon CDN d'après le
+// `chunkSize` inscrit dans sa version, donc rien à changer côté lecture.
+// Push incrémental : surchargeable via ZR_PUSH_CHUNK_MB. Défaut 150 Mo. Sur un UPLINK INSTABLE (gros pushes qui
+// se déconnectent en plein transfert « unexpected disconnect », alors que les petites requêtes passent), réduire
+// à ~40 Mo : chaque push est plus court -> bien plus de chances d'aboutir avant une coupure (incident 2026-06-12).
+// SEUIL D'ENVOI PROGRESSIF. Un seuil fixe de 150 Mo veut dire que sur un dossier de gros fichiers, on découpe
+// pendant des minutes avant que le premier octet ne parte : à l'écran, l'app semble ne faire que du découpage,
+// et rien n'apparaît dans Create. Le seuil commence donc PETIT et grandit : le premier lot part en quelques
+// secondes, les suivants s'agrandissent pour amortir le coût fixe d'un push. Le reliquat part à la fermeture
+// du dépôt, sans imposer un push Git à chaque petit fichier.
+// 12 October 2026: the numbers below (first push 20 MiB, ceiling 150 MiB, growth 1.8, 40 attempts, repository cap 2 GiB) moved to
+// ONE object, lib/push-batch-policy.mjs (parameters folderPushMinMiB, folderPushMaxMiB, folderPushRampFactor, folderMaxAttempts,
+// folderRepoCapMiB); their defaults are the values that were written here, so the behaviour is unchanged. The film archive push
+// (video-raw-lib.mjs) uses the adaptive batch policy; a folder archive keeps this slow start because its chunks are small and many.
+// FR : ces nombres vivent desormais dans lib/push-batch-policy.mjs ; leurs valeurs par defaut sont celles d'avant.
+const PUSH_POLICY = loadPushPolicyConfig()
+const pushMetrics = createPushMetrics(PUSH_POLICY)
+// 14 October 2026: the CEILING of the incremental push is no longer the fixed 150 MiB: it follows the push batch policy (the measured line,
+// up to 1 900 MiB). The slow start (20 MiB, growth 1.8) stays so that the first bytes leave within seconds. ZR_PUSH_CHUNK_MB (legacy)
+// still caps it when set explicitly. FR : le plafond du push incremental suit la politique de lots ; le depart progressif reste.
+const batchPolicy = sharedBatchAdapter()
+const PUSH_MAX_LEGACY = process.env.ZR_PUSH_CHUNK_MB ? PUSH_POLICY.folderPushMaxMiB * 1024 * 1024 : Infinity
+const pushMax = () => Math.min(PUSH_MAX_LEGACY, batchPolicy.budgetBytes())
+const PUSH_MIN = PUSH_POLICY.folderPushMinMiB * 1024 * 1024
+let PUSH_CHUNK = PUSH_MIN
+// INVARIANT DUR (2026-06-12) : un shard ne dépasse JAMAIS 5 Go. Le rollover se fait EN COURS DE FICHIER
+// (mid-file), pas seulement entre deux fichiers — sinon un seul fichier de 16 Go gonfle un shard à 16 Go
+// (bug constaté sur l'archive DJI : shards -02/-04/-05/-06/-07 à 14-17 Go). Quand un fichier traverse la
+// frontière, ses chunks sont répartis sur PLUSIEURS shards (manifeste v4 `parts[]`). SHARD_CAP < 5 Go avec
+// marge (README + objets git) : le shard final ≈ SHARD_CAP, jamais au-dessus de 5 Go.
+// PLAFOND DE DÉPÔT, RAMENÉ DE 4,5 À 2 Go LE 2026-08-16, ET C'EST UNE MESURE, PAS UNE PRÉCAUTION.
+// `zenray-productions-archive-downloads-30` a commencé à refuser tous les push à 2 305 493 Kio, soit 2,3 Go,
+// avec « repository rule violations », alors qu'aucun ruleset personnalisé n'est posé sur ce dépôt (vérifié
+// par `gh api .../rules/branches/main`, qui rend `[]`). La limite est donc appliquée par GitHub lui-même,
+// bien avant les 5 Go annoncés. Un cap à 4,5 Go garantissait donc de fabriquer des dépôts increvables… et
+// increvablement bloqués. À 2 Go on roule avant le mur.
+const SHARD_CAP = repoCapBytes(PUSH_POLICY, 'folder')
+const SPLIT_AT = 5 * 1024 ** 3          // suffixe -NN dès qu'une archive OU un fichier seul dépasse 5 Go
+// Dossier de travail PERSISTANT (PAS /tmp) : macOS nettoie /tmp en cours de route et peut effacer le work dir
+// pendant un run de plusieurs heures -> le script meurt (incident 2026-06-12, archive InterviewPablo tuée à 79%).
+// On le met sous HOME (jamais auto-nettoyé). Surchargeable via ZR_ARCHIVE_WORK.
+const WORK_ROOT = process.env.ZR_ARCHIVE_WORK || `${process.env.HOME}/.zr-archive-work`
+// UN CLONE PAR VOIE, ET NON UN CLONE PARTAGÉ (incident mesuré le 2026-08-16). Les six voies démarrant à la
+// même seconde, elles clonaient toutes `_zenray-data` au même endroit : la première gagnait, les cinq autres
+// mouraient sur « destination path already exists and is not an empty directory ». Le passage tournait donc
+// en une seule voie sans que rien ne l'annonce, six fois plus lentement, ce qui est très exactement le genre
+// de panne silencieuse qu'on refuse. Chaque voie a désormais son propre dossier de travail, comme elle a
+// déjà ses propres dépôts de morceaux.
+const TRANCHE_ARG = (process.argv.find((a) => a.startsWith('--part=')) || '').slice(7)
+// UN ATELIER PAR PROCESSUS. Les dépôts binaires avaient déjà un suffixe par voie, mais `_img`, `_media` et
+// surtout le `rm(WORK)` final restaient partagés. La première voie terminée effaçait donc les dépôts Git des
+// autres, qui enchaînaient ensuite les « not a git repository ». Un dossier de run unique rend cette classe de
+// collision impossible, y compris si une ancienne application laisse un processus vivre quelques secondes.
+const WORK = path.join(WORK_ROOT,
+  `run-${process.pid}-${Date.now().toString(36)}${TRANCHE_ARG ? '-t' + (parseInt(TRANCHE_ARG, 10) + 1) : ''}`)
+// Les ateliers d'un processus interrompu ne contiennent que des dérivés locaux reprenables. Au passage suivant,
+// on retire uniquement ceux dont le PID n'existe plus ; un ancien processus encore vivant reste donc intact.
+for (const entree of await readdir(WORK_ROOT, { withFileTypes: true }).catch(() => [])) {
+  const m = entree.isDirectory() && /^run-(\d+)-/.exec(entree.name)
+  if (!m || Number(m[1]) === process.pid) continue
+  let vivant = false
+  try { process.kill(Number(m[1]), 0); vivant = true } catch (error) { vivant = error?.code === 'EPERM' }
+  if (!vivant) await rm(path.join(WORK_ROOT, entree.name), { recursive: true, force: true })
+}
+// 21 October 2026: `let`, because initDataClone may move it onto a warm slot kept between runs (lib/warm-data-clone.mjs).
+let DATA_WORK = process.env.ZR_ARCHIVE_DATA_WORK
+  || path.join(WORK, `_zenray-data${TRANCHE_ARG ? '-t' + (parseInt(TRANCHE_ARG, 10) + 1) : ''}`)
+
+const SRC = process.argv[2] && path.resolve(process.argv[2])
+if (!SRC) { console.error('usage: node Scripts/archive-folder.mjs <dossierSource> [destCreate]'); process.exit(1) }
+const FOLDER_NAME = path.basename(SRC)
+// Nom GitHub : caractères repo valides uniquement, minuscules, espaces -> '-' (PAS un « slug » marketing :
+// simple nettoyage technique, le nom du dossier reste lisible tel quel).
+// 8 October 2026, 20:26 CEST: a persisted retry suffix separates new chunks from a full rejected depot.
+const REPO_NAME = archiveRepoName(FOLDER_NAME, process.env.ZR_ARCHIVE_REPO_SUFFIX)
+
+// ── CONVENTION DJI (rushs drone) ─────────────────────────────────────────────
+// Toute archive DJI (dossier sous un parent « DJI ») est rangée sous pages/Build/DJI/<dossier> dans Create,
+// et SON NOM DOIT CONTENIR UNE DATE (un dossier DJI = un tournage daté). La segmentation interne
+// Photos/Videos/BestOf n'est PAS imposée par le script : elle est simplement MIROIR du dossier source — donc
+// organiser le dossier Mac en Photos/Videos/BestOf AVANT d'archiver suffit (walk récursif préserve l'arbo).
+const parentName = path.basename(path.dirname(SRC))
+const isDji = /^dji$/i.test(parentName) || /dji/i.test(FOLDER_NAME)
+const hasDate = /(\b\d{4}\b|\b\d{1,2}[ ._-]?(jan|fév|fev|mar|avr|mai|juin|juil|aoû|aou|sep|oct|nov|déc|dec)[a-zé]*[ ._-]?\d{2,4}|\d{4}[-_]\d{2}[-_]\d{2})/i.test(FOLDER_NAME)
+if (isDji && !hasDate) {
+  console.error(`REFUS : archive DJI sans date. Le dossier « ${FOLDER_NAME} » doit contenir une date (ex. « 16 Juin 2026 »).\n` +
+    `Renomme le dossier source avec sa date, puis relance. (Convention : une archive DJI = un tournage daté.)`)
+  process.exit(1)
+}
+
+const explicitDest = process.argv[3] && !process.argv[3].startsWith('--')
+const DEST = explicitDest ? process.argv[3].replace(/\/+$/, '')
+  : isDji ? `pages/Build/DJI/${FOLDER_NAME}`          // DJI -> Build/DJI/<dossier daté>, segmentation = miroir source
+  : `pages/Archives/${FOLDER_NAME}`                   // défaut générique inchangé
+const DRY = process.argv.includes('--dry')
+const REINDEX = process.argv.includes('--reindex')
+// ROUTAGE STREAMABLE (refactor unified-ingest) : par défaut ON. Les images sortent TOUJOURS du chunk (zéro
+// dépendance). Les vidéos/audios ne sortent du chunk que si leurs prérequis (serveur local + ffmpeg + clé
+// maître) sont réunis ; sinon ils retombent automatiquement sur le chunk (jamais perdus). `--no-stream`
+// force l'ancien comportement (TOUT en chunk), utile pour une archive 100% binaire ou un debug.
+const NO_STREAM = process.argv.includes('--no-stream')
+// 2 October 2026, 14:28 CEST: retry transient macOS cleanup races after archive verification.
+const WORK_CLEANUP = { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }
+// SORTIE MACHINE (2026-08-15, ZenRayCloud) : `--json` ajoute des lignes NDJSON préfixées `{"zr":1,...}` sur
+// stdout, EN PLUS des logs humains existants (qui ne bougent pas d'un caractère). Le consommateur ne lit que
+// les lignes qui commencent par `{"zr":` et ignore le reste — donc aucun log existant ne peut casser le parseur,
+// et le script reste lisible tel quel dans un terminal. Sans le flag, comportement rigoureusement identique.
+const JSON_OUT = process.argv.includes('--json') || process.env.ZR_JSON === '1'
+const emit = (o) => { if (JSON_OUT) { try { process.stdout.write(JSON.stringify({ zr: 1, ...o }) + '\n') } catch {} } }
+// SUPPRESSIONS (ZenRayCloud) : `--mark-deleted` marque `deleted:true` les manifestes dont le fichier source a
+// disparu, au lieu de les effacer. Le drive est une SAUVEGARDE, pas un miroir : un fichier effacé par erreur en
+// local doit rester récupérable, et l'historique `versions[]` reste intact. Sans le flag, rien n'est marqué.
+const MARK_DELETED = process.argv.includes('--mark-deleted')
+// INDEX D'ÉTAT POUR LE FINDER : `--index=<fichier>` écrit, en fin de run, la liste des chemins relatifs qui ont
+// un manifeste sur le drive. L'extension Finder ne fait que lire ce fichier ; elle ne parle jamais au réseau, ce
+// qui lui évite de bloquer le Finder, et elle n'a aucun secret à connaître.
+const INDEX_ETAT = (process.argv.find((a) => a.startsWith('--index=')) || '').slice(8)
+// TRANCHE `--part=i/N` : ce processus ne traite que les fichiers dont l'empreinte du CHEMIN tombe dans sa
+// tranche. Deux processus lancés avec des tranches différentes ne se recouvrent JAMAIS, ce qui est la seule
+// façon sûre de paralléliser : chacun a son propre dépôt de morceaux, son propre index git, son propre push.
+// Aucun morceau ne peut être confondu, puisqu'aucun fichier n'est vu par deux processus à la fois.
+const TRANCHE = (() => {
+  const a = (process.argv.find((x) => x.startsWith('--part=')) || '').slice(7)
+  const m = /^(\d+)\/(\d+)$/.exec(a)
+  return m ? { i: Number(m[1]), n: Number(m[2]) } : null
+})()
+async function ecrireIndexEtat(parRelMap, recs, annexesBlobs, dest) {
+  if (!INDEX_ETAT) return
+  // L'index porte de quoi bâtir un TABLEAU sans toucher au réseau : pour chaque fichier, sa taille, son nombre
+  // de versions, la date du premier et du dernier envoi, et son chemin précédent s'il a été déplacé. Tout cela
+  // vit déjà dans les manifestes ; on ne fait que le rassembler là où l'app peut le lire instantanément.
+  const fiches = new Map()
+  const depuisManifeste = (rel, m, cheminManifeste) => {
+    fiches.set(rel, stateCardFromManifest(rel, m, cheminManifeste))
+  }
+  for (const [rel, entree] of parRelMap) depuisManifeste(rel, entree.manifest, entree.path)
+  for (const r of recs) fiches.set(r.rel, { rel: r.rel, taille: r.size, sha: r.sha256,
+    versions: (r.prevVersions || []).length + 1, premier: ((r.prevVersions || [])[0] || {}).ts || new Date().toISOString(),
+    dernier: new Date().toISOString(), supprime: false, depuis: r.depuis || null,
+    manifeste: `${r.rel}.file.json` })
+  for (const b of annexesBlobs) {
+    const cheminManifeste = b.path.slice(dest.length + 1)
+    depuisManifeste(cheminManifeste.replace(/\.file\.json$/, ''), JSON.parse(b.content), cheminManifeste)
+  }
+  let verrou = null
+  try {
+    verrou = await acquireDirectoryLock(INDEX_ETAT + '.lock', directoryLockOptions('court', 'index ZenRayCloud'))
+    // Une voie peut avoir cloné les manifestes avant que sa voisine publie les siens. On reprend donc l'index
+    // déjà écrit sous verrou, puis la voie courante remplace uniquement les fiches qu'elle connaît.
+    try {
+      const precedent = JSON.parse(await readFile(INDEX_ETAT, 'utf8'))
+      const fusion = mergePreviousStateCards(fiches, precedent.fiches,
+        (rel) => !TRANCHE || belongsToPartition(rel, TRANCHE))
+      fiches.clear()
+      for (const [rel, fiche] of fusion) fiches.set(rel, fiche)
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.error(`  ⚠ index précédent illisible, reconstruction : ${error.message}`)
+    }
+    await mkdir(path.dirname(INDEX_ETAT), { recursive: true })
+    const temporaire = `${INDEX_ETAT}.tmp-${process.pid}`
+    await writeFile(temporaire, JSON.stringify({ src: SRC, dest, at: new Date().toISOString(),
+      rels: [...fiches.keys()], fiches: [...fiches.values()] }))
+    await rename(temporaire, INDEX_ETAT)
+    console.log(`  index d'état : ${fiches.size} fiche(s)`)
+  } finally { if (verrou) await verrou.release() }
+}
+// BRUIT SYSTÈME (ZenRayCloud) : `--skip-noise` écarte de l'inventaire les fichiers que macOS sème partout
+// (.DS_Store, ._AppleDouble, corbeilles, index Spotlight) et les écritures partielles (.part, .crdownload, ~$).
+// OPT-IN et jamais par défaut : les archives existantes ont été constituées sans ce filtre, et un dossier
+// archivé doit rester le miroir exact de ce qu'on lui a donné tant que personne n'a demandé le contraire.
+const SKIP_NOISE = process.argv.includes('--skip-noise')
+// EXCLUSIONS (ZenRayCloud) : `--exclude=<motif>`, répétable. Un motif désigne un CHEMIN RELATIF au dossier
+// source, jamais un fragment de nom au hasard : « DJI » écarte le dossier DJI et tout ce qu'il contient, mais
+// laisse tranquille un fichier nommé « photo-DJI.jpg ». Sans cela, sauvegarder un dossier comme Downloads
+// re-téléverserait des centaines de gigaoctets déjà archivés ailleurs sur le drive.
+const EXCLUDES = process.argv.filter((a) => a.startsWith('--exclude=')).map((a) => a.slice(10).replace(/^\/+|\/+$/g, '').toLowerCase()).filter(Boolean)
+const estExclu = (rel) => {
+  const r = rel.toLowerCase()
+  return EXCLUDES.some((m) => r === m || r.startsWith(m + '/') || r.includes('/' + m + '/'))
+}
+const BRUIT = [/(^|\/)\.DS_Store$/i, /(^|\/)\._/, /(^|\/)\.Trash(es)?(\/|$)/i, /(^|\/)\.Spotlight-V100(\/|$)/i,
+  /(^|\/)\.fseventsd(\/|$)/i, /(^|\/)\.TemporaryItems(\/|$)/i, /(^|\/)\.zr-archive-work(\/|$)/,
+  /\.(tmp|temp|part|crdownload|download|swp|lock)$/i, /(^|\/)~\$/]
+const API_BASE = process.env.ZR_API_BASE || 'http://localhost:3000'
+// Racine du repo (pour trouver la clé maître .zenray-media-key et importer classify.js).
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+// 8 October 2026, 14:10 CEST: Git reads credentials through askpass, never from a remote URL argument.
+const GENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: path.join(REPO_ROOT, 'scripts/lib/GitHubAskpass.sh') }
+const REMOTE_PROBE_TIMEOUT_MS = Number(process.env.ZR_REMOTE_PROBE_TIMEOUT_MS) || 30000
+const REPO_CREATE_TIMEOUT_MS = Number(process.env.ZR_REPO_CREATE_TIMEOUT_MS) || 30000
+const LOCAL_GIT_TIMEOUT_MS = Number(process.env.ZR_LOCAL_GIT_TIMEOUT_MS) || 600000
+const git = (dir, a, timeout = LOCAL_GIT_TIMEOUT_MS) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', env: GENV, timeout, killSignal: 'SIGKILL' })
+const head = (dir, label) => requireCommitSha(git(dir, ['rev-parse', 'HEAD']), label)
+function reconstruireIndexRecherche() {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'build-search-index.mjs')
+  const resultat = spawnSync(process.execPath, [script, '--apply'], {
+    stdio: 'inherit', env: process.env, timeout: LOCAL_GIT_TIMEOUT_MS, killSignal: 'SIGKILL',
+  })
+  const raison = resultat.status ?? resultat.error?.message ?? 'inconnue'
+  if (resultat.status !== 0) throw new Error(`réindexation Create échouée (${raison})`)
+}
+function commitStaged(dir, msg, label) {
+  const commit = git(dir, ['commit', '-q', '-m', msg])
+  const staged = commit.status === 0 ? null : git(dir, ['diff', '--cached', '--quiet'])
+  const resultat = classifyCommitResult(commit.status, staged?.status)
+  if (resultat === 'failed') {
+    throw new Error(`git commit ${label}: ` + (commit.stderr || commit.stdout || staged?.stderr || 'sans message').slice(-200))
+  }
+  return resultat
+}
+function sha256File(p) {
+  return new Promise((res, rej) => { const h = createHash('sha256'); const s = createReadStream(p); s.on('data', (c) => h.update(c)); s.on('end', () => res(h.digest('hex'))); s.on('error', rej) })
+}
+const MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', svg: 'image/svg+xml', mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', mkv: 'video/x-matroska', ts: 'video/mp2t', wav: 'audio/wav', mp3: 'audio/mpeg', m4a: 'audio/mp4', flac: 'audio/flac', pdf: 'application/pdf', md: 'text/markdown', txt: 'text/plain', py: 'text/x-python', js: 'text/javascript', mjs: 'text/javascript', json: 'application/json', m3u8: 'application/vnd.apple.mpegurl', zip: 'application/zip', pkg: 'application/octet-stream' }
+const mimeOf = (p) => MIME[p.split('.').pop().toLowerCase()] || 'application/octet-stream'
+
+// UN SEUL ENDROIT FABRIQUE UN MANIFESTE, qu'il parte au fil de l'envoi ou à la fin. Deux fabriques auraient
+// fini par diverger d'un champ, et c'est exactement le genre d'écart qui rend une archive illisible.
+const partsOf = (r) => r.parts.map((pt) => ({ repo: pt.shard, commit: shardCommit[pt.shard], chunks: pt.chunks }))
+function construireBlobManifeste(r) {
+  const parts = partsOf(r)
+  const first = parts[0] || { repo: null, commit: null, chunks: [] }
+  const cur = { ts: new Date().toISOString(), size: r.size, sha256: r.sha256, chunkSize: r.chunkSize || CHUNK,
+    parts, repo: first.repo, commit: first.commit, chunks: first.chunks }
+  const versions = [...(r.prevVersions || []), cur]
+  return {
+    path: `${DEST}/${r.rel}.file.json`,
+    content: JSON.stringify({ type: 'file', v: 4, name: path.basename(r.rel), rel: r.rel, mime: r.mime,
+      mode: 'chunked', size: cur.size, sha256: cur.sha256, chunkSize: cur.chunkSize, parts,
+      repo: cur.repo, commit: cur.commit, chunks: cur.chunks, versions }),
+  }
+}
+
+// LE VERROU DES MANIFESTES (2026-08-16, trois voies perdues dessus). Les morceaux vont dans des dépôts
+// séparés par voie, mais les MANIFESTES vont tous, par construction, dans le même `zenray-data` : six voies
+// y poussent donc en même temps, et douze rebases ne suffisent pas quand la base bouge à chaque tentative.
+// Un verrou par dossier, créé avec `mkdir` qui est atomique sur tous les systèmes de fichiers, sérialise
+// ces écritures sans rien changer au reste : chaque voie attend son tour quelques secondes plutôt que de
+// mourir au bout de douze essais. Le détenteur écrit son PID : une commande Git synchrone peut bloquer la
+// boucle JavaScript plusieurs minutes, mais tant que ce processus vit, le verrou ne peut jamais lui être volé.
+// Un jeton empêche aussi un ancien détenteur de supprimer le verrou du suivant en se réveillant tard.
+const VERROU = path.join(WORK_ROOT, '_verrou-manifestes')
+const VERROU_OPTIONS = directoryLockOptions('long', 'publication des manifestes')
+
+// 21 October 2026: the clone used to be deleted and rebuilt on every run (34.7 s of a 52 s one-file pass). It is now a
+// slot kept under WORK_ROOT and refreshed with one fetch; ZR_ARCHIVE_WARM_CLONE=0 restores the old behaviour exactly.
+let releaseDataClone = async () => {}
+async function initDataClone() {
+  const claim = await claimDataClone({
+    slotsRoot: path.join(WORK_ROOT, '_warm-data'), fallbackDir: DATA_WORK,
+    url: `https://github.com/${OWNER}/${DATA}.git`, destination: DEST, env: GENV,
+    referenceRepo: process.env.ZR_ARCHIVE_REFERENCE_REPO,
+    enabled: process.env.ZR_ARCHIVE_WARM_CLONE !== '0' && !process.env.ZR_ARCHIVE_DATA_WORK,
+  })
+  DATA_WORK = claim.dir
+  releaseDataClone = claim.release
+  emit({ ev: 'data-clone', mode: claim.mode })
+}
+// LE VERROU VIT ICI, ET NON CHEZ L'APPELANT (correction du 2026-08-16 au soir, après cinq voies perdues).
+// Il n'avait été posé que dans `publierManifestesPrets`, alors que CINQ endroits différents écrivent dans
+// `zenray-data` : le marquage des suppressions, les manifestes au fil de l'envoi, les streamables, et les
+// réutilisés. Protéger un seul appelant laissait donc quatre portes ouvertes, et les voies continuaient de
+// se marcher dessus. La ressource partagée est cette fonction : c'est elle qui porte le verrou.
+async function commitDataFiles(files, msg) {
+  const verrou = await acquireDirectoryLock(VERROU, VERROU_OPTIONS)
+  if (verrou.waitedMs > 3000) {
+    console.log(`  ⏳ verrou des manifestes obtenu après ${(verrou.waitedMs / 1000).toFixed(0)} s d'attente`)
+  }
+  try { return await commitDataFilesVerrouille(files, msg) }
+  finally { await verrou.release() }
+}
+
+async function commitDataFilesVerrouille(files, msg) {
+  if (!files.length) return true
+  for (const f of files) {
+    const out = path.join(DATA_WORK, f.path)
+    await mkdir(path.dirname(out), { recursive: true })
+    await writeFile(out, f.content)
+  }
+  const add = git(DATA_WORK, ['add', '--sparse', '--', ...files.map((f) => f.path)])
+  if (add.status !== 0) throw new Error('git add manifests: ' + (add.stderr || '').slice(-200))
+  // ── LES ORPHELINS, ET LA VRAIE RAISON POUR LAQUELLE AUCUN REBASE NE PASSAIT ────────────────────────────
+  // Relevé le 2026-08-18 dans un clone en cours d'exécution : quatre manifestes `.media.json` y étaient
+  // MODIFIÉS et hors de l'index, écrits par un lot précédent puis jamais indexés. Or un rebase refuse de
+  // démarrer tant qu'un fichier suivi est modifié sans être indexé, et `--autostash` ne les sauve pas ici :
+  // ce clone est creux en mode NON-CONE (`core.sparseCheckoutCone = false`), configuration dans laquelle le
+  // remisage laisse l'arbre sale. D'où « Created autostash » suivi, dans le même souffle, de « cannot
+  // rebase: You have unstaged changes ». On ramasse donc ces orphelins et on les emmène dans le commit.
+  //
+  // On ne prend QUE les fichiers suivis et modifiés (` M `), jamais un `git add -A` : dans un clone creux,
+  // les chemins hors du cône sont absents du disque, et `-A` indexerait leur SUPPRESSION, c'est-à-dire
+  // effacerait du dépôt des manifestes parfaitement valides. Le remède serait alors pire que le mal.
+  const etat = git(DATA_WORK, ['status', '--porcelain', '-z', '--', DEST])
+  // Format `--porcelain -z` : deux caractères d'état, une espace, puis le chemin BRUT (jamais échappé,
+  // contrairement au format par défaut, qui aurait rendu « Décembre » sous forme d'octets et cassé l'ajout).
+  // Le second caractère décrit l'arbre de travail : « M » est un fichier suivi et modifié, le seul cas qu'on
+  // rattrape. Un « D » y serait une suppression, qu'on laisse délibérément échouer plus haut plutôt que
+  // d'indexer l'effacement d'un manifeste.
+  const orphelins = (etat.stdout || '').split('\0')
+    .filter((l) => l.length > 3 && l[1] === 'M')
+    .map((l) => l.slice(3))
+  if (orphelins.length) {
+    console.log(`  ⓘ ${orphelins.length} manifeste(s) écrit(s) sans être indexé(s) : rattrapés dans ce commit`)
+    for (let i = 0; i < orphelins.length; i += 300) {
+      const r = git(DATA_WORK, ['add', '--sparse', '--', ...orphelins.slice(i, i + 300)])
+      if (r.status !== 0) console.error(`  ⚠ rattrapage partiel : ${(r.stderr || '').slice(-160)}`)
+    }
+  }
+  // Deux voies peuvent publier le même manifeste. Après un commit refusé, seul un index Git réellement vide
+  // prouve qu'il n'y avait rien à faire ; un message vide ne constitue jamais une preuve de succès.
+  if (commitStaged(DATA_WORK, msg, 'manifests') === 'unchanged') {
+    console.log('  ⓘ manifestes déjà à jour, rien à committer')
+    return true
+  }
+  // PLUSIEURS PROCESSUS ÉCRIVENT LEURS MANIFESTES SUR LE MÊME DÉPÔT. Le premier passe, les suivants sont
+  // refusés parce que leur base a bougé. On rejoue alors sur la nouvelle base : nos manifestes portent des
+  // chemins distincts (chaque tranche a ses fichiers), donc un rebase ne peut pas produire de conflit de
+  // contenu, seulement un décalage de base. Sans cette boucle, paralléliser ferait perdre des manifestes.
+  let pousse = false
+  let dernierEchec = ''
+  for (let essai = 0; essai < 12 && !pousse; essai++) {
+    const push = git(DATA_WORK, ['push', '-q', 'origin', 'HEAD:main'], 300000)
+    if (push.status === 0) { pousse = true; break }
+    // `--autostash` EST LA PIÈCE QUI MANQUAIT (2026-08-18). Le rebase refuse de s'exécuter dès qu'un fichier
+    // traîne, modifié et non indexé, dans l'arbre de travail — ce qui arrive constamment ici, puisqu'on écrit
+    // les manifestes AVANT de n'indexer que ceux du lot courant. Le rebase échouait donc à chaque tour, on
+    // l'annulait, la base locale ne bougeait jamais, et les douze tentatives rejouaient le même push perdu
+    // d'avance. L'autostash met de côté ce qui traîne, rejoue, puis le remet : c'est exactement le geste.
+    const rb = git(DATA_WORK, ['pull', '--rebase', '--autostash', '-q', 'origin', 'main'], 300000)
+    if (rb.status !== 0) {
+      // ON DIT POURQUOI. Sans cette ligne, l'échec du rebase était muet et seul le push apparaissait au
+      // journal : on voyait « la base est restée en mouvement » sans jamais savoir que le rebase, lui,
+      // n'avait pas même démarré.
+      dernierEchec = ((rb.stderr || '') + (rb.stdout || '')).trim().slice(-200)
+      console.error(`  ⚠ rebase des manifestes refusé (essai ${essai + 1}/12) : ${dernierEchec}`)
+      git(DATA_WORK, ['rebase', '--abort'])
+    }
+    await sleep(800 * (essai + 1))
+  }
+  if (!pousse && dernierEchec) throw new Error(`git push manifests : ${dernierEchec}`)
+  if (!pousse) throw new Error('git push manifests : la base est restée en mouvement pendant toutes les tentatives')
+  return true
+}
+// TIMEOUT sur TOUT fetch direct (raw/HEAD) : sans ça, un fetch peut PENDRE indéfiniment (réseau saturé par un
+// autre job, connexion TCP morte) et geler le process à 0% CPU. AbortSignal.timeout garantit qu'on échoue vite
+// (et qu'on retente) plutôt que de rester bloqué.
+// LE STATUT NE SUFFIT PAS, LA TAILLE DÉCIDE (2026-08-18). Un `HEAD 200` prouve qu'un morceau EXISTE et
+// qu'il est servi ; il ne dit rien de sa longueur. Un morceau tronqué par un cache ou par une coupure
+// côté CDN répondrait donc « vérifié » alors que le fichier reconstitué serait faux, et l'erreur ne se
+// découvrirait qu'au moment de restaurer, c'est-à-dire le jour où l'on en a besoin. On lit désormais
+// `content-length` et on le compare à ce qu'on a écrit.
+// LA VÉRIFICATION COMPARAIT UNE LONGUEUR COMPRESSÉE À UNE LONGUEUR RÉELLE (mesuré le 2026-08-18, et c'est
+// ce défaut qui arrêtait la sauvegarde entière). `raw.githubusercontent` sert les petits morceaux en gzip
+// quand rien ne le lui interdit, si bien que `content-length` rend la taille COMPRESSÉE. Le contrôle voyait
+// alors 338 octets là où le morceau en fait 932, criait au morceau corrompu, et le passage entier passait en
+// échec ; l'application le rejouait cinq fois avant d'abandonner. Relevé sur le morceau 325e8439… :
+//     tel quel   content-length 338 · content-encoding gzip
+//     identity   content-length 932 · content-encoding (aucun)   ← la vraie taille, celle du dépôt
+// On exige donc l'encodage brut. Et si un intermédiaire compresse malgré la demande, la comparaison de
+// tailles n'a plus de sens : on rend `octets: 0`, ce que la boucle de vérification traite déjà comme « je ne
+// sais pas », plutôt que comme « c'est faux ». Un contrôle qui ne peut pas conclure ne condamne pas.
+const headTaille = async (url) => {
+  try {
+    const r = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(20000),
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Accept-Encoding': 'identity' } })
+    const comprime = !!r.headers.get('content-encoding')
+    return { status: r.status, octets: comprime ? 0 : Number(r.headers.get('content-length')) || 0 }
+  } catch { return { status: 0, octets: 0 } }
+}
+
+// id de fichier déterministe (hash du chemin d'origine) -> chemin de chunk anonyme aa/bb/<fid>-NNN.
+// Aucun nom ni extension d'origine n'apparait sur le repo public ; le mapping vit dans le manifeste privé.
+const fidOf = (rel) => createHash('sha256').update(rel).digest('hex').slice(0, 40)
+const chunkPath = (fid, i) => `${fid.slice(0, 2)}/${fid.slice(2, 4)}/${fid}-${String(i).padStart(3, '0')}`
+// README PUBLIC : explique le projet + le mécanisme, lié à la version de clonage. AUCUN nom de fichier d'origine.
+const SITE = 'https://zenray-progress.vercel.app'
+const README = () => `# ${shard}
+
+Archive **ZenRay Create** du dossier de projet « ${FOLDER_NAME} ».
+
+Ce dépôt fait partie de **ZenRay Progress** — un espace de travail façon Finder/Notion qui stocke ses médias
+sur GitHub et les sert via CDN. Voir le projet : ${SITE}
+
+## Ce que contient ce dépôt
+
+Des **morceaux binaires de 19 Mo** (\`aa/bb/<id>-NNN\`), nommés par hachage du chemin d'origine. Il n'y a
+volontairement **aucun fichier directement consultable** ici : un morceau seul n'est pas un fichier utilisable.
+
+Le **manifeste** qui décrit chaque fichier (nom réel, arborescence, ordre des morceaux, empreinte sha256) est
+**privé** et n'est pas dans ce dépôt. La reconstitution bit à bit se fait uniquement depuis l'application
+ZenRay Create, qui réassemble les morceaux dans l'ordre puis vérifie l'empreinte.
+
+## Version de clonage
+
+Cette archive est figée sur le commit courant de ce dépôt (chaque manifeste privé référence ce commit). Une
+nouvelle archive du même dossier produit un nouveau commit ; les anciens morceaux ne sont plus référencés.
+`
+
+// VERSIONNING : lecture du manifeste .file.json EXISTANT. Permet de comparer le sha256 (re-archiver ne
+// re-chunke PAS un fichier inchangé) et de conserver l'historique des versions (append-only).
+//
+// LECTURE SUR DISQUE, PLUS JAMAIS PAR `git show` (bug payé le 2026-08-15 sur Downloads). Deux raisons, la
+// seconde étant grave. D'abord la vitesse : un dossier de quatorze mille fichiers déclenchait quatorze mille
+// sous-processus git, là où une seule marche du dossier suffit — le clone creux a déjà tous ces manifestes sur
+// le disque. Ensuite la correction : `git show HEAD:<chemin>` traite les CROCHETS du chemin comme un motif, si
+// bien qu'un fichier nommé « repack [FitGirl].zip » renvoyait un succès avec une sortie VIDE ; le `JSON.parse`
+// levait « Unexpected end of JSON input », et le fichier finissait dans les sautés, donc NON SAUVEGARDÉ. Les
+// noms de release en portent presque tous. Un dossier de téléchargements en était plein.
+const parRel = new Map()
+const parStreamRel = new Map()
+const streamPublies = new Map()
+function cataloguePourIndex() {
+  const catalogue = new Map()
+  for (const [rel, manifeste] of parRel) catalogue.set(rel, { manifest: manifeste, path: `${rel}.file.json` })
+  for (const [rel, info] of parStreamRel) catalogue.set(rel, {
+    manifest: info.manifest,
+    path: info.path.startsWith(DEST + '/') ? info.path.slice(DEST.length + 1) : info.path,
+  })
+  for (const [rel, info] of streamPublies) catalogue.set(rel, info)
+  return catalogue
+}
+function readExistingManifest(rel) { return parRel.get(rel) || null }
+// Liste des versions d'un manifeste existant (v3 = champ versions[] ; v2 = on fabrique 1 entrée depuis le top-level).
+const versionsOf = (m) => {
+  if (!m) return []
+  if (Array.isArray(m.versions) && m.versions.length) return m.versions
+  if (m.sha256 && m.commit) return [{ ts: m.ts || null, commit: m.commit, repo: m.repo, size: m.size, sha256: m.sha256, chunks: m.chunks || [], chunkSize: m.chunkSize || CHUNK }]
+  return []
+}
+
+// ── 1) INVENTAIRE ────────────────────────────────────────────────────────────
+const files = []
+async function walk(abs, rel) {
+  for (const e of await readdir(abs, { withFileTypes: true })) {
+    if (e.name === '.git') continue
+    const a = path.join(abs, e.name), r = rel ? `${rel}/${e.name}` : e.name
+    if (e.isDirectory()) await walk(a, r)
+    // Taille, modification et changement d'inode forment la preuve du cache. `ctimeMs` bouge notamment quand
+    // un outil réécrit le contenu puis restaure volontairement `mtimeMs`, cas que le couple précédent ratait.
+    else if (e.isFile()) {
+      const st = await stat(a)
+      files.push({ abs: a, rel: r, size: st.size, mtime: st.mtimeMs, ctime: st.ctimeMs })
+    }
+  }
+}
+await walk(SRC, '')
+if (TRANCHE) {
+  const avant = files.length
+  const miens = files.filter((f) => belongsToPartition(f.rel, TRANCHE))
+  files.length = 0; files.push(...miens)
+  console.log(`  tranche ${TRANCHE.i + 1}/${TRANCHE.n} : ${files.length} fichier(s) sur ${avant}`)
+}
+if (EXCLUDES.length) {
+  const avant = files.length
+  const gardes = files.filter((f) => !estExclu(f.rel))
+  files.length = 0; files.push(...gardes)
+  console.log(`  ${avant - files.length} fichier(s) écarté(s) par --exclude (${EXCLUDES.join(', ')})`)
+}
+if (SKIP_NOISE) {
+  const avant = files.length
+  const gardes = files.filter((f) => !BRUIT.some((r) => r.test(f.rel)))
+  files.length = 0; files.push(...gardes)
+  if (avant !== files.length) console.log(`  ${avant - files.length} fichier(s) de bruit système écarté(s) (--skip-noise)`)
+}
+const totalBytes = files.reduce((n, f) => n + f.size, 0)
+const maxFile = files.reduce((n, f) => Math.max(n, f.size), 0)
+// MULTI-shards (suffixe -NN + rollover actif) dès que l'archive OU un seul fichier dépasse 5 Go : un fichier
+// >5 Go ne tient pas dans un shard ≤5 Go, il DOIT être réparti (parts[]), même si l'archive entière est petite.
+const multiShard = totalBytes > SPLIT_AT || maxFile > SPLIT_AT
+console.log(`ARCHIVE ${FOLDER_NAME} -> ${DEST}`)
+console.log(`  ${files.length} fichiers · ${(totalBytes / 1e9).toFixed(2)} Go · ${NO_STREAM ? 'TOUT en chunks 19 Mo (--no-stream)' : 'routage unifié : image/vidéo/audio streamables, reste en chunks 19 Mo'} · ${multiShard ? 'MULTI-shards -NN (>5 Go)' : `1 shard : ${REPO_NAME}`}`)
+emit({ ev: 'inventory', folder: FOLDER_NAME, dest: DEST, files: files.length, bytes: totalBytes, multiShard })
+if (DRY) process.exit(0)
+
+await initDataClone()
+
+// ── 1bis-a) HACHAGE EN PARALLÈLE SUR TOUS LES CŒURS ──────────────────────────
+//
+// L'empreinte sha256 décide de TOUT : inchangé, modifié, déplacé. Elle se calculait fichier par fichier sur un
+// seul cœur, au fil de la boucle, alors que la machine en a dix-huit et que le disque tient plusieurs flux de
+// front. Sur un dossier de trois cent quarante-huit gigaoctets, c'était la lecture entière du dossier au débit
+// d'un seul cœur avant qu'un seul octet ne parte.
+//
+// Un pool de fils d'exécution lit et hache en parallèle, puis la boucle principale se contente de consulter le
+// résultat. Le hachage est borné par le disque, pas par le processeur, donc on vise les cœurs moins deux comme
+// partout ailleurs sur cette machine, et jamais plus : au-delà, les flux se disputent le même SSD sans gain.
+// Déclaré ICI, avant le hachage : la progression est bridée de la même façon pendant les empreintes et pendant
+// l'envoi, donc les deux phases partagent le même garde-temps.
+let lastEmit = 0
+const HACHE_EN_PARALLELE = Math.max(1, Math.min(16, (cpus().length || 8) - 2))
+const empreintes = new Map()
+const CODE_OUVRIER = `
+  const { parentPort } = require('node:worker_threads')
+  const { createHash } = require('node:crypto')
+  const { createReadStream } = require('node:fs')
+  parentPort.on('message', (t) => {
+    if (t === null) return process.exit(0)
+    const h = createHash('sha256')
+    const f = createReadStream(t.abs, { highWaterMark: 4 * 1024 * 1024 })
+    f.on('data', (c) => h.update(c))
+    f.on('end', () => parentPort.postMessage({ rel: t.rel, sha: h.digest('hex') }))
+    f.on('error', (e) => parentPort.postMessage({ rel: t.rel, erreur: e.code || e.message }))
+  })
+`
+// ── A3 : LE CACHE D'EMPREINTES ────────────────────────────────────────────────────────────────────
+// Sans lui, chaque relance relit et hache l'INTÉGRALITÉ du dossier avant qu'un seul octet ne reparte. Sur les
+// trois cent vingt-quatre gigaoctets de Downloads, cela suffisait à faire croire l'application bloquée, et
+// surtout à repayer le même travail à chaque crash — or il y en a eu trois en douze heures le 2026-08-16.
+// Une empreinte ne change que si le fichier change. Le cache exige donc la même taille, la même date de
+// modification ET la même date de changement d'inode. Ce troisième témoin ferme le cas courant où un outil
+// réécrit un contenu de même taille puis restaure `mtime`. En cas de doute, y compris avec un ancien cache qui
+// ne porte pas encore `ctime`, on rehache : le cache accélère la preuve, il ne la remplace jamais.
+// LE CHEMIN DU CACHE SE CONSTRUIT, IL NE SE DEVINE PAS (trouvé par le banc d'essai le 2026-08-16).
+// Il était dérivé par `replace(/index-/, 'empreintes-')`, ce qui suppose que le fichier d'index s'appelle
+// toujours `index-<quelquechose>`. Avec un index nommé simplement `index.json`, le motif ne correspond à
+// rien : `replace` rend la chaîne INCHANGÉE, et le cache s'écrivait donc PAR-DESSUS l'index, en silence.
+// Le banc l'a vu en dix secondes là où l'œil ne l'aurait jamais vu, puisque le passage réussit quand même,
+// simplement sans jamais réutiliser une seule empreinte.
+const CHEMIN_CACHE = process.env.ZR_CACHE_EMPREINTES
+  || (INDEX_ETAT ? path.join(path.dirname(INDEX_ETAT), 'empreintes-' + path.basename(INDEX_ETAT)) : null)
+function lireCacheEmpreintes() {
+  if (!CHEMIN_CACHE) return new Map()
+  try { return new Map(Object.entries(JSON.parse(readFileSync(CHEMIN_CACHE, 'utf8')))) }
+  catch (error) {
+    if (error.code !== 'ENOENT') console.error(`  ⚠ cache d'empreintes illisible, recalcul complet : ${error.message}`)
+    return new Map()
+  }
+}
+async function ecrireCacheEmpreintes(cache) {
+  if (!CHEMIN_CACHE) return
+  let verrou = null
+  try {
+    verrou = await acquireDirectoryLock(CHEMIN_CACHE + '.lock', directoryLockOptions('court', 'cache empreintes ZenRayCloud'))
+    const reuni = lireCacheEmpreintes()
+    // Chaque voie remplace sa propre tranche et laisse les autres intactes. Sans tranche, le passage connaît
+    // tout le dossier et remplace donc le cache entier, ce qui retire naturellement les chemins disparus.
+    if (TRANCHE) {
+      for (const rel of reuni.keys()) if (belongsToPartition(rel, TRANCHE)) reuni.delete(rel)
+    } else reuni.clear()
+    for (const [rel, valeur] of cache) reuni.set(rel, valeur)
+    await mkdir(path.dirname(CHEMIN_CACHE), { recursive: true })
+    const temporaire = `${CHEMIN_CACHE}.tmp-${process.pid}`
+    await writeFile(temporaire, JSON.stringify(Object.fromEntries(reuni)))
+    await rename(temporaire, CHEMIN_CACHE)
+  } catch (error) {
+    // La sauvegarde reste prouvée par ses manifestes et leurs morceaux. Seule la prochaine passe sera plus
+    // lente ; le dire explique le coût sans transformer un accélérateur local en autorité sur les données.
+    console.error(`  ⚠ cache d'empreintes non écrit, prochaine analyse complète : ${error.message}`)
+  }
+  finally { if (verrou) await verrou.release() }
+}
+
+const skipped = [] // fichiers illisibles/disparus pendant le run : { rel, reason } — JAMAIS silencieux, listés à la fin
+const preuveStat = (st) => fileChangeToken({ size: st.size, mtime: st.mtimeMs, ctime: st.ctimeMs })
+
+// ── GROS FICHIERS INSTABLES : ne pas repayer le hachage et l'envoi à chaque passage (2026-08-18) ─────────────
+// MESURÉ dans le journal réel : un fichier de 31 Go issu d'un téléchargement torrent encore actif (« The
+// Sinking City 2/fg-01.bin ») a été détecté « modifié pendant la lecture » DIX-HUIT FOIS dans la même soirée,
+// la dernière quelques minutes avant l'écriture de cette ligne. Chaque tentative hache le fichier en entier,
+// le découpe, en pousse parfois plus de vingt gigaoctets, et ne s'aperçoit qu'à la toute fin que le contenu
+// avait encore changé pendant l'opération. C'est très exactement ce que Matthieu observait à l'écran : « ça
+// dit 13993/13993 fichiers sauvegardés, 100 %, et pourtant ça continue de pousser plusieurs Mo/s ». Le fichier
+// n'est pas cassé, il attend la fin d'un téléchargement qui dure des heures ; le hacher en entier pour s'en
+// apercevoir après coup est la seule partie qui gaspille, et elle se répétait sans fin.
+//
+// La parade tient en deux gestes, appliqués aux seuls fichiers assez gros pour que le coût existe.
+//
+// D'abord un contrôle QUASI GRATUIT avant tout hachage : deux `stat` séparés de quelques secondes, sans lire
+// un octet du fichier. Un fichier réellement stable les passe en un instant ; un fichier encore écrit s'y
+// trahit sans qu'on ait payé le moindre hachage.
+//
+// Ensuite un ARRÊT PROGRESSIF pour les fichiers qui échouent malgré ce contrôle — un torrent peut très bien
+// écrire entre les deux `stat` et se taire juste après, ce que le contrôle rapide ne peut pas voir. Chaque
+// échec, qu'il vienne du contrôle rapide ou de la vérification finale déjà en place plus bas, allonge
+// l'attente avant le prochain essai (1, 2, 5, 10, 15 puis 30 minutes), au lieu de retenter à chaque passage
+// suivant, parfois quelques minutes plus tard.
+const GROS_SEUIL_OCTETS = (Number(process.env.ZR_STABLE_MIN_MO) || 200) * 1024 * 1024
+const STABLE_DELAI_MS = Number(process.env.ZR_STABLE_DELAI_MS) || 4000
+const BACKOFF_INSTABLE_SEC = [60, 120, 300, 600, 900, 1800]
+const CHEMIN_INSTABLES = process.env.ZR_CACHE_INSTABLES
+  || (INDEX_ETAT ? path.join(path.dirname(INDEX_ETAT), 'instables-' + path.basename(INDEX_ETAT)) : null)
+
+function lireInstables() {
+  if (!CHEMIN_INSTABLES) return new Map()
+  try { return new Map(Object.entries(JSON.parse(readFileSync(CHEMIN_INSTABLES, 'utf8')))) }
+  catch (error) {
+    if (error.code !== 'ENOENT') console.error(`  ⚠ cache d'instabilité illisible, on repart de zéro : ${error.message}`)
+    return new Map()
+  }
+}
+async function ecrireInstables(muter) {
+  if (!CHEMIN_INSTABLES) return
+  let verrou = null
+  try {
+    verrou = await acquireDirectoryLock(CHEMIN_INSTABLES + '.lock', directoryLockOptions('court', 'cache instabilité ZenRayCloud'))
+    const table = lireInstables()
+    muter(table)
+    await mkdir(path.dirname(CHEMIN_INSTABLES), { recursive: true })
+    const temporaire = `${CHEMIN_INSTABLES}.tmp-${process.pid}`
+    await writeFile(temporaire, JSON.stringify(Object.fromEntries(table)))
+    await rename(temporaire, CHEMIN_INSTABLES)
+  } catch (error) {
+    // Au pire, le prochain passage retente sans attendre : moins bon, jamais faux.
+    console.error(`  ⚠ cache d'instabilité non écrit : ${error.message}`)
+  } finally { if (verrou) await verrou.release() }
+}
+// Chargé UNE SEULE FOIS au début du passage : les échecs que CE passage détecte lui-même ne doivent pas
+// s'appliquer à lui-même, sous peine qu'un fichier devienne invisible dès sa première détection au lieu
+// d'attendre le vrai backoff au passage suivant.
+const tableInstables = lireInstables()
+function enAttenteInstable(f) {
+  if (f.size < GROS_SEUIL_OCTETS) return false
+  const entree = tableInstables.get(f.rel)
+  return !!entree && entree.prochainEssai > Date.now()
+}
+async function noterInstabilite(rel) {
+  let fois = 1, delaiMs = BACKOFF_INSTABLE_SEC[0] * 1000
+  await ecrireInstables((table) => {
+    fois = (table.get(rel)?.fois || 0) + 1
+    delaiMs = BACKOFF_INSTABLE_SEC[Math.min(fois - 1, BACKOFF_INSTABLE_SEC.length - 1)] * 1000
+    table.set(rel, { fois, prochainEssai: Date.now() + delaiMs })
+  })
+  return { fois, delaiMs }
+}
+async function noterStabilite(rel) {
+  if (!CHEMIN_INSTABLES || !tableInstables.has(rel)) return   // rien à effacer : on épargne l'écriture disque
+  tableInstables.delete(rel)
+  await ecrireInstables((table) => table.delete(rel))
+}
+/** Le contrôle quasi gratuit : deux `stat`, aucune lecture de contenu. `true` si quelque chose a changé entre
+ *  les deux, ce qui suffit à prouver qu'un autre processus écrit encore dans ce fichier. */
+async function fichierEncoreEnEcriture(f) {
+  try {
+    const avant = preuveStat(await stat(f.abs))
+    await sleep(STABLE_DELAI_MS)
+    const apres = preuveStat(await stat(f.abs))
+    return avant !== apres
+  } catch { return false }   // disparu entre les deux stat : le chemin normal le constatera et le nommera
+}
+
+async function hacherTout() {
+  if (!files.length) return
+  const t0 = Date.now()
+  const cache = lireCacheEmpreintes()
+  const aHacher = []
+  let reutilises = 0, instables = 0
+  for (const f of files) {
+    // GROS FICHIER DÉJÀ CONNU INSTABLE : le backoff n'est pas écoulé, on ne le hache pas cette passe.
+    if (enAttenteInstable(f)) { instables++; continue }
+    const c = cache.get(f.rel)
+    if (canReuseFingerprint(f, c)) { empreintes.set(f.rel, c.s); reutilises++; continue }
+    // GROS FICHIER JAMAIS ENCORE SIGNALÉ INSTABLE : un contrôle quasi gratuit AVANT de payer le hachage complet.
+    if (f.size >= GROS_SEUIL_OCTETS && await fichierEncoreEnEcriture(f)) {
+      const { delaiMs } = await noterInstabilite(f.rel)
+      skipped.push({ rel: f.rel, reason: `fichier volumineux encore en écriture ailleurs, nouvel essai dans ${Math.round(delaiMs / 1000)}s` })
+      emit({ ev: 'skip', rel: f.rel, raison: 'instable' })
+      console.error(`  ⚠ ENCORE EN ÉCRITURE (contrôle rapide, sans hachage complet) : ${f.rel}`)
+      instables++
+      continue
+    }
+    aHacher.push(f)
+  }
+  if (instables) console.log(`  ${instables} gros fichier(s) instable(s) écarté(s) sans hachage`)
+  if (reutilises) console.log(`  ${reutilises} empreinte(s) reprises du cache — ${aHacher.length} à calculer`)
+  if (!aHacher.length) {
+    // « Rien à hacher » recouvre deux réalités différentes, et les confondre mentirait au journal : soit tout
+    // vient du cache (le cas courant), soit une partie a été écartée comme instable (le cas de ce soir-là).
+    console.log(instables
+      ? `  ${reutilises} empreinte(s) du cache, ${instables} gros fichier(s) instable(s) — rien d'autre à hacher (${(Date.now() - t0) / 1000}s)`
+      : `  toutes les empreintes venaient du cache (${(Date.now() - t0) / 1000}s)`)
+    emit({ ev: 'progress', seen: files.length, total: files.length, rel: '', size: 0,
+      updated: 0, unchanged: reutilises, phase: 'empreintes', lus: 0 })
+    return
+  }
+  const aFaire = aHacher
+  const tailleParRel = new Map(aFaire.map((f) => [f.rel, f.size]))
+  let suivant = 0, finis = 0, octets = 0
+  await new Promise((resolve) => {
+    const ouvriers = new Set()
+    let resolu = false
+    const terminer = () => {
+      if (resolu) return
+      resolu = true
+      for (const w of ouvriers) {
+        try { w.postMessage(null) } catch { /* un ouvrier déjà mort ne bloque pas les autres */ }
+      }
+      resolve()
+    }
+    const donner = (w) => {
+      if (suivant >= aFaire.length) {
+        ouvriers.delete(w)
+        try { w.postMessage(null) } catch { /* l'ouvrier a déjà quitté */ }
+        return
+      }
+      w.postMessage(aFaire[suivant++])
+    }
+    const lancerOuvrier = () => {
+      const w = new Worker(CODE_OUVRIER, { eval: true })
+      ouvriers.add(w)
+      w.on('message', (r) => {
+        finis++
+        if (r.sha) { empreintes.set(r.rel, r.sha); octets += tailleParRel.get(r.rel) || 0 }
+        else console.error(`  empreinte à reprendre : ${r.rel} (${r.erreur || 'erreur inconnue'})`)
+        if (JSON_OUT && Date.now() - lastEmit > 200) {
+          lastEmit = Date.now()
+          // LES OCTETS DÉJÀ LUS PARTENT AVEC. Sans eux, l'écran affiche « — Mo/s » pendant toute la phase
+          // d'empreintes, qui dure des minutes sur un gros dossier : l'application a l'air arrêtée alors
+          // qu'elle lit à plusieurs gigaoctets par seconde. Ce n'est pas le débit RÉSEAU, c'est le débit de
+          // lecture, et c'est celui qui a du sens à ce moment-là.
+          emit({ ev: 'progress', seen: reutilises + finis, total: files.length, rel: r.rel, size: 0,
+            updated: 0, unchanged: reutilises, phase: 'empreintes', lus: octets })
+        }
+        if (finis % 500 === 0) console.log(`  empreintes ${finis}/${aFaire.length}`)
+        if (finis >= aFaire.length) { terminer(); return }
+        donner(w)
+      })
+      w.on('error', (e) => {
+        ouvriers.delete(w)
+        finis++
+        console.error(`  ouvrier d'empreintes arrêté : ${e.message}`)
+        if (finis >= aFaire.length) terminer()
+        else if (suivant < aFaire.length) lancerOuvrier()
+      })
+      donner(w)
+    }
+    for (let i = 0; i < Math.min(HACHE_EN_PARALLELE, aFaire.length); i++) lancerOuvrier()
+  })
+  // Une erreur de lecture ou la mort d'un thread ne peut pas laisser une empreinte absente en silence. Les
+  // rares fichiers concernés sont relus ici, dans le processus principal ; si cette seconde lecture échoue,
+  // la passe échoue clairement et sera retentée au lieu d'annoncer une sauvegarde complète.
+  const manquantes = aFaire.filter((f) => !empreintes.has(f.rel))
+  if (manquantes.length) console.log(`  ${manquantes.length} empreinte(s) reprise(s) après erreur d'ouvrier`)
+  for (const f of manquantes) {
+    empreintes.set(f.rel, await sha256File(f.abs))
+    octets += f.size
+  }
+  const sec = (Date.now() - t0) / 1000
+  console.log(`  ${aFaire.length} empreintes en ${sec.toFixed(1)} s sur ${HACHE_EN_PARALLELE} cœurs (${(octets / 1e9 / Math.max(sec, 0.1)).toFixed(2)} Go/s)`)
+  emit({ ev: 'progress', seen: files.length, total: files.length, rel: '', size: 0,
+    updated: 0, unchanged: reutilises, phase: 'empreintes', lus: octets })
+  // Le cache est réécrit ENTIER à partir de l'état courant : les fichiers disparus en sortent d'eux-mêmes,
+  // et il ne peut donc pas grossir indéfiniment ni garder des chemins qui n'existent plus.
+  const neuf = new Map()
+  for (const f of files) {
+    const sha = empreintes.get(f.rel)
+    if (sha) neuf.set(f.rel, fingerprintCacheEntry(f, sha))
+  }
+  await ecrireCacheEmpreintes(neuf)
+}
+await hacherTout()
+
+// ── 1bis) INDEX DE RÉUTILISATION PAR EMPREINTE ───────────────────────────────
+//
+// LE CAS QUI COÛTE LE PLUS CHER : déplacer ou renommer un fichier. Pour le script, « Videos/film.mkv » devenu
+// « Films/film.mkv » est un chemin inconnu, donc un nouveau fichier : il le redécoupe et le renvoie en entier,
+// alors que ses morceaux sont DÉJÀ en ligne, identiques au bit près. Sur un dossier comme Downloads, réorganiser
+// une soirée coûterait des dizaines de gigaoctets de téléversement pour zéro octet de contenu nouveau.
+//
+// LA PARADE : une table empreinte -> manifeste, bâtie une fois depuis les manifestes déjà présents. Quand un
+// fichier « nouveau » porte une empreinte déjà connue, on n'envoie RIEN : on écrit un manifeste au nouveau chemin
+// qui pointe les mêmes morceaux. Déplacement, renommage, copie et doublon retombent tous sur ce même chemin.
+//
+// Les `.file.json` alimentent aussi l'index empreinte -> contenu pour réutiliser un binaire déplacé. Les
+// manifestes streamables alimentent, eux, chemin -> empreinte source : même preuve, autre schéma de stockage.
+const parSha = new Map()
+async function indexerManifestes() {
+  const racine = path.join(DATA_WORK, DEST)
+  const pile = [racine]
+  while (pile.length) {
+    const dir = pile.pop()
+    let entrees = []
+    try { entrees = await readdir(dir, { withFileTypes: true }) } catch { continue }
+    for (const e of entrees) {
+      const abs = path.join(dir, e.name)
+      if (e.isDirectory()) { pile.push(abs); continue }
+      if (!/\.(file|img|media)\.json$/.test(e.name)) continue
+      try {
+        const m = JSON.parse(await readFile(abs, 'utf8'))
+        if (!m) continue
+        if (!e.name.endsWith('.file.json')) {
+          const cheminManifeste = path.relative(racine, abs)
+          const source = sourceOfStreamManifest(cheminManifeste, m)
+          if (source) {
+            const precedent = parStreamRel.get(source.rel)
+            if (!precedent || source.sha256) {
+              parStreamRel.set(source.rel, { ...source, manifest: m, path: `${DEST}/${cheminManifeste}` })
+            }
+          }
+          continue
+        }
+        // Chemin relatif au dossier surveillé, reconstruit depuis l'emplacement du manifeste ; `m.rel` fait foi
+        // quand il est présent, comme partout ailleurs dans ce script.
+        const relatif = typeof m.rel === 'string' && m.rel
+          ? m.rel
+          : path.relative(racine, abs).replace(/\.file\.json$/, '')
+        parRel.set(relatif, m)
+        if (m.sha256 && !parSha.has(m.sha256)) parSha.set(m.sha256, m)
+      } catch { /* manifeste illisible : on l'ignore, le fichier sera simplement re-téléversé, jamais sauté */ }
+    }
+  }
+  if (parSha.size) console.log(`  ${parSha.size} empreinte(s) connue(s) -> déplacements et doublons ne repartiront pas de zéro`)
+  if (parStreamRel.size) console.log(`  ${parStreamRel.size} média(s) streamable(s) connu(s) -> aucun renvoi si l'empreinte correspond`)
+}
+await indexerManifestes()
+
+// ── UN SEUL APPEL REST AVANT DE POUSSER QUOI QUE CE SOIT (2026-08-18, demande de Matthieu) ─────────
+//
+// LE PROBLÈME QU'IL RÉSOUT. `indexerManifestes()` lit les manifestes sur le DISQUE du clone creux. Ce
+// clone est fait avec `--filter=blob:none`, donc les contenus ne descendent qu'à la demande : si le
+// sparse-checkout n'a pas tout matérialisé, le moteur ne voit qu'une partie de ce qui existe en ligne,
+// conclut que le reste est neuf, et le renvoie. C'est exactement le « les fichiers ont été retraités
+// plein de fois successives » que Matthieu observe, et aucune trace d'erreur ne le signale.
+//
+// LA PARADE TIENT EN UN APPEL. L'API des arbres rend TOUS les chemins d'une destination d'un coup, pour
+// une seule lecture de quota — la règle du 2026-07-20 interdit les boucles REST, pas un appel unique.
+// On obtient donc la vérité du drive, on la compare à ce que le clone a su lire, et l'écart devient
+// visible au lieu de se traduire en gigaoctets renvoyés.
+//
+// CE QU'ON EN FAIT, ET CE QU'ON N'EN FAIT PAS. Un chemin présent en ligne mais absent du clone est noté
+// `presentEnLigne` : le fichier ne sera pas considéré comme neuf. On ne télécharge pas son manifeste
+// pour autant, faute de quoi on retomberait dans la boucle REST interdite ; on se contente de savoir
+// qu'il existe, ce qui suffit à ne pas le repousser.
+const presentEnLigne = new Set()
+let dejaEnLigneReleve = 0
+const cacheAvantPassage = lireCacheEmpreintes()
+async function releverArbreDuDrive() {
+  const ref = `main:${DEST.split('/').map(encodeURIComponent).join('/')}`
+  const url = `https://api.github.com/repos/${OWNER}/${DATA}/git/trees/${ref}?recursive=1`
+  try {
+    const r = await fetch(url, {
+      headers: { Authorization: `Bearer ${TOKEN}`, 'User-Agent': 'ZenRayCloud' },
+      signal: AbortSignal.timeout(60000),
+    })
+    if (r.status === 404) { console.log('  ⓘ destination jamais écrite : premier passage'); return }
+    if (!r.ok) { console.error(`  ⚠ relevé du drive indisponible (${r.status}) — on continue sans lui`); return }
+    const j = await r.json()
+    if (j.truncated) {
+      // Un relevé partiel ferait croire à des absences : on préfère ne rien conclure que conclure faux.
+      console.error("  ⚠ arbre tronqué par GitHub — relevé ignoré, aucune conclusion tirée")
+      return
+    }
+    for (const n of j.tree || []) {
+      if (n.type !== 'blob' || !n.path.endsWith('.file.json')) continue
+      presentEnLigne.add(n.path.replace(/\.file\.json$/, ''))
+    }
+    const manquants = [...presentEnLigne].filter((rel) => !parRel.has(rel)).length
+    console.log(`  ↯ relevé du drive : ${presentEnLigne.size} manifeste(s) en ligne, ${parRel.size} lu(s) dans le clone`)
+    if (manquants) {
+      console.log(`  ⚠ ${manquants} fichier(s) sont EN LIGNE mais absents du clone creux : ils ne seront pas renvoyés`)
+    }
+  } catch (e) {
+    console.error(`  ⚠ relevé du drive impossible (${(e.message || e).toString().slice(0, 90)}) — on continue sans lui`)
+  }
+}
+await releverArbreDuDrive()
+
+// MIGRATION DES ANCIENS STREAMABLES, SANS RENVOI. Avant `sourceSha256`, leur petit manifeste ne permettait
+// pas une comparaison bit à bit. Le journal Git donne cependant une preuve de chronologie : si le manifeste a
+// été committé après la dernière écriture locale, il décrit la version encore présente. On ne calcule cette
+// table que tant qu'il reste réellement des manifestes anciens à migrer.
+if ([...parStreamRel.values()].some((x) => !x.sha256)) {
+  const historique = spawnSync('git', ['-C', DATA_WORK, 'log', '--format=ZRC:%ct', '--name-only', '--', `${DEST}/`], {
+    encoding: 'utf8', env: GENV, maxBuffer: 64 * 1024 * 1024,
+    timeout: LOCAL_GIT_TIMEOUT_MS, killSignal: 'SIGKILL',
+  })
+  if (historique.status === 0) {
+    const dates = parseLatestGitChanges(historique.stdout)
+    for (const x of parStreamRel.values()) x.commitAt = dates.get(x.path) || 0
+  }
+}
+
+// ── 1ter) SUPPRESSIONS (--mark-deleted) ──────────────────────────────────────
+// Les manifestes vivent dans le clone sparse de zenray-data sous DEST. Ceux dont le fichier source n'existe
+// plus reçoivent `deleted:true` + la date ; on ne touche NI aux versions, NI aux chunks (rien n'est effacé sur
+// le drive). Un fichier qui réapparaît plus tard repasse simplement par le chemin normal, qui réécrit son
+// manifeste sans le drapeau. Idempotent : un manifeste déjà marqué n'est pas réécrit.
+if (MARK_DELETED) {
+  const vivants = new Set(files.map((f) => f.rel))
+  const ls = git(DATA_WORK, ['ls-files', '--', `${DEST}/`])
+  // Les anciens `.media.json` portent parfois un suffixe aléatoire. Leur propre champ `name` permet néanmoins
+  // de retrouver la source sans deviner ; les nouveaux écrivent `sourceRel`, qui fait foi directement.
+  const suffixes = ['.file.json', '.img.json', '.media.json']
+  const aMarquer = []
+  for (const p of (ls.stdout || '').split('\n')) {
+    const suf = suffixes.find((s) => p.endsWith(s))
+    if (!suf) continue
+    let m = null
+    // Le sparse checkout contient déjà le manifeste. `git show HEAD:<chemin>` lançait un processus par fichier
+    // et interprétait les crochets des noms de release comme des motifs ; la lecture disque est directe et exacte.
+    try { m = JSON.parse(await readFile(path.join(DATA_WORK, p), 'utf8')) } catch { continue }
+    if (!m || m.deleted) continue
+    // Le manifeste porte son propre `rel` : il fait foi, l'arithmétique de chemin n'est qu'un repli.
+    const relatifManifeste = p.slice(DEST.length + 1)
+    const sourceStream = suf === '.file.json' ? null : sourceOfStreamManifest(relatifManifeste, m)
+    const rel = typeof m.rel === 'string' && m.rel
+      ? m.rel : sourceStream?.rel || (suf === '.media.json' ? null : relatifManifeste.slice(0, -suf.length))
+    if (!rel) continue
+    // « Exclure » signifie ne pas observer ce sous-arbre, donc ne pas le monter ET ne pas modifier son état
+    // distant. Le traiter comme absent marquait supprimés des fichiers qui existent toujours sur le Mac.
+    if (estExclu(rel) || (SKIP_NOISE && BRUIT.some((r) => r.test(rel)))) continue
+    // Une voie ne juge que sa propre tranche. Comparer sa fraction aux manifestes des autres voies marquerait
+    // cinq sixièmes du drive comme supprimés alors que les fichiers existent toujours sur le Mac.
+    if (!belongsToPartition(rel, TRANCHE) || vivants.has(rel)) continue
+    aMarquer.push({ path: p, content: JSON.stringify({ ...m, deleted: true, deletedAt: new Date().toISOString() }) })
+  }
+  if (aMarquer.length) {
+    for (let i = 0; i < aMarquer.length; i += 600) {
+      await commitDataFiles(aMarquer.slice(i, i + 600), `archive ${FOLDER_NAME} : ${aMarquer.length} fichier(s) marqué(s) supprimé(s)`)
+    }
+    console.log(`  ${aMarquer.length} manifeste(s) marqué(s) deleted:true (aucun chunk effacé)`)
+  }
+  emit({ ev: 'deleted', count: aMarquer.length })
+}
+
+// ── 2) SHARDS LOCAUX (git init + remote public + push incrémental) ──────────
+let shardIdx = 0, shard = null, shardDir = null, shardBytes = 0, sincePush = 0, shardCommit = {}
+// Octets CONFIRMÉS par un push, et taille de chaque morceau en attente pour pouvoir les additionner.
+let octetsPousses = 0
+function confirmerTransfert(octets, rail) {
+  if (!Number.isFinite(octets) || octets <= 0) return
+  octetsPousses += octets
+  emit({ ev: 'transfer', envoyes: octetsPousses, bytes: octets, rail })
+}
+const tailleMorceaux = new Map()
+const taillesAttendues = new Map()
+// Part du fichier en cours ; elle reste visible jusqu'à la publication finale du dépôt.
+let curPart = { shard: null, chunks: [] }
+// Le roulement n'a de sens que sur un nom numéroté ; en mono-shard on garde la réouverture historique.
+const ROULEMENT = multiShard
+// Morceaux écrits depuis le dernier push. Sert à DEUX choses : n'ajouter à l'index que ces chemins-là (jamais un
+// `-A` qui rescanne tout l'arbre), et effacer les fichiers du disque une fois qu'ils sont en ligne.
+let aPousser = []
+// CHAQUE TRANCHE A SES PROPRES DÉPÔTS. Sans cela, trois processus lancés en parallèle visaient le MÊME dépôt de
+// morceaux et deux d'entre eux mouraient sur « cannot lock ref refs/heads/main » (mesuré, 2026-08-16). Le suffixe
+// de tranche rend toute collision impossible par construction : un dépôt n'a jamais qu'un seul écrivain, donc
+// aucun morceau ne peut être confondu ni écrasé, quel que soit le nombre de processus.
+const SUFFIXE_TRANCHE = TRANCHE ? `-t${TRANCHE.i + 1}` : ''
+function shardName() {
+  return multiShard
+    ? `${REPO_NAME}${SUFFIXE_TRANCHE}-${String(shardIdx + 1).padStart(2, '0')}`
+    : `${REPO_NAME}${SUFFIXE_TRANCHE}`
+}
+const SHARD_CFG = [['user.email', 'bot@zenray'], ['user.name', 'zenray-bot'],
+  ['gc.auto', '0'], ['gc.autoDetach', 'false'], ['maintenance.auto', 'false'],
+  ['core.bigFileThreshold', '1m'], ['core.compression', '0'], ['pack.compression', '0'],
+  ['pack.window', '0'], ['pack.depth', '0'], ['pack.threads', '1'], ['pack.windowMemory', '32m'],
+  ['http.postBuffer', '524288000'], ['http.version', 'HTTP/1.1']]
+async function openShard() {
+  shard = shardName(); shardDir = path.join(WORK, shard)
+  await rm(shardDir, { recursive: true, force: true })
+  const url = `https://github.com/${OWNER}/${shard}.git`
+  // Le repo existe-t-il DÉJÀ avec des commits ? Si oui = RE-ARCHIVAGE -> on PRÉSERVE l'historique (versionning).
+  const sonde = spawnSync('gh', ['api', `repos/${OWNER}/${shard}/commits?per_page=1`], {
+    encoding: 'utf8', env: GENV, timeout: REMOTE_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL',
+  })
+  const etatDepot = classifyRepoProbe(sonde.status, sonde.stdout, sonde.stderr, sonde.error)
+  if (etatDepot.kind === 'error') throw new Error(`sonde ${shard} indéterminée : ${etatDepot.message}`)
+  const hasContent = etatDepot.kind === 'content'
+  // ROULEMENT PLUTÔT QUE RÉOUVERTURE (bug mesuré le 2026-08-15 sur Downloads). Rouvrir un shard existant passe
+  // par un clone partiel `--filter=blob:none`, et git rattrape alors PARESSEUSEMENT les objets manquants : chaque
+  // `git commit` déclenchait un `git fetch` vers GitHub et durait plus de quatre minutes, pendant lesquelles rien
+  // ne montait. Mesuré : vingt kilo-octets par seconde en sortie, un commit bloqué à 4 min 38 s. Or on n'a AUCUN
+  // besoin de l'ancien contenu : les morceaux sont nommés par empreinte et les manifestes pointent (dépôt, commit).
+  // On passe donc au shard suivant, vierge, où `git init` + push ne demandent rien à personne.
+  if (hasContent && ROULEMENT) {
+    console.log(`  ${shard} contient déjà des morceaux -> on passe au suivant (aucun clone, aucun rattrapage paresseux)`)
+    shardIdx++
+    return openShard()
+  }
+  if (hasContent) {
+    // CLONE PARTIEL (blob:none, no-checkout) : on récupère l'arbre + l'historique SANS tirer les Go de chunks
+    // existants. read-tree HEAD remplit l'index avec TOUS les fichiers existants (par sha) -> les commits suivants
+    // les préservent (on n'uploade QUE les nouveaux chunks) et l'historique = les versions reste INTACT.
+    const cl = spawnSync('git', ['clone', '--quiet', '--filter=blob:none', '--sparse', url, shardDir], { encoding: 'utf8', env: GENV, timeout: 180000, killSignal: 'SIGKILL' })
+    if (cl.status !== 0) throw new Error('clone: ' + (cl.stderr || '').slice(-200))
+    for (const [k, v] of SHARD_CFG) git(shardDir, ['config', k, v])
+    git(shardDir, ['sparse-checkout', 'set', '--no-cone', 'README.md'])
+    await writeFile(path.join(shardDir, 'README.md'), README())
+    console.log(`\n>>> SHARD ${shard} rouvert (historique préservé -> versions)`)
+  } else {
+    // NOUVEAU repo : init + 1er commit + push (force OK, repo vide).
+    await mkdir(shardDir, { recursive: true })
+    git(shardDir, ['init', '-q']); git(shardDir, ['branch', '-M', 'main'])
+    for (const [k, v] of SHARD_CFG) git(shardDir, ['config', k, v])
+    await writeFile(path.join(shardDir, 'README.md'), README())
+    let created = false
+    for (let attempt = 1; attempt <= 5 && !created; attempt++) {
+      const r = spawnSync('gh', ['repo', 'create', `${OWNER}/${shard}`, '--public', '-d', `ZenRay archive — ${FOLDER_NAME}`], {
+        encoding: 'utf8', env: GENV, timeout: REPO_CREATE_TIMEOUT_MS, killSignal: 'SIGKILL',
+      })
+      if (r.status === 0 || /already exists|Name already/i.test((r.stderr || '') + (r.stdout || ''))) { created = true; break }
+      const rest = spawnSync('curl', ['-s', '--max-time', String(Math.ceil(REPO_CREATE_TIMEOUT_MS / 1000)), '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', '-H', '@-', 'https://api.github.com/user/repos', '-d', JSON.stringify({ name: shard, private: false, description: `ZenRay archive — ${FOLDER_NAME}` })], {
+        encoding: 'utf8', env: GENV, input: `Authorization: Bearer ${TOKEN}\n`, timeout: REPO_CREATE_TIMEOUT_MS, killSignal: 'SIGKILL',
+      })
+      if (/^(201|422)$/.test((rest.stdout || '').trim())) { created = true; break }
+      console.error(`repo create ${attempt}/5 échec (${shard})`); await sleep(3000 * attempt)
+    }
+    if (!created) throw new Error('repo-create')
+    git(shardDir, ['add', '-A']); git(shardDir, ['commit', '-q', '-m', 'init'])
+    git(shardDir, ['remote', 'add', 'origin', url])
+    const ps = git(shardDir, ['push', '-q', '-f', 'origin', 'HEAD:main'], 120000)
+    if (ps.status !== 0) throw new Error('push-init: ' + (ps.stderr || '').slice(-200))
+    console.log(`\n>>> SHARD ${shard} ouvert (nouveau)`)
+  }
+  // Chaque shard a son propre arbre de travail : les chemins en attente du shard précédent n'y existent pas.
+  shardBytes = 0; sincePush = 0; aPousser = []
+}
+// Fichiers dont les morceaux sont tous écrits et dont le manifeste attend un commit poussé.
+const prets = []
+let manifestesPublies = 0
+async function publierManifestesPrets() {
+  if (!prets.length) return
+  const publiables = prets.filter((r) => r.parts.every((pt) => shardCommit[pt.shard]))
+  if (!publiables.length) return
+  // UN MANIFESTE NON PUBLIÉ N'EST PAS UNE RAISON DE MOURIR (2026-08-16, quatre voies sur six perdues
+  // dessus en une soirée). C'est la même faute que celle corrigée pour les morceaux, commise à un autre
+  // endroit : « git push manifests : la base est restée en mouvement » faisait sortir le processus en
+  // code 1, et l'application relançait tout depuis le début.
+  //
+  // Or les MORCEAUX sont déjà en ligne à cet instant, et ce sont eux qui portent les données. Le manifeste
+  // n'est que la carte qui dit où ils se trouvent : il se republie au passage suivant sans qu'un seul
+  // octet ne reparte, et `prets` en garde la liste. On signale, on continue, et la voie survit.
+  try {
+    return await publierVraiment(publiables)
+  } catch (e) {
+    console.error(`  ⚠ manifestes non publiés cette fois (${(e.message || e).toString().slice(0, 120)})`)
+    console.error('    les morceaux SONT en ligne ; la carte sera réécrite au prochain passage, sans renvoi')
+    if (JSON_OUT) emit({ ev: 'manifests-differes', combien: publiables.length })
+    return false
+  }
+}
+
+async function publierVraiment(publiables) {
+  const blobs = publiables.map(construireBlobManifeste)
+  for (let i = 0; i < blobs.length; i += 600) {
+    await commitDataFiles(blobs.slice(i, i + 600), `archive ${FOLDER_NAME} (+${blobs.length} au fil de l'envoi)`)
+  }
+  manifestesPublies += publiables.length
+  for (const r of publiables) { const k = prets.indexOf(r); if (k >= 0) prets.splice(k, 1); r.publie = true }
+  console.log(`  📤 ${publiables.length} manifeste(s) en ligne (${manifestesPublies} au total) — visibles dans Create`)
+  emit({ ev: 'manifests', done: manifestesPublies, total: manifestesPublies + prets.length })
+}
+
+async function pushChunk() {
+  if (!aPousser.length) return true
+  // ON N'AJOUTE QUE LES NOUVEAUX CHEMINS. `git add -A` rescanne tout l'arbre de travail à chaque push, ce qui
+  // devient absurde passé quelques milliers de morceaux, et surtout empêche d'effacer les morceaux déjà en ligne
+  // (ils seraient vus comme des suppressions à committer). En nommant les chemins, on peut libérer le disque.
+  const lot = aPousser.slice()
+  for (let i = 0; i < lot.length; i += 500) {
+    const a = git(shardDir, ['add', '--sparse', '--', ...lot.slice(i, i + 500)])
+    if (a.status !== 0) throw new Error('add: ' + (a.stderr || '').slice(-160))
+  }
+  // Un commit raté avec des morceaux encore staged est fatal. Pousser l'ancien HEAD puis effacer le lot local
+  // ferait autrement disparaître des données sans qu'aucune erreur ne soit visible.
+  commitStaged(shardDir, '+fichiers', 'morceaux')
+  // Résilience push : jusqu'à 40 tentatives, backoff plafonné à 120 s -> survit à une COUPURE INTERNET de ~1 h
+  // (incidents 2026-06-12 : push-incr après 4 puis 10 essais, dont une perte DNS « Could not resolve host » de
+  // plusieurs minutes, a tué InterviewPablo). Le work dir est PERSISTANT et le commit local est déjà fait : chaque
+  // retry repousse le MÊME état (idempotent), donc patienter pendant l'outage puis reprendre est toujours sûr.
+  const lotBytes = lot.reduce((n, c) => n + (tailleMorceaux.get(c) || 0), 0)
+  const lotTrack = batchPolicy.track(lotBytes, lot.length)
+  for (let a = 0; a < PUSH_POLICY.folderMaxAttempts; a++) {
+    const pushStartedAt = Date.now()
+    const ps = git(shardDir, ['push', '-q', 'origin', 'HEAD:main'], batchPolicy.timeoutMs(lotBytes))
+    pushMetrics.recordAttempt({ ok: ps.status === 0, count: lot.length, bytes: lotBytes, durationMs: Date.now() - pushStartedAt, attempt: a + 1 })
+    if (ps.status === 0) lotTrack.ok(Date.now() - pushStartedAt)
+    else lotTrack.fail(Date.now() - pushStartedAt, (ps.stderr || '') + (ps.stdout || ''))
+    if (ps.status === 0) {
+      sincePush = 0
+      // LE DISQUE NE GONFLE PLUS. Une fois le morceau en ligne et référencé par le commit, sa copie dans l'arbre
+      // de travail ne sert plus à rien : on l'efface. Sans cela, sauvegarder 348 Go en exigerait 348 de libre,
+      // alors qu'il en reste 420 sur cette machine — on frôlait le disque plein. L'index garde l'entrée, donc
+      // rien n'est perdu ni marqué supprimé.
+      // LE SEUL INSTANT OÙ DES OCTETS SONT VRAIMENT PARTIS. Le panneau doit compter les morceaux confirmés
+      // par Git, y compris lorsqu'un gros fichier n'est pas encore terminé. On additionne
+      // donc ce que le push vient de confirmer, ce qui est la définition même d'un octet envoyé.
+      confirmerTransfert(lot.reduce((n, c) => n + (tailleMorceaux.get(c) || 0), 0), 'chunk')
+      for (const c of lot) tailleMorceaux.delete(c)
+      await Promise.all(lot.map((c) => rm(path.join(shardDir, c), { force: true }).catch(() => {})))
+      emit({ ev: 'menage', depot: shard, morceaux: lot.length, atelier: shardDir })
+      aPousser = aPousser.slice(lot.length)
+      // LE COMMIT EST CONNU DÈS MAINTENANT, et il contient TOUS les morceaux poussés jusqu'ici sur ce dépôt,
+      // les anciens comme ceux de ce lot. On peut donc publier tout de suite les manifestes des fichiers
+      // terminés. Deux gains, et le second vaut plus que le premier : les fichiers apparaissent dans Create au
+      // fil de l'envoi au lieu d'attendre la fin, et surtout une interruption ne fait plus rien perdre. Jusqu'ici
+      // les manifestes n'étaient écrits qu'à la toute fin : chaque arrêt laissait des morceaux en ligne que plus
+      // aucun manifeste ne réclamait, donc du travail entièrement perdu.
+      shardCommit[shard] = head(shardDir, shard)
+      await publierManifestesPrets()
+      return true
+    }
+    const err = ((ps.stderr || '') + (ps.stdout || '')).toLowerCase()
+    // DEUX FAMILLES D'ÉCHEC, ET LES CONFONDRE COÛTAIT LE PASSAGE ENTIER (incident du 2026-08-16).
+    // Un échec TRANSITOIRE — DNS perdu, coupure, base en mouvement — se répare en attendant : les quarante
+    // tentatives avec attente croissante existent pour cela et elles ont déjà sauvé des envois d'une heure.
+    // Un échec DÉFINITIF — dépôt plein, objet trop gros, règle de dépôt violée — ne se répare jamais en
+    // réessayant : le même push est refusé quarante fois, puis le script mourait et l'application relançait
+    // tout depuis le début, indéfiniment. On distingue donc les deux, et un refus définitif fait ROULER vers
+    // un dépôt neuf, ce qui est exactement le geste qui débloque.
+    // LE MOTIF ÉTAIT TROP LARGE et se déclenchait sur des messages quasi vides : le journal a montré
+    // « refuse définitivement (s) », c'est-à-dire un roulement décidé sur une chaîne d'un caractère. On
+    // exige donc un message d'une longueur crédible AVANT de conclure, faute de quoi un hoquet réseau
+    // ferait abandonner un dépôt parfaitement sain et fabriquerait des dépôts à l'infini.
+    if (isPermanentPushRejection(err)) {
+      // 8 October 2026, 21:11 CEST: classify the refusal before writing any diagnostic.
+      const rejectionType = classifyPermanentPushRejection(err)
+      console.error(`  ⛔ ${shard} refuse définitivement (${rejectionType})`)
+      emit({ ev: 'rollover', depot: shard, raison: 'refus définitif ; reprise requise', rejectionType })
+      throw new Error(`push-refus-definitif ${shard} ${rejectionType}`)
+    }
+    console.error(`  push retry ${a + 1}/${PUSH_POLICY.folderMaxAttempts}`, (ps.stderr || '').slice(-140))
+    await sleep(Math.min(120000, 4000 * (a + 1)))
+  }
+  return false
+}
+
+async function flushShard() {
+  if (!await pushChunk()) throw new Error('push-final ' + shard)
+  shardCommit[shard] = head(shardDir, shard)
+  console.log(`  ✓ ${shard} poussé (commit ${shardCommit[shard].slice(0, 7)}, ${(shardBytes / 1073741824).toFixed(2)} Go)`)
+  emit({ ev: 'shard', shard, commit: shardCommit[shard], bytes: shardBytes })
+}
+
+// ── 3) COPIE (bruts + chunks) — séquentiel, RAM bornée ───────────────────────
+// Le dépôt de morceaux s'ouvre au premier VRAI binaire à envoyer. L'ouvrir ici fabriquait un dépôt public avec
+// seulement un README à chaque passage entièrement inchangé, donc à chaque reprise ou simple contrôle.
+async function assurerShard() { if (!shard) await openShard() }
+const records = [] // nouveaux/modifiés seulement : { rel, size, sha256, mime, shard, chunks[], prevVersions }
+const reutilises = [] // { path, content } : manifestes écrits SANS aucun transfert (déplacement, renommage, copie)
+const restaures = []  // { path, content } : manifestes dont on retire seulement le drapeau `deleted` (fichier revenu)
+async function confirmerSourceStable(f, preuve) {
+  const gros = f.size >= GROS_SEUIL_OCTETS
+  try {
+    if (preuveStat(await stat(f.abs)) === preuve) {
+      // LE FICHIER A TENU JUSQU'AU BOUT : s'il portait un passif d'échecs, il ne le mérite plus. Le prochain
+      // vrai changement de contenu (une future partie du même téléchargement) mérite un essai immédiat.
+      if (gros) await noterStabilite(f.rel)
+      return true
+    }
+    skipped.push({ rel: f.rel, reason: 'modifié pendant la lecture, manifeste non publié — sera refait' })
+    console.error(`  ⚠ MODIFIÉ PENDANT LA LECTURE, non publié : ${f.rel}`)
+    emit({ ev: 'instable', rel: f.rel })
+    // GROS FICHIER : l'échec compte pour le backoff, sinon le passage suivant retente à l'identique dans la
+    // minute qui vient, pour très probablement le même résultat.
+    if (gros) await noterInstabilite(f.rel)
+  } catch (error) {
+    skipped.push({ rel: f.rel, reason: `disparu pendant la lecture (${error.code || 'stat'})` })
+    console.error(`  ⚠ DISPARU PENDANT LA LECTURE, non publié : ${f.rel}`)
+    emit({ ev: 'skip', rel: f.rel, raison: 'disparu pendant la lecture' })
+  }
+  return false
+}
+let done = 0, unchanged = 0
+
+// ── CONTEXTES STREAMABLES (refactor unified-ingest) ──────────────────────────
+// imgCtx : shard image public dédié (git push, rollover < 5 Go). Toujours actif (zéro dépendance serveur).
+// mediaCtx : pipelines vidéo exacte + audio/pdf chunked-media (best-effort, dépend du serveur local).
+// imgPending[] : manifestes .img.json à résoudre APRÈS le flush du shard image (le commit jsDelivr n'est connu
+//   qu'à ce moment). streamBlobs[] : manifestes .media.json (video-raw/chunked) déjà finalisés à committer sur data.
+let imgCtx = null, mediaCtx = null
+const imgPending = []     // { ...pending } de ingestImageBulk, résolus en blobs après imgCtx.flush()
+const streamBlobs = []    // { path, content } de manifestes .media.json (audio/pdf chunked) prêts à committer
+let streamedImg = 0, streamedVid = 0, streamedMedia = 0
+let migrationsStream = 0
+if (!NO_STREAM) {
+  try {
+    imgCtx = makeImgShardCtx({ token: TOKEN, owner: OWNER, work: path.join(WORK, '_img'), repoRoot: REPO_ROOT,
+      log: console.log, onPushed: (octets) => confirmerTransfert(octets, 'img') })
+  } catch (e) { console.log(`  ⚠ ingestion image indisponible (${e.message}) -> images resteront en chunk`) }
+  mediaCtx = await makeMediaCtx({ token: TOKEN, apiBase: API_BASE, work: path.join(WORK, '_media'),
+    repoRoot: REPO_ROOT, lockRoot: WORK_ROOT, log: console.log, enabled: true,
+    onPushed: confirmerTransfert })
+}
+// Dossier Create d'un fichier (DEST + le dossier du rel), pour ranger les nœuds streamables au bon endroit.
+const destDirOf = (rel) => { const d = path.dirname(rel); return d === '.' ? DEST : `${DEST}/${d}` }
+// COMMIT INCRÉMENTAL des manifestes streamables (.img.json/.media.json) par LOTS, PENDANT la boucle. POURQUOI :
+// sinon le run traite des centaines d'images sans qu'AUCUNE n'apparaisse sur le site avant la fin du dossier
+// (UX "navigation dans le vide"). Tous les ~256 fichiers : flush du shard image (-> commit SHA pour pinner
+// jsDelivr) + résolution des manifestes en attente + commit sur zenray-data -> visibles au refresh suivant.
+// Permet aussi de purger la source plus tôt. Appelé aussi en fin de run pour le reste.
+const BATCH_COMMIT = Number(process.env.ZR_BATCH || 256)
+const BATCH_COMMIT_DELAY_MS = (Number(process.env.ZR_BATCH_DELAY_SEC) || 30) * 1000
+let dernierFlushStream = Date.now()
+const annexesEnAttente = []
+async function flushAnnexes() {
+  if (!annexesEnAttente.length) return
+  const lot = annexesEnAttente.splice(0)
+  try {
+    for (let i = 0; i < lot.length; i += 600) {
+      await commitDataFiles(lot.slice(i, i + 600), `archive ${FOLDER_NAME} : ${lot.length} manifeste(s) sans transfert`)
+    }
+  } catch (error) {
+    annexesEnAttente.unshift(...lot)
+    throw error
+  }
+  console.log(`  📤 ${lot.length} manifeste(s) sans transfert en ligne`)
+}
+async function flushStreamBatch() {
+  if (imgCtx && imgPending.length) {
+    // Une image sans manifeste n'est pas sauvegardée. Avaler une erreur ici comptait pourtant l'image dans
+    // `done`, puis effaçait l'atelier à la fin. On laisse donc l'échec remonter : l'app relance le passage, qui
+    // saute ce qui est déjà publié et reprend ce lot sans annoncer un faux succès.
+    await imgCtx.flush()
+    const resolus = imgPending.map((pending) => resolveImgManifest(pending, imgCtx))
+    streamBlobs.push(...resolus)
+    imgPending.length = 0
+  }
+  if (streamBlobs.length) {
+    const lot = [...streamBlobs]
+    const n = lot.length
+    for (let i = 0; i < lot.length; i += 600) {
+      await commitDataFiles(lot.slice(i, i + 600), `archive ${FOLDER_NAME} streamables +${n} [${done}]`)
+    }
+    for (const blob of lot) {
+      const manifeste = JSON.parse(blob.content)
+      const relatif = blob.path.startsWith(DEST + '/') ? blob.path.slice(DEST.length + 1) : blob.path
+      const source = sourceOfStreamManifest(relatif, manifeste)
+      if (!source) throw new Error(`manifeste streamable sans source : ${blob.path}`)
+      streamPublies.set(source.rel, { manifest: manifeste, path: relatif })
+    }
+    streamBlobs.length = 0
+    dernierFlushStream = Date.now()
+    console.log(`  📤 LOT EN LIGNE : ${n} manifestes streamables committés (visibles au refresh) — ${done} fichiers traités`)
+  }
+}
+const streamBatchPret = () => shouldFlushStreamBatch(
+  imgPending.length + streamBlobs.length, BATCH_COMMIT, dernierFlushStream, Date.now(), BATCH_COMMIT_DELAY_MS)
+
+const ONLY = process.env.ZR_ONLY || '' // '' = tout ; 'video' = vidéos seules ; 'novideo' = tout sauf vidéos.
+// Progression machine, bridée à 5 lignes/seconde : le hachage d'un gros fichier peut durer, on veut que
+// l'interface montre QUEL fichier occupe le moteur, sans inonder le tuyau sur un dossier de 100 000 entrées.
+let seen = 0
+for (const f of files) {
+ seen++
+ if (JSON_OUT && (seen === 1 || seen === files.length || Date.now() - lastEmit > 200)) {
+   lastEmit = Date.now()
+   emit({ ev: 'progress', seen, total: files.length, rel: f.rel, size: f.size, updated: done, unchanged })
+ }
+ // ROBUSTESSE : un seul fichier disparu (ENOENT) ou illisible (EACCES, I/O) ne doit PAS avorter un upload de
+ // 100+ Go. On l'isole : log + skip + on continue. Les erreurs réseau (pushChunk) restent fatales (rethrow).
+ try {
+  // GROS FICHIER EN COOLDOWN : hacherTout() a déjà refusé de le hacher, mais cette boucle-ci continue de
+  // parcourir TOUS les fichiers, pas seulement ceux qu'il a retenus. Sans ce second verrou, l'absence
+  // d'empreinte aurait fait tomber le fichier dans le repli `sha256File` juste plus bas, et le gaspillage se
+  // serait simplement déplacé de quelques lignes.
+  if (enAttenteInstable(f)) {
+    const entree = tableInstables.get(f.rel)
+    const reste = Math.max(0, Math.round((entree.prochainEssai - Date.now()) / 1000))
+    skipped.push({ rel: f.rel, reason: `fichier volumineux encore en écriture ailleurs, nouvel essai dans ${reste}s (déjà ${entree.fois} échec(s))` })
+    emit({ ev: 'skip', rel: f.rel, raison: 'instable' })
+    continue
+  }
+  // FILTRE PAR TYPE (ZR_ONLY) : permet DEUX runs concurrents par type — un « novideo » (images/audio/chunks,
+  // rapide, lancé en premier) EN PARALLÈLE d'un « video » (encode pipeline, lent). Placé AVANT le hash pour ne
+  // PAS hasher inutilement les fichiers de l'autre run. Types par extension (cheap), pas besoin de classify ici.
+  if (ONLY) {
+    const isVid = /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.rel)
+    if (ONLY === 'video' && !isVid) continue
+    if (ONLY === 'novideo' && isVid) continue
+  }
+  // Le fichier existe-t-il encore ? (un dossier source peut être vidé en parallèle : import Photos, sync, etc.)
+  let curSize, empreinteTemps, currentMtime, currentFile
+  try {
+    const st = await stat(f.abs)
+    curSize = st.size
+    currentMtime = st.mtimeMs
+    currentFile = { size: st.size, mtime: st.mtimeMs, ctime: st.ctimeMs }
+    // La preuve couvre les trois métadonnées qui accompagnaient les octets au moment du hachage. Elle sera
+    // recomparée après chaque lecture, y compris sur les rails streamables qui quittaient autrefois la boucle.
+    empreinteTemps = fileChangeToken(currentFile)
+  } catch (e) { skipped.push({ rel: f.rel, reason: 'disparu (' + (e.code || 'stat') + ')' }); emit({ ev: 'skip', rel: f.rel, raison: 'disparu' }); console.error(`  ⚠ SKIP (source disparue) ${f.rel}`); continue }
+  // L'empreinte a déjà été calculée en parallèle plus haut ; on ne relit le fichier que si elle manque
+  // OU si le fichier a changé depuis l'inventaire. Sans ce second test, un fichier traité une heure après le
+  // hachage pouvait publier ses nouveaux octets avec l'ancienne empreinte.
+  let sha = empreintes.get(f.rel)
+  if (!canUseInventoryFingerprint(f, currentFile, sha)) {
+    sha = await sha256File(f.abs)
+    if (!await confirmerSourceStable(f, empreinteTemps)) continue
+    empreintes.set(f.rel, sha)
+  }
+  // VERSIONNING : si le fichier est IDENTIQUE à sa dernière version (même sha256), on ne re-chunke RIEN et on
+  // ne réécrit pas son manifeste -> zéro duplication. Sinon (nouveau OU modifié) on ajoute une nouvelle version.
+  const existing = readExistingManifest(f.rel)
+  const prevVersions = versionsOf(existing)
+  const latest = prevVersions[prevVersions.length - 1]
+  if (latest && latest.sha256 === sha) {
+    // LE FICHIER EST REVENU. Il avait été marqué supprimé, le voilà de nouveau là, identique. On n'envoie rien,
+    // mais on RETIRE le drapeau : sans cela il resterait barré à vie dans Create alors qu'il existe sur le disque.
+    if (existing && existing.deleted) {
+      const propre = { ...existing }
+      delete propre.deleted; delete propre.deletedAt
+      restaures.push({ path: `${DEST}/${f.rel}.file.json`, content: JSON.stringify(propre) })
+      annexesEnAttente.push(restaures[restaures.length - 1])
+      console.log(`  ↩ revenu, drapeau supprimé retiré : ${f.rel}`)
+      if (annexesEnAttente.length >= BATCH_COMMIT) await flushAnnexes()
+    }
+    unchanged++; continue
+  }
+
+  // LE RELEVÉ REST TRANCHE QUAND LE CLONE EST INCOMPLET (2026-08-18). Le clone creux ne matérialise pas
+  // toujours tous les manifestes : un fichier bel et bien EN LIGNE peut donc être absent de `parRel`, et
+  // le moteur le renvoyait alors intégralement. C'est la cause du « les fichiers ont été retraités plein
+  // de fois successives ». L'unique appel à l'API des arbres, fait au démarrage, connaît la vérité du
+  // drive ; on s'y fie plutôt qu'au disque, et on le DIT pour que ce ne soit jamais un saut muet.
+  //
+  // On ne saute que si l'empreinte locale est INCHANGÉE depuis le cache : un fichier modifié doit repartir,
+  // même s'il existe en ligne, sans quoi la nouvelle version ne serait jamais publiée.
+  if (!existing && presentEnLigne.has(f.rel) && cacheAvantPassage.get(f.rel)?.s === sha) {
+    console.log(`  ⏭ déjà en ligne (relevé du drive), non renvoyé : ${f.rel}`)
+    dejaEnLigneReleve++
+    unchanged++
+    continue
+  }
+
+  // IMAGES, VIDÉOS, AUDIO ET PDF ONT LE MÊME CONTRAT D'IDEMPOTENCE. Les anciens rails streamables étaient
+  // absents de `parRel`, si bien que chaque balayage recréait des dépôts et renvoyait les mêmes gigaoctets.
+  // Une empreinte source identique prouve que le nœud existant correspond exactement aux octets présents.
+  const streamExistant = parStreamRel.get(f.rel)
+  if (streamExistant?.sha256 === sha) {
+    if (streamExistant.manifest.deleted) {
+      const propre = { ...streamExistant.manifest }
+      delete propre.deleted; delete propre.deletedAt
+      streamBlobs.push({ path: streamExistant.path, content: JSON.stringify(propre) })
+      console.log(`  ↩ revenu, drapeau supprimé retiré : ${f.rel}`)
+    }
+    unchanged++
+    continue
+  }
+  if (streamExistant && !streamExistant.sha256
+      && canAdoptSourceHash(streamExistant.manifest, curSize, currentMtime, streamExistant.commitAt)) {
+    const propre = { ...streamExistant.manifest }
+    delete propre.deleted; delete propre.deletedAt
+    streamBlobs.push(enrichStreamManifest({ path: streamExistant.path, content: JSON.stringify(propre) }, f.rel, sha))
+    migrationsStream++
+    unchanged++
+    continue
+  }
+
+  // DÉPLACÉ, RENOMMÉ, COPIÉ, OU SIMPLE DOUBLON : la même empreinte existe déjà ailleurs sous ce dossier. Ses
+  // morceaux sont en ligne, identiques au bit près, et rien ne justifie de les renvoyer. On écrit un manifeste au
+  // nouveau chemin qui pointe les mêmes morceaux, et l'ancien sera marqué supprimé par `--mark-deleted` s'il a
+  // vraiment disparu. Coût : zéro octet monté. C'est le cas le plus fréquent sur un dossier qu'on réorganise.
+  const jumeau = parSha.get(sha)
+  const vJumeau = jumeau ? versionsOf(jumeau).slice(-1)[0] : null
+  if (vJumeau && (vJumeau.parts || vJumeau.chunks)) {
+    const partsJ = Array.isArray(vJumeau.parts) && vJumeau.parts.length
+      ? vJumeau.parts
+      : [{ repo: vJumeau.repo, commit: vJumeau.commit, chunks: vJumeau.chunks || [] }]
+    const premiere = partsJ[0] || { repo: null, commit: null, chunks: [] }
+    const cur = { ts: new Date().toISOString(), size: curSize, sha256: sha, chunkSize: vJumeau.chunkSize || CHUNK,
+      parts: partsJ, repo: premiere.repo, commit: premiere.commit, chunks: premiere.chunks || [] }
+    reutilises.push({
+      path: `${DEST}/${f.rel}.file.json`,
+      content: JSON.stringify({ type: 'file', v: 4, name: path.basename(f.rel), rel: f.rel, mime: mimeOf(f.rel),
+        mode: 'chunked', size: cur.size, sha256: cur.sha256, chunkSize: cur.chunkSize, parts: cur.parts,
+        repo: cur.repo, commit: cur.commit, chunks: cur.chunks, versions: [...prevVersions, cur] }),
+    })
+    parSha.set(sha, { ...jumeau, rel: f.rel })
+    // On garde d'où il vient : c'est ce qui permet d'afficher « déplacé depuis … » au lieu de faire croire à un
+    // nouveau fichier surgi de nulle part.
+    try { const o = JSON.parse(reutilises[reutilises.length - 1].content); o.depuis = jumeau.rel; reutilises[reutilises.length - 1].content = JSON.stringify(o) } catch {}
+    annexesEnAttente.push(reutilises[reutilises.length - 1])
+    if (annexesEnAttente.length >= BATCH_COMMIT) await flushAnnexes()
+    done++
+    console.log(`  ⇄ déjà en ligne sous un autre nom, rien à envoyer : ${f.rel}`)
+    continue
+  }
+
+  // ── ROUTAGE UNIFIÉ (refactor unified-ingest) : AVANT le chunk binaire ───────────────────────────────
+  // classify (module pur partagé) décide la pipeline. Tout format OUVRABLE (image/vidéo/audio/pdf) sort du
+  // chunk vers son rail streamable. SEUL le binaire non ouvrable (projets/zip/RAW/propriétaire) descend dans
+  // le code chunk legacy ci-dessous, INTACT. C'est la garde qui protège les 130 Go .file.json existants :
+  // le chemin chunk n'est jamais modifié, on lui retire seulement les fichiers qui n'avaient rien à y faire.
+  const { kind, pipeline: railClasse } = classify({ name: f.rel, mime: mimeOf(f.rel) })
+  // Le classificateur partagé nomme encore `hls` le rail vidéo du navigateur. L'archive conserve désormais
+  // l'original au bit près ; son protocole annonce donc `video`, sans changer le classificateur des captures web.
+  const railArchive = normaliserRailArchive(railClasse)
+  const pipeline = bornerRailMemoire(railArchive, curSize)
+  if (pipeline !== railArchive) console.log(`  ⓘ ${kind} de ${(curSize / 1048576).toFixed(0)} Mio : rail chunké en flux, mémoire protégée`)
+  emit({ ev: 'route', pipeline, rel: f.rel, size: curSize, seen, files: files.length })
+  if (pipeline === 'img' && imgCtx) {
+    let pending = null
+    try {
+      pending = await ingestImageBulk(f.abs, f.rel, DEST, imgCtx)
+    } catch (e) {
+      console.error(`  ⚠ image -> repli chunk (${(e.message || e).toString().slice(0, 100)}) ${f.rel}`)
+    }
+    if (pending) {
+      if (!await confirmerSourceStable(f, empreinteTemps)) continue
+      pending.sourceRel = f.rel; pending.sourceSha256 = sha
+      imgPending.push(pending); streamedImg++; done++
+      if (done % 25 === 0) console.log(`  [${done} maj] image -> .img.json (streamable) ${f.rel}`)
+      // L'échec de PUBLICATION reste hors du catch d'ingestion : il arrête et rend le passage reprenable, au
+      // lieu de rechunker en double la dernière image tout en gardant son manifeste en attente.
+      if (streamBatchPret()) await flushStreamBatch()
+      continue
+    }
+    // chute volontaire vers le chunk si l'ingestion image a échoué (jamais perdre le fichier)
+  } else if (pipeline === 'video') {
+    const res = await ingestVideoBulk(f.abs, f.rel, destDirOf(f.rel), mediaCtx, sha)
+    if (res) {
+      if (!await confirmerSourceStable(f, empreinteTemps)) continue
+      streamBlobs.push(res.manifestBlob); streamedVid++; done++
+      if (streamBatchPret()) await flushStreamBatch()
+      console.log(`  [${done} maj] vidéo exacte -> .media.json ${f.rel}`)
+      continue
+    }
+    // null = serveur/ffmpeg absent ou échec -> repli chunk (intact)
+  } else if (pipeline === 'media') {
+    const res = await ingestMediaBulk(f.abs, f.rel, mimeOf(f.rel), kind, destDirOf(f.rel), mediaCtx)
+    if (res) {
+      if (!await confirmerSourceStable(f, empreinteTemps)) continue
+      streamBlobs.push(enrichStreamManifest(res.manifestBlob, f.rel, sha)); streamedMedia++; done++
+      console.log(`  [${done} maj] ${kind} -> chunked-media (streamable) ${f.rel}`)
+      if (streamBatchPret()) await flushStreamBatch()
+      continue
+    }
+    // null = serveur/clé absent ou échec -> repli chunk (intact)
+  }
+  // pipeline === 'chunk' (ou repli ci-dessus) : CODE CHUNK LEGACY .file.json, STRICTEMENT INCHANGÉ.
+  await assurerShard()
+  const fid = fidOf(f.rel)
+  // Manifeste v4 : rec.parts[] = [{shard, chunks[]}]. Un GROS fichier traverse plusieurs shards (rollover
+  // MID-FILE) -> ses chunks sont répartis en plusieurs parts, chacune sur son shard ≤5 Go. Reassemblage =
+  // concaténation des chunks de toutes les parts, dans l'ordre (ci monotone).
+  const tailleMorceau = storageChunkFor(curSize)
+  const rec = { rel: f.rel, size: curSize, mime: mimeOf(f.rel), sha256: sha, prevVersions, parts: [], chunkSize: tailleMorceau }
+  curPart = { shard, chunks: [] }
+  const fd = await open(f.abs, 'r')
+  const buf = Buffer.alloc(8 * 1024 * 1024)
+  let ci = 0, pos = 0
+  try {
+    do {
+      // ROLLOVER MID-FILE : si le shard courant atteint le cap, on le flushe et on en ouvre un nouveau AVANT
+      // d'écrire le prochain chunk — y compris au MILIEU d'un fichier. Garantit shard ≤5 Go en toute circonstance.
+      if (multiShard && shardBytes >= SHARD_CAP) {
+        if (curPart.chunks.length) rec.parts.push(curPart)
+        // LE SHARD FINI QUITTE LE DISQUE. Effacer les morceaux de l'arbre de travail après chaque push ne suffit
+        // pas : leurs objets restent dans le `.git` du shard, qui pèse donc sa taille pleine, ici quatre gigaoctets
+        // et demi. Sur trois cent quarante-huit gigaoctets, cela ferait soixante-dix-sept dossiers et autant de
+        // fois quatre gigaoctets et demi, soit le disque plein bien avant la fin. Une fois le shard poussé et son
+        // commit noté, il n'a plus aucune utilité locale : on le supprime, et le suivant repart à zéro.
+        const ancien = shardDir
+        await flushShard()
+        await rm(ancien, { recursive: true, force: true }).catch(() => {})
+        shardIdx++; await openShard()
+        curPart = { shard, chunks: [] }
+      }
+      const cname = chunkPath(fid, ci)
+      const cdst = path.join(shardDir, cname)
+      await mkdir(path.dirname(cdst), { recursive: true })
+      const out = createWriteStream(cdst)
+      let written = 0
+      while (written < tailleMorceau && pos < curSize) {
+        const { bytesRead } = await fd.read(buf, 0, Math.min(buf.length, tailleMorceau - written), pos)
+        if (!bytesRead) break
+        await new Promise((res, rej) => out.write(buf.subarray(0, bytesRead), (e) => e ? rej(e) : res()))
+        written += bytesRead; pos += bytesRead
+      }
+      await new Promise((res) => out.end(res))
+      curPart.chunks.push(cname); aPousser.push(cname); tailleMorceaux.set(cname, written)
+      // Taille attendue, gardée pour la vérification finale : c'est le seul chiffre qui permette de
+      // distinguer un morceau complet d'un morceau tronqué servi avec un statut 200.
+      taillesAttendues.set(cname, written); ci++
+      shardBytes += written; sincePush += written
+      // LES OCTETS COMPTENT DÈS QU'ILS SONT ÉCRITS, PAS À LA FIN DU FICHIER. Pendant les vingt minutes que
+      // prend un film de sept gigaoctets, le total progresse donc au fil de l'eau, et `pos` cesse d'être
+      // ajouté deux fois puisqu'il est désormais inclus dans le cumul.
+      // PROGRESSION FINE. Sans elle, un fichier de six gigaoctets fige l'affichage pendant de longues minutes :
+      // le compteur de FICHIERS ne bouge pas, et l'app a l'air plantée alors qu'elle travaille. On dit donc où on
+      // en est DANS le fichier, bridé à cinq lignes par seconde comme le reste.
+      if (JSON_OUT && Date.now() - lastEmit > 200) {
+        lastEmit = Date.now()
+        emit({ ev: 'chunk', rel: f.rel, done: pos, total: curSize, seen, files: files.length,
+          envoyes: octetsPousses, depot: shard, morceau: ci, morceaux: Math.ceil(curSize / tailleMorceau),
+          tailleMorceau, atelier: shardDir })
+      }
+      if (shouldFlushChunkBatch(sincePush, PUSH_CHUNK)) {
+        PUSH_CHUNK = Math.min(pushMax(), Math.round(PUSH_CHUNK * PUSH_POLICY.folderPushRampFactor))   // on amortit à mesure qu'on prend le rythme
+        if (JSON_OUT) { lastEmit = Date.now(); emit({ ev: 'chunk', rel: f.rel, done: pos, total: curSize, seen,
+          files: files.length, envoyes: octetsPousses, depot: shard, morceau: ci,
+          morceaux: Math.ceil(curSize / tailleMorceau), tailleMorceau, atelier: shardDir, poussee: true }) }
+        if (!await pushChunk()) throw new Error('push-incr')
+      }
+    } while (pos < curSize)
+  } finally { await fd.close().catch(() => {}) }
+  if (curPart.chunks.length) rec.parts.push(curPart)
+  // LE FICHIER A-T-IL BOUGÉ PENDANT QU'ON LE LISAIT ? Si Matthieu enregistre par-dessus, ou qu'un
+  // téléchargement se termine pendant la découpe, les octets envoyés ne correspondent plus à l'empreinte
+  // calculée au départ. Publier ce manifeste écrirait un mensonge vérifiable : sha256 annoncé qui ne
+  // correspond pas au contenu. On refuse donc de le publier, on le signale, et le passage suivant le refera
+  // proprement. Les morceaux déjà poussés restent en ligne sans être référencés : de la place perdue, jamais
+  // une archive fausse.
+  if (!await confirmerSourceStable(f, empreinteTemps)) continue
+
+  records.push(rec); prets.push(rec); done++
+  // Les petits fichiers partent en lot au seuil de données. Le reliquat est toujours envoyé par flushShard,
+  // tandis que les gros fichiers continuent de pousser leurs morceaux pendant leur lecture.
+  if (done % 25 === 0 || curSize > RAW_MAX) console.log(`  [${done} maj / ${unchanged} inchangés / ${skipped.length} skip / ${files.length}] ${f.rel} (${(curSize / 1048576).toFixed(1)} Mo, ${ci} chunk(s)${rec.parts.length > 1 ? `, ${rec.parts.length} parts` : ''}) [shard ${(shardBytes / 1073741824).toFixed(2)} Go]`)
+ } catch (e) {
+  // 12 October 2026: a failed repo creation (GitHub secondary rate limit, 403) used to be swallowed here: the next files wrote
+  // their chunks, pushed 40 times to a shard WITHOUT a remote (51 min of pauses) and the service killed the run at 900 s.
+  // It is fatal now: the service retries the whole run a minute later, from a clean state.
+  // FR : un echec de creation de depot est fatal ; avant, 51 minutes de push sans remote avant le kill a 900 s.
+  if (/push-|repo-create/.test(e.message)) throw e // erreur réseau/push = fatale, on ne perd pas de données
+  skipped.push({ rel: f.rel, reason: e.code || e.message }); console.error(`  ⚠ SKIP (${e.code || e.message}) ${f.rel}`)
+ }
+}
+if (shard) await flushShard()
+
+// ── 3bis) RESTE des manifestes streamables (dernier lot < 256 + manifestes audio en attente). Le gros a déjà
+// été committé par lots de 256 PENDANT la boucle (flushStreamBatch) -> visible au fil de l'eau, plus de "vide".
+await flushStreamBatch()
+
+// ANNEXES : manifestes écrits sans aucun transfert (réutilisations et restaurations). Committés AVANT le test
+// « rien de neuf » plus bas, sinon un run qui n'aurait fait que déplacer des fichiers sortirait sans rien écrire.
+await flushAnnexes()
+const annexes = [...reutilises, ...restaures]
+if (annexes.length) {
+  console.log(`  ${reutilises.length} manifeste(s) réutilisé(s) sans transfert, ${restaures.length} restauré(s)`)
+}
+
+console.log(`\n${records.length} fichier(s) chunk · ${streamedImg} image(s) · ${streamedVid} vidéo(s) exacte(s) · ${streamedMedia} audio/pdf · ${unchanged} inchangé(s)`)
+if (migrationsStream) console.log(`  ${migrationsStream} ancien(s) manifeste(s) streamable(s) enrichi(s) sans renvoi de données`)
+if (skipped.length) {
+  console.error(`\n⚠ ${skipped.length} fichier(s) IGNORÉS (disparus/illisibles pendant le run) — NON archivés, source à conserver :`)
+  for (const s of skipped) console.error(`    - ${s.rel} (${s.reason})`)
+}
+
+if (!records.length) {
+  // Rien à chunker, mais on a peut-être créé des nœuds streamables (gérés ci-dessus). Reindex éventuel + sortie.
+  const totalStreamables = streamPublies.size
+  if (totalStreamables && REINDEX) reconstruireIndexRecherche()
+  await ecrireIndexEtat(cataloguePourIndex(), [], [...reutilises, ...restaures], DEST)
+  console.log(totalStreamables ? `\n=== TERMINÉ — ${totalStreamables} nœud(s) streamable(s), 0 chunk ===` : 'Rien de neuf à archiver — toutes les versions sont à jour.')
+if (dejaEnLigneReleve) console.log(`  ⏭ ${dejaEnLigneReleve} fichier(s) déjà en ligne d'après le relevé du drive : aucun octet renvoyé`)
+  emit({ ev: 'done', chunked: 0, images: streamedImg, videos: streamedVid, media: streamedMedia, unchanged, reused: reutilises.length, restored: restaures.length, skipped: skipped.map((x) => x.rel), verifyKo: 0 })
+  await rm(WORK, WORK_CLEANUP).catch(() => {})
+  process.exit(0)
+}
+
+// ── 4) MANIFESTES .file.json dans zenray-data (lots de 600, arbre inline) ───
+// Manifeste v4 : `parts[]` = [{repo, commit, chunks[]}] (un fichier peut s'étaler sur PLUSIEURS shards ≤5 Go).
+// versions[] APPEND-ONLY ; chaque version porte ses propres parts. Top-level repo/commit/chunks = 1re part
+// (rétro-compat lecteurs v2/v3 mono-shard : un fichier ≤5 Go a une seule part, donc reste lisible tel quel).
+// Il ne reste ici que les fichiers dont le manifeste n'a pas déjà été publié au fil de l'envoi.
+const blobs = records.filter((r) => !r.publie).map(construireBlobManifeste)
+console.log(`\nmanifestes: ${blobs.length} .file.json -> ${DATA}:${DEST}`)
+// LA MÊME FAUTE QU'AILLEURS, COMMISE À UN SECOND ENDROIT (2026-08-18). `publierManifestesPrets` sait déjà
+// qu'un manifeste non publié ne justifie pas de mourir : les morceaux sont en ligne, ils portent les données,
+// et le manifeste n'est que la carte qui dit où ils se trouvent. Cette boucle-ci, la publication de fin de
+// passage, ne portait pas ce garde-fou : une contention sur `zenray-data` y jetait une exception, le
+// processus sortait en code 1, et l'application déclarait en échec un passage qui venait de tout sauvegarder
+// et de passer sa vérification à seize sur seize.
+let manifestesDifferes = 0
+for (let i = 0; i < blobs.length; i += 600) {
+  const lot = blobs.slice(i, i + 600)
+  try {
+    await commitDataFiles(lot, `archive ${FOLDER_NAME} (${i + 1}-${Math.min(i + 600, blobs.length)}/${blobs.length})`)
+    console.log(`  manifestes ${Math.min(i + 600, blobs.length)}/${blobs.length} ✓`)
+    emit({ ev: 'manifests', done: Math.min(i + 600, blobs.length), total: blobs.length })
+  } catch (e) {
+    manifestesDifferes += lot.length
+    console.error(`  ⚠ manifestes non publiés cette fois (${(e.message || e).toString().slice(0, 160)})`)
+    console.error('    les morceaux SONT en ligne ; la carte sera réécrite au prochain passage, sans renvoi')
+    emit({ ev: 'manifests-differes', combien: lot.length })
+    break   // la cause est la même pour les lots suivants : insister ne ferait qu'allonger le passage
+  }
+}
+if (manifestesDifferes) console.log(`ⓘ ${manifestesDifferes} manifeste(s) différé(s) au prochain passage`)
+
+// ── 5) VÉRIF 200 (raw.githubusercontent, parallèle x16) sur TOUT (toutes les parts) ─────────────
+const urls = []
+for (const r of records) {
+  for (const pt of r.parts) { const c = shardCommit[pt.shard]; for (const ch of pt.chunks) urls.push({ chunk: ch, url: `https://raw.githubusercontent.com/${OWNER}/${pt.shard}/${c}/${ch.split('/').map(encodeURIComponent).join('/')}` }) }
+}
+console.log(`vérification ${urls.length} URLs ...`)
+let vi = 0, ko = 0
+await Promise.all(Array.from({ length: 16 }, async () => {
+  while (vi < urls.length) {
+    const { url: u, chunk } = urls[vi++]
+    let vu = { status: 0, octets: 0 }
+    for (let a = 0; a < 3 && vu.status !== 200; a++) { vu = await headTaille(u); if (vu.status !== 200) await sleep(800 * (a + 1)) }
+    if (vu.status !== 200) { ko++; console.error(`  vérif KO (${vu.status}) ${u.slice(-80)}`); continue }
+    const attendu = taillesAttendues.get(chunk)
+    // On ne juge que ce qu'on connaît : un morceau écrit lors d'un passage antérieur n'a pas sa taille
+    // ici, et l'absence de référence n'est pas une preuve d'erreur.
+    if (attendu && vu.octets && vu.octets !== attendu) {
+      ko++
+      console.error(`  vérif KO (taille ${vu.octets} au lieu de ${attendu}) ${u.slice(-80)}`)
+    }
+  }
+}))
+console.log(ko === 0 ? `vérif COMPLÈTE : ${urls.length}/${urls.length} OK ✓` : `vérif: ${ko} KO sur ${urls.length} — NE PAS PURGER`)
+emit({ ev: 'verify', total: urls.length, ko })
+
+// ── 6) fin : reindex optionnel + consigne de purge (JAMAIS auto) ─────────────
+if (REINDEX && ko === 0) {
+  console.log('reindex ...')
+  reconstruireIndexRecherche()
+}
+await ecrireIndexEtat(cataloguePourIndex(), records, [...reutilises, ...restaures], DEST)
+await rm(WORK, WORK_CLEANUP)
+emit({ ev: 'done', chunked: records.length, images: streamedImg, videos: streamedVid, media: streamedMedia, unchanged, reused: reutilises.length, restored: restaures.length, skipped: skipped.map((x) => x.rel), verifyKo: ko })
+{
+  const pushSummary = pushMetrics.summary()
+  if (pushSummary.attempts) console.log(`  push measures: ${pushSummary.batches} push(es), ${pushSummary.failedAttempts} failed attempt(s), average ${(pushSummary.averageThroughputBps / 1048576).toFixed(1)} MiB/s, effective ${(pushSummary.effectiveThroughputBps / 1048576).toFixed(1)} MiB/s`)
+}
+console.log(`\n=== TERMINÉ — ${records.length} fichiers archivés (${(totalBytes / 1e9).toFixed(2)} Go) ===`)
+console.log((ko === 0 && skipped.length === 0)
+  ? `Purge locale possible (à TA main, après contrôle dans Create) :\n  rm -rf "${SRC}"`
+  : ko !== 0
+    ? `ÉCHECS de vérification : sources à CONSERVER, relancer le script (reprise sûre par re-push).`
+    : `${skipped.length} fichier(s) ignorés : NE PAS purger la source. Relancer le script une fois la cause réglée (reprise sûre, les fichiers déjà archivés sont sautés).`)

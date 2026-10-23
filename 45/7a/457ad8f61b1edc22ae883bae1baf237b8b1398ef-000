@@ -1,0 +1,221 @@
+// 4 October 2026: official applicant tracking boards (SmartRecruiters, Lever, Greenhouse). Public JSON, one board per studio.
+// FR : les tableaux officiels des studios (SmartRecruiters, Lever, Greenhouse), JSON public, un tableau par studio.
+import { ROLE_PATTERN, offerId } from '../lib/Offer.mjs'
+import { mapLimited } from '../lib/Http.mjs'
+import { decodeEntities } from '../lib/Text.mjs'
+
+const empty = (key, label, board) => ({ key: `${key}:${board}`, label, listings: [], seenIds: [], listed: 0, matched: 0, errors: [], complete: true })
+
+export async function smartrecruiters({ http, config }) {
+  const settings = config.sources.smartrecruiters
+  const boards = []
+  for (const [identifier, name] of Object.entries(settings.boards)) {
+    const board = empty('smartrecruiters', name, identifier)
+    try {
+      const base = `https://api.smartrecruiters.com/v1/companies/${identifier}/postings`
+      const first = await http.json(`${base}?limit=100&offset=0`)
+      const jobs = [...first.content]
+      for (let offset = 100; offset < first.totalFound; offset += 100) jobs.push(...(await http.json(`${base}?limit=100&offset=${offset}`)).content)
+      const unique = new Map()
+      const variants = new Map()
+      for (const job of jobs.filter((entry) => ROLE_PATTERN.test(entry.name))) {
+        const key = `${job.refNumber || job.id}|${job.location?.fullLocation}`
+        if (!unique.has(key)) unique.set(key, job)
+        variants.set(key, [...(variants.get(key) || []), offerId(`${identifier}:${job.id}`)])
+      }
+      board.listed = jobs.length
+      // Every duplicate posting counts as seen, and a record written from any of them is recognised: the representative may change between passes.
+      // FR : chaque doublon compte comme vu, et une fiche ecrite depuis l'un d'eux est reconnue : le representant peut changer d'une passe a l'autre.
+      board.seenIds = [...variants.values()].flat()
+      const entries = [...unique.entries()]
+      const results = await mapLimited(entries, config.http.workers, async ([key, job]) => {
+        const value = await http.json(`${base}/${job.id}`)
+        const sections = value.jobAd?.sections || {}
+        const text = Object.values(sections).map((section) => section?.text || '').join(' ')
+        const location = value.location || job.location || {}
+        return {
+          sourceKey: `smartrecruiters:${identifier}`, sourceLabel: name, evidence: `${name}, recrutement officiel SmartRecruiters`, name, title: value.name || job.name,
+          url: `https://jobs.smartrecruiters.com/${identifier}/${job.id}`, applyUrl: value.applyUrl || '', sourceId: `${identifier}:${job.id}`,
+          location: location.fullLocation || location.city || '', country: location.country || '', contract: value.typeOfEmployment?.label || '',
+          workplace: location.remote ? 'Remote' : location.hybrid ? 'Hybride' : 'Sur site selon le champ publié', published: value.releasedDate, text, variantIds: variants.get(key), careersUrl: `https://jobs.smartrecruiters.com/${identifier}`,
+        }
+      })
+      results.forEach((result, index) => { if (result.ok) board.listings.push(result.value); else board.errors.push({ source: `${identifier}:${entries[index][1].id}`, error: result.error.message }) })
+      board.matched = board.listings.length
+    } catch (error) { board.complete = false; board.errors.push({ source: identifier, error: error.message }) }
+    boards.push(board)
+  }
+  return boards
+}
+
+export async function lever({ http, config }) {
+  const settings = config.sources.lever
+  const boards = []
+  for (const [identifier, name] of Object.entries(settings.boards)) {
+    const board = empty('lever', name, identifier)
+    try {
+      const jobs = await http.json(`https://api.lever.co/v0/postings/${identifier}?mode=json`)
+      if (!Array.isArray(jobs)) throw new Error('Lever returned a non-list payload')
+      board.listed = jobs.length
+      for (const job of jobs.filter((entry) => ROLE_PATTERN.test(entry.text))) {
+        board.seenIds.push(offerId(`${identifier}:${job.id}`))
+        const text = [job.descriptionPlain, job.additionalPlain, ...(job.lists || []).map((entry) => entry.content)].join(' ')
+        const categories = job.categories || {}
+        board.listings.push({
+          sourceKey: `lever:${identifier}`, sourceLabel: name, evidence: `${name}, recrutement officiel Lever`, name, title: job.text, url: job.hostedUrl, applyUrl: job.applyUrl,
+          sourceId: `${identifier}:${job.id}`, location: categories.location || '', country: job.country || '', contract: categories.commitment || '', workplace: job.workplaceType || '',
+          published: job.createdAt, text, careersUrl: `https://jobs.lever.co/${identifier}`, extra: job.salaryRange ? `Rémunération publiée : ${JSON.stringify(job.salaryRange)}` : '',
+        })
+      }
+      board.matched = board.listings.length
+    } catch (error) { board.complete = false; board.errors.push({ source: identifier, error: error.message }) }
+    boards.push(board)
+  }
+  return boards
+}
+
+export async function greenhouse({ http, config }) {
+  const settings = config.sources.greenhouse
+  const boards = []
+  for (const [identifier, name] of Object.entries(settings.boards)) {
+    const board = empty('greenhouse', name, identifier)
+    try {
+      const payload = await http.json(`https://boards-api.greenhouse.io/v1/boards/${identifier}/jobs?content=true`)
+      const jobs = payload.jobs
+      if (!Array.isArray(jobs)) throw new Error('Greenhouse returned no job list')
+      board.listed = jobs.length
+      const groups = new Map()
+      for (const job of jobs.filter((entry) => ROLE_PATTERN.test(entry.title))) {
+        board.seenIds.push(offerId(`${identifier}:${job.id}`))
+        const key = job.internal_job_id || job.id
+        groups.set(key, [...(groups.get(key) || []), job])
+      }
+      for (const variants of groups.values()) {
+        const job = variants.find((entry) => !entry.location?.name?.includes('BLANK')) || variants[0]
+        const place = (entry) => String(entry.location?.name || '').replace('BLANK,BLANK,', '')
+        board.listings.push({
+          sourceKey: `greenhouse:${identifier}`, sourceLabel: name, evidence: `${name}, recrutement officiel Greenhouse`, name, title: job.title, url: job.absolute_url, applyUrl: job.absolute_url,
+          sourceId: `${identifier}:${job.id}`, location: place(job), country: '', contract: 'Non précisé dans les données structurées', workplace: 'Voir conditions ; remote non présumé',
+          published: job.first_published || '', text: job.content || '', careersUrl: `https://boards.greenhouse.io/${identifier}`, variantIds: variants.map((entry) => offerId(`${identifier}:${entry.id}`)),
+          extra: variants.length > 1 ? `Même recrutement sous plusieurs localisations : ${variants.map((entry) => `${place(entry)}: ${entry.absolute_url}`).join(' / ')}` : '',
+        })
+      }
+      board.matched = board.listings.length
+    } catch (error) { board.complete = false; board.errors.push({ source: identifier, error: error.message }) }
+    boards.push(board)
+  }
+  return boards
+}
+
+export async function ashby({ http, config }) {
+  const settings = config.sources.ashby
+  const boards = []
+  for (const [identifier, name] of Object.entries(settings.boards)) {
+    const board = empty('ashby', name, identifier)
+    try {
+      const payload = await http.json(`https://api.ashbyhq.com/posting-api/job-board/${identifier}?includeCompensation=true`)
+      if (!Array.isArray(payload.jobs)) throw new Error('Ashby returned no job list')
+      const jobs = payload.jobs.filter((entry) => entry.isListed !== false)
+      board.listed = jobs.length
+      for (const job of jobs.filter((entry) => ROLE_PATTERN.test(entry.title))) {
+        board.seenIds.push(offerId(`${identifier}:${job.id}`))
+        const salary = job.compensation?.compensationTierSummary
+        board.listings.push({
+          sourceKey: `ashby:${identifier}`, sourceLabel: name, evidence: `${name}, recrutement officiel Ashby`, name, title: job.title, url: job.jobUrl, applyUrl: job.applyUrl || job.jobUrl,
+          sourceId: `${identifier}:${job.id}`, location: job.location || '', country: job.address?.postalAddress?.addressCountry || '', contract: job.employmentType || '',
+          workplace: job.isRemote ? 'Remote' : job.workplaceType || '', published: job.publishedAt || '', text: job.descriptionHtml || job.descriptionPlain || '', careersUrl: `https://jobs.ashbyhq.com/${identifier}`,
+          extra: salary ? `Rémunération publiée : ${salary}` : '',
+        })
+      }
+      board.matched = board.listings.length
+    } catch (error) { board.complete = false; board.errors.push({ source: identifier, error: error.message }) }
+    boards.push(board)
+  }
+  return boards
+}
+
+export async function recruitee({ http, config }) {
+  const settings = config.sources.recruitee
+  const boards = []
+  for (const [identifier, name] of Object.entries(settings.boards)) {
+    const board = empty('recruitee', name, identifier)
+    try {
+      const payload = await http.json(`https://${identifier}.recruitee.com/api/offers/`)
+      if (!Array.isArray(payload.offers)) throw new Error('Recruitee returned no offer list')
+      const offers = payload.offers.filter((entry) => entry.status === undefined || entry.status === 'published')
+      board.listed = offers.length
+      for (const job of offers.filter((entry) => ROLE_PATTERN.test(entry.title))) {
+        board.seenIds.push(offerId(`${identifier}:${job.id}`))
+        board.listings.push({
+          sourceKey: `recruitee:${identifier}`, sourceLabel: name, evidence: `${name}, recrutement officiel Recruitee`, name, title: job.title, url: job.careers_url, applyUrl: job.careers_apply_url || job.careers_url,
+          sourceId: `${identifier}:${job.id}`, location: job.location || '', country: job.country_code || '', contract: String(job.employment_type_code || '').replace(/_/g, ' '),
+          workplace: job.remote ? 'Remote' : job.hybrid ? 'Hybride' : job.on_site ? 'Sur site' : '', published: job.published_at || job.created_at || '', text: `${job.description || ''} ${job.requirements || ''}`, careersUrl: `https://${identifier}.recruitee.com`,
+        })
+      }
+      board.matched = board.listings.length
+    } catch (error) { board.complete = false; board.errors.push({ source: identifier, error: error.message }) }
+    boards.push(board)
+  }
+  return boards
+}
+
+export async function breezy({ http, config }) {
+  const settings = config.sources.breezy
+  const boards = []
+  for (const [identifier, name] of Object.entries(settings.boards)) {
+    const board = empty('breezy', name, identifier)
+    try {
+      const positions = await http.json(`https://${identifier}.breezy.hr/json`)
+      if (!Array.isArray(positions)) throw new Error('Breezy returned no position list')
+      board.listed = positions.length
+      const selected = positions.filter((entry) => ROLE_PATTERN.test(entry.name))
+      board.seenIds = selected.map((entry) => offerId(`${identifier}:${entry.id}`))
+      const results = await mapLimited(selected, config.http.workers, async (job) => {
+        const page = await http.text(job.url)
+        const text = (page.match(/<div class="description">([\s\S]*?)<\/div>\s*<\/div>/) || [])[1] || ''
+        if (text.length < 80) throw new Error('Breezy page layout changed: no description found')
+        const place = job.location || {}
+        return {
+          sourceKey: `breezy:${identifier}`, sourceLabel: name, evidence: `${name}, recrutement officiel Breezy`, name, title: job.name, url: job.url, applyUrl: job.url, sourceId: `${identifier}:${job.id}`,
+          location: [place.city, place.country?.name].filter(Boolean).join(', '), country: place.country?.id || '', contract: job.type?.name || '', workplace: place.is_remote ? 'Remote' : '',
+          published: job.published_date || '', text, careersUrl: `https://${identifier}.breezy.hr`,
+        }
+      })
+      results.forEach((result, index) => { if (result.ok) board.listings.push(result.value); else board.errors.push({ source: selected[index].url, error: result.error.message }) })
+      board.matched = board.listings.length
+    } catch (error) { board.complete = false; board.errors.push({ source: identifier, error: error.message }) }
+    boards.push(board)
+  }
+  return boards
+}
+
+const tag = (block, name) => (block.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`)) || [])[1] || ''
+
+export async function teamtailor({ http, config }) {
+  const settings = config.sources.teamtailor
+  const boards = []
+  for (const [host, name] of Object.entries(settings.boards)) {
+    const board = empty('teamtailor', name, host)
+    try {
+      const feed = await http.text(`https://${host}/jobs.rss`)
+      if (!feed.includes('<rss')) throw new Error('Teamtailor returned no feed')
+      const items = [...feed.matchAll(/<item>([\s\S]*?)<\/item>/g)].map((match) => match[1])
+      board.listed = items.length
+      for (const item of items) {
+        const title = decodeEntities(tag(item, 'title')).trim()
+        if (!ROLE_PATTERN.test(title)) continue
+        const guid = tag(item, 'guid').trim()
+        board.seenIds.push(offerId(`${host}:${guid}`))
+        const city = tag(item, 'tt:city'), country = tag(item, 'tt:country')
+        board.listings.push({
+          sourceKey: `teamtailor:${host}`, sourceLabel: name, evidence: `${name}, recrutement officiel Teamtailor`, name, title, url: tag(item, 'link').trim(), applyUrl: tag(item, 'link').trim(), sourceId: `${host}:${guid}`,
+          location: [city, country].filter(Boolean).join(', '), country, contract: /freelance/i.test(title) ? 'Freelance' : '', workplace: tag(item, 'remoteStatus') || '',
+          published: tag(item, 'pubDate') ? new Date(tag(item, 'pubDate')).toISOString() : '', text: tag(item, 'description'), careersUrl: `https://${host}/jobs`,
+        })
+      }
+      board.matched = board.listings.length
+    } catch (error) { board.complete = false; board.errors.push({ source: host, error: error.message }) }
+    boards.push(board)
+  }
+  return boards
+}

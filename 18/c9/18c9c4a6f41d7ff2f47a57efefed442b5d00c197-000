@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Restructure the film cloud folder into <base>/{Anime,Movies,Series,Documentaries} (14 October 2026).
+
+Moves every file of the legacy folder (pages/Anime_Movies_Series) into its category folder, merges
+the duplicated work folders (Anime/Bleach vs Bleach), rewrites every reference (media.json master
+and mpd, m3u8 URIs) and validates the result. Nothing is deleted: a name collision keeps both
+files, the second one gets " (2)". Re-runnable: only what is still under the legacy folder moves.
+
+Usage (dry run by default):
+  RestructureCloud.py --clone <zenray-data clone> [--apply] [--report report.json]
+
+FR : deplace tout le dossier historique vers <base>/<Categorie>, fusionne les doublons de
+dossiers d'une meme oeuvre, reecrit les references et valide. Rien n'est supprime.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+from collections import defaultdict
+from pathlib import Path
+from urllib.parse import quote, unquote
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import WorkCategories as wc  # noqa: E402
+
+# A flat folder of a work that has a separate "Season NN" folder is its first season.
+# FR : le dossier plat d'une oeuvre qui a un dossier "Season NN" a part est sa saison 1.
+UNMARKED_FOLDER_SEASON = {'Peter Grill To Kenja No Jikan': 'Saison 01'}
+# Legacy sub-folder that only duplicated the category (Anime/Bleach).
+LEGACY_CATEGORY_FOLDERS = {'Anime'}
+PLAIN_REF = re.compile(r'pages/Anime_Movies_Series/([^"\\<>\n]*)')
+ENCODED_REF = re.compile(r'pages%2FAnime_Movies_Series%2F([^"&\s<>]*)')
+TEXT_SUFFIXES = ('.json', '.m3u8', '.mpd')
+STREAM_KEYS = ('master', 'mpd')
+
+
+def js_quote(text):
+    # Same alphabet as encodeURIComponent. / Meme alphabet que encodeURIComponent.
+    return quote(text, safe="!~*'()")
+
+
+class Restructure:
+    def __init__(self, clone, table):
+        self.clone = Path(clone)
+        self.table = table
+        self.legacy = table['legacyBase']
+        self.base = table['base']
+        self.legacy_dir = self.clone / self.legacy
+        self.base_dir = self.clone / self.base
+        self.files = []          # relative paths under legacy
+        self.owner_category = {}  # stream dir name -> category
+        self.moves = {}          # old rel -> new rel (under base)
+        self.flags = []
+
+    # ---- scan -----------------------------------------------------------------
+    def scan(self):
+        for root, _dirs, names in os.walk(self.legacy_dir):
+            for name in names:
+                self.files.append(os.path.relpath(os.path.join(root, name), self.legacy_dir))
+        self.files.sort()
+        for rel in self.files:
+            if rel.endswith('.media.json'):
+                for key in STREAM_KEYS:
+                    ref = self.manifest(rel).get(key)
+                    if ref and f'{self.legacy}/.streams/' in ref:
+                        found = wc.classify(os.path.basename(rel), self.table)
+                        if found:
+                            stream_dir = ref.split('/.streams/', 1)[1].split('/', 1)[0]
+                            self.owner_category[stream_dir] = found[0]
+
+    def manifest(self, rel):
+        try:
+            return json.loads((self.legacy_dir / rel).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return {}
+
+    def has_streaming(self, rel):
+        data = self.manifest(rel)
+        return bool(data.get('master') and data.get('mpd'))
+
+    # ---- mapping of one file ----------------------------------------------------
+    def desired(self, rel):
+        parts = rel.split('/')
+        top = parts[0]
+        if rel == '.zrfolder.json':
+            return '.zrfolder.json'
+        if top == '.streams':
+            category = self.owner_category.get(parts[1])
+            if category is None:
+                self.flags.append(f'stream without known owner kept at root: {rel}')
+                return f'.streams/{"/".join(parts[1:])}'
+            return f'{category}/.streams/{"/".join(parts[1:])}'
+        if len(parts) == 1:  # loose film manifest or loose stream file
+            found = wc.classify(top, self.table)
+            if not found:
+                self.flags.append(f'unknown work kept at root: {rel}')
+                return rel
+            category, work = found
+            return f'{category}/{work}/{rel}' if work == 'Hors Normes' else f'{category}/{rel}'
+        if top in LEGACY_CATEGORY_FOLDERS:
+            found = wc.classify(parts[1], self.table)
+            if not found:
+                self.flags.append(f'unknown work under {top}: {rel}')
+                return f'{top}/{"/".join(parts[1:])}'
+            category, work = found
+            rest = parts[2:]
+            if len(rest) == 1:  # file directly under the work folder
+                season = wc.season_folder(rest[0])
+                return f'{category}/{work}/{season}/{rest[0]}' if season else f'{category}/{work}/{rest[0]}'
+            season = wc.season_folder(rest[0])
+            if season and rest[0] != season:
+                rest = [season] + rest[1:]
+            return f'{category}/{work}/{"/".join(rest)}'
+        found = wc.classify(top, self.table)
+        if not found:
+            self.flags.append(f'unknown work folder kept at root: {rel}')
+            return rel
+        category, work = found
+        rest = parts[1:]
+        marker = wc.season_folder(top) if top != work else None
+        if marker:
+            return f'{category}/{work}/{marker}/{"/".join(rest)}'
+        if top == work and work in UNMARKED_FOLDER_SEASON and wc.season_folder(rest[0]) is None:
+            return f'{category}/{work}/{UNMARKED_FOLDER_SEASON[work]}/{"/".join(rest)}'
+        return f'{category}/{work}/{"/".join(rest)}'
+
+    # ---- collisions -------------------------------------------------------------
+    @staticmethod
+    def with_suffix(path, number):
+        head, name = path.rsplit('/', 1) if '/' in path else ('', path)
+        if name.endswith('.media.json'):
+            stem, suffix = name[:-len('.media.json')], '.media.json'
+        else:
+            stem, suffix = name, ''
+        if '.' in stem:
+            stem, ext = stem.rsplit('.', 1)
+            stem, suffix = f'{stem} ({number})', f'.{ext}{suffix}'
+        else:
+            stem = f'{stem} ({number})'
+        return f'{head}/{stem}{suffix}' if head else f'{stem}{suffix}'
+
+    @staticmethod
+    def canon(path):
+        # The cloud clone lives on a case-insensitive disk: names that differ only by case or by
+        # Unicode form are the same file. / Disque insensible a la casse : meme fichier.
+        return unicodedata.normalize('NFC', path).casefold()
+
+    def plan(self):
+        wanted = defaultdict(list)
+        for rel in self.files:
+            target = self.desired(rel)
+            wanted[self.canon(target)].append((rel, target))
+        taken = set()
+        for key, entries in wanted.items():
+            if len(entries) == 1:
+                taken.add(key)
+        for existing_root, _dirs, names in os.walk(self.base_dir):
+            for name in names:
+                taken.add(self.canon(os.path.relpath(os.path.join(existing_root, name), self.base_dir)))
+        for key in sorted(wanted):
+            entries = wanted[key]
+            if len(entries) == 1:
+                rel, target = entries[0]
+                self.moves[rel] = target
+                continue
+            if not entries[0][1].endswith('.media.json'):
+                raise SystemExit(f'collision on a non manifest file, stop: {entries}')
+            ranked = sorted(entries, key=lambda e: (0 if self.has_streaming(e[0]) else 1,
+                                                    0 if not e[0].startswith('Anime/') else 1, e[0]))
+            number = 2
+            for position, (rel, target) in enumerate(ranked):
+                if position == 0 and key not in taken:
+                    self.moves[rel] = target
+                    taken.add(key)
+                    continue
+                if position == 0:
+                    self.flags.append(f'collision with an existing file: {target}')
+                candidate = self.with_suffix(target, number)
+                while self.canon(candidate) in taken:
+                    number += 1
+                    candidate = self.with_suffix(target, number)
+                taken.add(self.canon(candidate))
+                self.moves[rel] = candidate
+                number += 1
+        return self.moves
+
+    # ---- references -------------------------------------------------------------
+    def new_path_of_reference(self, rel_old):
+        if rel_old in self.moves:
+            return self.moves[rel_old]
+        self.flags.append(f'reference to a file that is not in the tree: {rel_old}')
+        return self.desired(rel_old)
+
+    def rewrite_text(self, text):
+        def plain(match):
+            raw = match.group(1)
+            old = json.loads(f'"{raw}"')
+            new = self.new_path_of_reference(old)
+            escaped = json.dumps(new, ensure_ascii=('\\u' in raw))[1:-1]
+            return f'{self.base}/{escaped}'
+
+        def encoded(match):
+            old = unquote(match.group(1))
+            return f'pages%2F{self.base.split("/", 1)[1]}%2F{js_quote(self.new_path_of_reference(old))}'
+
+        text = PLAIN_REF.sub(plain, text)
+        return ENCODED_REF.sub(encoded, text)
+
+    # ---- apply ------------------------------------------------------------------
+    def apply(self):
+        for old, new in sorted(self.moves.items()):
+            source, target = self.legacy_dir / old, self.base_dir / new
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, target)
+        for new in self.moves.values():
+            path = self.base_dir / new
+            if not new.endswith(TEXT_SUFFIXES):
+                continue
+            text = path.read_text(encoding='utf-8')
+            rewritten = self.rewrite_text(text)
+            if rewritten != text:
+                path.write_text(rewritten, encoding='utf-8')
+        for root, dirs, names in os.walk(self.legacy_dir, topdown=False):
+            if not os.listdir(root):
+                os.rmdir(root)
+        # Folder markers so the empty-folder view keeps the four categories. / Marqueurs de dossier.
+        for category in self.table['categories']:
+            marker = self.base_dir / category / '.zrfolder.json'
+            if not marker.exists():
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(json.dumps({'folder': True, 'createdAt': int(time.time() * 1000)}), encoding='utf-8')
+
+
+def validate(clone, base, streaming_keys=STREAM_KEYS):
+    """Every manifest parses and every master/mpd it names exists. / Manifestes valides."""
+    base_dir = Path(clone) / base
+    manifests, bad_json, missing = 0, [], []
+    for root, _dirs, names in os.walk(base_dir):
+        for name in names:
+            if not name.endswith('.media.json'):
+                continue
+            manifests += 1
+            path = Path(root) / name
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+            except ValueError as error:
+                bad_json.append(f'{path}: {error}')
+                continue
+            for key in streaming_keys:
+                ref = data.get(key)
+                if ref and not (Path(clone) / ref).is_file():
+                    missing.append(f'{os.path.relpath(path, clone)} -> {key} {ref}')
+    return {'manifests': manifests, 'badJson': bad_json, 'missingStreams': missing}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    parser.add_argument('--clone', required=True)
+    parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--report')
+    parser.add_argument('--table', default=str(wc.TABLE_PATH))
+    args = parser.parse_args(argv)
+    table = wc.load_table(args.table)
+    job = Restructure(args.clone, table)
+    job.scan()
+    before = validate(args.clone, table['legacyBase'])
+    job.plan()
+    summary = {
+        'files': len(job.files), 'moves': len(job.moves), 'flags': job.flags,
+        'renamedOnCollision': {o: n for o, n in job.moves.items() if re.search(r' \(\d+\)\.', n) and not re.search(r' \(\d+\)\.', o)},
+        'before': before,
+    }
+    if args.apply:
+        job.apply()
+        summary['after'] = validate(args.clone, table['base'])
+        summary['legacyLeft'] = sum(len(f) for _r, _d, f in os.walk(job.legacy_dir)) if job.legacy_dir.exists() else 0
+    summary['mapping'] = job.moves
+    if args.report:
+        Path(args.report).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+    view = {k: v for k, v in summary.items() if k != 'mapping'}
+    print(json.dumps(view, ensure_ascii=False, indent=2)[:6000])
+    ok = not before['badJson'] and (not args.apply or (not summary['after']['badJson'] and summary['legacyLeft'] == 0))
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

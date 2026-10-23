@@ -1,0 +1,167 @@
+// V — Importeur Eagle -> drive ZenRay (modèle "fichier média pur", style Finder).
+// Pour chaque image AVIF d'Eagle :
+//   - le binaire part dans un repo SHARD PRIVÉ (zenray-media-NN), nom ANONYMISÉ (hash, sous-dossiers ab/cd/)
+//   - un noeud .img.json (manifest léger {repo, path, name, w, h, tags...}) est créé dans zenray-content
+//     SOUS pages/References/<arborescence Eagle reproduite>/<name>.img.json
+//   - un fichier de tracking (scripts/.eagle-import.json) note chaque item fait -> reprise + anti-ban + remplissage shards.
+// Anti-ban : blobs créés en petits lots, UN commit Git Data API par lot (peu de commits), pauses légères.
+// Usage : GITHUB_TOKEN=$(gh auth token) node scripts/eagle-import.mjs [--limit N | --half | --all] [--batch 150]
+import { readFile, writeFile, readdir } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
+const LIB = process.env.EAGLE_LIB || '/Users/zenray/Create/Media/References/References.library'
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const CONTENT_REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-content'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const TOKEN = process.env.GITHUB_TOKEN
+const SHARD_CAP = 4.5 * 1024 * 1024 * 1024 // bascule de shard à ~4,5 Go
+const TRACK = path.join(path.dirname(new URL(import.meta.url).pathname), '.eagle-import.json')
+
+const args = process.argv.slice(2)
+const getArg = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d }
+const MODE = args.includes('--all') ? 'all' : args.includes('--half') ? 'half' : 'limit'
+const LIMIT = MODE === 'limit' ? parseInt(getArg('--limit', '200'), 10) : Infinity
+const BATCH = parseInt(getArg('--batch', '150'), 10)
+if (!TOKEN) { console.error('no GITHUB_TOKEN'); process.exit(1) }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const ghAbs = (p, init = {}) => fetch(`https://api.github.com/${p}`, { ...init, headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-import', ...(init.headers || {}) } })
+const gh = (repo, p, init) => ghAbs(`repos/${repo}/${p}`, init)
+const hash = (s) => createHash('sha1').update(s).digest('hex')
+const sanitize = (s) => String(s || '').replace(/[^\p{L}\p{N} ._-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 80) || '_'
+
+// ---- 1) Arborescence des dossiers Eagle -> chemin complet par id ----
+function buildFolderPaths(folders, prefix, map) {
+  for (const f of folders || []) {
+    const p = prefix ? `${prefix}/${sanitize(f.name)}` : sanitize(f.name)
+    map.set(f.id, p)
+    if (f.children && f.children.length) buildFolderPaths(f.children, p, map)
+  }
+  return map
+}
+
+// ---- 2) Tracking ----
+async function loadTrack() { try { return JSON.parse(await readFile(TRACK, 'utf8')) } catch { return { done: {}, shards: {}, started: new Date().toISOString() } } }
+async function saveTrack(t) { await writeFile(TRACK, JSON.stringify(t, null, 2)) }
+
+// ---- 3) Gestion des shards privés ----
+const _shardOk = new Set()
+async function ensureShard(name) {
+  if (_shardOk.has(name)) return true
+  const r = await ghAbs(`repos/${OWNER}/${name}`)
+  if (r.ok) { _shardOk.add(name); return true }
+  const cr = await ghAbs('user/repos', { method: 'POST', body: JSON.stringify({ name, private: true, auto_init: true, description: 'ZenRay drive — shard media (images hashées)' }) })
+  if (!cr.ok) { console.error('create shard', name, await cr.text()); return false }
+  await sleep(1500) // laisse GitHub initialiser
+  _shardOk.add(name); return true
+}
+// POST blob avec auto-backoff si GitHub renâcle (secondary rate limit / 403 / 429). Rapide tant que permis.
+async function blobWithBackoff(repo, b64) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const r = await gh(repo, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: b64, encoding: 'base64' }) })
+    if (r.ok) return (await r.json()).sha
+    if (r.status === 403 || r.status === 429) {
+      const ra = parseInt(r.headers.get('retry-after') || '0', 10)
+      const wait = ra ? ra * 1000 : Math.min(60000, 2000 * 2 ** attempt)
+      process.stdout.write(`\n  ⏳ GitHub limite (${r.status}), pause ${(wait / 1000).toFixed(0)}s...`)
+      await sleep(wait); continue
+    }
+    const t = await r.text(); console.error('\nblob', r.status, t.slice(0, 120)); return null
+  }
+  return null
+}
+async function commitBlobs(repo, entries, message) {
+  // entries: [{path, sha}] ou [{path, content}] (content = blob inline, 0 requête). 1 commit atomique.
+  const headSha = (await (await gh(repo, `git/ref/heads/${BRANCH}`)).json()).object.sha
+  const baseTree = (await (await gh(repo, `git/commits/${headSha}`)).json()).tree.sha
+  const tree = entries.map((e) => e.sha ? ({ path: e.path, mode: '100644', type: 'blob', sha: e.sha }) : ({ path: e.path, mode: '100644', type: 'blob', content: e.content }))
+  const newTree = (await (await gh(repo, 'git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree }) })).json()).sha
+  const newCommit = (await (await gh(repo, 'git/commits', { method: 'POST', body: JSON.stringify({ message, tree: newTree, parents: [headSha] }) })).json()).sha
+  const pr = await gh(repo, `git/refs/heads/${BRANCH}`, { method: 'PATCH', body: JSON.stringify({ sha: newCommit, force: false }) })
+  if (!pr.ok) throw new Error('ref ' + repo + ' ' + (await pr.text()).slice(0, 120))
+}
+
+// ---- MAIN ----
+const meta = JSON.parse(await readFile(path.join(LIB, 'metadata.json'), 'utf8'))
+const folderPaths = buildFolderPaths(meta.folders, '', new Map())
+console.log(`dossiers Eagle: ${folderPaths.size}`)
+
+const dirs = (await readdir(path.join(LIB, 'images'))).filter((d) => d.endsWith('.info'))
+console.log(`items Eagle: ${dirs.length} — lecture des metadata pour filtrer les AVIF...`)
+
+const track = await loadTrack()
+let shardNum = track.curShard || 1
+let shardName = `zenray-media-${String(shardNum).padStart(2, '0')}`
+let shardBytes = (track.shards[shardName] && track.shards[shardName].bytes) || 0
+
+// collecte des items AVIF non encore faits
+const items = []
+for (const d of dirs) {
+  const id = d.replace(/\.info$/, '')
+  if (track.done[id]) continue
+  let m; try { m = JSON.parse(await readFile(path.join(LIB, 'images', d, 'metadata.json'), 'utf8')) } catch { continue }
+  if ((m.ext || '').toLowerCase() !== 'avif') continue
+  items.push({ id, dir: d, name: m.name, ext: m.ext, w: m.width, h: m.height, size: m.size || 0, tags: m.tags || [], folders: m.folders || [], btime: m.btime || 0 })
+  if (MODE === 'limit' && items.length >= LIMIT) break // pilote : pas besoin de tout scanner
+}
+console.log(`AVIF restants à importer: ${items.length}`)
+const targetCount = MODE === 'half' ? Math.ceil(items.length / 2) : MODE === 'all' ? items.length : Math.min(LIMIT, items.length)
+const work = items.slice(0, targetCount)
+console.log(`mode=${MODE} -> ${work.length} images cette passe, batch=${BATCH}\n`)
+
+const t0 = performance.now()
+let doneCount = 0, uploadedBytes = 0
+for (let b = 0; b < work.length; b += BATCH) {
+  const batch = work.slice(b, b + BATCH)
+  // bascule de shard si plein
+  if (shardBytes >= SHARD_CAP) { shardNum++; shardName = `zenray-media-${String(shardNum).padStart(2, '0')}`; shardBytes = 0 }
+  await ensureShard(shardName)
+
+  // 3a) uploader les blobs binaires dans le shard (concurrence modérée)
+  const shardEntries = [], nodeEntries = []
+  let i = 0
+  const worker = async () => {
+    while (i < batch.length) {
+      const it = batch[i++]
+      const buf = await readFile(path.join(LIB, 'images', it.dir, `${it.name}.${it.ext}`)).catch(() => null)
+      if (!buf) continue
+      const h = hash(it.id)
+      const shardPath = `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.avif` // nom anonymisé, sous-dossiers
+      const sha = await blobWithBackoff(`${OWNER}/${shardName}`, buf.toString('base64'))
+      if (!sha) continue
+      shardEntries.push({ path: shardPath, sha, it, buf })
+    }
+  }
+  await Promise.all(Array.from({ length: 10 }, worker))
+
+  // 3b) commit binaire dans le shard
+  if (shardEntries.length) await commitBlobs(`${OWNER}/${shardName}`, shardEntries.map((e) => ({ path: e.path, sha: e.sha })), `import ${shardEntries.length} images`)
+
+  // 3c) noeuds .img.json dans zenray-content — manifestes EN CLAIR dans l'arbre (0 requête blob), 1 commit
+  for (const e of shardEntries) {
+    const it = e.it
+    const folderPath = it.folders.length ? (folderPaths.get(it.folders[0]) || '_Unsorted') : '_Unsorted'
+    e.nodePath = `pages/References/${folderPath}/${sanitize(it.name)}.${it.id}.img.json`
+    e.nodeContent = JSON.stringify({ type: 'image', v: 1, repo: shardName, path: e.path, name: it.name, ext: 'avif', w: it.w, h: it.h, size: it.size, tags: it.tags, addedAt: it.btime, eagleId: it.id })
+    shardBytes += e.buf.length; uploadedBytes += e.buf.length
+  }
+  if (shardEntries.length) await commitBlobs(CONTENT_REPO, shardEntries.map((e) => ({ path: e.nodePath, content: e.nodeContent })), `import ${shardEntries.length} noeuds image`)
+
+  // 3d) tracking
+  for (const e of shardEntries) { track.done[e.it.id] = { shard: shardName, path: e.path, node: e.nodePath } }
+  track.shards[shardName] = { bytes: shardBytes }
+  track.curShard = shardNum
+  await saveTrack(track)
+  doneCount += shardEntries.length
+
+  const rate = doneCount / ((performance.now() - t0) / 1000)
+  process.stdout.write(`\rfait ${doneCount}/${work.length} — ${(uploadedBytes / 1048576).toFixed(0)} Mo — ${rate.toFixed(1)} img/s — shard ${shardName} ${(shardBytes / 1073741824).toFixed(2)} Go`)
+  await sleep(80) // respiration légère (le backoff auto gère les vraies limites)
+}
+
+const secs = (performance.now() - t0) / 1000
+console.log(`\n\nterminé: ${doneCount} images en ${secs.toFixed(0)}s (${(doneCount / secs).toFixed(1)} img/s, ${(uploadedBytes / 1048576 / secs).toFixed(1)} Mo/s)`)
+const remaining = items.length - doneCount
+if (remaining > 0 && doneCount > 0) console.log(`extrapolation: ${remaining} AVIF restants ~= ${(remaining / (doneCount / secs) / 60).toFixed(0)} min`)
+console.log(`tracking: ${TRACK}`)

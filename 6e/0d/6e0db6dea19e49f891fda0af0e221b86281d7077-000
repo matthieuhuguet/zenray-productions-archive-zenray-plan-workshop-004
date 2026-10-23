@@ -1,0 +1,75 @@
+// /api/video-comment — commentaires publics sous une vidéo (lecteur normal ET page de partage /watch).
+// Même patron que page.js (Git Data API, pas de base de données) : chaque commentaire est APPENDÉ à un
+// fichier JSON dédié `pages/_comments/<hash du chemin vidéo>.json` (array de {name, text, at}) dans le
+// repo content (zenray-data). Un visiteur d'un lien /watch peut commenter SANS mot de passe : cette route
+// est déclarée PUBLIQUE dans api/[...route].js (comme img/stream/hls), donc jamais gatée par x-zr-auth.
+import { createHash } from 'node:crypto'
+import { instrument } from './cmdlog.js'
+
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+const ghRaw = (token, path, init = {}) =>
+  fetch(`https://api.github.com/repos/${REPO}/${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) },
+  })
+const gh = instrument(ghRaw, { repoOf: () => REPO, pathOf: (args) => args[1], initOf: (args) => args[2] || {} })
+const b64e = (s) => Buffer.from(s, 'utf8').toString('base64')
+const b64d = (s) => Buffer.from(s, 'base64').toString('utf8')
+
+// hash court et stable du chemin vidéo -> nom de fichier commentaires (pas de caractères spéciaux/longueur imprévisible).
+const hashPath = (p) => createHash('sha256').update(String(p)).digest('hex').slice(0, 24)
+const fileFor = (videoPath) => `pages/_comments/${hashPath(videoPath)}.json`
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(200).json({ error: 'no-token' })
+  res.setHeader('Cache-Control', 'no-store')
+
+  try {
+    if (req.method === 'GET') {
+      const videoPath = (req.query.videoPath || '').toString()
+      if (!videoPath) return res.status(400).json({ error: 'bad-path' })
+      const file = fileFor(videoPath)
+      // Lecture RAW (hors quota REST) : liste de commentaires, lecture pure, pas de sha nécessaire.
+      const rr = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(file)}`, { headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' } })
+      if (rr.status === 404) return res.status(200).json({ comments: [] })
+      if (!rr.ok) return res.status(200).json({ comments: [], error: 'github' })
+      try { const arr = JSON.parse(await rr.text()); return res.status(200).json({ comments: Array.isArray(arr) ? arr : [] }) }
+      catch { return res.status(200).json({ comments: [] }) }
+    }
+
+    if (req.method === 'POST') {
+      let body = req.body
+      if (typeof body === 'string') { try { body = JSON.parse(body) } catch { body = {} } }
+      const videoPath = (body.videoPath || '').toString()
+      const name = (body.name || '').toString().trim().slice(0, 60)
+      const text = (body.text || '').toString().trim().slice(0, 1000)
+      if (!videoPath || !name || !text) return res.status(400).json({ error: 'bad-input' })
+      const file = fileFor(videoPath)
+      const entry = { name, text, at: new Date().toISOString() }
+
+      // Read-modify-write avec retry sur conflit (409/422), comme saveJsonWithRetry côté client pour `page`.
+      for (let i = 0; i < 3; i++) {
+        let cur = []; let sha = null
+        const r = await gh(token, `contents/${encodeURI(file)}?ref=${BRANCH}`)
+        if (r.ok) { const j = await r.json(); sha = j.sha; try { cur = JSON.parse(b64d(j.content)) } catch { cur = [] } }
+        else if (r.status !== 404) return res.status(200).json({ error: 'github' })
+        const next = [...(Array.isArray(cur) ? cur : []), entry].slice(-500) // borne raisonnable
+        const payload = { message: 'video comment', content: b64e(JSON.stringify(next, null, 2)), branch: BRANCH }
+        if (sha) payload.sha = sha
+        const w = await gh(token, `contents/${encodeURI(file)}`, { method: 'PUT', body: JSON.stringify(payload) })
+        if (w.ok) return res.status(200).json({ ok: true, comment: entry })
+        if (w.status === 409 || w.status === 422) continue // HEAD a bougé -> on relit et rejoue
+        return res.status(200).json({ error: 'github' })
+      }
+      return res.status(200).json({ error: 'conflict' })
+    }
+
+    res.setHeader('Allow', 'GET, POST')
+    return res.status(405).end()
+  } catch (e) {
+    return res.status(200).json({ error: 'fetch', detail: String((e && e.message) || e).slice(0, 160) })
+  }
+}

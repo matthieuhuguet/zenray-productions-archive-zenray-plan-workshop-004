@@ -1,0 +1,86 @@
+// INGESTION D'IMAGE RÉSILIENTE pour le Shelf.
+// Prend une URL externe (API média, web) OU un dataUrl (fichier local converti), télécharge les octets CÔTÉ
+// SERVEUR (pas de CORS), les stocke dans le repo PUBLIC `zenray-shelf-img`, et renvoie une URL jsDelivr
+// ÉPINGLÉE AU COMMIT (immuable, servie par le CDN). But : ne plus dépendre de l'hôte d'origine — les API média
+// peuvent tomber, jsDelivr non. Layout PLAT à la racine (cohérent avec le seed : `<slug>-<rand>.<ext>`).
+import { logStart, logEnd, describeCommand } from './cmdlog.js'
+
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const REPO = process.env.SHELF_IMG_REPO || 'zenrayshards-img-124ff562adad' // ex zenray-shelf-img, renommé 2026-07-05 (rename v2) — les ÉCRITURES API ne suivent pas la redirection GitHub, d'où la mise à jour
+const BRANCH = process.env.SHELF_IMG_BRANCH || 'main'
+const MAX_BYTES = 12 * 1024 * 1024 // 12 Mo : large pour un poster, borne anti-abus.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+const slug = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 48) || 'poster'
+const extFor = (ct, url) => {
+  ct = (ct || '').toLowerCase()
+  if (ct.includes('webp')) return 'webp'
+  if (ct.includes('avif')) return 'avif'
+  if (ct.includes('png')) return 'png'
+  if (ct.includes('gif')) return 'gif'
+  if (ct.includes('jpeg') || ct.includes('jpg')) return 'jpg'
+  const m = (url || '').split('?')[0].match(/\.(jpe?g|png|webp|avif|gif)$/i)
+  return m ? m[1].toLowerCase().replace('jpeg', 'jpg') : 'jpg'
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return res.status(405).end() }
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(200).json({ ok: false, error: 'no-token' })
+
+  let body = req.body
+  if (typeof body === 'string') { try { body = JSON.parse(body) } catch { body = {} } }
+  const { url, dataUrl, name, cat } = body || {}
+
+  // 1) Récupérer les octets : dataUrl direct, ou fetch serveur de l'URL externe.
+  let buf = null, ct = ''
+  try {
+    if (dataUrl && /^data:image\//.test(dataUrl)) {
+      ct = dataUrl.slice(5, dataUrl.indexOf(';'))
+      buf = Buffer.from(dataUrl.split(',')[1] || '', 'base64')
+    } else if (url && /^https?:\/\//.test(url)) {
+      // Retry : la source (RAWG/TMDB/CDN) peut renvoyer un 5xx/timeout ponctuel. 3 tentatives -> évite l'échec
+      // d'ingestion qui laissait une image non stockée (donc noire) côté client.
+      let r = null, lastStatus = 0
+      for (let i = 0; i < 3; i++) {
+        try { r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 zenray-progress', Accept: 'image/*,*/*' }, redirect: 'follow' }) } catch { r = null }
+        if (r && r.ok) break
+        lastStatus = r ? r.status : 0
+        if (i < 2) await sleep(500 * (i + 1))
+      }
+      if (!r || !r.ok) return res.status(200).json({ ok: false, error: 'fetch-failed', httpStatus: lastStatus })
+      ct = r.headers.get('content-type') || ''
+      buf = Buffer.from(await r.arrayBuffer())
+    } else {
+      return res.status(400).json({ ok: false, error: 'bad-input' })
+    }
+  } catch (e) { return res.status(200).json({ ok: false, error: 'fetch-exception', detail: e && e.message }) }
+
+  if (!buf || !buf.length) return res.status(200).json({ ok: false, error: 'empty' })
+  if (buf.length > MAX_BYTES) return res.status(200).json({ ok: false, error: 'too-large', bytes: buf.length })
+  // Tolérance : certains hôtes renvoient octet-stream ; on accepte si l'URL porte une extension image.
+  if (ct && !ct.startsWith('image/') && !/\.(jpe?g|png|webp|avif|gif)(\?|$)/i.test(url || '')) {
+    return res.status(200).json({ ok: false, error: 'not-image', contentType: ct })
+  }
+
+  const ext = extFor(ct, url)
+  const rand = Math.random().toString(16).slice(2, 6)
+  const path = `${slug(cat ? `${cat}-${name}` : name)}-${rand}.${ext}`
+  const b64 = buf.toString('base64')
+
+  // 2) PUT dans le repo public + récupérer le SHA du commit pour épingler jsDelivr (immuable).
+  const logId = logStart({ repo: `${OWNER}/${REPO}`, dir: `contents/${path}`, action: 'put', command: describeCommand('PUT', `contents/${path}`) })
+  try {
+    const put = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/contents/${encodeURI(path)}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress' },
+      body: JSON.stringify({ message: `shelf poster: ${name || path}`, content: b64, branch: BRANCH }),
+    })
+    if (!put.ok) { const t = await put.text(); logEnd(logId, { httpStatus: put.status, detail: t.slice(0, 200) }); return res.status(200).json({ ok: false, error: 'put-failed', httpStatus: put.status, detail: t.slice(0, 200) }) }
+    const j = await put.json()
+    logEnd(logId, { httpStatus: put.status })
+    const sha = (j && j.commit && j.commit.sha) || BRANCH
+    const cdn = `https://cdn.jsdelivr.net/gh/${OWNER}/${REPO}@${sha}/${encodeURI(path)}`
+    return res.status(200).json({ ok: true, url: cdn, path, sha, bytes: buf.length })
+  } catch (e) { logEnd(logId, { status: 'failed', detail: e && e.message }); return res.status(200).json({ ok: false, error: 'put-exception', detail: e && e.message }) }
+}

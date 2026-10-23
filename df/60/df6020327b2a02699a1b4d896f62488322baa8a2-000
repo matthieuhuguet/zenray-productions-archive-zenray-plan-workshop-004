@@ -1,0 +1,612 @@
+// >>> PIVOT CMAF/fMP4 (repackaging sans perte, VP9 inclus) : voir docs/video-backup-canonical.md. Le .ts ci-dessous est le legacy.
+// video-hls-lib.mjs — coeur RÉUTILISABLE du transcodage HLS (HTTP Live Streaming).
+// JUMEAU de video-mse-lib.mjs, même philosophie, même chemins Git Data API SÛRS.
+//
+// CE QUE FAIT CE MODULE (en clair) :
+//   Il prend une vidéo locale et la découpe en « morceaux de quelques secondes » (segments HLS),
+//   le standard utilisé par YouTube/Netflix/Apple. ffmpeg produit :
+//     - un master.m3u8        (la carte : « voici la vidéo, voici les pistes audio, voici les sous-titres »)
+//     - des media playlists    (stream_0.m3u8 = vidéo, stream_1.m3u8 = audio FR, etc. : la liste ordonnée des segments)
+//     - des segments .m4s      (les morceaux vidéo/audio eux-mêmes, format CMAF fMP4)
+//     - des init_*.mp4         (la « carte d'identité » de chaque piste, à charger avant ses segments)
+//     - des sous-titres VTT    (texte)
+//
+// OÙ VONT LES FICHIERS (la séparation clé) :
+//   - les BINAIRES (.m4s, init_*.mp4, .vtt) sont NOMMÉS PAR LEUR EMPREINTE SHA-256 (anonymisés),
+//     rangés sous ab/cd/<hash>.<ext>, et poussés sur un SHARD PRIVÉ (zenray-media-NN).
+//   - les PLAYLISTS (.m3u8) + le manifest .media.json {type:'hls'} sont du TEXTE, poussés dans le
+//     repo PUBLIC zenray-data sous pages/Videos/<base>/.
+//
+// L'ASTUCE QUI SIMPLIFIE TOUT (réécriture des m3u8) :
+//   On ne sert PAS les m3u8 d'origine de ffmpeg (qui référencent « seg_0_001.m4s » en relatif).
+//   Après transcodage, le worker RÉÉCRIT chaque playlist pour remplacer chaque nom de segment local
+//   par une URL ABSOLUE proxifiée : /api/shard?repo=zenray-media-NN&path=ab/cd/<hash>.m4s.
+//   Du coup hls.js (ou Safari) fetch chaque segment directement par cette URL : aucun serveur de
+//   segments dédié n'est nécessaire, /api/shard sert déjà les binaires privés.
+//
+// CONTRAINTES DURES respectées : shards PRIVÉS ; jamais de token committé ; gros repo via Git Data API
+// (blobs + base_tree + commit + ref force:false), JAMAIS de clone ; sharding profond ab/cd/<hash> LIBRE
+// ici (les segments ne passent pas par /api/stream, contrairement au MSE qui était bridé).
+
+import { readFile, writeFile, mkdir, readdir, stat, rm } from 'node:fs/promises'
+import { createCipheriv, createHash, randomBytes } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { createReadStream } from 'node:fs'
+import path from 'node:path'
+import { promisify } from 'node:util'
+import { PUBLIC_VIDEO_SHARD_BIN_BYTES, MiB } from '../src/config/chunkPolicy.js'
+import { openVideoGitShard } from './lib/video-git-shard.mjs'
+import { createPushController, loadPushPolicyConfig, sharedPushController } from './lib/push-batch-policy.mjs'
+import {
+  probe, extractSubs, ffmpegProgress, pushBlobs, activeShard, LANG_LABEL,
+} from './video-mse-lib.mjs'
+
+const noop = () => {}
+const execFileP = promisify(execFile)
+const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`
+const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
+const sha256File = async (file) => {
+  const hash = createHash('sha256')
+  for await (const chunk of createReadStream(file)) hash.update(chunk)
+  return hash.digest('hex')
+}
+export const encryptSubtitle = (buf, key, iv) => {
+  const cipher = createCipheriv('aes-128-cbc', key, iv)
+  return Buffer.concat([cipher.update(buf), cipher.final()])
+}
+const SHARD_RE = /^zenray-media-\d{2,}$/
+const VID_SHARD_RE = /^zenray-vid(-public)?-\d{2,}$/ // HARMONISÉ : nouveau zenray-vid-public-NN + ancien zenray-vid-NN (lecture)
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+// Repo PUBLIC dédié aux segments chiffrés (servis par jsDelivr). Famille harmonisée zenray-vid-public-NN.
+const PUBLIC_MEDIA_REPO = process.env.PUBLIC_MEDIA_REPO || 'zenray-vid-public-01'
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Appel GitHub authentifié (helper minimal local, jumeau de ghAbs d'upload-shard.js).
+function gh(token, apiPath, init = {}) {
+  return fetch(`https://api.github.com/${apiPath}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) },
+  })
+}
+
+// Résout le shard VIDÉO PUBLIC ACTIF via /api/upload-shard (avec rollover automatique côté serveur).
+// Jumeau de activeShard (video-mse-lib) mais pour l'état vidéo public zenray-vid-NN. Renvoie le nom du repo.
+async function activeVidShard(apiBase, need = 0) {
+  // RÉSILIENCE : quand le shard public est plein, le serveur fait un ROLLOVER (création d'un repo GitHub +
+  // attente de propagation) qui peut prendre plusieurs dizaines de secondes. Sans timeout long ni retry, le
+  // fetch tombait ('active-vid-shard: fetch') et tout le transcodage était perdu. On tolère donc la lenteur :
+  // timeout 120 s + 3 tentatives (le rollover serveur est idempotent : un repo déjà créé renvoie 422 toléré).
+  let last = 'fail'
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), 120000)
+    try {
+      const r = await fetch(`${apiBase}/api/upload-shard`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'active-shard', kind: 'vid', vis: 'public', need }), signal: ac.signal, // HARMONISÉ : endpoint générique -> zenray-vid-public-NN
+      }).then((x) => x.json())
+      if (r && r.repo) return { repo: r.repo, bytes: Number(r.bytes) || 0 }
+      last = (r && r.error) || 'fail'
+    } catch (e) { last = e && e.name === 'AbortError' ? 'timeout' : 'fetch' }
+    finally { clearTimeout(timer) }
+    if (attempt < 2) await new Promise((s) => setTimeout(s, 2000 * 3 ** attempt)) // 2s, 6s
+  }
+  throw new Error('active-vid-shard: ' + last)
+}
+
+// Incrémente le compteur d'octets du shard vidéo actif APRÈS le push (best-effort : un échec ne casse rien).
+async function commitVidBytes(apiBase, repo, addBytes, log = noop) {
+  if (!(addBytes > 0)) return
+  try {
+    const r = await fetch(`${apiBase}/api/upload-shard`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'vid-commit-bytes', repo, addBytes }),
+    }).then((x) => x.json()).catch(() => null)
+    if (!r || r.error) log(`  vid-commit-bytes best-effort: ${(r && r.error) || 'fail'}`)
+  } catch { /* best-effort */ }
+}
+
+// Garantit l'existence du repo PUBLIC fourni (private:false, auto_init), prêt à recevoir des
+// commits Git Data API (sa branche main doit porter au moins un commit). Idempotent : 422 = déjà créé.
+// Filet de sécurité : le serveur (active-vid-shard) crée déjà le repo rolled ; ceci couvre le tout 1er run.
+async function ensurePublicRepo(token, name, log = noop) {
+  const probeRepo = await gh(token, `repos/${OWNER}/${name}`)
+  if (probeRepo.ok) return true
+  log(`  repo public ${OWNER}/${name} absent -> création...`)
+  const cr = await gh(token, 'user/repos', {
+    method: 'POST',
+    body: JSON.stringify({ name, private: false, auto_init: true, description: 'ZenRay media — segments HLS CHIFFRÉS (AES-128), servis via jsDelivr. Clés AES jamais ici (repo privé).' }),
+  })
+  if (!cr.ok && cr.status !== 422) throw new Error(`create public repo -> ${cr.status} ${(await cr.text()).slice(0, 200)}`)
+  // auto_init crée la branche main de façon asynchrone : on attend qu'elle porte un commit.
+  for (let i = 0; i < 12; i++) {
+    const rr = await gh(token, `repos/${OWNER}/${name}/git/ref/heads/main`)
+    if (rr.ok) return true
+    await sleep(1500)
+  }
+  throw new Error(`public repo ${name} pas prêt (branche main absente après attente)`)
+}
+const HLS_TIME = 6 // secondes par segment (recommandation Apple VOD ; moins de requêtes/overhead que 4 s, seek toujours fin)
+// Placeholder d'URI de clé écrit par ffmpeg dans les EXT-X-KEY au moment de l'encodage. On le réécrit
+// ensuite (dans pushHls) vers l'URL réelle /api/hls-key?v=<base> une fois le base name connu/encodé.
+const KEY_URI_PLACEHOLDER = 'ZR_HLS_KEY_URI'
+// Nom du fichier clé dans le repo PRIVÉ (doit matcher server/hls-key.js KEY_FILE).
+const KEY_FILE = '.hlskey.bin'
+
+// --- chemin shard profond ab/cd/<hash>.<ext> (jumeau de shardPathFor de universalCapture.js) -----
+function shardPathFor(hash, ext) {
+  return `${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.${ext}`
+}
+
+// --- TRANSCODE COMPLET D'UNE VIDÉO EN HLS -----------------------------------
+// Produit en local master.m3u8 + stream_*.m3u8 + init_*.mp4 + seg_*.m4s + sub_*.vtt, SANS rien pousser.
+// Renvoie l'objet `result` que pushHls() consomme. Options :
+//   { workDir, crf='21', sampleSec=null, log, onProgress(stage, pct) }
+export async function transcodeHls(file, opts = {}) {
+  const log = opts.log || noop
+  const onProgress = opts.onProgress || noop
+  const crf = String(opts.crf || '21')
+  const sampleSec = opts.sampleSec != null ? Number(opts.sampleSec) : null
+  const work = opts.workDir || '/tmp/zr_hls'
+
+  const base = path.basename(file).replace(/\.[^.]+$/, '')
+  const id = newId()
+  const outDir = path.join(work, 'out', id)
+  await mkdir(outDir, { recursive: true })
+
+  const p = probe(file)
+  log(`${base} — ${p.duration.toFixed(0)}s, ${p.audio.length} audio, ${p.subs.length} sous-titres${sampleSec ? ` [échantillon ${sampleSec}s]` : ''}`)
+  if (!p.video.length) throw new Error('aucune piste vidéo')
+
+  const tlim = sampleSec ? ['-t', String(sampleSec)] : []
+  const outDuration = sampleSec ? Math.min(p.duration || sampleSec, sampleSec) : p.duration
+  const nAudio = p.audio.length
+
+  // 0) CHIFFREMENT AES-128 : on génère une clé aléatoire 16 octets + un IV 16 octets PROPRES à cette vidéo.
+  //    ffmpeg chiffre TOUS les segments avec cette clé (HLS EXT-X-KEY METHOD=AES-128). Le « key info file »
+  //    est un fichier texte 3 lignes que ffmpeg lit :
+  //      ligne 1 = l'URI écrite TELLE QUELLE dans la playlist (on met un placeholder, réécrit ensuite) ;
+  //      ligne 2 = le CHEMIN LOCAL du fichier de clé (ffmpeg le lit pour chiffrer, il ne le publie pas) ;
+  //      ligne 3 = l'IV en hexadécimal.
+  //    La clé brute (key.bin) part PLUS TARD dans le repo PRIVÉ (jamais public, jamais sur le CDN).
+  const aesKey = randomBytes(16)
+  const aesIv = randomBytes(16)
+  const keyFile = path.join(outDir, 'enc.key')         // clé brute, locale (ffmpeg la lit pour chiffrer)
+  const keyInfoFile = path.join(outDir, 'enc.keyinfo') // le « mode d'emploi » 3 lignes pour ffmpeg
+  await writeFile(keyFile, aesKey)
+  await writeFile(keyInfoFile, `${KEY_URI_PLACEHOLDER}\n${keyFile}\n${aesIv.toString('hex')}\n`, 'utf8')
+
+  // 1) Construire les -map et le -var_stream_map dynamiquement (1 vidéo + N audios).
+  //    -g 48 = un keyframe toutes les ~2 s, aligne les segments sur -hls_time 4 (segments décodables).
+  const maps = ['-map', '0:v:0']
+  const varParts = ['v:0,agroup:aud,name:video']
+  for (let i = 0; i < nAudio; i++) {
+    const a = p.audio[i]
+    const lang = a.tags?.language || 'und'
+    maps.push('-map', `0:a:${i}`)
+    varParts.push(`a:${i},agroup:aud,language:${lang},name:a${i}${i === 0 ? ',default:yes' : ''}`)
+  }
+  const varStreamMap = varParts.join(' ')
+
+  // FORMAT DE SEGMENT = MPEG-TS (.ts), PAS fMP4. POURQUOI : ffmpeg 8.1.1 NE SAIT PAS chiffrer en AES-128
+  // des segments fMP4 (« Not yet implemented in FFmpeg, patches welcome » -> l'encodage échoue à 0 packet).
+  // Le chiffrement AES-128 standard HLS ne fonctionne qu'avec mpegts dans cette version. Le .ts est lu
+  // NATIVEMENT par Safari et par hls.js (qui déchiffre la clé AES tout seul), donc zéro perte de compat.
+  // Conséquence : plus d'init segment séparé (l'info de décodage est dans chaque .ts), donc pas d'EXT-X-MAP.
+  // PHASE 2 — STRATÉGIE D'ENCODAGE selon le codec SOURCE (gros gain de vitesse) :
+  //  - REMUX (-c:v copy) si la vidéo est déjà H.264 8-bit yuv420p : ZÉRO réencodage (x10+). ffmpeg segmente
+  //    aux keyframes >= hls_time (seek un peu plus grossier, lecture parfaite). Audio idem si déjà AAC.
+  //  - HW (h264_videotoolbox, GPU M5 Max) sinon : ~temps réel (x4-6 vs libx264), keyframes FORCÉES toutes les
+  //    HLS_TIME s -> segments propres. Repli AUTOMATIQUE sur libx264 si le GPU refuse la source.
+  // Le chiffrement AES-128 et la segmentation mpegts sont identiques quelle que soit la stratégie.
+  const v0 = p.video[0] || {}
+  const isH264_8bit = v0.codec_name === 'h264' && /^(yuv|yuvj)420p$/.test(v0.pix_fmt || '') && !/10/.test(v0.profile || '')
+  const allAac = p.audio.length > 0 && p.audio.every((a) => a.codec_name === 'aac')
+  const audioArgs = allAac ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-ac', '2', '-b:a', '160k']
+  const strategies = []
+  if (isH264_8bit && !opts.forceEncode) strategies.push({ name: 'remux', v: ['-c:v', 'copy'] })
+  strategies.push({ name: 'hw', v: ['-c:v', 'h264_videotoolbox', '-b:v', String(opts.hwBitrate || '6M'), '-profile:v', 'main', '-force_key_frames', `expr:gte(t,n_forced*${HLS_TIME})`] })
+  strategies.push({ name: 'cpu', v: ['-c:v', 'libx264', '-preset', 'fast', '-crf', crf, '-pix_fmt', 'yuv420p', '-g', '48', '-keyint_min', '48', '-sc_threshold', '0'] })
+  const buildArgs = (vArgs) => [
+    '-y', '-i', file, ...tlim, ...maps, ...vArgs, ...audioArgs,
+    '-f', 'hls', '-hls_time', String(HLS_TIME), '-hls_playlist_type', 'vod', '-hls_segment_type', 'mpegts',
+    '-hls_key_info_file', keyInfoFile,
+    '-hls_segment_filename', path.join(outDir, 'seg_%v_%03d.ts'),
+    '-master_pl_name', 'master.m3u8', '-var_stream_map', varStreamMap,
+    path.join(outDir, 'stream_%v.m3u8'),
+  ]
+  let used = null, lastErr = null
+  for (const s of strategies) {
+    try {
+      log(`  transcode HLS AES-128 [${s.name}] (1 vidéo + ${nAudio} audio${allAac ? ' copie' : ' aac'}, hls_time ${HLS_TIME})...`)
+      await ffmpegProgress(buildArgs(s.v), outDuration, (pct) => onProgress('video', pct))
+      used = s.name; break
+    } catch (e) {
+      lastErr = e
+      log(`  [${s.name}] échec (${String(e.message || e).slice(0, 100)}) -> repli`)
+      try { for (const f of await readdir(outDir)) if (/\.ts$|^stream_.*\.m3u8$|^master\.m3u8$/.test(f)) await rm(path.join(outDir, f), { force: true }) } catch {}
+    }
+  }
+  if (!used) throw lastErr || new Error('ffmpeg: toutes les stratégies ont échoué')
+  log(`  encodage utilisé: ${used}`)
+
+  // 2) sous-titres -> VTT monolithique (extractSubs de video-mse-lib, réutilisé tel quel).
+  //    DÉCISION (RISQUE 4 du design) : VTT monolithique + playlist subs générée À LA MAIN (1 segment =
+  //    durée totale). La segmentation VTT native de ffmpeg en mode HLS est capricieuse ; cette voie est
+  //    plus simple et robuste, et lue partout (Safari natif + hls.js).
+  const subsRaw = await extractSubs(file, p, outDir, log)
+  log(`  ${subsRaw.length} sous-titre(s) VTT${subsRaw.length ? ': ' + subsRaw.map((s) => s.label).join(', ') : ''}`)
+
+  // 3) Inventaire des fichiers produits par ffmpeg dans outDir.
+  //    NB : avec -var_stream_map, ffmpeg utilise le `name:` (ex video/a0/a1) comme jeton %v, PAS un index
+  //    numérique. Donc les fichiers sont init_video.mp4, seg_a0_000.m4s, stream_a1.m3u8, etc. Les regexes
+  //    doivent matcher un jeton alphanumérique, pas \d+.
+  const all = await readdir(outDir)
+  const segments = all.filter((f) => /\.ts$/.test(f))
+  const inits = [] // mpegts : pas d'init segment séparé (l'init est embarqué dans chaque .ts)
+  const mediaPlaylists = all.filter((f) => /^stream_.+\.m3u8$/.test(f))
+  if (!all.includes('master.m3u8')) throw new Error('ffmpeg HLS: master.m3u8 absent')
+  log(`  produit: master.m3u8 + ${mediaPlaylists.length} media playlists, ${segments.length} segments chiffrés`)
+
+  // POSTER (miniature vidéo) : 1 frame extraite ~1/3 de la durée, en webp 480px. BEST-EFFORT — un échec ne
+  // bloque JAMAIS le transcodage. Poussée en clair sur le shard public (les segments y sont déjà, juste chiffrés ;
+  // une frame basse-déf sert d'aperçu dans le Finder/Drive). Référencée dans le manifeste (champ `poster`).
+  let posterFile = null
+  try {
+    const at = Math.max(0.5, Math.min(3, (outDuration || 3) / 3))
+    await new Promise((res, rej) => execFile('ffmpeg', ['-y', '-ss', String(at), '-i', file, '-frames:v', '1', '-vf', 'scale=480:-2', '-q:v', '80', path.join(outDir, 'poster.webp')], { timeout: 30000 }, (e) => e ? rej(e) : res()))
+    await stat(path.join(outDir, 'poster.webp')); posterFile = 'poster.webp'
+    log('  poster.webp extrait (miniature vidéo)')
+  } catch { posterFile = null /* pas de poster, on continue */ }
+
+  // métadonnées audio (info UI ; la vérité opérationnelle reste hls.audioTracks côté lecteur)
+  const audioMeta = p.audio.map((a, i) => {
+    const lang = a.tags?.language || 'und'
+    return { lang, label: (a.tags?.title) || LANG_LABEL[lang] || lang, default: i === 0 }
+  })
+  const subMeta = subsRaw.map((s) => ({ lang: s.lang, label: s.label }))
+
+  const result = {
+    id, base, outDir, outDuration, nAudio,
+    segments, inits, mediaPlaylists, subsRaw,
+    audioMeta, subMeta,
+    aesKey, aesIv, // clé AES-128 (16 octets) + IV : poussés dans le repo PRIVÉ par pushHls
+    posterFile,    // 'poster.webp' ou null (miniature vidéo, best-effort)
+    dest: opts.dest || 'pages/Videos',
+  }
+  // MÉTA DE REPRISE : on persiste tout ce dont pushHls a besoin, pour pouvoir re-pousser SANS retranscoder
+  // (node scripts/video-hls.mjs --resume <outDir> --push) si le push échoue. Clés/IV en hex ; subs par nom de
+  // fichier (relatif à outDir). Voir loadResult() dans video-hls.mjs.
+  try {
+    await writeFile(path.join(outDir, '.zr-meta.json'), JSON.stringify({
+      id, base, dest: result.dest, outDuration, nAudio, audioMeta, subMeta,
+      subs: subsRaw.map((s) => ({ file: path.basename(s.file), lang: s.lang, label: s.label })),
+      aesKey: aesKey.toString('hex'), aesIv: aesIv.toString('hex'), posterFile,
+    }))
+  } catch {}
+  return result
+}
+
+// --- RÉÉCRITURE des playlists -------------------------------------------------
+// Une media playlist (stream_N.m3u8) liste des segments par nom local + un EXT-X-MAP:URI="init_N.mp4".
+// On remplace chaque référence locale par l'URL ABSOLUE de son hash sur le shard. `map` = { nomLocal -> url }.
+function rewriteMediaPlaylist(text, map, keyUri) {
+  return text.split('\n').map((line) => {
+    // EXT-X-KEY:METHOD=AES-128,URI="ZR_HLS_KEY_URI",IV=0x...  -> pointer l'URI vers /api/hls-key gated
+    if (line.startsWith('#EXT-X-KEY') && keyUri) {
+      return line.replace(/URI="([^"]*)"/, `URI="${keyUri}"`)
+    }
+    // EXT-X-MAP:URI="init_0.mp4" -> remplacer l'URI par l'URL CDN
+    const mm = /^#EXT-X-MAP:URI="([^"]+)"(.*)$/.exec(line)
+    if (mm) {
+      const url = map[mm[1].trim()]
+      return url ? `#EXT-X-MAP:URI="${url}"${mm[2]}` : line
+    }
+    // ligne non-# et non vide = un nom de segment local (ex seg_0_001.m4s)
+    if (line && !line.startsWith('#')) {
+      const url = map[line.trim()]
+      return url || line
+    }
+    return line
+  }).join('\n')
+}
+
+// Le master référence les media playlists (stream_N.m3u8) via EXT-X-STREAM-INF (URI = ligne suivante)
+// et les pistes audio/subs via EXT-X-MEDIA:...,URI="stream_N.m3u8". On réécrit toutes ces URI vers
+// /api/hls?path=pages/Videos/<base>/<playlist>.m3u8 (les playlists vivent dans le repo content, servies texte).
+function rewriteMaster(text, playlistUrlFor) {
+  return text.split('\n').map((line) => {
+    // EXT-X-MEDIA:...,URI="..."
+    const out = line.replace(/URI="([^"]+)"/g, (full, uri) => {
+      const u = playlistUrlFor(uri.trim())
+      return u ? `URI="${u}"` : full
+    })
+    if (out !== line) return out
+    // ligne non-# = URI d'un EXT-X-STREAM-INF (la media playlist vidéo)
+    if (line && !line.startsWith('#')) {
+      const u = playlistUrlFor(line.trim())
+      return u || line
+    }
+    return out
+  }).join('\n')
+}
+
+// Génère une media playlist SUBS minimale (1 segment VTT couvrant toute la durée).
+export function buildSubsPlaylist(durationSec, vttUrl, keyUri, ivHex) {
+  const dur = Math.max(1, Math.ceil(durationSec))
+  return [
+    '#EXTM3U',
+    '#EXT-X-VERSION:7',
+    `#EXT-X-KEY:METHOD=AES-128,URI="${keyUri}",IV=0x${ivHex}`,
+    `#EXT-X-TARGETDURATION:${dur}`,
+    '#EXT-X-MEDIA-SEQUENCE:0',
+    '#EXT-X-PLAYLIST-TYPE:VOD',
+    `#EXTINF:${dur.toFixed(3)},`,
+    vttUrl,
+    '#EXT-X-ENDLIST',
+    '',
+  ].join('\n')
+}
+
+// Construit les entrées EXT-X-MEDIA SUBTITLES à injecter dans le master (groupe "subs").
+function subsMediaLines(subMeta, subsPlaylistUrls) {
+  return subMeta.map((s, i) => {
+    const def = i === 0 ? 'YES' : 'NO'
+    const autosel = i === 0 ? 'YES' : 'NO'
+    return `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${s.label}",LANGUAGE="${s.lang}",DEFAULT=${def},AUTOSELECT=${autosel},FORCED=NO,URI="${subsPlaylistUrls[i]}"`
+  })
+}
+
+// Rattache le groupe de sous-titres aux variantes vidéo du master (ajoute ,SUBTITLES="subs" sur EXT-X-STREAM-INF).
+function attachSubsGroup(masterText) {
+  return masterText.split('\n').map((line) => {
+    if (line.startsWith('#EXT-X-STREAM-INF') && !/SUBTITLES=/.test(line)) {
+      return `${line},SUBTITLES="subs"`
+    }
+    return line
+  }).join('\n')
+}
+
+// --- PUSH COMPLET HLS (archi SÉCURISÉE) --------------------------------------
+// Schéma en clair :
+//   - segments CHIFFRÉS (.m4s) + init (.mp4) + sous-titres (.vtt), nommés par leur SHA-256 (anonymisés),
+//     poussés sur le repo PUBLIC zenray-vid-01 via Git Data API ; URLs réécrites vers jsDelivr
+//     PINNÉ sur le commit (cache immuable, bande passante illimitée). Publics mais ILLISIBLES sans la clé.
+//   - clé AES-128 (16 octets) poussée dans le repo PRIVÉ zenray-data sous pages/Videos/<base>/.hlskey.bin.
+//   - master.m3u8 + media playlists + .media.json {type:'hls'} restent PRIVÉS (zenray-data), servis par
+//     /api/hls. L'URI de clé dans les playlists pointe /api/hls-key?v=<base> (endpoint gated).
+// Renvoie { repo, publicRepo, commitPublic, manifest, manifestPath, masterPath, keyPath, commitContent }.
+// REPRISE : reconstruit l'objet `result` (entrée de pushHls) depuis un outDir existant, SANS retranscoder.
+// Préfère .zr-meta.json (persisté par transcodeHls) ; sinon reconstruit tout depuis le disque (clé/IV, durée
+// via EXTINF, sous-titres via sub<i>_<lang>.vtt, audio via les lignes EXT-X-MEDIA du master). overrides: { base, dest }.
+export async function loadResult(outDir, overrides = {}) {
+  const all = await readdir(outDir)
+  if (!all.includes('master.m3u8')) throw new Error('outDir invalide (master.m3u8 absent): ' + outDir)
+  const segments = all.filter((f) => /\.ts$/.test(f))
+  const inits = []
+  const mediaPlaylists = all.filter((f) => /^stream_.+\.m3u8$/.test(f))
+  let meta = null
+  try { meta = JSON.parse(await readFile(path.join(outDir, '.zr-meta.json'), 'utf8')) } catch {}
+  let base, dest, outDuration, audioMeta, subMeta, subsRaw, aesKey, aesIv, subIvs, posterFile
+  if (meta) {
+    base = overrides.base || meta.base
+    dest = overrides.dest || meta.dest
+    outDuration = meta.outDuration
+    audioMeta = meta.audioMeta || []
+    subMeta = meta.subMeta || []
+    subsRaw = (meta.subs || []).map((s) => ({ file: path.join(outDir, s.file), lang: s.lang, label: s.label }))
+    aesKey = Buffer.from(meta.aesKey, 'hex'); aesIv = Buffer.from(meta.aesIv, 'hex')
+    subIvs = Array.isArray(meta.subIvs) ? meta.subIvs : []
+    posterFile = meta.posterFile || null
+  } else {
+    aesKey = await readFile(path.join(outDir, 'enc.key'))
+    const ki = (await readFile(path.join(outDir, 'enc.keyinfo'), 'utf8')).trim().split('\n')
+    aesIv = Buffer.from((ki[2] || '').trim(), 'hex')
+    const vpl = mediaPlaylists.find((p) => /video/i.test(p)) || mediaPlaylists[0]
+    const vraw = await readFile(path.join(outDir, vpl), 'utf8')
+    outDuration = (vraw.match(/#EXTINF:([\d.]+)/g) || []).reduce((s, l) => s + parseFloat(l.replace('#EXTINF:', '')), 0) || 0
+    const vtts = all.filter((f) => /\.vtt$/.test(f)).sort()
+    subsRaw = vtts.map((f) => { const m = f.match(/sub\d+_([a-z]{2,3})/i); const lang = m ? m[1] : 'und'; return { file: path.join(outDir, f), lang, label: lang } })
+    subIvs = []
+    posterFile = all.includes('poster.webp') ? 'poster.webp' : null
+    subMeta = subsRaw.map((s) => ({ lang: s.lang, label: s.label }))
+    const mraw = await readFile(path.join(outDir, 'master.m3u8'), 'utf8')
+    audioMeta = []
+    for (const l of mraw.split('\n')) if (/#EXT-X-MEDIA:TYPE=AUDIO/.test(l)) { const lg = (l.match(/LANGUAGE="([^"]*)"/) || [])[1] || 'und'; const nm = (l.match(/NAME="([^"]*)"/) || [])[1] || lg; audioMeta.push({ lang: lg, label: nm, default: audioMeta.length === 0 }) }
+    base = overrides.base || path.basename(outDir)
+    dest = overrides.dest || 'pages/Videos'
+  }
+  return { id: path.basename(outDir), base, outDir, outDuration, nAudio: audioMeta.length, segments, inits, mediaPlaylists, subsRaw, audioMeta, subMeta, aesKey, aesIv, subIvs, posterFile, dest }
+}
+
+// 12 October 2026: the batches of the segments are decided by the push batch policy (lib/push-batch-policy.mjs, bytes, same ladder
+// as the archive push). `batchBytes` is the legacy fixed batch: only an explicit value disables the policy; `pushController` lets
+// a caller or a test supply its own controller.
+// FR : les lots de segments sont decides par la politique commune, en octets ; `batchBytes` explicite = lot fixe (politique coupee).
+export async function pushHls(token, result, { apiBase = 'http://localhost:3000', contentRepo = 'zenray-data', publicRepo = null, onProgress = noop, log = noop, workDir = null, batchBytes = undefined, pushController = null } = {}) {
+  const { outDir, base, dest, segments, inits, mediaPlaylists, subsRaw, outDuration, aesKey, aesIv, posterFile } = result
+  const enc = encodeURIComponent
+  const baseDirRel = `${dest}/${base}`
+  const keyUri = `/api/hls-key?v=${enc(`${baseDirRel}/${KEY_FILE}`)}`
+  const binaryByPath = new Map()
+  const pathByName = {}
+  const subHashPaths = []
+  const subIvs = Array.isArray(result.subIvs) ? result.subIvs.slice() : []
+
+  const addBinary = async (localName, filePath = path.join(outDir, localName), extension = localName.split('.').pop()) => {
+    const size = (await stat(filePath)).size
+    const hashPath = shardPathFor(await sha256File(filePath), extension)
+    pathByName[localName] = hashPath
+    if (!binaryByPath.has(hashPath)) binaryByPath.set(hashPath, { path: hashPath, sourcePath: filePath, size })
+    return hashPath
+  }
+
+  for (const file of inits) await addBinary(file)
+  for (const file of segments) await addBinary(file)
+  if (posterFile) { try { await addBinary(posterFile) } catch {} }
+
+  // 10 October 2026, 19:06 CEST: Encrypt subtitle payloads too, and persist their IVs for safe push retries.
+  while (subIvs.length < subsRaw.length) subIvs.push(randomBytes(16).toString('hex'))
+  if (subIvs.some((iv) => !/^[0-9a-f]{32}$/i.test(iv))) throw new Error('Invalid HLS subtitle IV')
+  result.subIvs = subIvs
+  const metaPath = path.join(outDir, '.zr-meta.json')
+  try {
+    const meta = JSON.parse(await readFile(metaPath, 'utf8'))
+    await writeFile(metaPath, JSON.stringify({ ...meta, subIvs }, null, 2))
+  } catch {}
+  for (const [index, subtitle] of subsRaw.entries()) {
+    const encryptedPath = path.join(outDir, `.subtitle-${index}.vtt.enc`)
+    const clear = await readFile(subtitle.file)
+    await writeFile(encryptedPath, encryptSubtitle(clear, aesKey, Buffer.from(subIvs[index], 'hex')))
+    subHashPaths.push(await addBinary(`subtitle-${index}.vtt`, encryptedPath, 'vtt'))
+  }
+
+  const binaries = [...binaryByPath.values()]
+  const totalSize = binaries.reduce((sum, file) => sum + file.size, 0)
+  const bins = []
+  let currentBin = [], currentBinBytes = 0
+  for (const file of binaries) {
+    if (file.size > PUBLIC_VIDEO_SHARD_BIN_BYTES) throw new Error(`HLS object exceeds shard bin limit: ${file.path}`)
+    if (currentBin.length && currentBinBytes + file.size > PUBLIC_VIDEO_SHARD_BIN_BYTES) {
+      bins.push({ files: currentBin, bytes: currentBinBytes })
+      currentBin = []; currentBinBytes = 0
+    }
+    currentBin.push(file); currentBinBytes += file.size
+  }
+  if (currentBin.length) bins.push({ files: currentBin, bytes: currentBinBytes })
+  if (publicRepo && bins.length > 1) throw new Error('Explicit HLS shard cannot hold this movie; automatic rollover is required')
+
+  const workRoot = workDir || path.resolve(outDir, '..', '..')
+  const transportRoot = path.join(workRoot, 'git-shards')
+  const urlByPath = new Map()
+  const shardsUsed = new Set()
+  const commitsUsed = new Set()
+  let completedBytes = 0
+  let latestPublicRepo = publicRepo
+  let latestPublicCommit = ''
+  const controller = pushController
+    || (Number(batchBytes) > 0
+      ? createPushController(loadPushPolicyConfig(process.env, { fixedBatchMiB: Number(batchBytes) / MiB }), { log })
+      : sharedPushController({ log }))
+
+  onProgress('uploading', 0)
+  for (const bin of bins) {
+    const active = publicRepo ? { repo: publicRepo, bytes: 0 } : await activeVidShard(apiBase, bin.bytes)
+    const shard = active.repo
+    if (!VID_SHARD_RE.test(shard)) throw new Error(`shard vidéo invalide: ${shard}`)
+    await ensurePublicRepo(token, shard, log)
+    const writer = await openVideoGitShard({ owner: OWNER, repo: shard, workDir: transportRoot, token, log, pushController: controller })
+    shardsUsed.add(shard)
+    latestPublicRepo = shard
+
+    // The whole bin goes to pushFiles: the policy cuts it into batches by bytes, retries, falls back and recovers.
+    // FR : le lot entier va a pushFiles ; la politique le decoupe par octets, rejoue, retombe et remonte.
+    const pushed = await writer.pushFiles(bin.files, {
+      message: `hls encrypted media ${bin.files.length}`,
+      onProgress: (pct) => onProgress('uploading', Math.min(99, Math.round(((completedBytes + bin.bytes * pct / 100) / Math.max(1, totalSize)) * 100))),
+    })
+    const commit = pushed.commit
+    latestPublicCommit = commit
+    commitsUsed.add(commit)
+    for (const file of bin.files) urlByPath.set(file.path, `https://cdn.jsdelivr.net/gh/${OWNER}/${shard}@${commit}/${file.path}`)
+    if (pushed.bytes > 0) await commitVidBytes(apiBase, shard, pushed.bytes, log)
+    completedBytes += bin.bytes
+    onProgress('uploading', Math.min(99, Math.round((completedBytes / Math.max(1, totalSize)) * 100)))
+    await rm(writer.directory, { recursive: true, force: true })
+  }
+
+  if (!binaries.length) throw new Error('HLS produced no segment files')
+  const segMap = Object.fromEntries(Object.entries(pathByName).map(([name, hashPath]) => [name, urlByPath.get(hashPath)]))
+  const subVttUrls = subHashPaths.map((hashPath) => urlByPath.get(hashPath))
+  const publicRepoLabel = [...shardsUsed].join('+') || publicRepo
+  const commitPublic = latestPublicCommit
+  onProgress('uploading', 95)
+
+  // --- 2) réécrire les playlists ----------------------------------------------
+  const hlsUrl = (playlistName) => `/api/hls?path=${enc(`${baseDirRel}/${playlistName}`)}`
+
+  // media playlists (vidéo + audios) : segments + EXT-X-MAP -> jsDelivr@sha ; EXT-X-KEY URI -> /api/hls-key
+  const textBlobs = [] // { path, content(utf-8) }
+  for (const pl of mediaPlaylists) {
+    const raw = await readFile(path.join(outDir, pl), 'utf8')
+    const rewritten = rewriteMediaPlaylist(raw, segMap, keyUri)
+    textBlobs.push({ path: `${baseDirRel}/${pl}`, content: rewritten, encoding: 'utf-8' })
+  }
+
+  // playlists subs (1 par sous-titre) : générées à la main, pointent le VTT hashé
+  const subsPlaylistNames = subsRaw.map((_, i) => `subs_${i}.m3u8`)
+  const subsPlaylistUrls = subsPlaylistNames.map((n) => hlsUrl(n))
+  subsRaw.forEach((s, i) => {
+    textBlobs.push({ path: `${baseDirRel}/${subsPlaylistNames[i]}`, content: buildSubsPlaylist(outDuration, subVttUrls[i], keyUri, subIvs[i]), encoding: 'utf-8' })
+  })
+
+  // master : réécrire les URI des media playlists (stream_N.m3u8 -> /api/hls?...), injecter le groupe subs.
+  let masterRaw = await readFile(path.join(outDir, 'master.m3u8'), 'utf8')
+  // la map nom-local-playlist -> /api/hls?path=... (les media playlists gardent leur nom dans le content repo)
+  const knownPlaylists = new Set(mediaPlaylists)
+  masterRaw = rewriteMaster(masterRaw, (uri) => knownPlaylists.has(uri) ? hlsUrl(uri) : null)
+  // injecter les sous-titres comme groupe SUBTITLES et les rattacher aux variantes
+  if (subsRaw.length) {
+    const subLines = subsMediaLines(result.subMeta, subsPlaylistUrls)
+    // insérer les EXT-X-MEDIA SUBTITLES après l'en-tête (#EXTM3U + #EXT-X-VERSION). L'ordre des tags
+    // après #EXTM3U n'est pas imposé par RFC 8216, mais on reste propre : on insère juste avant la 1re
+    // ligne EXT-X-MEDIA / EXT-X-STREAM-INF existante (ou à défaut après #EXT-X-VERSION).
+    const lines = masterRaw.split('\n')
+    let insertAt = lines.findIndex((l) => l.startsWith('#EXT-X-MEDIA') || l.startsWith('#EXT-X-STREAM-INF'))
+    if (insertAt < 0) {
+      const verIdx = lines.findIndex((l) => l.startsWith('#EXT-X-VERSION'))
+      insertAt = (verIdx >= 0 ? verIdx : lines.findIndex((l) => l.startsWith('#EXTM3U'))) + 1
+    }
+    lines.splice(insertAt, 0, ...subLines)
+    masterRaw = lines.join('\n')
+    masterRaw = attachSubsGroup(masterRaw)
+  }
+  const masterPath = `${baseDirRel}/master.m3u8`
+  textBlobs.push({ path: masterPath, content: masterRaw, encoding: 'utf-8' })
+
+  // --- 3) CLÉ AES-128 dans le repo PRIVÉ (jamais publique, jamais sur jsDelivr) -----------------
+  // 16 octets bruts en base64. Servie ensuite par /api/hls-key (gated) à hls.js du site.
+  const keyPath = `${baseDirRel}/${KEY_FILE}`
+  textBlobs.push({ path: keyPath, content: Buffer.from(aesKey).toString('base64'), encoding: 'base64' })
+
+  // --- 4) manifest .media.json {type:'hls'} ----------------------------------
+  const manifest = {
+    type: 'hls', v: 1, name: `${base}.mp4`, mime: 'application/vnd.apple.mpegurl',
+    duration: outDuration,
+    master: masterPath,        // chemin content du master, servi via /api/hls
+    enc: 'AES-128',            // info : segments chiffrés AES-128
+    keyUri,                    // endpoint gated qui sert la clé
+    keyPath,                   // chemin privé de la clé (zenray-data)
+    iv: Buffer.from(aesIv).toString('hex'),
+    poster: (posterFile && segMap[posterFile]) || undefined, // miniature vidéo (URL jsDelivr@sha, en clair)
+    publicRepo: publicRepoLabel, // shards publics des segments chiffrés (info/debug)
+    publicShards: [...shardsUsed],
+    commitPublic,              // SHA jsDelivr pinné (info/debug ; URLs déjà absolues dans les playlists)
+    probe: { duration: outDuration },
+    audio: result.audioMeta,   // info UI ; vérité = hls.audioTracks
+    subs: result.subMeta,
+    size: totalSize,
+    count: segments.length,    // nombre de segments .ts (vidéo + audios) — affiché dans l'UI
+    segments: segments.length,
+    createdAt: new Date().toISOString(),
+  }
+  const manifestPath = `${baseDirRel}/${base}.mp4.media.json`
+  textBlobs.push({ path: manifestPath, content: JSON.stringify(manifest, null, 2), encoding: 'utf-8' })
+
+  const commitContent = await pushBlobs(token, contentRepo, textBlobs, `content update ${new Date().toISOString().slice(0, 10)}`, log)
+  log(`  ${textBlobs.length} playlists+clé+manifest poussés sur ${contentRepo} (commit ${commitContent.slice(0, 7)})`)
+  const sampleEntry = binaries.find((file) => file.path.endsWith('.ts')) || binaries[0]
+  if (sampleEntry) {
+    const sampleUrl = urlByPath.get(sampleEntry.path)
+    const response = await fetch(sampleUrl, { method: 'HEAD', signal: AbortSignal.timeout(15000) })
+    if (!response.ok) throw new Error(`Pinned jsDelivr sample unavailable: HTTP ${response.status}`)
+  }
+  const readBack = await gh(token, `repos/${OWNER}/${contentRepo}/contents/${manifestPath.split('/').map(encodeURIComponent).join('/')}?ref=${commitContent}`)
+  if (!readBack.ok) throw new Error(`HLS manifest read-back failed: HTTP ${readBack.status}`)
+  const saved = await readBack.json()
+  const savedManifest = JSON.parse(Buffer.from(saved.content || '', 'base64').toString('utf8'))
+  if (savedManifest.type !== 'hls' || savedManifest.master !== masterPath) throw new Error('HLS manifest read-back mismatch')
+  onProgress('uploading', 100)
+
+  return { publicRepo: publicRepoLabel, publicShards: [...shardsUsed], commitPublic, manifest, manifestPath, masterPath, keyPath, commitContent }
+}

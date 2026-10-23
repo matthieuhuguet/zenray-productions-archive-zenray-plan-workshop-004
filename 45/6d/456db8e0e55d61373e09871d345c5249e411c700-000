@@ -1,0 +1,101 @@
+// 23 October 2026: the ZenRay Knowledge service, same pattern as ZenRay Freelance: a pass at 00, 06, 12 and 18 h Paris time
+// (or at wake-up when one was missed), the site's questions answered between passes, and a loopback bridge for the page.
+// FR : le service Knowledge, sur le patron de Freelance : passes à heures fixes, questions du site traitées entre deux passes, pont local.
+import http from 'node:http'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { slotAtOrBefore, slotAfter } from '../Freelance/lib/Schedule.mjs'
+import { config, drainStep, engineStatus, processInbox, runPass, search } from './knowledge.mjs'
+import { loadState, saveState, runtimeDirectory } from './lib/Pipeline.mjs'
+import { loadStore, saveStore, withStoreLock } from './lib/Store.mjs'
+import { publish } from './lib/Publish.mjs'
+
+import { execFile } from 'node:child_process'
+
+const LOOPBACK = ['127.0.0.1', '::1', '::ffff:127.0.0.1']
+// Local macOS notification only; nothing leaves the Mac. FR : notification locale, rien ne sort du Mac.
+const notify = (text) => execFile('osascript', ['-e', `display notification ${JSON.stringify(text)} with title "ZenRay Knowledge"`], () => {})
+const log = (message) => console.log(`${new Date().toISOString()} ${message}`)
+let busy = null
+
+async function pass(reason) {
+  if (busy || draining) return busy
+  busy = (async () => {
+    log(`pass (${reason}) started`)
+    try { const r = await runPass(); if (r.ingested.added) notify(`${r.ingested.added} nouvelle(s) question(s) dans ZenRay Knowledge`); log(`pass ok: ${JSON.stringify({ queued: r.prepared.queued, read: r.extracted.read, failed: r.extracted.failed, error: r.extracted.error, added: r.ingested.added, committed: r.published.committed })}`) }
+    catch (error) { log(`pass failed: ${error.message}`) }
+    const state = await loadState(); state.lastSlot = slotAtOrBefore(new Date(), config.service.schedule).toISOString(); await saveState(state)
+  })().finally(() => { busy = null })
+  return busy
+}
+
+/** Between passes: only the site's questions, cheap (a question already in the base needs no model). */
+async function inbox() {
+  if (busy || draining) return busy
+  busy = (async () => {
+    try {
+      const state = await loadState()
+      const { entries, updates } = await withStoreLock(config, async () => {
+        const entries = await loadStore(config), updates = await processInbox(entries, { withModel: state.model?.ok !== false })
+        if (Object.keys(updates).length) await saveStore(config, entries)
+        return { entries, updates }
+      })
+      if (!Object.keys(updates).length) return
+      const r = await publish(config, entries, await engineStatus(), { directory: path.join(runtimeDirectory(), 'DataClone'), inboxUpdates: updates })
+      log(`inbox: ${Object.keys(updates).length} question(s) treated, committed=${r.committed}`)
+    } catch (error) { log(`inbox failed: ${error.message}`) }
+  })().finally(() => { busy = null })
+  return busy
+}
+
+/**
+ * After a pass, while units wait and the model answers, keep reading them back to back (one unit at a time, sequential).
+ * Stops at the first model refusal; the next scheduled pass tries again. FR : vider la file en continu, une unité à la fois.
+ */
+let draining = false
+async function drain() {
+  if (draining || busy) return
+  draining = true
+  try {
+    for (;;) {
+      const r = await drainStep()
+      log(`drain: ${JSON.stringify(r)}`)
+      if (r.added) notify(`${r.added} nouvelle(s) question(s), ${r.total} au total`)
+      if (!r.read || r.error || !r.pending) break
+      await new Promise((resolve) => setTimeout(resolve, config.extract.drainPauseSeconds * 1000))
+    }
+  } catch (error) { log(`drain failed: ${error.message}`) }
+  draining = false
+}
+
+async function tick() {
+  const state = await loadState(), due = slotAtOrBefore(new Date(), config.service.schedule).toISOString()
+  if (!state.lastSlot || state.lastSlot < due) { await pass('schedule'); return drain() }
+  if (state.model?.ok !== false && (await loadState()).model?.ok !== false) drain()
+}
+
+const server = http.createServer(async (req, res) => {
+  const send = (status, value) => { res.statusCode = status; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(value)) }
+  if (!LOOPBACK.includes(req.socket?.remoteAddress || '')) return send(403, { error: 'loopback only' })
+  const origin = req.headers.origin
+  if (origin && !config.service.allowedOrigins.includes(origin)) return send(403, { error: 'origin refused' })
+  if (origin) { res.setHeader('access-control-allow-origin', origin); res.setHeader('vary', 'Origin') }
+  res.setHeader('cache-control', 'no-store')
+  if (req.method === 'OPTIONS') { res.setHeader('access-control-allow-methods', 'POST, OPTIONS'); res.setHeader('access-control-allow-headers', 'content-type, x-zr-knowledge-client'); res.setHeader('access-control-allow-private-network', 'true'); return send(204, {}) }
+  if (req.method !== 'POST' || req.headers['x-zr-knowledge-client'] !== 'zenray-progress') return send(403, { error: 'client header required' })
+  let body = ''; for await (const chunk of req) { body += chunk; if (body.length > config.service.bodyLimitBytes) return send(413, { error: 'too large' }) }
+  let payload = {}; try { payload = JSON.parse(body || '{}') } catch { return send(400, { error: 'json' }) }
+  try {
+    if (payload.action === 'status') { const state = await loadState(); return send(200, { ...(await engineStatus()), busy: Boolean(busy), next: slotAfter(new Date(), config.service.schedule).toISOString(), lastSlot: state.lastSlot }) }
+    if (payload.action === 'search') return send(200, { results: await search(String(payload.q || ''), 10) })
+    if (payload.action === 'inbox') { inbox(); return send(202, { accepted: true }) }
+    if (payload.action === 'run') { pass('manual').then(drain); return send(202, { accepted: true }) }
+    return send(400, { error: 'unknown action' })
+  } catch (error) { return send(500, { error: error.message }) }
+})
+
+server.listen(config.service.port, '127.0.0.1', () => log(`ZenRay Knowledge listening on 127.0.0.1:${config.service.port}`))
+setTimeout(tick, 20000)
+setInterval(tick, config.service.tickSeconds * 1000)
+setInterval(inbox, config.service.inboxPollSeconds * 1000)
+process.on('SIGTERM', () => server.close(() => process.exit(0)))

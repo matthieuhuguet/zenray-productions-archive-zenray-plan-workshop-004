@@ -1,0 +1,753 @@
+import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react'
+import { PALETTE, RADII, SHADOWS } from '../theme.js'
+import { colToLetter, toA1, normSel, inRect, clamp } from './grid.js'
+import { solve, isFormula, offsetFormula } from './formula.js'
+import { toTSV, fromTSV, writeClipboard, readClipboard } from './clipboard.js'
+import { toCSV, fromCSV, downloadCSV } from './csv.js'
+import { makeHistory } from './history.js'
+import { formatValue, cellStyle, condStyle, NUM_FORMATS } from './format.js'
+import { safeMarkedParse } from '../safeMarked.js'
+
+// LOT TABLES — SheetGrid : clone Excel / Google Sheets monté sur le schéma .db.json existant.
+// La base reste {columns:[{id,name,type,options,w,format}], rows:[{id,cells:{colId:val}}]}.
+// Ici on la regarde comme une GRILLE : colonne A = columns[0], ligne 1 = rows[0].
+// Une cellule "=A1+B2" est une formule, calculée par le moteur src/table/formula.js.
+const FONTS = { sans: "var(--zr-police-sans)", mono: "var(--zr-police-mono)" }
+const RH = 34   // hauteur de ligne
+const HH = 34   // hauteur d'en-tête
+const GUT = 52  // gouttière des numéros de ligne
+const DEFW = 130
+const uid = (p = 'x') => p + Math.random().toString(36).slice(2, 8)
+
+// gridSkin : palette dérivée du thème courant pour la grille — hairlines fins, zebra subtile, en-têtes en
+// verre, accent macOS. Détecte le sombre via la couleur de texte. Défensif (t.glass optionnel).
+function gridSkin(t) {
+  const dark = t.textPrimary === PALETTE.textPrimaryDark
+  return {
+    line: dark ? 'rgba(255,255,255,0.075)' : 'rgba(0,0,0,0.07)',
+    lineStrong: dark ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.12)',
+    // Zebra explicite demandée : lignes paires #fff (blanc), impaires #f4f5f5 (gris) en clair. Sombre = nuances.
+    base: dark ? t.cardBg : '#ffffff',
+    zebra: dark ? 'rgba(255,255,255,0.04)' : '#f4f5f5',
+    headBg: (t.glass && t.glass.bgStrong) || t.windowBg,
+    headFilter: (t.glass && t.glass.filter) || 'none',
+    headText: dark ? 'rgba(236,236,234,0.80)' : '#3c3c43',
+    accent: PALETTE.primary,
+    accentSoft: PALETTE.primarySoft,
+    selBg: t.selection,
+  }
+}
+
+export default function SheetGrid({ t, db, onChange, onOpenPage, immersive }) {
+  const cols = db.columns
+  const rows = db.rows
+  const nR = rows.length, nC = cols.length
+  const sk = gridSkin(t)
+
+  const rawGet = useCallback((r, c) => {
+    if (r < 0 || c < 0 || r >= nR || c >= nC) return ''
+    const v = rows[r].cells[cols[c].id]
+    return v == null ? '' : v
+  }, [rows, cols, nR, nC])
+
+  // recalcul de toutes les formules (mémoïsé sur le contenu)
+  const computed = useMemo(() => {
+    const s = solve(rawGet, nR, nC)
+    return s.computeAll()
+  }, [rawGet, nR, nC])
+
+  const dispValue = (r, c) => {
+    const raw = rawGet(r, c)
+    if (isFormula(raw)) { const k = r + ',' + c; return computed.has(k) ? computed.get(k) : '' }
+    return raw
+  }
+
+  const [sel, setSel] = useState({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+  const [editing, setEditing] = useState(null) // {row,col,value}
+  const rect = normSel(sel)
+  const [findOpen, setFindOpen] = useState(false)
+  const [find, setFind] = useState({ q: '', repl: '' })
+  const [autofill, setAutofill] = useState(null) // rect cible pendant le glissement de poignée
+  const dragSel = useRef(false)
+  const gridRef = useRef(null)
+  const csvInputRef = useRef(null)
+  const hist = useRef(makeHistory()).current
+  // buffer de copie INTERNE : garde les formules brutes + l'origine, pour coller en décalant
+  // les références comme Excel (=A1 copié de B2 et collé en B5 -> =A4). Le presse-papier système
+  // (TSV) reste rempli en parallèle pour le copier/coller vers Excel.
+  const copyBuf = useRef(null) // { rows:[[raw]], r0, c0, signature }
+  const [, force] = useState(0)
+
+  // ── persistance via le parent (DatabaseTable -> /api/page) ──
+  const commit = (next, snapshotBefore = true) => {
+    if (snapshotBefore) hist.push(db)
+    onChange(next)
+    force((x) => x + 1)
+  }
+  const setCellRaw = (r, c, val, snap = true) => {
+    const next = { ...db, rows: rows.map((row, ri) => ri === r ? { ...row, cells: { ...row.cells, [cols[c].id]: val } } : row) }
+    commit(next, snap)
+  }
+  const setManyCells = (writes, snap = true) => {
+    // writes: [{r,c,val}]
+    const byRow = new Map()
+    for (const w of writes) { if (!byRow.has(w.r)) byRow.set(w.r, {}); byRow.get(w.r)[cols[w.c].id] = w.val }
+    const next = { ...db, rows: rows.map((row, ri) => byRow.has(ri) ? { ...row, cells: { ...row.cells, ...byRow.get(ri) } } : row) }
+    commit(next, snap)
+  }
+
+  // ── ajout auto de lignes / colonnes au besoin (comme un tableur infini) ──
+  // CHAÎNABLE : on dérive d'une base optionnelle (défaut db). Indispensable quand paste/autofill
+  // ajoutent À LA FOIS des lignes ET des colonnes : sans ça, ensureCols repartait de db et écrasait
+  // les lignes que ensureRows venait d'ajouter (bug confirmé de perte de données, revue tables-Excel).
+  const ensureRows = (n, from = db) => { if (n <= from.rows.length) return; const add = []; for (let i = from.rows.length; i < n; i++) add.push({ id: uid('r'), cells: {} }); return { ...from, rows: [...from.rows, ...add] } }
+  const ensureCols = (n, from = db) => { if (n <= from.columns.length) return; const add = []; for (let i = from.columns.length; i < n; i++) add.push({ id: uid('c'), name: colToLetter(i), type: 'text', w: DEFW }); return { ...from, columns: [...from.columns, ...add] } }
+
+  // ── undo / redo ──
+  const doUndo = () => { const prev = hist.undo(db); if (prev) { onChange(prev); force((x) => x + 1) } }
+  const doRedo = () => { const nxt = hist.redo(db); if (nxt) { onChange(nxt); force((x) => x + 1) } }
+
+  // ── sélection ──
+  const selectCell = (r, c, extend) => {
+    r = clamp(r, 0, Math.max(0, nR - 1)); c = clamp(c, 0, Math.max(0, nC - 1))
+    setSel((s) => extend ? { anchor: s.anchor, focus: { row: r, col: c } } : { anchor: { row: r, col: c }, focus: { row: r, col: c } })
+  }
+  const onCellMouseDown = (r, c, e) => {
+    if (editing) return
+    if (e.shiftKey) selectCell(r, c, true)
+    else { selectCell(r, c, false); dragSel.current = true }
+  }
+  const onCellMouseEnter = (r, c) => { if (dragSel.current) selectCell(r, c, true); if (autofill) setAutofill(extendAutofill(r, c)) }
+  // Listener mouseup STABLE (attaché une seule fois) : lit l'état courant via refs pour éviter de
+  // ré-attacher/détacher à chaque render (sinon un relâchement pouvait être manqué pendant un drag).
+  const autofillRef = useRef(autofill); autofillRef.current = autofill
+  const applyAutofillRef = useRef(null)
+  useEffect(() => {
+    const up = () => {
+      dragSel.current = false
+      if (autofillRef.current) { applyAutofillRef.current && applyAutofillRef.current(); setAutofill(null) }
+    }
+    window.addEventListener('mouseup', up); return () => window.removeEventListener('mouseup', up)
+  }, [])
+
+  // ── édition ──
+  const startEdit = (r, c, initial) => { const raw = rawGet(r, c); setEditing({ row: r, col: c, value: initial != null ? initial : (raw == null ? '' : String(raw)) }) }
+  const commitEdit = (moveRow = 1, moveCol = 0) => {
+    if (!editing) return
+    const { row, col, value } = editing
+    let base = db
+    const er = ensureRows(row + 1, base); if (er) base = er
+    const ec = ensureCols(col + 1, base); if (ec) base = ec
+    const colId = base.columns[col].id
+    const next = { ...base, rows: base.rows.map((rw, ri) => ri === row ? { ...rw, cells: { ...rw.cells, [colId]: castVal(value, base.columns[col].type) } } : rw) }
+    commit(next, base === db)
+    setEditing(null)
+    if (moveRow || moveCol) selectCell(row + moveRow, col + moveCol, false)
+  }
+  const cancelEdit = () => setEditing(null)
+
+  // ── clavier global de la grille ──
+  const onKeyDown = (e) => {
+    if (editing) {
+      if (e.key === 'Enter') { e.preventDefault(); commitEdit(e.shiftKey ? -1 : 1, 0) }
+      else if (e.key === 'Tab') { e.preventDefault(); commitEdit(0, e.shiftKey ? -1 : 1) }
+      else if (e.key === 'Escape') { e.preventDefault(); cancelEdit() }
+      return
+    }
+    const meta = e.metaKey || e.ctrlKey
+    if (meta && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? doRedo() : doUndo(); return }
+    if (meta && e.key.toLowerCase() === 'y') { e.preventDefault(); doRedo(); return }
+    if (meta && e.key.toLowerCase() === 'c') { e.preventDefault(); copySel(); return }
+    if (meta && e.key.toLowerCase() === 'x') { e.preventDefault(); copySel(true); return }
+    if (meta && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteSel(); return }
+    if (meta && e.key.toLowerCase() === 'a') { e.preventDefault(); setSel({ anchor: { row: 0, col: 0 }, focus: { row: nR - 1, col: nC - 1 } }); return }
+    if (meta && e.key.toLowerCase() === 'f') { e.preventDefault(); setFindOpen(true); return }
+    if (meta && e.key.toLowerCase() === 'b') { e.preventDefault(); toggleFmt('bold'); return }
+    if (meta && e.key.toLowerCase() === 'i') { e.preventDefault(); toggleFmt('italic'); return }
+    if (meta && e.key.toLowerCase() === 'u') { e.preventDefault(); toggleFmt('underline'); return }
+    const f = sel.focus
+    if (e.key === 'ArrowUp') { e.preventDefault(); selectCell(f.row - 1, f.col, e.shiftKey) }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); selectCell(f.row + 1, f.col, e.shiftKey) }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); selectCell(f.row, f.col - 1, e.shiftKey) }
+    else if (e.key === 'ArrowRight' || e.key === 'Tab') { e.preventDefault(); selectCell(f.row, f.col + 1, e.shiftKey) }
+    else if (e.key === 'Enter') { e.preventDefault(); startEdit(f.row, f.col) }
+    else if (e.key === 'F2') { e.preventDefault(); startEdit(f.row, f.col) }
+    else if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); clearSel() }
+    else if (e.key.length === 1 && !meta && !e.altKey) { startEdit(f.row, f.col, e.key) }
+  }
+
+  // ── copier / couper / coller ──
+  const selGrid = () => { const g = []; for (let r = rect.r0; r <= rect.r1; r++) { const row = []; for (let c = rect.c0; c <= rect.c1; c++) row.push(dispValue(r, c)); g.push(row) } return g }
+  const rawGrid = () => { const g = []; for (let r = rect.r0; r <= rect.r1; r++) { const row = []; for (let c = rect.c0; c <= rect.c1; c++) row.push(rawGet(r, c)); g.push(row) } return g }
+  const copySel = async (cut) => {
+    const tsv = toTSV(selGrid())
+    copyBuf.current = { rows: rawGrid(), r0: rect.r0, c0: rect.c0, signature: tsv }
+    await writeClipboard(tsv)
+    if (cut) clearSel()
+  }
+  const clearSel = () => { const w = []; for (let r = rect.r0; r <= rect.r1; r++) for (let c = rect.c0; c <= rect.c1; c++) w.push({ r, c, val: '' }); setManyCells(w) }
+  const pasteSel = async () => {
+    const text = await readClipboard()
+    // Coller INTERNE formule-aware : si le presse-papier système correspond exactement à notre
+    // dernière copie, on réutilise les formules brutes et on les décale. Sinon (texte venu d'Excel,
+    // d'ailleurs, ou presse-papier illisible), on colle le TSV tel quel.
+    const buf = copyBuf.current
+    const useBuf = buf && (text == null || text === buf.signature)
+    const grid = useBuf ? buf.rows : (text == null ? null : fromTSV(text))
+    if (!grid || !grid.length) return
+    const r0 = rect.r0, c0 = rect.c0
+    const dR = useBuf ? r0 - buf.r0 : 0, dC = useBuf ? c0 - buf.c0 : 0
+    let base = db
+    // Largeur max des lignes collées ; garde-fou 1 minimum pour une ligne TSV vide (sinon Math.max() = -Infinity).
+    const maxW = Math.max(1, ...grid.map((g) => g.length || 0))
+    const er = ensureRows(r0 + grid.length, base); if (er) base = er
+    const ec = ensureCols(c0 + maxW, base); if (ec) base = ec
+    hist.push(db)
+    const byRow = new Map()
+    grid.forEach((line, dr) => line.forEach((val0, dc) => { const r = r0 + dr, c = c0 + dc; const val = (useBuf && isFormula(val0)) ? offsetFormula(val0, dR, dC) : val0; if (!byRow.has(r)) byRow.set(r, {}); byRow.get(r)[base.columns[c].id] = castVal(val, base.columns[c].type) }))
+    const next = { ...base, rows: base.rows.map((row, ri) => byRow.has(ri) ? { ...row, cells: { ...row.cells, ...byRow.get(ri) } } : row) }
+    onChange(next); force((x) => x + 1)
+    setSel({ anchor: { row: r0, col: c0 }, focus: { row: r0 + grid.length - 1, col: c0 + maxW - 1 } })
+  }
+
+  // ── autofill (poignée en bas à droite de la sélection) ──
+  const extendAutofill = (r, c) => {
+    // on n'autorise que l'extension verticale ou horizontale dominante
+    const dDown = r - rect.r1, dRight = c - rect.c1
+    if (Math.abs(dDown) >= Math.abs(dRight)) return { r0: rect.r0, c0: rect.c0, r1: Math.max(rect.r1, r), c1: rect.c1, dir: 'v' }
+    return { r0: rect.r0, c0: rect.c0, r1: rect.r1, c1: Math.max(rect.c1, c), dir: 'h' }
+  }
+  const applyAutofill = () => {
+    if (!autofill) return
+    const a = autofill
+    const srcH = rect.r1 - rect.r0 + 1, srcW = rect.c1 - rect.c0 + 1
+    let base = db
+    const er = ensureRows(a.r1 + 1, base); if (er) base = er
+    const ec = ensureCols(a.c1 + 1, base); if (ec) base = ec
+    hist.push(db)
+    const writes = []
+    if (a.dir === 'v') {
+      // une série par colonne : on lit la pile source de cette colonne pour deviner le pas (1,2->3,4…)
+      for (let c = rect.c0; c <= rect.c1; c++) {
+        const srcCol = []; for (let r = rect.r0; r <= rect.r1; r++) srcCol.push(rawGet(r, c))
+        const series = linearStep(srcCol)
+        for (let r = rect.r1 + 1; r <= a.r1; r++) {
+          const pos = r - rect.r0
+          const srcR = rect.r0 + (pos % srcH)
+          writes.push({ r, c, val: fillCell(rawGet(srcR, c), r - srcR, 0, series, pos) })
+        }
+      }
+    } else {
+      for (let r = rect.r0; r <= rect.r1; r++) {
+        const srcRow = []; for (let c = rect.c0; c <= rect.c1; c++) srcRow.push(rawGet(r, c))
+        const series = linearStep(srcRow)
+        for (let c = rect.c1 + 1; c <= a.c1; c++) {
+          const pos = c - rect.c0
+          const srcC = rect.c0 + (pos % srcW)
+          writes.push({ r, c, val: fillCell(rawGet(r, srcC), 0, c - srcC, series, pos) })
+        }
+      }
+    }
+    const byRow = new Map()
+    for (const w of writes) { if (!byRow.has(w.r)) byRow.set(w.r, {}); byRow.get(w.r)[base.columns[w.c].id] = w.val }
+    const next = { ...base, rows: base.rows.map((row, ri) => byRow.has(ri) ? { ...row, cells: { ...row.cells, ...byRow.get(ri) } } : row) }
+    onChange(next); force((x) => x + 1)
+  }
+  applyAutofillRef.current = applyAutofill
+
+  // ── find / replace ──
+  const findNext = () => {
+    if (!find.q) return
+    const q = find.q.toLowerCase()
+    const start = sel.focus
+    for (let i = 1; i <= nR * nC; i++) {
+      const idx = (start.row * nC + start.col + i) % (nR * nC)
+      const r = Math.floor(idx / nC), c = idx % nC
+      if (String(dispValue(r, c)).toLowerCase().includes(q)) { selectCell(r, c, false); return }
+    }
+  }
+  const replaceAll = () => {
+    if (!find.q) return
+    hist.push(db)
+    const next = { ...db, rows: rows.map((row) => { const cells = { ...row.cells }; for (const c of cols) { const v = cells[c.id]; if (typeof v === 'string' && v.includes(find.q)) cells[c.id] = v.split(find.q).join(find.repl) } return { ...row, cells } }) }
+    commit(next, false)
+  }
+
+  // ── colonnes : redimension, type, format, freeze, reorder ──
+  // Listeners STABLES (attachés une fois) lisant db/commit via refs : sinon réattache à chaque render.
+  const resizeRef = useRef(null)
+  const dbRef = useRef(db); dbRef.current = db
+  const commitRef = useRef(commit); commitRef.current = commit
+  const onChangeRef = useRef(onChange); onChangeRef.current = onChange
+  useEffect(() => {
+    const move = (e) => { const r = resizeRef.current; if (!r) return; const cur = dbRef.current; const w = Math.max(50, r.startW + (e.clientX - r.startX)); onChangeRef.current({ ...cur, columns: cur.columns.map((c) => c.id === r.colId ? { ...c, w } : c) }); force((x) => x + 1) }
+    const up = () => { if (resizeRef.current) { resizeRef.current = null; document.body.style.cursor = ''; commitRef.current(dbRef.current, false) } }
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up)
+    return () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up) }
+  }, []) // eslint-disable-line
+  const updCol = (id, fields) => commit({ ...db, columns: cols.map((c) => c.id === id ? { ...c, ...fields } : c) })
+  const [dragCol, setDragCol] = useState(null)
+  const moveCol = (from, to) => { if (from === to) return; const n = [...cols]; const [m] = n.splice(from, 1); n.splice(to, 0, m); commit({ ...db, columns: n }) }
+  const freeze = db.freeze || { cols: 1, rows: 0 } // 1ʳᵉ colonne figée par défaut (comme Sheets)
+  const setFreeze = (f) => commit({ ...db, freeze: { ...freeze, ...f } }, false)
+
+  const [ctx, setCtx] = useState(null) // menu contextuel {x,y,r,c}
+  const insertRow = (at) => { const r = { id: uid('r'), cells: {} }; const n = [...rows]; n.splice(at, 0, r); commit({ ...db, rows: n }) }
+  const insertCol = (at) => { const c = { id: uid('c'), name: colToLetter(nC), type: 'text', w: DEFW }; const n = [...cols]; n.splice(at, 0, c); commit({ ...db, columns: n }) }
+  const delRow = (r) => commit({ ...db, rows: rows.filter((_, i) => i !== r) })
+  const delCol = (c) => commit({ ...db, columns: cols.filter((_, i) => i !== c), rows: rows.map((row) => { const cells = { ...row.cells }; delete cells[cols[c].id]; return { ...row, cells } }) })
+
+  // ── largeurs cumulées pour le freeze (offset sticky) ──
+  const colW = (c) => cols[c].w || DEFW
+  const stickyLeft = (c) => { let x = GUT; for (let i = 0; i < c; i++) x += colW(i); return x }
+  // hauteur de ligne (resize au drag de la bordure inférieure du numéro de ligne)
+  const rowH = (r) => (rows[r] && rows[r].h) || RH
+  const rowResizeRef = useRef(null)
+  useEffect(() => {
+    const move = (e) => { const r = rowResizeRef.current; if (!r) return; const cur = dbRef.current; const h = Math.max(24, r.startH + (e.clientY - r.startY)); onChangeRef.current({ ...cur, rows: cur.rows.map((row, i) => i === r.rowIdx ? { ...row, h } : row) }); force((x) => x + 1) }
+    const up = () => { if (rowResizeRef.current) { rowResizeRef.current = null; document.body.style.cursor = ''; commitRef.current(dbRef.current, false) } }
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up)
+    return () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up) }
+  }, []) // eslint-disable-line
+
+  const cellBg = (r, c, isFocus, inSel) => {
+    const f = cols[c].cellFmt && cols[c].cellFmt[rows[r].id]
+    if (f && f.bg) return f.bg
+    if (inSel && !isFocus) return sk.selBg
+    // Mise en forme conditionnelle (règles globales) : prime sur le zebra, pas sur la sélection ni le fond manuel.
+    if (db.condFmt && db.condFmt.length) { const cs = condStyle(db.condFmt, dispValue(r, c)); if (cs && cs.bg) return cs.bg }
+    if (isFocus) return sk.base
+    return r % 2 === 1 ? sk.zebra : sk.base
+  }
+  const condTextColor = (r, c) => { if (!db.condFmt || !db.condFmt.length) return undefined; const cs = condStyle(db.condFmt, dispValue(r, c)); return cs && cs.color }
+  // Fusion de cellules (rendu HORIZONTAL dans une même ligne : l'ancre s'élargit, les cellules couvertes
+  // ne sont pas rendues). Les fusions multi-lignes sont mémorisées mais non span-rendues (dégradation propre).
+  const mergeOf = (r, c) => (db.merges || []).find((m) => r >= m.r0 && r <= m.r1 && c >= m.c0 && c <= m.c1)
+
+  const [menu, setMenu] = useState(null)   // menu déroulant ouvert (label) de la barre de menus
+  const [condUI, setCondUI] = useState(false) // panneau mise en forme conditionnelle
+  const [chart, setChart] = useState(false)   // panneau graphique
+  // Données du graphique depuis la sélection : 1re colonne = libellés, colonnes suivantes = séries numériques.
+  const chartData = () => {
+    const labels = [], series = []
+    const multi = rect.c1 > rect.c0
+    for (let r = rect.r0; r <= rect.r1; r++) {
+      labels.push(String(dispValue(r, rect.c0)))
+      const row = []; for (let c = (multi ? rect.c0 + 1 : rect.c0); c <= rect.c1; c++) { const n = parseFloat(dispValue(r, c)); row.push(isNaN(n) ? 0 : n) }
+      series.push(row)
+    }
+    const names = []; for (let c = (multi ? rect.c0 + 1 : rect.c0); c <= rect.c1; c++) names.push(cols[c].name || colToLetter(c))
+    return { labels, series, names }
+  }
+  const c0 = rect.c0
+  // Barre de menus type Excel/Sheets : chaque entrée = [label, action] (ou ['—'] séparateur).
+  const MENUS = {
+    Fichier: [
+      ['Importer CSV…', () => csvInputRef.current && csvInputRef.current.click()],
+      ['Exporter CSV', () => downloadCSV((db.name || 'table'), gridForExport())],
+    ],
+    Édition: [
+      ['Annuler', doUndo, '⌘Z'], ['Rétablir', doRedo, '⌘⇧Z'], ['—'],
+      ['Copier', () => copySel(false), '⌘C'], ['Couper', () => copySel(true), '⌘X'], ['Coller', pasteSel, '⌘V'],
+      ['Effacer le contenu', clearSel, '⌫'], ['—'],
+      ['Rechercher / Remplacer', () => setFindOpen(true), '⌘F'], ['Tout sélectionner', () => setSel({ anchor: { row: 0, col: 0 }, focus: { row: nR - 1, col: nC - 1 } }), '⌘A'],
+    ],
+    Insertion: [
+      ['Ligne au-dessus', () => insertRow(rect.r0)], ['Ligne en dessous', () => insertRow(rect.r1 + 1)],
+      ['Colonne à gauche', () => insertCol(c0)], ['Colonne à droite', () => insertCol(rect.c1 + 1)], ['—'],
+      ['Colonne : case à cocher', () => updCol(cols[c0].id, { type: cols[c0].type === 'checkbox' ? 'text' : 'checkbox' })],
+      ['Colonne : liste déroulante…', () => { const o = window.prompt('Options (séparées par des virgules)', (cols[c0].options || []).join(',')); if (o != null) updCol(cols[c0].id, { type: 'select', options: o.split(',').map((x) => x.trim()).filter(Boolean) }) }],
+      ['Colonne : markdown', () => updCol(cols[c0].id, { type: cols[c0].type === 'markdown' ? 'text' : 'markdown' })], ['—'],
+      ['Graphique (barres) de la sélection', () => setChart(true)],
+    ],
+    Format: [
+      ['Gras', () => toggleFmt('bold'), '⌘B'], ['Italique', () => toggleFmt('italic'), '⌘I'], ['Souligné', () => toggleFmt('underline'), '⌘U'], ['Barré', () => toggleFmt('strike')], ['—'],
+      ['Aligner à gauche', () => alignSel('left')], ['Centrer', () => alignSel('center')], ['Aligner à droite', () => alignSel('right')], ['Retour à la ligne', () => toggleFmt('wrap')], ['—'],
+      ['Bordures : tout', () => setBorderSel('all')], ['Bordures : aucune', () => setBorderSel('none')], ['—'],
+      ['Fusionner les cellules', mergeSel], ['Annuler la fusion', unmergeSel], ['—'],
+      ['Mise en forme conditionnelle…', () => setCondUI(true)], ['Effacer les règles', clearCondRules],
+    ],
+    Données: [
+      ['Trier croissant (A→Z)', () => sortByCol(c0, 'asc')], ['Trier décroissant (Z→A)', () => sortByCol(c0, 'desc')], ['—'],
+      ['Supprimer les doublons', removeDuplicates], ['Fractionner le texte (virgule)', () => splitTextToCols(',')], ['Fractionner (tab)', () => splitTextToCols('\t')], ['—'],
+      ['Figer 1 colonne', () => setFreeze({ cols: 1 })], ['Figer 1 ligne', () => setFreeze({ rows: 1 })], ['Libérer', () => setFreeze({ cols: 0, rows: 0 })],
+    ],
+  }
+
+  return (
+    <div onClick={() => menu && setMenu(null)}>
+      {/* CHROME (menus + toolbar + formule + find) : masqué en mode immersif -> grille seule. display:contents
+         ne perturbe pas le layout quand visible ; none cache tout d'un bloc en immersif. */}
+      <div style={{ display: immersive ? 'none' : 'contents' }}>
+      {/* BARRE DE MENUS (Excel/Sheets) — macOS/Numbers */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 2, marginBottom: 8, padding: '2px 4px', position: 'relative', zIndex: 30 }}>
+        {Object.keys(MENUS).map((label) => (
+          <div key={label} style={{ position: 'relative' }}>
+            <button onClick={(e) => { e.stopPropagation(); setMenu(menu === label ? null : label) }} onMouseEnter={() => menu && setMenu(label)}
+              style={{ background: menu === label ? sk.accentSoft : 'transparent', color: menu === label ? sk.accent : t.textPrimary, border: 'none', borderRadius: 7, padding: '5px 11px', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)', fontWeight: 500, cursor: 'pointer' }}>{label}</button>
+            {menu === label && (
+              <div onClick={(e) => e.stopPropagation()} style={{ position: 'absolute', top: '100%', left: 0, marginTop: 3, minWidth: 230, background: t.cardBg, border: `0.5px solid ${t.border}`, borderRadius: 10, boxShadow: '0 12px 32px rgba(0,0,0,0.22)', padding: 5, zIndex: 40 }}>
+                {MENUS[label].map((it, i) => it[0] === '—'
+                  ? <div key={i} style={{ height: 1, background: t.border, margin: '4px 6px' }} />
+                  : <button key={i} onClick={() => { setMenu(null); it[1]() }} style={{ display: 'flex', justifyContent: 'space-between', gap: 18, width: '100%', textAlign: 'left', background: 'transparent', border: 'none', color: t.textPrimary, cursor: 'pointer', padding: '6px 9px', borderRadius: 6, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)' }} onMouseEnter={(e) => e.currentTarget.style.background = sk.accentSoft} onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}><span>{it[0]}</span>{it[2] && <span style={{ color: t.textSecondary, fontFamily: FONTS.mono, fontSize: 'var(--zr-ui-xs)' }}>{it[2]}</span>}</button>)}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      <input ref={csvInputRef} type="file" accept=".csv,text/csv" onChange={importCsv} style={{ display: 'none' }} />
+      {condUI && <CondPanel t={t} rules={db.condFmt || []} onAdd={addCondRule} onClear={clearCondRules} onClose={() => setCondUI(false)} />}
+      {chart && <ChartPanel t={t} data={chartData()} onClose={() => setChart(false)} />}
+
+      {/* barre d'outils tableur */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap', padding: '6px 8px', background: (t.glass && t.glass.bg) || 'transparent', borderRadius: RADII.md, border: `0.5px solid ${t.border}` }}>
+        <Btn t={t} onClick={doUndo} title="Annuler (⌘Z)">↶</Btn>
+        <Btn t={t} onClick={doRedo} title="Rétablir (⌘⇧Z)">↷</Btn>
+        <Sep t={t} />
+        <Btn t={t} onClick={() => toggleFmt('bold')} title="Gras (⌘B)">B</Btn>
+        <Btn t={t} onClick={() => toggleFmt('italic')} title="Italique (⌘I)"><i>I</i></Btn>
+        <Btn t={t} onClick={() => toggleFmt('underline')} title="Souligné (⌘U)"><u>U</u></Btn>
+        <Btn t={t} onClick={() => toggleFmt('strike')} title="Barré"><s>S</s></Btn>
+        <select title="Taille du texte" defaultValue="" onChange={(e) => { if (e.target.value) setFmtVal('fontSize', +e.target.value); e.target.value = '' }} style={{ ...selStyle(t), width: 52 }}>
+          <option value="">⌀</option>{[11, 12, 13, 14, 16, 18, 20, 24].map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <Btn t={t} onClick={() => toggleFmt('wrap')} title="Retour à la ligne">↵</Btn>
+        <Btn t={t} onClick={() => setBorderSel('all')} title="Bordures">▦</Btn>
+        <Btn t={t} onClick={() => alignSel('left')} title="Gauche">⇤</Btn>
+        <Btn t={t} onClick={() => alignSel('center')} title="Centré">≡</Btn>
+        <Btn t={t} onClick={() => alignSel('right')} title="Droite">⇥</Btn>
+        <input type="color" title="Couleur du texte" onChange={(e) => colorSel('color', e.target.value)} style={{ width: 24, height: 24, border: 'none', borderRadius: '50%', background: 'transparent', cursor: 'pointer', padding: 0 }} />
+        <input type="color" title="Couleur de fond" onChange={(e) => colorSel('bg', e.target.value)} style={{ width: 24, height: 24, border: 'none', borderRadius: '50%', background: 'transparent', cursor: 'pointer', padding: 0 }} />
+        <Sep t={t} />
+        <select title="Format colonne" value={cols[rect.c0]?.format || 'auto'} onChange={(e) => updCol(cols[rect.c0].id, { format: e.target.value })} style={selStyle(t)}>
+          {NUM_FORMATS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+        </select>
+        <Sep t={t} />
+        <Btn t={t} onClick={() => setFindOpen((v) => !v)} title="Rechercher (⌘F)">🔍</Btn>
+        <Btn t={t} onClick={() => downloadCSV((db.name || 'table'), gridForExport())} title="Export CSV">CSV ↓</Btn>
+        <label style={{ ...btnStyle(t), cursor: 'pointer' }} title="Import CSV">CSV ↑
+          <input type="file" accept=".csv,text/csv" onChange={importCsv} style={{ display: 'none' }} />
+        </label>
+        <Sep t={t} />
+        <span style={{ fontFamily: FONTS.mono, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>{toA1(rect.r0, rect.c0)}{(rect.r0 !== rect.r1 || rect.c0 !== rect.c1) ? ':' + toA1(rect.r1, rect.c1) : ''}</span>
+      </div>
+
+      {/* barre de formule */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontFamily: FONTS.mono, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, fontWeight: 700, minWidth: 34 }}>{toA1(sel.focus.row, sel.focus.col)}</span>
+        <span style={{ color: t.textSecondary }}>ƒx</span>
+        <input value={editing && editing.row === sel.focus.row && editing.col === sel.focus.col ? editing.value : String(rawGet(sel.focus.row, sel.focus.col) ?? '')}
+          onChange={(e) => setEditing({ row: sel.focus.row, col: sel.focus.col, value: e.target.value })}
+          onFocus={() => { if (!editing) startEdit(sel.focus.row, sel.focus.col) }}
+          onBlur={() => { if (editing) commitEdit(0, 0) }}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commitEdit(1, 0); gridRef.current && gridRef.current.focus() } else if (e.key === 'Escape') cancelEdit() }}
+          placeholder="valeur ou =formule" style={{ flex: 1, background: (t.glass && t.glass.bg) || t.surface, border: `0.5px solid ${t.border}`, borderRadius: 8, color: t.textPrimary, fontFamily: FONTS.mono, fontSize: 'var(--zr-ui-md)', padding: '6px 10px', outline: 'none' }} />
+      </div>
+
+      {findOpen && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, background: t.surface, border: `1px solid ${t.border}`, borderRadius: RADII.sm, padding: 6 }}>
+          <input autoFocus value={find.q} onChange={(e) => setFind({ ...find, q: e.target.value })} onKeyDown={(e) => e.key === 'Enter' && findNext()} placeholder="rechercher" style={inp(t)} />
+          <input value={find.repl} onChange={(e) => setFind({ ...find, repl: e.target.value })} placeholder="remplacer par" style={inp(t)} />
+          <Btn t={t} onClick={findNext}>Suivant</Btn>
+          <Btn t={t} onClick={replaceAll}>Tout remplacer</Btn>
+          <Btn t={t} onClick={() => setFindOpen(false)}>✕</Btn>
+        </div>
+      )}
+
+      </div>
+      {/* GRILLE */}
+      <div ref={gridRef} tabIndex={0} onKeyDown={onKeyDown} style={{ outline: 'none', overflow: 'auto', maxHeight: immersive ? 'calc(100vh - 150px)' : '70vh', width: '100%', border: `0.5px solid ${sk.lineStrong}`, borderRadius: RADII.lg, position: 'relative', userSelect: 'none', background: t.cardBg, boxShadow: SHADOWS.apple, WebkitOverflowScrolling: 'touch' }}>
+        <div style={{ display: 'inline-block', minWidth: '100%' }}>
+          {/* en-tête colonnes A B C… */}
+          <div style={{ display: 'flex', position: 'sticky', top: 0, zIndex: 5 }}>
+            <div style={{ width: GUT, height: HH, flex: '0 0 auto', boxSizing: 'border-box', position: 'sticky', left: 0, zIndex: 6, background: sk.headBg, backdropFilter: sk.headFilter, WebkitBackdropFilter: sk.headFilter, borderBottom: `0.5px solid ${sk.lineStrong}`, borderRight: `0.5px solid ${sk.lineStrong}` }} />
+            {cols.map((c, ci) => {
+              const fz = ci < freeze.cols
+              const colActive = ci >= rect.c0 && ci <= rect.c1
+              return (
+                <div key={c.id} draggable onDragStart={() => setDragCol(ci)} onDragOver={(e) => e.preventDefault()} onDrop={() => { if (dragCol != null) moveCol(dragCol, ci); setDragCol(null) }}
+                  onContextMenu={(e) => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY, kind: 'col', c: ci }) }}
+                  style={{ width: colW(ci), flex: `0 0 ${colW(ci)}px`, height: HH, position: fz ? 'sticky' : 'relative', left: fz ? stickyLeft(ci) : undefined, zIndex: fz ? 6 : 4, background: colActive ? sk.accentSoft : sk.headBg, backdropFilter: sk.headFilter, WebkitBackdropFilter: sk.headFilter, borderBottom: `0.5px solid ${sk.lineStrong}`, borderRight: `0.5px solid ${sk.line}`, display: 'flex', alignItems: 'center', justifyContent: 'flex-start', padding: '0 9px', boxSizing: 'border-box', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', fontWeight: 600, letterSpacing: '0.02em', color: colActive ? sk.accent : sk.headText, cursor: 'pointer', transition: 'background .12s ease, color .12s ease' }}
+                  onClick={() => setSel({ anchor: { row: 0, col: ci }, focus: { row: nR - 1, col: ci } })} title={c.name}>
+                  {c.name && c.name !== colToLetter(ci) ? c.name : colToLetter(ci)}
+                  <span onMouseDown={(e) => { e.stopPropagation(); resizeRef.current = { colId: c.id, startX: e.clientX, startW: colW(ci) }; document.body.style.cursor = 'col-resize' }}
+                    style={{ position: 'absolute', top: 0, right: -3, width: 7, height: '100%', cursor: 'col-resize', zIndex: 7 }} />
+                </div>
+              )
+            })}
+            <div style={{ width: 34, height: HH, boxSizing: 'border-box', background: sk.headBg, borderBottom: `0.5px solid ${sk.lineStrong}`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <button onClick={() => insertCol(nC)} title="Ajouter colonne" style={{ background: 'none', border: 'none', color: sk.headText, cursor: 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-lg)' }}>+</button>
+            </div>
+          </div>
+
+          {/* lignes */}
+          {rows.map((row, r) => {
+            const rowActive = r >= rect.r0 && r <= rect.r1
+            return (
+            <div key={row.id} style={{ display: 'flex' }}>
+              <div onClick={() => setSel({ anchor: { row: r, col: 0 }, focus: { row: r, col: nC - 1 } })} onContextMenu={(e) => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY, kind: 'row', r }) }}
+                style={{ width: GUT, height: rowH(r), flex: '0 0 auto', boxSizing: 'border-box', position: 'sticky', left: 0, zIndex: 3, background: rowActive ? sk.accentSoft : sk.headBg, backdropFilter: sk.headFilter, WebkitBackdropFilter: sk.headFilter, borderBottom: `0.5px solid ${sk.line}`, borderRight: `0.5px solid ${sk.lineStrong}`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: FONTS.mono, fontSize: 'var(--zr-ui-xs)', fontWeight: rowActive ? 700 : 500, color: rowActive ? sk.accent : sk.headText, cursor: 'pointer', transition: 'background .12s ease' }}>{r + 1}
+                <span onMouseDown={(e) => { e.stopPropagation(); rowResizeRef.current = { rowIdx: r, startY: e.clientY, startH: rowH(r) }; document.body.style.cursor = 'row-resize' }}
+                  style={{ position: 'absolute', left: 0, bottom: -3, width: '100%', height: 7, cursor: 'row-resize', zIndex: 7 }} /></div>
+              {cols.map((c, ci) => {
+                // Fusion horizontale : cellule couverte non-ancre dans une ligne -> non rendue ; l'ancre s'élargit.
+                const mg = mergeOf(r, ci)
+                if (mg && mg.r0 === mg.r1 && !(mg.r0 === r && mg.c0 === ci) && r === mg.r0) return null
+                const mergeW = (mg && mg.r0 === mg.r1 && mg.c0 === ci && mg.r0 === r) ? (() => { let w = 0; for (let k = mg.c0; k <= mg.c1; k++) w += colW(k); return w })() : null
+                const isFocus = sel.focus.row === r && sel.focus.col === ci
+                const inSel = inRect(r, ci, rect)
+                const inFill = autofill && inRect(r, ci, autofill) && !inRect(r, ci, rect)
+                const fz = ci < freeze.cols
+                const isEd = editing && editing.row === r && editing.col === ci
+                const fmt = c.cellFmt && c.cellFmt[row.id]
+                const disp = dispValue(r, ci)
+                const raw = rawGet(r, ci)
+                return (
+                  <div key={c.id}
+                    onMouseDown={(e) => onCellMouseDown(r, ci, e)} onMouseEnter={() => onCellMouseEnter(r, ci)}
+                    onDoubleClick={() => startEdit(r, ci)}
+                    onContextMenu={(e) => { e.preventDefault(); selectCell(r, ci, false); setCtx({ x: e.clientX, y: e.clientY, kind: 'cell', r, c: ci }) }}
+                    style={{ width: mergeW || colW(ci), flex: `0 0 ${mergeW || colW(ci)}px`, height: rowH(r), position: fz ? 'sticky' : 'relative', left: fz ? stickyLeft(ci) : undefined, zIndex: mergeW ? 3 : (fz ? 2 : 1),
+                      background: cellBg(r, ci, isFocus, inSel), borderBottom: `0.5px solid ${sk.line}`, borderRight: `0.5px solid ${sk.line}`,
+                      boxShadow: isFocus ? `inset 0 0 0 1.5px ${sk.accent}` : (inFill ? `inset 0 0 0 1px ${sk.accent}` : 'none'),
+                      boxSizing: 'border-box', padding: '0 9px', display: 'flex', alignItems: 'center', overflow: 'hidden', cursor: 'cell', ...cellStyle(fmt) }}>
+                    {isEd ? (
+                      <input autoFocus value={editing.value} onChange={(e) => setEditing({ ...editing, value: e.target.value })} onBlur={() => commitEdit(0, 0)}
+                        style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', color: t.textPrimary, fontFamily: isFormula(editing.value) ? FONTS.mono : FONTS.sans, fontSize: 'var(--zr-ui-md)', ...cellStyle(fmt) }} />
+                    ) : (
+                      <span style={{ whiteSpace: (fmt && fmt.wrap) ? 'normal' : 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 'var(--zr-ui-md)', color: condTextColor(r, ci) || (typeof disp === 'string' && disp[0] === '#' && /^#[A-Z]/.test(disp) ? PALETTE.red : undefined), width: '100%', textAlign: c.type === 'checkbox' ? 'left' : (fmt && fmt.align ? fmt.align : (typeof disp === 'number' || c.type === 'number' ? 'right' : 'left')), fontFamily: c.type === 'number' || typeof disp === 'number' ? FONTS.mono : FONTS.sans }}>
+                        {c.type === 'checkbox'
+                          ? <input type="checkbox" checked={!!raw} onChange={(e) => { setCellRaw(r, ci, e.target.checked); gridRef.current && gridRef.current.focus() }} />
+                          : c.type === 'markdown' && disp
+                            ? <span className="shelf-md" dangerouslySetInnerHTML={{ __html: safeMarkedParse(String(disp)) }} />
+                            : c.type === 'select' && c.options && c.options.length
+                              ? <select value={String(raw ?? '')} onChange={(e) => { setCellRaw(r, ci, e.target.value); gridRef.current && gridRef.current.focus() }} style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', font: 'inherit', color: 'inherit', cursor: 'pointer' }}><option value=""></option>{c.options.map((o) => <option key={o} value={o}>{o}</option>)}</select>
+                              : formatValue(disp, c.format || 'auto', c.decimals)}
+                      </span>
+                    )}
+                    {/* poignée d'autofill au coin bas-droit de la sélection */}
+                    {!isEd && r === rect.r1 && ci === rect.c1 && (
+                      <span onMouseDown={(e) => { e.stopPropagation(); setAutofill({ r0: rect.r0, c0: rect.c0, r1: rect.r1, c1: rect.c1, dir: 'v' }) }}
+                        style={{ position: 'absolute', right: -4, bottom: -4, width: 9, height: 9, background: sk.accent, border: `1.5px solid ${t.cardBg}`, borderRadius: '50%', cursor: 'crosshair', zIndex: 8, boxShadow: '0 1px 2px rgba(0,0,0,0.25)' }} />
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          ) })}
+          <div style={{ display: 'flex' }}>
+            <button onClick={() => insertRow(nR)} style={{ width: GUT, height: RH, background: sk.headBg, border: 'none', borderRight: `0.5px solid ${sk.lineStrong}`, borderBottom: `0.5px solid ${sk.lineStrong}`, color: sk.headText, cursor: 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-lg)' }}>+</button>
+          </div>
+        </div>
+      </div>
+
+      {/* BARRE D'ÉTAT (façon Excel/Sheets) : stats live de la sélection + figer — masquée en immersif */}
+      <div style={{ display: immersive ? 'none' : 'flex', gap: 14, marginTop: 8, alignItems: 'center', fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, flexWrap: 'wrap', padding: '6px 10px', background: (t.glass && t.glass.bg) || 'transparent', border: `0.5px solid ${t.border}`, borderRadius: RADII.md }}>
+        {(() => {
+          const vals = []; for (let r = rect.r0; r <= rect.r1; r++) for (let c = rect.c0; c <= rect.c1; c++) { const v = dispValue(r, c); if (v !== '' && v != null) vals.push(v) }
+          const nums = vals.map((v) => parseFloat(v)).filter((n) => !isNaN(n))
+          const sum = nums.reduce((s, x) => s + x, 0)
+          const fmtN = (n) => Number(n).toLocaleString('fr-FR', { maximumFractionDigits: 4 })
+          return <>
+            <span><b style={{ color: t.textPrimary }}>Nb</b> {vals.length}</span>
+            {nums.length > 0 && <><span><b style={{ color: t.textPrimary }}>Somme</b> {fmtN(sum)}</span>
+            <span><b style={{ color: t.textPrimary }}>Moyenne</b> {fmtN(sum / nums.length)}</span>
+            <span><b style={{ color: t.textPrimary }}>Min</b> {fmtN(Math.min(...nums))}</span>
+            <span><b style={{ color: t.textPrimary }}>Max</b> {fmtN(Math.max(...nums))}</span></>}
+          </>
+        })()}
+        <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 6 }}>Figer
+          <select value={freeze.cols} onChange={(e) => setFreeze({ cols: +e.target.value })} style={selStyle(t)}>{[0, 1, 2, 3].map((n) => <option key={n} value={n}>{n} col.</option>)}</select>
+          <select value={freeze.rows} onChange={(e) => setFreeze({ rows: +e.target.value })} style={selStyle(t)}>{[0, 1, 2, 3].map((n) => <option key={n} value={n}>{n} lig.</option>)}</select>
+        </span>
+      </div>
+
+      {ctx && <CtxMenu t={t} ctx={ctx} close={() => setCtx(null)} insertRow={insertRow} insertCol={insertCol} delRow={delRow} delCol={delCol} />}
+    </div>
+  )
+
+  // ── helpers de formatage de la sélection (cellFmt par colonne -> {rowId:{bold,...}}) ──
+  function applyFmtToSel(fn) {
+    hist.push(db)
+    const nextCols = cols.map((c, ci) => {
+      if (ci < rect.c0 || ci > rect.c1) return c
+      const cellFmt = { ...(c.cellFmt || {}) }
+      for (let r = rect.r0; r <= rect.r1; r++) { const id = rows[r] && rows[r].id; if (!id) continue; cellFmt[id] = fn({ ...(cellFmt[id] || {}) }) }
+      return { ...c, cellFmt }
+    })
+    commit({ ...db, columns: nextCols }, false)
+  }
+  function toggleFmt(key) { applyFmtToSel((f) => ({ ...f, [key]: !f[key] })) }
+  function alignSel(a) { applyFmtToSel((f) => ({ ...f, align: a })) }
+  function colorSel(key, val) { applyFmtToSel((f) => ({ ...f, [key]: val })) }
+  function setFmtVal(key, val) { applyFmtToSel((f) => ({ ...f, [key]: val })) }
+  // Bordures sur la sélection : side ∈ top|right|bottom|left|all|none.
+  function setBorderSel(side, color = '#9aa0a6') {
+    applyFmtToSel((f) => {
+      if (side === 'none') return { ...f, border: undefined }
+      const b = { ...(f.border || {}) }
+      if (side === 'all') { b.top = b.right = b.bottom = b.left = color } else b[side] = color
+      return { ...f, border: b }
+    })
+  }
+  // ── DONNÉES : tri, doublons, validation, split ──
+  function sortByCol(ci, dir) {
+    hist.push(db)
+    const idx = rows.map((_, i) => i)
+    const colId = cols[ci].id
+    const val = (i) => { const v = dispValue(i, ci); const n = parseFloat(v); return { n: isNaN(n) ? null : n, s: String(v ?? '').toLowerCase() } }
+    idx.sort((a, b) => { const A = val(a), B = val(b); let c; if (A.n != null && B.n != null) c = A.n - B.n; else c = A.s < B.s ? -1 : A.s > B.s ? 1 : 0; return dir === 'desc' ? -c : c })
+    commit({ ...db, rows: idx.map((i) => rows[i]) }, false)
+    void colId
+  }
+  function removeDuplicates() {
+    hist.push(db)
+    const seen = new Set(); const kept = []
+    for (let r = 0; r < nR; r++) { const key = cols.map((_, c) => String(dispValue(r, c))).join(''); if (seen.has(key)) continue; seen.add(key); kept.push(rows[r]) }
+    commit({ ...db, rows: kept }, false)
+  }
+  function splitTextToCols(sep = ',') {
+    hist.push(db); const c0 = rect.c0
+    const parts = rows.map((_, r) => String(dispValue(r, c0)).split(sep))
+    const maxP = Math.max(1, ...parts.map((p) => p.length))
+    let base = db; const ec = ensureCols(c0 + maxP, base); if (ec) base = ec
+    const next = { ...base, rows: base.rows.map((row, r) => { const cells = { ...row.cells }; parts[r].forEach((v, k) => { cells[base.columns[c0 + k].id] = v.trim() }); return { ...row, cells } }) }
+    commit(next, false)
+  }
+  // ── MISE EN FORME CONDITIONNELLE (règles globales table) ──
+  function addCondRule(rule) { commit({ ...db, condFmt: [...(db.condFmt || []), rule] }, false) }
+  function clearCondRules() { commit({ ...db, condFmt: [] }, false) }
+  // ── FUSION de cellules (rect courant) : on mémorise les spans dans db.merges = [{r0,c0,r1,c1}] ──
+  function mergeSel() { if (rect.r0 === rect.r1 && rect.c0 === rect.c1) return; commit({ ...db, merges: [...(db.merges || []).filter((m) => !overlap(m, rect)), { ...rect }] }, false) }
+  function unmergeSel() { commit({ ...db, merges: (db.merges || []).filter((m) => !overlap(m, rect)) }, false) }
+
+  function gridForExport() { const g = [cols.map((c) => c.name || '')]; for (let r = 0; r < nR; r++) g.push(cols.map((_, c) => dispValue(r, c))); return g }
+  function importCsv(e) {
+    const file = e.target.files && e.target.files[0]; if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      const grid = fromCSV(String(reader.result || ''))
+      if (!grid.length) return
+      hist.push(db)
+      const header = grid[0]
+      const newCols = header.map((h, i) => ({ id: uid('c'), name: h || colToLetter(i), type: 'text', w: DEFW }))
+      const newRows = grid.slice(1).map((line) => { const cells = {}; line.forEach((v, i) => { if (newCols[i]) cells[newCols[i].id] = v }); return { id: uid('r'), cells } })
+      commit({ ...db, columns: newCols, rows: newRows }, false)
+      setSel({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+    }
+    reader.readAsText(file); e.target.value = ''
+  }
+}
+
+// Détecte une suite linéaire dans les cellules source (comme Excel/Sheets) :
+// [1,2] -> pas +1 ; [10,20,30] -> pas +10 ; [5] -> pas +1 (incrément simple).
+// Renvoie { base, step } si tous les éléments sont des nombres réguliers, sinon null (= pas de série).
+function isPlainNum(v) { const s = String(v).trim(); return s !== '' && /^-?\d*\.?\d+$/.test(s) && !isNaN(parseFloat(s)) }
+function linearStep(srcArr) {
+  const ns = srcArr.map((v) => (isFormula(v) || !isPlainNum(v)) ? null : parseFloat(v))
+  if (ns.some((x) => x == null)) return null
+  if (ns.length === 1) return { base: ns[0], step: 1 }
+  const step = ns[1] - ns[0]
+  for (let i = 2; i < ns.length; i++) if (Math.abs((ns[i] - ns[i - 1]) - step) > 1e-9) return null
+  return { base: ns[0], step }
+}
+// Calcule la valeur d'une cellule remplie.
+// - formule : on la DÉCALE (=A1 tiré d'une ligne devient =A2), $ respectés.
+// - nombre dans une série : on continue la suite (base + pos*step).
+// - sinon : on recopie tel quel (texte, etc.).
+function fillCell(srcVal, dRow, dCol, series, pos) {
+  if (isFormula(srcVal)) return offsetFormula(srcVal, dRow, dCol)
+  if (series && isPlainNum(srcVal)) {
+    const v = series.base + pos * series.step
+    return String(Number.isInteger(v) ? v : +v.toFixed(10))
+  }
+  return srcVal
+}
+
+// Chevauchement de deux rectangles {r0,c0,r1,c1} (fusion de cellules).
+function overlap(a, b) { return a.r0 <= b.r1 && a.r1 >= b.r0 && a.c0 <= b.c1 && a.c1 >= b.c0 }
+
+function castVal(v, type) {
+  if (type === 'number') { if (v === '' || v == null) return ''; const n = parseFloat(v); return isNaN(n) ? v : (isFormula(v) ? v : n) }
+  if (type === 'checkbox') return v === true || v === 'true' || v === '1' || v === '✓'
+  return v
+}
+
+const btnStyle = (t) => ({ background: (t.glass && t.glass.bg) || t.btnSecondaryBg, color: t.textPrimary, border: `0.5px solid ${t.border}`, borderRadius: 8, padding: '5px 10px', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', fontWeight: 500, cursor: 'pointer', lineHeight: 1.3, boxShadow: SHADOWS.sm, transition: 'background .12s ease, transform .1s ease' })
+const Btn = ({ t, children, ...p }) => <button {...p} style={btnStyle(t)} onMouseDown={(e) => { e.currentTarget.style.transform = 'scale(0.96)' }} onMouseUp={(e) => { e.currentTarget.style.transform = 'none' }} onMouseLeave={(e) => { e.currentTarget.style.transform = 'none' }}>{children}</button>
+const Sep = ({ t }) => <span style={{ width: 1, height: 18, background: gridSkin(t).line, margin: '0 2px' }} />
+const selStyle = (t) => ({ background: (t.glass && t.glass.bg) || t.surface, color: t.textPrimary, border: `0.5px solid ${t.border}`, borderRadius: 8, padding: '5px 8px', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', cursor: 'pointer', outline: 'none' })
+const inp = (t) => ({ background: t.bg, border: `0.5px solid ${t.border}`, borderRadius: 8, color: t.textPrimary, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', padding: '5px 9px', outline: 'none', width: 140 })
+
+// Panneau de mise en forme conditionnelle : règle = {op, value, bg, color}. Aperçu live, liste des règles.
+const COND_OPS = [['>', '>'], ['<', '<'], ['>=', '≥'], ['<=', '≤'], ['=', '='], ['!=', '≠'], ['contains', 'contient'], ['empty', 'vide'], ['notEmpty', 'non vide']]
+function CondPanel({ t, rules, onAdd, onClear, onClose }) {
+  const [op, setOp] = useState('>')
+  const [value, setValue] = useState('')
+  const [bg, setBg] = useState('#ffe08a')
+  const [color, setColor] = useState('#1c1c1e')
+  const noVal = op === 'empty' || op === 'notEmpty'
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 1200, background: 'rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 'min(420px,92vw)', background: t.cardBg, border: `1px solid ${t.border}`, borderRadius: RADII.lg, boxShadow: '0 30px 80px rgba(0,0,0,0.45)', padding: 18, fontFamily: FONTS.sans }}>
+        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 12 }}><b style={{ color: t.textPrimary, fontSize: 'var(--zr-ui-xl)' }}>Mise en forme conditionnelle</b><button onClick={onClose} style={{ marginLeft: 'auto', background: 'transparent', border: 'none', color: t.textSecondary, cursor: 'pointer', fontSize: 'var(--zr-ui-2xl)' }}>✕</button></div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
+          <span style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-sm)' }}>Si la cellule est</span>
+          <select value={op} onChange={(e) => setOp(e.target.value)} style={selStyle(t)}>{COND_OPS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select>
+          {!noVal && <input value={value} onChange={(e) => setValue(e.target.value)} placeholder="valeur" style={inp(t)} />}
+          <label style={{ fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, display: 'inline-flex', alignItems: 'center', gap: 4 }}>fond <input type="color" value={bg} onChange={(e) => setBg(e.target.value)} style={{ width: 26, height: 26, border: 'none', background: 'none', cursor: 'pointer' }} /></label>
+          <label style={{ fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, display: 'inline-flex', alignItems: 'center', gap: 4 }}>texte <input type="color" value={color} onChange={(e) => setColor(e.target.value)} style={{ width: 26, height: 26, border: 'none', background: 'none', cursor: 'pointer' }} /></label>
+          <button onClick={() => { onAdd({ op, value, bg, color }); setValue('') }} style={{ ...btnStyle(t), background: PALETTE.primary, color: '#fff', border: 'none' }}>Ajouter</button>
+        </div>
+        {!!rules.length && <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8 }}>{rules.map((r, i) => <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'var(--zr-ui-sm)', color: t.textPrimary }}><span style={{ width: 16, height: 16, borderRadius: 4, background: r.bg, border: `1px solid ${t.border}` }} /><span>{(COND_OPS.find((o) => o[0] === r.op) || [])[1]} {r.value}</span></div>)}</div>}
+        {!!rules.length && <button onClick={onClear} style={{ ...btnStyle(t), color: '#9B5A57' }}>Effacer toutes les règles</button>}
+      </div>
+    </div>
+  )
+}
+
+// Graphique en barres (SVG) depuis la sélection. labels = abscisses, series[r] = valeurs par groupe, names = légende.
+const CHART_COLORS = ['#0A84FF', '#34C759', '#FF9F0A', '#FF453A', '#BF5AF2', '#5AC8FA', '#FFD60A']
+function ChartPanel({ t, data, onClose }) {
+  const { labels, series, names } = data
+  const W = 620, H = 340, pad = { l: 44, r: 16, t: 18, b: 54 }
+  const nGroups = labels.length, nSer = names.length || 1
+  const allVals = series.flat()
+  const maxV = Math.max(1, ...allVals), minV = Math.min(0, ...allVals)
+  const span = maxV - minV || 1
+  const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b
+  const gW = plotW / Math.max(1, nGroups)
+  const bW = (gW * 0.74) / nSer
+  const y0 = pad.t + plotH * (maxV / span) // ligne du zéro
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 1200, background: 'rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: t.cardBg, border: `1px solid ${t.border}`, borderRadius: RADII.lg, boxShadow: '0 30px 80px rgba(0,0,0,0.45)', padding: 18, fontFamily: FONTS.sans }}>
+        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}><b style={{ color: t.textPrimary, fontSize: 'var(--zr-ui-xl)' }}>Graphique</b>
+          <span style={{ marginLeft: 12, display: 'inline-flex', gap: 10 }}>{names.map((n, i) => <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary }}><span style={{ width: 10, height: 10, borderRadius: 2, background: CHART_COLORS[i % CHART_COLORS.length] }} />{n}</span>)}</span>
+          <button onClick={onClose} style={{ marginLeft: 'auto', background: 'transparent', border: 'none', color: t.textSecondary, cursor: 'pointer', fontSize: 'var(--zr-ui-2xl)' }}>✕</button></div>
+        <svg width={W} height={H} style={{ display: 'block' }}>
+          <line x1={pad.l} y1={y0} x2={W - pad.r} y2={y0} stroke={t.border} />
+          {[0, 0.25, 0.5, 0.75, 1].map((f, i) => { const val = maxV - f * span; const y = pad.t + f * plotH; return <g key={i}><line x1={pad.l} y1={y} x2={W - pad.r} y2={y} stroke={t.border} strokeOpacity={0.4} /><text x={pad.l - 6} y={y + 3} textAnchor="end" fontSize="10" fill={t.textSecondary}>{Number(val).toLocaleString('fr-FR', { maximumFractionDigits: 1 })}</text></g> })}
+          {labels.map((lab, gi) => (
+            <g key={gi}>
+              {(series[gi] || []).map((v, si) => { const h = Math.abs(v) / span * plotH; const x = pad.l + gi * gW + (gW * 0.13) + si * bW; const y = v >= 0 ? y0 - h : y0; return <rect key={si} x={x} y={y} width={Math.max(1, bW - 2)} height={Math.max(0, h)} rx={2} fill={CHART_COLORS[si % CHART_COLORS.length]} /> })}
+              <text x={pad.l + gi * gW + gW / 2} y={H - pad.b + 16} textAnchor="middle" fontSize="10.5" fill={t.textSecondary}>{lab.length > 10 ? lab.slice(0, 9) + '…' : lab}</text>
+            </g>
+          ))}
+        </svg>
+      </div>
+    </div>
+  )
+}
+
+function CtxMenu({ t, ctx, close, insertRow, insertCol, delRow, delCol }) {
+  useEffect(() => { const h = () => close(); window.addEventListener('click', h); return () => window.removeEventListener('click', h) }, [])
+  const items = []
+  if (ctx.kind === 'row' || ctx.kind === 'cell') { items.push(['Insérer une ligne au-dessus', () => insertRow(ctx.r)], ['Insérer une ligne en dessous', () => insertRow(ctx.r + 1)], ['Supprimer la ligne', () => delRow(ctx.r)]) }
+  if (ctx.kind === 'col' || ctx.kind === 'cell') { const c = ctx.c; items.push(['Insérer une colonne à gauche', () => insertCol(c)], ['Insérer une colonne à droite', () => insertCol(c + 1)], ['Supprimer la colonne', () => delCol(c)]) }
+  return (
+    <div style={{ position: 'fixed', left: ctx.x, top: ctx.y, zIndex: 1000, background: t.cardBg, border: `1px solid ${t.border}`, borderRadius: 8, boxShadow: '0 8px 24px rgba(0,0,0,0.2)', padding: 4, minWidth: 200 }}>
+      {items.map(([label, fn], i) => <button key={i} onClick={() => { fn(); close() }} style={{ display: 'block', width: '100%', textAlign: 'left', background: 'transparent', border: 'none', color: t.textPrimary, cursor: 'pointer', padding: '6px 10px', borderRadius: 5, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)' }}>{label}</button>)}
+    </div>
+  )
+}

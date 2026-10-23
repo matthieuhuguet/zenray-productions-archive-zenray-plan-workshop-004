@@ -1,0 +1,218 @@
+// PIPELINE VIDÉO CMAF/fMP4 PUBLIC (sans réencodage, sans chiffrement) — voir docs/video-backup-canonical.md.
+// Repackage une vidéo (mp4 H.264 OU webm VP9) en fMP4 CMAF par `-c copy` (lossless, ~temps réel x600),
+// pousse init+segments (noms hashés SHA-256, anonymisés) sur le shard PUBLIC zenray-vid-public-NN (servi par
+// jsDelivr, commit pinné), réécrit les playlists vers jsDelivr, et écrit le manifeste .media.json (type hls,
+// enc:'none') dans zenray-data. Le lecteur hls.js lit le fMP4 direct depuis le CDN (VP9 OK sur Chrome/FF/Edge).
+//
+// Usage : GITHUB_TOKEN=$(gh auth token) node Scripts/video-fmp4.mjs <fichier> --dest pages/Videos/Eagle --base "Nom" [--api http://localhost:3000]
+import { readdir, readFile, rm, mkdir, stat, copyFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { CDN_CHUNK, PUBLIC_VIDEO_SHARD_BIN_BYTES } from '../src/config/chunkPolicy.js' // seuil 19 Mo/segment + capacité de lot (sources uniques)
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+import { pushBlobs } from './video-mse-lib.mjs'
+const exec = promisify(execFile)
+
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN requis'); process.exit(1) }
+const OWNER = 'matthieuhuguet', DATA = 'zenray-data', BRANCH = 'main'
+const FFMPEG = '/opt/homebrew/bin/ffmpeg', FFPROBE = '/opt/homebrew/bin/ffprobe'
+const HLS_TIME = 6
+const args = process.argv.slice(2)
+const getArg = (f, d = null) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : d }
+const input = args[0]
+const DEST = getArg('--dest', 'pages/Videos/Eagle')
+const BASE = (getArg('--base') || path.basename(input).replace(/\.[^.]+$/, '')).replace(/[^\p{L}\p{N} ._-]/gu, '').replace(/\s+/g, ' ').trim() || 'video'
+const API = getArg('--api', 'http://localhost:3000')
+const sha256 = (b) => createHash('sha256').update(b).digest('hex')
+const shardPathFor = (h, ext) => `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.${ext}`
+const log = (s) => console.log(s)
+
+// 1) shard vidéo public actif (rollover serveur) -> zenray-vid-public-NN
+async function activeVidShard(need) {
+  const r = await fetch(`${API}/api/upload-shard`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'active-shard', kind: 'vid', vis: 'public', need }) }).then((x) => x.json())
+  if (!r || !r.repo) throw new Error('active-shard: ' + JSON.stringify(r))
+  return r.repo
+}
+
+const outDir = path.join('/tmp/zr_fmp4', sha256(input).slice(0, 12))
+await rm(outDir, { recursive: true, force: true }); await mkdir(outDir, { recursive: true })
+
+// --- probe : codec vidéo/audio + durée ---
+const probe = JSON.parse((await exec(FFPROBE, ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type,codec_name', '-of', 'json', input])).stdout)
+const vcodec = (probe.streams.find((s) => s.codec_type === 'video') || {}).codec_name || ''
+const acodec = (probe.streams.find((s) => s.codec_type === 'audio') || {}).codec_name || ''
+const duration = Number(probe.format?.duration) || 0
+log(`source: ${vcodec}${acodec ? '+' + acodec : ''}, ${Math.round(duration)}s`)
+
+// --- 2) repackage -c copy -> fMP4 CMAF. Repli HW H.264 si copy refusé (codec exotique). ---
+const baseCmd = (vargs) => ['-y', '-i', input, ...vargs,
+  '-f', 'hls', '-hls_time', String(HLS_TIME), '-hls_playlist_type', 'vod', '-hls_segment_type', 'fmp4',
+  '-hls_fmp4_init_filename', 'init.mp4', '-hls_segment_filename', path.join(outDir, 'seg_%03d.m4s'),
+  path.join(outDir, 'stream.m3u8')]
+let strategy = 'copy'
+try { await exec(FFMPEG, baseCmd(['-c', 'copy']), { maxBuffer: 1 << 28 }); log('repackagé -c copy (lossless)') }
+catch (e) {
+  log('copy refusé -> réencode HW H.264 (fallback): ' + String(e.message || e).slice(0, 80))
+  strategy = 'hw'
+  await exec(FFMPEG, baseCmd(['-c:v', 'h264_videotoolbox', '-b:v', '6M', '-c:a', 'aac', '-ac', '2', '-b:a', '160k',
+    '-force_key_frames', `expr:gte(t,n_forced*${HLS_TIME})`]), { maxBuffer: 1 << 28 })
+}
+
+// --- 3) hash + push init + segments — MULTI-SHARD (cap 5 Go CRITIQUE anti-ban GitHub) ---
+// Une vidéo peut dépasser 5 Go (ex 18 Go) : on répartit ses segments en BINS de <= BIN_CAP, chaque bin
+// poussé sur SON shard public actif (rollover serveur entre les bins). Possible car chaque segment a son
+// URL jsDelivr ABSOLUE dans la playlist -> les segments d'une même vidéo peuvent vivre sur N shards.
+const BIN_CAP = PUBLIC_VIDEO_SHARD_BIN_BYTES
+// GARDE-FOU 19 Mo/fichier : jsDelivr refuse de SERVIR les fichiers > ~20 Mo (vérifié empiriquement :
+// 13,7 Mo -> 200, 27,8 Mo -> 403). On redécoupe (3 s, 2 s, 1 s) ; si même 1 s dépasse (bitrate extrême),
+// on RÉENCODE en HW 6 Mbps (~4,5 Mo/segment). La limite GitHub 100 Mo est couverte de facto.
+// Seuil (19 Mo) importé de la SOURCE UNIQUE src/config/chunkPolicy.js (CDN_CHUNK, en tête) : même nombre partout.
+const SEG_MAX = CDN_CHUNK
+let files = await readdir(outDir)
+let segs = files.filter((f) => /\.m4s$/.test(f)).sort()
+const maxSeg = async () => Math.max(...(await Promise.all(segs.map((f) => stat(path.join(outDir, f)).then((x) => x.size)))), 0)
+for (const retry of [{ t: 3 }, { t: 2 }, { t: 1 }, { t: 6, reenc: true }]) {
+  if ((await maxSeg()) <= SEG_MAX) break
+  log(`  segment > 19 Mo (cap jsDelivr) -> ${retry.reenc ? 'RÉENCODE HW 6M' : 'redécoupage'} hls_time ${retry.t}s`)
+  for (const f of files) if (/\.m4s$|\.m3u8$|init\.mp4/.test(f)) await rm(path.join(outDir, f), { force: true })
+  const vargs = retry.reenc || strategy !== 'copy'
+    ? ['-c:v', 'h264_videotoolbox', '-b:v', '6M', '-c:a', 'aac', '-ac', '2', '-b:a', '160k', '-force_key_frames', `expr:gte(t,n_forced*${retry.t})`]
+    : ['-c', 'copy']
+  if (retry.reenc) strategy = 'hw'
+  const cmd = baseCmd(vargs)
+  const ti = cmd.indexOf('-hls_time'); cmd[ti + 1] = String(retry.t)
+  await exec(FFMPEG, cmd, { maxBuffer: 1 << 28 })
+  files = await readdir(outDir)
+  segs = files.filter((f) => /\.m4s$/.test(f)).sort()
+}
+const segUrl = {} // nom local -> URL jsDelivr absolue (shard+commit du bin où il a été poussé)
+const allFiles = ['init.mp4', ...segs]
+let bin = [], binBytes = 0, binsDone = 0, totalBytes = 0
+const shardsUsed = new Set()
+// PUSH PAR TRANSPORT GIT (pas l'API base64) : zéro buffer en RAM, quelques commits au lieu de
+// centaines d'appels (demande Matthieu : moins de pushes, moins de mémoire). Clone du shard réutilisé
+// entre bins/vidéos, pushes incrémentaux ~1,5 Go (un gros push unique hang), git non-interactif + timeout.
+const WORK = '/tmp/zr-vid-gitpush'
+const GENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/usr/bin/true' }
+const gitC = (dir, args, timeout = 0) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8', env: GENV, timeout: timeout || undefined, killSignal: 'SIGKILL' })
+// CLONE PARTIEL (--filter=blob:none --no-checkout) : on ne télécharge QUE les métadonnées du shard
+// (~quelques Mo même pour 4 Go de contenu), jamais les blobs des autres vidéos. Indispensable pour les
+// milliers de PETITES vidéos : avant, pousser 1 Mo exigeait de cloner 3,5 Go (timeout). L'index est
+// hydraté par read-tree origin/main ; le working tree reste vide -> git add EXPLICITE uniquement
+// (un `git add -A` ici marquerait tout le shard comme supprimé = destruction).
+async function ensureClone(shard) {
+  const dir = path.join(WORK, shard)
+  if (existsSync(path.join(dir, '.git'))) {
+    const f = gitC(dir, ['fetch', '--depth', '1', 'origin', 'main'], 120000)
+    const rt = gitC(dir, ['read-tree', 'origin/main'])
+    const ok = f.status === 0 && rt.status === 0 && gitC(dir, ['rev-parse', 'origin/main']).status === 0 && !existsSync(path.join(dir, '.git', 'index.lock'))
+    if (ok) { gitC(dir, ['reset', '--soft', 'origin/main']); return dir }
+    await rm(dir, { recursive: true, force: true })
+  }
+  if (existsSync(dir)) await rm(dir, { recursive: true, force: true })
+  await mkdir(WORK, { recursive: true })
+  const r = spawnSync('git', ['clone', '--filter=blob:none', '--no-checkout', '--depth', '1', `https://x-access-token:${TOKEN}@github.com/${OWNER}/${shard}.git`, dir], { encoding: 'utf8', env: GENV, timeout: 120000, killSignal: 'SIGKILL' })
+  if (r.status !== 0) throw new Error('clone ' + shard + ': ' + (r.stderr || '').slice(0, 150))
+  gitC(dir, ['config', 'user.email', 'bot@zenray']); gitC(dir, ['config', 'user.name', 'zenray-bot'])
+  gitC(dir, ['config', 'http.postBuffer', '1048576000'])
+  const rt = gitC(dir, ['read-tree', 'origin/main']) // index = arbre complet (sans télécharger les blobs)
+  if (rt.status !== 0) throw new Error('read-tree ' + shard + ': ' + (rt.stderr || '').slice(0, 120))
+  return dir
+}
+function pushDir(dir, label, paths) { // commit+push des CHEMINS EXPLICITES (jamais -A : working tree partiel)
+  if (!paths || !paths.length) return
+  for (let i = 0; i < paths.length; i += 200) gitC(dir, ['add', '--', ...paths.slice(i, i + 200)])
+  const cm = gitC(dir, ['commit', '-m', label])
+  if (cm.status !== 0 && !/nothing to commit/.test((cm.stdout || '') + (cm.stderr || ''))) throw new Error('commit: ' + (cm.stderr || '').slice(0, 120))
+  for (let a = 0; a < 4; a++) { const ps = gitC(dir, ['push', 'origin', 'HEAD:main'], 300000); if (ps.status === 0) return; log(`  push retry ${a + 1}/4 (${ps.signal || ps.status}): ${(ps.stderr || '').slice(-180)}`) }
+  throw new Error('push épuisé')
+}
+const PUSH_EVERY = 512 * 1024 ** 2
+// SEUIL HYBRIDE : sous 300 Mo, on pousse par API Git Data (blob->tree->commit, AUCUN clone -> quelques
+// secondes pour une petite vidéo). Au-dessus, transport git (clone réutilisé) pour éviter de bufferiser
+// des Go en RAM. La quasi-totalité des vidéos (médiane 30 Mo) prennent la voie rapide API.
+const API_MAX = 300 * 1024 ** 2
+async function flushBin() {
+  if (!bin.length) return
+  const shard = await activeVidShard(binBytes)
+  const names = [] // [{name, shardPath}]
+  if (binBytes <= API_MAX) {
+    // VOIE RAPIDE API : un seul commit pour tout le bin, zéro clone, zéro working tree.
+    const blobs = []
+    for (const f of bin) {
+      const buf = await readFile(path.join(outDir, f))
+      const sp = shardPathFor(sha256(buf), f.endsWith('.mp4') ? 'mp4' : 'm4s')
+      blobs.push({ path: sp, content: buf.toString('base64'), encoding: 'base64' })
+      names.push({ name: f, shardPath: sp })
+    }
+    const commit = await pushBlobs(TOKEN, shard, blobs, `fmp4 cmaf ${BASE} (${++binsDone})`, log)
+    for (const n of names) segUrl[n.name] = `https://cdn.jsdelivr.net/gh/${OWNER}/${shard}@${commit}/${n.shardPath}`
+    log(`  bin ${binsDone}: ${names.length} segments -> ${shard} (API, commit ${commit.slice(0, 7)}, +${(binBytes / 1048576).toFixed(0)} Mo)`)
+  } else {
+    // VOIE GROS FICHIER : transport git, clone réutilisé, pushes incrémentaux.
+    const dir = await ensureClone(shard)
+    let pend = 0, pendPaths = []
+    for (const f of bin) {
+      const buf = await readFile(path.join(outDir, f))
+      const sp = shardPathFor(sha256(buf), f.endsWith('.mp4') ? 'mp4' : 'm4s')
+      const dst = path.join(dir, sp); await mkdir(path.dirname(dst), { recursive: true }); await copyFile(path.join(outDir, f), dst)
+      names.push({ name: f, shardPath: sp }); pend += buf.length; pendPaths.push(sp)
+      if (pend >= PUSH_EVERY) { pushDir(dir, `fmp4 ${BASE} (incr)`, pendPaths); pend = 0; pendPaths = []; await new Promise((r) => setTimeout(r, 2000)) }
+    }
+    pushDir(dir, `fmp4 cmaf ${BASE} (${++binsDone})`, pendPaths)
+    const commit = gitC(dir, ['rev-parse', 'HEAD']).stdout.trim()
+    for (const n of names) segUrl[n.name] = `https://cdn.jsdelivr.net/gh/${OWNER}/${shard}@${commit}/${n.shardPath}`
+    log(`  bin ${binsDone}: ${names.length} segments -> ${shard} (git, +${(binBytes / 1073741824).toFixed(2)} Go)`)
+  }
+  shardsUsed.add(shard)
+  await fetch(`${API}/api/upload-shard`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'vid-commit-bytes', repo: shard, addBytes: binBytes }) }).catch(() => {})
+  bin = []; binBytes = 0
+}
+for (const f of allFiles) {
+  const sz = (await stat(path.join(outDir, f))).size
+  if (binBytes + sz > BIN_CAP) await flushBin()
+  bin.push(f); binBytes += sz; totalBytes += sz
+}
+await flushBin()
+const shard = [...shardsUsed].join('+') // info manifeste (multi-shard possible)
+const need = Object.keys(segUrl).length
+log(`poussé ${need} blobs sur ${shardsUsed.size} shard(s): ${shard}`)
+const jsd = (name) => segUrl[name]
+
+// --- 4) réécrire la playlist média : init + segments -> URLs jsDelivr absolues ---
+let pl = await readFile(path.join(outDir, 'stream.m3u8'), 'utf8')
+pl = pl.split('\n').map((line) => {
+  const mapM = line.match(/^#EXT-X-MAP:URI="([^"]+)"/)
+  if (mapM) return line.replace(mapM[1], jsd('init.mp4'))
+  if (/^seg_\d+\.m4s$/.test(line.trim())) return jsd(line.trim())
+  return line
+}).join('\n')
+
+const baseDirRel = `${DEST}/${BASE}`
+const masterPath = `${baseDirRel}/master.m3u8`
+const mediaPath = `${baseDirRel}/stream.m3u8`
+// master minimal pointant la media playlist (servie par /api/hls)
+const master = `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=6000000,CODECS="${vcodec === 'vp9' ? 'vp09.00.50.08' : 'avc1.640028'}"\n/api/hls?path=${encodeURIComponent(mediaPath)}\n`
+
+const manifest = {
+  type: 'hls', v: 1, name: `${BASE}.mp4`, mime: 'application/vnd.apple.mpegurl',
+  duration, master: masterPath, enc: 'none', container: 'fmp4', vcodec, acodec,
+  publicRepo: shard, segments: segs.length, count: segs.length,
+  size: totalBytes, createdAt: new Date().toISOString(),
+}
+const textBlobs = [
+  { path: mediaPath, content: pl, encoding: 'utf-8' },
+  { path: masterPath, content: master, encoding: 'utf-8' },
+  { path: `${baseDirRel}/${BASE}.mp4.media.json`, content: JSON.stringify(manifest, null, 2), encoding: 'utf-8' },
+]
+const cc = await pushBlobs(TOKEN, DATA, textBlobs, `video fmp4 ${BASE}`, log)
+log(`manifeste + playlists poussés sur ${DATA} (commit ${cc.slice(0, 7)})`)
+await rm(outDir, { recursive: true, force: true })
+console.log(`\n✅ OK [${strategy}] : ${baseDirRel}/${BASE}.mp4.media.json`)
+console.log(`   jsDelivr init : ${jsd('init.mp4')}`)

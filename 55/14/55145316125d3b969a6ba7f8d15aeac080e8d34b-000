@@ -1,0 +1,162 @@
+// media-ingest.mjs — ingestion bulk VIDÉO BRUTE et AUDIO/PDF chiffré.
+//
+// EN CLAIR : quand le script d'archive croise une VIDÉO ou un SON/PDF, il ne doit plus le réduire en
+// morceaux binaires opaques. Une vidéo → parts privées chiffrées, sans réencodage.
+// Un son ou un PDF → on le découpe en petits morceaux
+// CHIFFRÉS lisibles par /api/stream (seek instantané), exactement comme l'app le fait au drop.
+//
+// DÉPENDANCES (le point clé de sécurité) : ces deux pipelines réutilisent l'infrastructure existante du
+// projet, qui exige LE SERVEUR LOCAL en marche (résolution des shards via /api/upload-shard) + ffmpeg
+// (vidéo) + la clé maître média. Si UN prérequis manque, ou si une étape échoue, la fonction renvoie
+// `null` : le bulk RETOMBE alors sur le chemin chunk legacy INTACT. Conséquence : un fichier n'est JAMAIS
+// perdu, et le comportement par défaut reste sûr même sans serveur. C'est l'invariant anti-régression.
+//
+// RÉUTILISE : video-raw-lib.mjs pour les vidéos, video-mse-lib.mjs pour les commits Git batchés,
+// et lib/img-pipeline.mjs pour la clé maître des autres médias.
+
+import { readFile, mkdir, rm } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
+import { createCipheriv, randomBytes, createHash } from 'node:crypto'
+import { makeVidRawShardCtx, ingestVideoRaw } from './video-raw-lib.mjs' // VIDÉO BRUTE : chunks 95 Mo, zéro réencodage, raw.github
+import { pushBlobs, activeShard } from './video-mse-lib.mjs'
+import { loadMasterKey } from './lib/img-pipeline.mjs'
+import { storageChunkFor } from '../src/config/chunkPolicy.js' // source unique 19/95
+import { acquireDirectoryLock, directoryLockOptions } from './lib/directory-lock.mjs'
+
+// BUG CORRIGÉ (2026-07-21) : ce chemin STOCKAIT des chunks de 3 Mo (const CHUNK_SIZE = 3145728) et écrivait
+// chunkSize:3145728 dans le manifeste -- la MÊME confusion transport/stockage que universalCapture avait déjà.
+// Ici pushBlobs va DIRECTEMENT sur l'API Git (pas de Vercel), donc AUCUNE raison de transport 3 Mo ; le même
+// pushBlobs pousse déjà les parts de 95 Mo de la vidéo brute. La taille vient désormais de storageChunkFor
+// (source unique). Ancienne ligne fautive supprimée :
+// const CHUNK_SIZE = 3145728 // 3 Mo brut — NE JAMAIS RESTAURER (chunk de STOCKAGE de 3 Mo interdit).
+const sha256Hex = (buf) => createHash('sha256').update(buf).digest('hex')
+export const mediaManifestPath = (destDir, rel) => `${destDir}/${path.basename(rel)}.media.json`
+
+// Le serveur local répond-il ? (prérequis dur des deux pipelines : résolution de shard via /api/upload-shard)
+async function serverReachable(apiBase) {
+  try {
+    const r = await fetch(`${apiBase}/api/upload-shard`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'active-shard' }), signal: AbortSignal.timeout(8000),
+    }).then((x) => x.json()).catch(() => null)
+    return !!(r && r.repo)
+  } catch { return false }
+}
+
+// ── VIDÉO -> ORIGINAL CHIFFRÉ ──────────────────────────────────────────────────────────────────────────
+// Découpage exact + push privé, puis rend le manifeste video-raw que l'appelant publie sous verrou.
+//   absPath : fichier source ; rel : chemin relatif miroir ; destDir : dossier Create cible (DEST/<dir du rel>)
+export async function ingestVideoBulk(absPath, rel, destDir, mctx, sourceSha256 = null) {
+  // VIDÉO BRUTE (2026-06-30) : ZÉRO réencodage. Le fichier original est découpé en parts de 95 Mo poussées sur
+  // raw.github (limite 100 Mo/fichier), lues par un Service Worker range-shim. Plus de ffmpeg/DASH (4h d'encode
+  // -> supprimées). N'a PAS besoin du serveur local : juste le token GitHub (gh) + git. Commit du manifeste
+  // .media.json (type 'video-raw') sur zenray-data via Data API -> EN LIGNE confirmé avant de rendre la main.
+  if (!mctx || !mctx.token) return null
+  try {
+    if (!mctx._vctx) {
+      mctx._vctx = makeVidRawShardCtx({ token: mctx.token, work: path.join(mctx.work, 'vidraw'), log: mctx.log,
+        onPushed: (octets) => mctx.onPushed(octets, 'video') })
+    }
+    const base = path.basename(rel).replace(/\.[^.]+$/, '')
+    // Deux voies peuvent rencontrer deux copies du même fichier. Puisque leur empreinte désigne le même dépôt
+    // reprenable, une seule l'écrit à la fois ; la seconde retrouve ensuite l'arbre et saute toutes les parts.
+    const verrou = sourceSha256 && mctx.lockRoot ? await acquireDirectoryLock(
+      path.join(mctx.lockRoot, `_verrou-video-${sourceSha256.slice(0, 16).toLowerCase()}`),
+      directoryLockOptions('long', `écriture vidéo ${sourceSha256.slice(0, 12)}`),
+    ) : null
+    let resultat
+    try {
+      resultat = await ingestVideoRaw(absPath, {
+        dest: destDir, base, vctx: mctx._vctx, workDir: path.join(mctx.work, 'vidraw-tmp'),
+        sourceSha256, log: mctx.log,
+      })
+    } finally { if (verrou) await verrou.release() }
+    const { manifestPath, manifest } = resultat
+    manifest.sourceRel = rel
+    if (sourceSha256) {
+      manifest.sourceSha256 = sourceSha256
+      manifest.sourceExact = true
+    }
+    // Le manifeste repart à l'appelant, qui possède l'unique verrou d'écriture de zenray-data. Le pousser ici
+    // créait une seconde porte concurrente, distincte de tous les autres types de fichiers.
+    mctx.log(`  ✓ PRÊTE (vidéo brute, ${manifest.parts.length} parts): ${rel} -> ${manifestPath}`)
+    return { manifestBlob: { path: manifestPath, content: JSON.stringify(manifest) } }
+  } catch (e) {
+    mctx.log(`  ⚠ vidéo brute échouée (${(e && e.message || e).toString().slice(0, 140)}) -> repli chunk: ${rel}`)
+    return null
+  }
+}
+
+// ── AUDIO / PDF -> chunked-media chiffré ───────────────────────────────────────────────────────────────
+// Reproduit uploadBinaryChunksEncrypted + captureAudio/captureBinaryMedia de l'app, en Node : chunks de
+// STOCKAGE 19 MiB (<=95 Mo) / 95 Mo (au-delà) via storageChunkFor, chiffrés AES-GCM (IV aléatoire par chunk),
+// poussés sur le shard actif, manifeste {type:chunked-media}. (Auparavant 3 Mo -- bug corrigé le 2026-07-21.)
+// Renvoie { manifestBlob:{path,content} } à committer sur zenray-data, ou null -> fallback chunk.
+export async function ingestMediaBulk(absPath, rel, mime, kind, destDir, mctx) {
+  if (!mctx || !mctx.serverOk || !mctx.key) return null
+  try {
+    const buf = await readFile(absPath)
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const dir = `media/${id}`
+    // Chunk de STOCKAGE : 19 MiB-16 (jsDelivr) <=95 Mo, 95 Mo-16 (raw.github) au-delà. perChunkEncrypted:true
+    // car on chiffre CHAQUE chunk (tag GCM par chunk). Identique à universalCapture.uploadBinaryChunksEncrypted.
+    const chunkSize = storageChunkFor(buf.length, { perChunkEncrypted: true })
+    const count = Math.ceil(buf.length / chunkSize) || 1
+    const pad = (i) => String(i).padStart(3, '0')
+
+    // shard actif (famille img/private comme l'app pour l'audio/binaire chunké) via le serveur
+    const repo = await activeShard(mctx.apiBase)
+
+    const blobs = new Array(count)
+    const ivs = new Array(count)
+    for (let i = 0; i < count; i++) {
+      const slice = buf.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, buf.length))
+      const iv = randomBytes(12)
+      const c = createCipheriv('aes-256-gcm', mctx.key, iv)
+      const cipher = Buffer.concat([c.update(slice), c.final(), c.getAuthTag()])
+      blobs[i] = { path: `${dir}/${pad(i)}.bin`, content: cipher.toString('base64'), encoding: 'base64' }
+      ivs[i] = iv.toString('base64')
+    }
+    const verrou = mctx.lockRoot ? await acquireDirectoryLock(
+      path.join(mctx.lockRoot, `_verrou-media-${repo}`),
+      directoryLockOptions('long', `écriture du dépôt média ${repo}`),
+    ) : null
+    let cdnCommit
+    try { cdnCommit = await pushBlobs(mctx.token, repo, blobs, `media chunks ${id}`, mctx.log) }
+    finally { if (verrou) await verrou.release() }
+    mctx.onPushed(blobs.reduce((n, blob) => n + Buffer.byteLength(blob.content, 'base64'), 0), 'media')
+    const parts = Array.from({ length: count }, (_, i) => pad(i))
+
+    // probe.duration : best-effort via ffprobe (audio) ; 0 sinon. Optionnel pour le rendu.
+    let duration = 0
+    if (kind === 'audio') {
+      try {
+        const { execFileSync } = await import('node:child_process')
+        const out = execFileSync(process.env.ZR_FFPROBE || '/opt/homebrew/bin/ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', absPath], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 30000 }).toString().trim()
+        duration = parseFloat(out) || 0
+      } catch {}
+    }
+
+    const manifest = {
+      type: 'chunked-media', v: 1, name: path.basename(rel), mime: mime || 'application/octet-stream',
+      size: buf.length, chunkSize, count, dir, parts,
+      vis: 'public', cdnRepo: repo, cdnCommit, alg: 'AES-GCM', ivs,
+      probe: { duration, audio: [], subs: [] },
+    }
+    return { manifestBlob: { path: mediaManifestPath(destDir, rel), content: JSON.stringify(manifest) } }
+  } catch (e) {
+    mctx.log(`  ⚠ média chunked échoué (${(e && e.message || e).toString().slice(0, 120)}) -> repli chunk: ${rel}`)
+    return null
+  }
+}
+
+// Contexte média partagé créé en début de run par le bulk. serverOk décide si on TENTE les pipelines
+// streamables ; sinon tout retombe sur le chunk legacy (sûr).
+export async function makeMediaCtx({ token, apiBase, work, repoRoot, lockRoot = null, log = console.log,
+  enabled = true, onPushed = () => {} }) {
+  const serverOk = enabled ? await serverReachable(apiBase) : false
+  const key = loadMasterKey(repoRoot, { readFileSync })
+  if (enabled && !serverOk) log('  ⚠ serveur local injoignable -> audio/PDF retomberont en chunk legacy. La vidéo brute Git reste disponible.')
+  return { token, apiBase, work, lockRoot, log, serverOk, key, onPushed }
+}

@@ -1,0 +1,71 @@
+// archiveChunks.js — PURE resolution of archive manifests .file.json (v2 / v3 / v4 multi-shard).
+//
+// Plainly: an archived file is NOT stored whole on GitHub. It is cut into 19 MB "chunks" spread
+// over one or more repos (shards). The .file.json manifest is the map: it says where the chunks
+// are and in what order to re-glue them. This file centralizes that map reading, which used to be
+// COPY-PASTED across 3 components (FileNodeViewer, DownloadsView, QuickLookOverlay) — with
+// divergences (QuickLook ignored parts[] -> broken on big v4 multi-shard files). One source now.
+//
+// PURITY: no network logic here (no fetch, no Blob). Just: from a manifest, produce the ORDERED
+// list of raw URLs to fetch, and pick the right version. Actual downloading lives in fetchAsset.js
+// (which consumes these URLs). ABSOLUTE backward compat: existing v2/v3/v4 manifests (130 GB)
+// resolve exactly as before — this module REPRODUCES FileNodeViewer's behavior, never changes it.
+
+export const OWNER = 'matthieuhuguet'
+
+// Raw URL of a path on a given (repo, commit). encodeURIComponent per segment (spaces, accents).
+const rawOf = (repo, commit, p) => `https://raw.githubusercontent.com/${OWNER}/${repo}/${commit}/${String(p).split('/').map(encodeURIComponent).join('/')}`
+
+// Raw URL of the file in 'raw' (non-chunked) mode: the manifest carries repo/commit/path top-level.
+export const rawUrl = (m, p) => rawOf(m.repo, m.commit, p)
+// Raw URL of a chunk reference { repo, commit, path }.
+export const refUrl = (r) => rawOf(r.repo, r.commit, r.path)
+
+// chunkRefs(m) -> [{ repo, commit, path }, ...] in RECONSTRUCTION ORDER.
+//   v4 multi-shard: m.parts[] = [{repo, commit, chunks[]}] -> flatten all parts in order.
+//   v2/v3 mono-shard: no parts -> m.chunks[] with the top-level repo/commit.
+export const chunkRefs = (m) => (Array.isArray(m.parts) && m.parts.length)
+  ? m.parts.flatMap((pt) => (pt.chunks || []).map((c) => ({ repo: pt.repo, commit: pt.commit, path: c })))
+  : (m.chunks || []).map((c) => ({ repo: m.repo, commit: m.commit, path: c }))
+
+// Total chunk count (all parts). For the "N pieces" display.
+export const chunkCount = (m) => (Array.isArray(m.parts) && m.parts.length)
+  ? m.parts.reduce((n, pt) => n + (pt.chunks || []).length, 0)
+  : (m.chunks || []).length
+
+// latestVersion(m) -> index of the current (last) version when the manifest carries versions[], else null.
+export const latestVersion = (m) => (Array.isArray(m.versions) && m.versions.length) ? m.versions.length - 1 : null
+
+// effectiveManifest(m, verIndex?) -> the EFFECTIVE manifest to read/download.
+//   If m carries versions[], switch to the requested (or last) version: its repo/commit/chunks/parts
+//   override the top-level ones. Otherwise m is returned as-is. This is exactly what FileNodeViewer
+//   (eff) and DownloadsView (effManifest) both did — factored here.
+export function effectiveManifest(m, verIndex = null) {
+  if (!m) return m
+  const versions = (Array.isArray(m.versions) && m.versions.length) ? m.versions : null
+  if (!versions) return m
+  const i = (verIndex != null && verIndex >= 0 && verIndex < versions.length) ? verIndex : versions.length - 1
+  const v = versions[i]
+  return { ...m, repo: v.repo, commit: v.commit, chunks: v.chunks, parts: v.parts, size: v.size, sha256: v.sha256, chunkSize: v.chunkSize || m.chunkSize, mode: 'chunked' }
+}
+
+// 2 October 2026, 15:05 CEST: restoration selects immutable content, including older retained versions.
+export function manifestByFingerprint(manifest, sha256) {
+  if (!/^[a-f0-9]{64}$/.test(sha256 || '')) throw new Error('Invalid archive fingerprint')
+  const current = effectiveManifest(manifest)
+  if (current?.sha256 === sha256) return current
+  const index = manifest?.versions?.findIndex((version) => version.sha256 === sha256)
+  if (index >= 0) return effectiveManifest(manifest, index)
+  throw new Error('Requested archive version is unavailable; original retained')
+}
+
+// downloadUrls(m) -> ORDERED list of URLs to fetch to rebuild the file.
+//   'raw' mode -> a single URL (the whole file). 'chunked' mode -> every chunk URL in order.
+// fetchAsset.streamDownload consumes this list directly.
+export function downloadUrls(m) {
+  // ZenRayShards blob-raw: parts[] = [{url,...}] (one direct blob per 95 MB part, in order). Return
+  // the URLs as-is -> BIT-EXACT reconstruction by simple concatenation (fetchAsset).
+  if (m && m.type === 'blob-raw' && Array.isArray(m.parts) && m.parts.length && m.parts[0] && m.parts[0].url) return m.parts.map((p) => p.url)
+  if (m.mode === 'raw') return [rawUrl(m, m.path)]
+  return chunkRefs(m).map(refUrl)
+}

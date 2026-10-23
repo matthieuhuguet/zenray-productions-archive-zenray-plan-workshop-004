@@ -1,0 +1,187 @@
+// 23 October 2026: what ZenRay Knowledge reads. Memory files become units of about 24 000 characters cut on headings;
+// Claude, Codex and Gemini conversations become (question, answer) pairs with their exact timestamp and session.
+// Secrets never leave this file: credential sections and secret-looking lines are dropped before anything is sent to a model.
+// FR : ce que lit Knowledge. Les fichiers de Memory deviennent des unités coupées aux titres ; les conversations deviennent des paires
+// question réponse avec leur date exacte. Les secrets ne sortent jamais d'ici.
+import { createHash } from 'node:crypto'
+import { readFile, readdir, stat } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import { createInterface } from 'node:readline'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import path from 'node:path'
+import { transcriptEntry } from '../../AssetsFeedbackCapture.mjs'
+
+const run = promisify(execFile)
+export const home = process.env.HOME
+export const expand = (p) => p.replace(/^~(?=\/|$)/, home)
+export const sha = (text) => createHash('sha256').update(text).digest('hex')
+
+// A line that looks like a secret is never sent to a model nor stored. FR : une ligne qui ressemble à un secret n'est jamais envoyée.
+const SECRET = /(api[_ -]?key|access[_ -]?token|secret|password|mot de passe|passcode|bearer\s|sk-ant-[a-z0-9]+-|sk-[a-z0-9]{8}|ghp_[a-z0-9]{8}|github_pat_|xox[bp]-|AKIA[0-9A-Z]{8}|-----BEGIN|\b\d{6}\b.{0,30}(code|secret|mot de passe)|(code|secret)\D{0,30}\b\d{6}\b)/i
+export const isSecretLine = (line) => SECRET.test(line)
+
+export function redact(text, dropSections = []) {
+  const lines = String(text).split('\n'), out = []
+  let dropLevel = 0
+  for (const line of lines) {
+    const heading = /^(#{1,6})\s+(.*)/.exec(line)
+    if (heading) {
+      const level = heading[1].length
+      if (dropLevel && level <= dropLevel) dropLevel = 0
+      if (!dropLevel && dropSections.some((name) => heading[2].toLowerCase().includes(name.toLowerCase()))) { dropLevel = level; continue }
+    }
+    if (dropLevel || isSecretLine(line)) continue
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+/** Cut a markdown text into pieces under `limit` characters, preferably on headings, never inside a line. */
+export function cutUnits(text, limit) {
+  const blocks = text.split(/\n(?=#{1,3}\s)/), units = []
+  let current = ''
+  const flush = () => { if (current.trim()) units.push(current); current = '' }
+  for (const block of blocks) {
+    if (block.length > limit) {
+      flush()
+      let piece = ''
+      for (const line of block.split('\n')) { if (piece.length + line.length + 1 > limit && piece) { units.push(piece); piece = '' } piece += (piece ? '\n' : '') + line.slice(0, limit) }
+      if (piece.trim()) units.push(piece)
+      continue
+    }
+    if (current.length + block.length + 1 > limit) flush()
+    current += (current ? '\n' : '') + block
+  }
+  flush()
+  return units
+}
+
+async function walk(dir, files = []) {
+  let entries = []
+  try { entries = await readdir(dir, { withFileTypes: true }) } catch { return files }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) { if (entry.name !== '.git' && entry.name !== 'node_modules') await walk(full, files) }
+    else if (entry.name.endsWith('.md')) files.push(full)
+  }
+  return files
+}
+
+/** Every Memory markdown file allowed by the configuration, with its relative name, size, modification time and hash. */
+export async function memoryFiles(config) {
+  const exclude = config.memory.exclude.map((pattern) => new RegExp(pattern))
+  const out = []
+  for (const root of config.memory.roots) {
+    const base = expand(root.path)
+    const info = await stat(base).catch(() => null)
+    if (!info) continue
+    const files = info.isDirectory() ? await walk(base) : [base]
+    for (const file of files) {
+      const rel = info.isDirectory() ? path.relative(base, file) : path.basename(file)
+      if (exclude.some((re) => re.test(rel))) continue
+      const text = await readFile(file, 'utf8')
+      const meta = await stat(file)
+      out.push({ file, ref: `${root.label}/${rel}`, text, mtime: meta.mtime.toISOString(), hash: sha(text) })
+    }
+  }
+  return out
+}
+
+/** Units of one memory file: id, source reference, redacted text. The id changes when the text changes, so a modified file is re-read. */
+export function memoryUnits(file, config) {
+  const clean = redact(file.text, config.memory.dropSections)
+  return cutUnits(clean, config.memory.unitChars).map((text, part) => ({
+    id: `m_${sha(file.ref + '\n' + text).slice(0, 16)}`, kind: 'memory', ref: file.ref, part, mtime: file.mtime, text,
+  }))
+}
+
+const QUESTION_START = /^(quel|quelle|quels|quelles|pourquoi|comment|combien|est-ce|qu'est|que |qui |où|ou est|c'est quoi|quand|lequel|laquelle|what|why|how|when|which|who|is |are |do |does |can |should )/i
+export function looksLikeQuestion(text) { const t = text.trim(); return /\?\s*$/.test(t) || QUESTION_START.test(t) || /\?\s/.test(t) }
+
+/** Pair each prompt with the final answer that follows it; keep the ones that look like a question. */
+export function pairsFromEntries(entries, meta, config) {
+  const skip = config.conversations.skipPrompt.map((p) => new RegExp(p, 'i'))
+  const out = []
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i]
+    if (e.kind !== 'prompt') continue
+    const q = e.text.trim()
+    if (q.length < 8 || q.length > config.conversations.maxQuestionChars || skip.some((re) => re.test(q)) || !looksLikeQuestion(q) || isSecretLine(q)) continue
+    let answer = ''
+    for (let j = i + 1; j < entries.length && entries[j].kind !== 'prompt'; j++) if (entries[j].kind === 'iteration') answer = entries[j].text
+    if (!answer) continue
+    answer = redact(answer).slice(0, config.conversations.maxAnswerChars)
+    out.push({ id: `c_${sha(`${meta.kind}|${meta.session}|${e.timestamp}|${q}`).slice(0, 16)}`, kind: meta.kind, session: meta.session, project: meta.project, at: e.timestamp, q, answer })
+  }
+  return out
+}
+
+// Transcripts reach several hundred megabytes: they are streamed, and a line over 200 KB (a tool output, an image) is skipped unread.
+// FR : les transcripts dépassent parfois 500 Mo : lecture en flux, et une ligne de plus de 200 Ko (sortie d'outil, image) est sautée.
+async function jsonlEntries(file) {
+  const entries = []
+  const lines = createInterface({ input: createReadStream(file, { encoding: 'utf8' }), crlfDelay: Infinity })
+  for await (const line of lines) {
+    if (!line || line.length > 200000) continue
+    let record; try { record = JSON.parse(line) } catch { continue }
+    if (record.isSidechain) continue
+    const entry = transcriptEntry(record)
+    if (entry) entries.push(entry)
+  }
+  return entries
+}
+
+/** All conversation pairs, from the three hosts. `seen(file, token)` lets the caller skip files that did not change. */
+export async function conversationPairs(config, { since = () => true, root } = {}) {
+  const pairs = [], files = { claude: [], codex: [], gemini: [] }
+  for (const file of await walkJsonl(expand(config.conversations.claude))) if (!file.includes('/subagents/')) files.claude.push(file)
+  files.codex = await walkJsonl(expand(config.conversations.codex))
+  try { files.gemini = (await readdir(expand(config.conversations.gemini))).filter((n) => n.endsWith('.db')).map((n) => path.join(expand(config.conversations.gemini), n)) } catch {}
+  for (const kind of ['claude', 'codex']) for (const file of files[kind]) {
+    const info = await stat(file)
+    if (!since(file, info.mtimeMs)) continue
+    const session = path.basename(file, '.jsonl')
+    const project = kind === 'claude' ? path.basename(path.dirname(file)) : 'codex'
+    pairs.push(...pairsFromEntries(await jsonlEntries(file), { kind, session, project }, config))
+  }
+  const reader = path.join(root, config.conversations.geminiReader)
+  for (const file of files.gemini) {
+    const info = await stat(file)
+    if (!since(file, info.mtimeMs)) continue
+    const session = path.basename(file, '.db'), entries = []
+    let before
+    for (let page = 0; page < 400; page++) {
+      let result
+      try { result = JSON.parse((await run('python3', [reader, file, ...(before === undefined ? [] : [String(before)]), '--session-id', session], { timeout: 60000, maxBuffer: 16 * 1024 * 1024 })).stdout) } catch { break }
+      entries.unshift(...(result.messages || []))
+      if (result.nextBefore === null || result.nextBefore === undefined || result.nextBefore === before) break
+      before = result.nextBefore
+    }
+    entries.sort((a, b) => Number(a.stepIndex) - Number(b.stepIndex))
+    pairs.push(...pairsFromEntries(entries, { kind: 'gemini', session, project: 'antigravity' }, config))
+  }
+  // A transcript can hold the same record twice (resumed session): one pair per id. FR : une paire par identifiant.
+  return [...new Map(pairs.map((p) => [p.id, p])).values()]
+}
+
+async function walkJsonl(dir, files = []) {
+  let entries = []
+  try { entries = await readdir(dir, { withFileTypes: true }) } catch { return files }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) await walkJsonl(full, files)
+    else if (entry.name.endsWith('.jsonl')) files.push(full)
+  }
+  return files
+}
+
+/** Conversation units: pairs grouped by host and session order, `pairsPerUnit` at a time. */
+export function conversationUnits(pairs, config) {
+  const units = []
+  for (let i = 0; i < pairs.length; i += config.conversations.pairsPerUnit) {
+    const group = pairs.slice(i, i + config.conversations.pairsPerUnit)
+    units.push({ id: `u_${sha(group.map((p) => p.id).join(',')).slice(0, 16)}`, kind: 'conversation', pairs: group })
+  }
+  return units
+}

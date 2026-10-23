@@ -1,0 +1,49 @@
+// /api/raw-proxy?u=<encoded raw.githubusercontent.com url> — read proxy for the SMALL files of
+// PRIVATE zenrayshards-* repos that must render in an <img> tag (video posters, thumbnails): an
+// <img src> cannot carry an Authorization header, so the server (which has the token) fetches the
+// bytes and serves them same-origin. RESERVED for small files (a ~50 KB poster) — 95 MB video
+// parts go through the Service Worker + api.github.com directly (never here: Vercel response cap ~4.5 MB).
+//
+// ANTI-ABUSE: only accepts raw.githubusercontent.com/<expected owner>/… — not an open proxy.
+import { parseShard } from './shard-naming.js'
+
+const OWNER = (process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data').split('/')[0]
+const COMMIT_SHA = /^[a-f0-9]{40}$/i
+const HASHED_POSTER_PATH = /^[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]{64}\.(?:jpe?g|png|webp)$/i
+
+// Un poster vidéo est adressé par hash dans un shard privé et TOUJOURS pinné sur un commit.
+// Cette validation interdit qu'un visiteur transforme ce proxy DOM en lecteur arbitraire de
+// n'importe quel fichier privé de l'organisation (ex. Memory/Identity).
+export function parsePrivatePosterUrl(input) {
+  let url
+  try { url = new URL(String(input || '')) } catch { return null }
+  if (url.protocol !== 'https:' || url.hostname !== 'raw.githubusercontent.com' || url.username || url.password || url.port || url.search || url.hash) return null
+  const parts = url.pathname.split('/').filter(Boolean)
+  const [owner, repo, commit, ...asset] = parts
+  const shard = parseShard(repo)
+  if (owner !== OWNER || !shard || shard.vis !== 'private' || !COMMIT_SHA.test(commit || '') || !HASHED_POSTER_PATH.test(asset.join('/'))) return null
+  return url
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return res.status(405).end() }
+  // Token séparé, lecture seule et limité aux shards : ne jamais réutiliser GITHUB_TOKEN,
+  // qui peut aussi accéder au repo privé Memory et transformerait ce endpoint en exfiltration.
+  const token = process.env.ZENRAY_RAW_TOKEN
+  if (!token) return res.status(503).end()
+  const url = parsePrivatePosterUrl(req.query.u)
+  if (!url) return res.status(400).end()
+  try {
+    const r = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' } })
+    if (!r.ok) return res.status(r.status === 404 ? 404 : 502).end()
+    const buf = Buffer.from(await r.arrayBuffer())
+    // Hard bound: this proxy serves posters/thumbnails, not parts. 8 MB is already very generous.
+    if (buf.length > 8 * 1024 * 1024) return res.status(413).end()
+    const ext = url.pathname.split('.').pop().toLowerCase()
+    res.setHeader('Content-Type', ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'application/octet-stream')
+    // URL pinned on a commit SHA -> immutable content -> long cache is safe (anti-blank-screen
+    // rule respected: this is NOT an index.html, it is a version-addressed binary).
+    res.setHeader('Cache-Control', 'public, max-age=31536000, s-maxage=31536000, immutable')
+    return res.status(200).send(buf)
+  } catch { return res.status(502).end() }
+}

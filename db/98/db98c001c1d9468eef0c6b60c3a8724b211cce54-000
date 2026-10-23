@@ -1,0 +1,776 @@
+// Universal capture: routes any File to the right storage + creates the matching node.
+//
+// Shared logic (no UI here). Manifest schemas follow the ZenRayProgress contract:
+//  - image -> .img.json  {type:'image',v:1,repo,path,name,ext,w,h,size,tags,addedAt}
+//  - media -> .media.json {type:'chunked-media',v:1,name,mime,size,chunkSize,count,dir,parts,probe}
+//            (chunkSize = 19 MiB-16 sous 95 Mo / 95 Mo-16 au-delà -- politique chunkPolicy.js, jamais 3 Mo)
+//  - page  -> .md (plain text)
+//
+// Binary storage (images/videos/audio/pdf): shard repos accessed through /api/upload-shard:
+//     {action:'active-shard'}                    -> {repo}  (current shard with room)
+//     {action:'blob', repo, b64}                 -> {sha}   (create a raw blob)
+//     {action:'commit', repo, files:[{path,sha}], addBytes} -> {ok}  (atomic commit)
+//   Binaries use HASHED names: ab/cd/<sha256>.<ext> (sharded by the first 2 hash bytes).
+//
+// The node (manifest) is written to the content repo via /api/page action save.
+//
+// Resilient: each file runs in its own try/catch; one failure never stops the others.
+// onProgress(ratio 0..1) is called per file (progress of the binary upload in flight).
+//
+// 2026-07-11 refactor note: the legacy, never-routed writers were removed from this file —
+// captureVideoNative + uploadBinaryChunks (dead since the "all video goes HLS" decision) and
+// captureVideoTranscode (deprecated 2026-06-02, frozen placeholder bug — see
+// docs/removed-video-transcode-placeholder.md and git history for restoration). Old
+// chunked-media manifests stay readable: that is the READ path (/api/stream), untouched.
+
+import { makeThumbWebp } from './thumbnailer.js'
+import { notify, notifyProgress } from '../components/Notifications.jsx'
+import { getMediaKey } from '../media/crypto.js'
+import { validateAttachment } from '../config/attachmentPolicy.js'
+import { classify } from './classify.js'
+import { buildJsDelivrUrl } from './shardNaming.js'
+import { buildAudioManifestV3 } from '../audio/audioManifest.js'
+// POLITIQUE DE DÉCOUPAGE : source de vérité UNIQUE (src/config/chunkPolicy.js). Ne JAMAIS redéfinir
+// 19 / 95 / 20 / 3 Mo en dur ici -- tout vient d'un seul endroit pour ne plus jamais diverger.
+import { TRANSPORT_CHUNK, RAW_THRESHOLD, CDN_CHUNK, storageChunkFor } from '../config/chunkPolicy.js'
+import { sansAccent } from '../lib/sansAccent.js'
+
+const CHUNK_SIZE = TRANSPORT_CHUNK // 3 Mo : TRANSPORT UNIQUEMENT (plafond body Vercel), jamais du stockage.
+// (constantes 19/95/GCM_TAG déplacées dans chunkPolicy.js -- voir storageChunkFor() plus bas)
+
+// Reliable audio MIME by extension: browsers often leave file.type empty for wav/flac/aiff.
+// Without a good mime in the manifest, /api/stream would send application/octet-stream and <audio> would refuse.
+const AUDIO_MIME_BY_EXT = {
+  mp3: 'audio/mpeg', mp2: 'audio/mpeg', mp1: 'audio/mpeg', m4a: 'audio/mp4', m4b: 'audio/mp4', m4p: 'audio/mp4', aac: 'audio/aac', adts: 'audio/aac', wav: 'audio/wav', wave: 'audio/wav',
+  flac: 'audio/flac', opus: 'audio/opus', oga: 'audio/ogg', ogg: 'audio/ogg',
+  spx: 'audio/ogg', alac: 'audio/mp4', aiff: 'audio/aiff', aif: 'audio/aiff', aifc: 'audio/aiff', caf: 'audio/x-caf', wma: 'audio/x-ms-wma', weba: 'audio/webm',
+  ape: 'audio/ape', wv: 'audio/wavpack', tta: 'audio/x-tta', mka: 'audio/x-matroska', ac3: 'audio/ac3', eac3: 'audio/eac3', dts: 'audio/vnd.dts', amr: 'audio/amr', '3ga': 'audio/3gpp', au: 'audio/basic', snd: 'audio/basic', ra: 'audio/vnd.rn-realaudio', ram: 'audio/vnd.rn-realaudio', dsf: 'audio/dsd', dff: 'audio/dsd', mid: 'audio/midi', midi: 'audio/midi',
+}
+
+// --- low-level helpers -------------------------------------------------------
+
+// Base64 of an ArrayBuffer OR a Uint8Array (accepting both replaced a duplicated twin encoder).
+export const abToB64 = (ab) => {
+  const bytes = ab instanceof Uint8Array ? ab : new Uint8Array(ab)
+  let bin = ''
+  const CH = 0x8000 // avoids String.fromCharCode argument-count overflow
+  for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH))
+  return btoa(bin)
+}
+
+// SHA-256 hex of binary content (crypto.subtle).
+async function sha256Hex(arrayBuffer) {
+  const digest = await crypto.subtle.digest('SHA-256', arrayBuffer)
+  const bytes = new Uint8Array(digest)
+  let hex = ''
+  for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, '0')
+  return hex
+}
+
+// Hashed shard path: ab/cd/<hash>.<ext> (first 2 hash bytes as directories).
+function shardPathFor(hash, ext) {
+  const ab = hash.slice(0, 2)
+  const cd = hash.slice(2, 4)
+  return `${ab}/${cd}/${hash}${ext ? '.' + ext : ''}`
+}
+
+// SPLIT INTO PIECES ≤19 MB (2026-07-07, browser mirror of scripts/lib/img-pipeline.mjs — same
+// convention, same threshold, same reason: jsDelivr refuses to serve files > ~20 MB). Replaces the
+// old recompressed dispPath derivative: the ciphertext is split AS-IS (lossless), one path per
+// piece, addressed by the WHOLE-FILE hash + index (deterministic/idempotent). The client rebuilds
+// by concatenating in order before decrypting -> bit-exact reconstruction, always served by jsDelivr.
+//
+// POLITIQUE DE DÉCOUPAGE — les IMAGES sont un CAS À PART, volontairement (2026-07-21) : elles restent
+// TOUJOURS sur la branche « ≤95 Mo -> 19 Mo jsDelivr » de la politique finale, JAMAIS sur la branche
+// « >95 Mo -> 95 Mo raw.github ». Raison : le lecteur d'images (ImageNodeViewer.decryptedObjectUrlChunked)
+// est STRICTEMENT jsDelivr, sans repli raw pendant le browsing (décision 2026-07-07, pour ne pas brûler
+// le quota REST en parcourant une galerie). Une « image » unique de plus de 95 Mo n'existe pas en
+// pratique (photos/captures = 1-30 Mo) ; un tel binaire géant doit passer par le chemin média générique
+// (uploadBinaryChunksEncrypted, plus bas), qui LUI applique bien le 19/95 par taille de fichier.
+// NB taille : ici on découpe le CIPHERTEXT DÉJÀ chiffré en UN bloc (tag GCM inclus une seule fois),
+// donc 19 Mo PLEINS (pas de -16 par chunk) — contrairement au média générique qui chiffre PAR chunk.
+// La valeur (19 Mo) vient de la source unique chunkPolicy.js (CDN_CHUNK) : les images ne peuvent plus
+// dériver du reste du système, même en gardant leur spécialisation « toujours jsDelivr ».
+const CHUNK_BYTES_IMG = CDN_CHUNK
+function shardChunkPathFor(hash, i) {
+  return `${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}-${String(i).padStart(3, '0')}.bin`
+}
+function splitIntoChunksImg(ab, chunkSize = CHUNK_BYTES_IMG) {
+  const slices = []
+  for (let off = 0; off < ab.byteLength; off += chunkSize) slices.push(ab.slice(off, Math.min(off + chunkSize, ab.byteLength)))
+  return slices.length ? slices : [ab]
+}
+
+// DEDUP-PRESERVING ENCRYPTION (public+encrypted model, see docs/media-public-encrypted-design.md §6.1).
+//
+// PROBLEM: encryptBytes() in src/media/crypto.js draws a RANDOM IV per call. Two uploads of the
+// SAME image would yield two different ciphertexts -> two different GitHub blobs -> dedup lost
+// (and migration not idempotent). We want the opposite: same plaintext = same ciphertext = same
+// blob (GitHub dedups by sha). So we derive a DETERMINISTIC IV from the SHA-256 of the PLAINTEXT:
+// its first 12 bytes (= first 24 hex chars). The IV is not secret; its only requirement
+// (uniqueness per file under one key) holds because distinct plaintexts have distinct hashes.
+//
+// We encrypt via getMediaKey() directly (not encryptBytes) so we can FORCE the derived IV.
+function deriveIvBytes(hashHex) {
+  const iv = new Uint8Array(12)
+  for (let i = 0; i < 12; i++) iv[i] = parseInt(hashHex.slice(i * 2, i * 2 + 2), 16)
+  return iv
+}
+
+// Encrypt an ArrayBuffer with an IV DERIVED from its plaintext hash. Returns { cipher: Uint8Array, iv: base64 }.
+// The ciphertext is deterministic (same plaintext -> same output), which preserves shard-side dedup.
+async function encryptBytesDeterministic(arrayBuffer, hashHex) {
+  const key = await getMediaKey()
+  const ivBytes = deriveIvBytes(hashHex)
+  const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivBytes }, key, arrayBuffer)
+  return { cipher: new Uint8Array(cipher), iv: abToB64(ivBytes) }
+}
+
+function extOf(name = '', mime = '') {
+  const m = name.match(/\.([a-z0-9]+)$/i)
+  if (m) return m[1].toLowerCase()
+  const sub = (mime.split('/')[1] || '').toLowerCase()
+  return sub || 'bin'
+}
+
+// Node-path-safe filename (no slashes, no exotic characters).
+function sanitize(name = '') {
+  // LES ACCENTS SE TRANSLITTÈRENT, ILS NE SE SUPPRIMENT PAS (2026-08-30). Sans `sansAccent` en
+  // tête, le filtre `[^\w.\- ]` qui suit EFFACE le caractère accentué au lieu de le remplacer :
+  // « Août » devenait « Aot », un nom faux et méconnaissable. En retirant l'accent d'abord, le
+  // « û » devient un « u » que le filtre garde. Règle posée par Matthieu : aucun accent dans les
+  // noms du drive.
+  return (sansAccent(name).replace(/\.[^.]+$/, '') || 'item')
+    .replace(/[/\\]/g, '_')
+    .replace(/[^\w.\- ]+/g, '')
+    .trim()
+    .slice(0, 80) || 'item'
+}
+
+const rand = () => Math.random().toString(36).slice(2, 8)
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+async function shardApiOnce(payload) {
+  return fetch('/api/upload-shard', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then((x) => x.json()).catch(() => null)
+}
+
+// POST /api/upload-shard (binary to shard).
+// RATE-LIMIT (2026-07-02): several parallel imports (captureFiles, FILE_CONCURRENCY=4) sometimes
+// trip GitHub's anti-abuse on concurrent commits. The server already retries internally (up to
+// ~20s, see server/upload-shard.js ghRetry); if it still gives up it returns {rateLimited:true,
+// resetAt}. Here we arm the SAME banner as reads (window.__zrMarkRateLimited, wired in App.jsx)
+// then wait until resetAt (capped at 90s so an import never blocks forever) before retrying ONCE.
+// Result: an import that hits anti-abuse pauses visibly then resumes by itself instead of failing.
+export async function shardApi(payload) {
+  const r = await shardApiOnce(payload)
+  if (r && r.rateLimited) {
+    try { window.__zrMarkRateLimited && window.__zrMarkRateLimited(r.resetAt) } catch {}
+    const waitMs = Math.min(Math.max(0, Number(r.resetAt) - Date.now()), 90000)
+    await sleep(waitMs + 300)
+    return shardApiOnce(payload)
+  }
+  return r
+}
+
+// Get the active shard (repo with room) of the (kind, vis) family.
+// Without kind/vis -> exact old flow (img/private). With them -> generic family.
+async function activeShard(kind, vis, need) {
+  const payload = { action: 'active-shard' }
+  if (kind && vis) { payload.kind = kind; payload.vis = vis; if (need) payload.need = need }
+  const r = await shardApi(payload)
+  if (!r || r.error || !r.repo) throw new Error('active-shard: ' + ((r && r.error) || 'fail'))
+  return r.repo
+}
+
+// P2 — GLOBAL semaphore for GitHub blob writes. When several files import IN PARALLEL
+// (captureFiles), each potentially pushing up to UP_CONCURRENCY chunks at once, total concurrent
+// PUTs would explode and risk GitHub's secondary rate-limit. This semaphore caps in-flight blob
+// PUTs at PUT_MAX regardless of how many files/chunks are active. putBlob is the ONLY blob write
+// point (every upload function goes through it), so capping here covers everything. PUT_MAX =
+// UP_CONCURRENCY: a single file (sequential path) is NEVER throttled; only multi-file parallelism is.
+const PUT_MAX = 6
+let _putInFlight = 0
+const _putWaiters = []
+function acquirePut() {
+  if (_putInFlight < PUT_MAX) { _putInFlight++; return Promise.resolve() }
+  return new Promise((resolve) => _putWaiters.push(resolve))
+}
+function releasePut() {
+  _putInFlight--
+  if (_putWaiters.length && _putInFlight < PUT_MAX) { _putInFlight++; _putWaiters.shift()() }
+}
+
+// Create a raw blob in the shard, with 1 light retry (re-create = same sha, idempotent).
+// Goes through the global semaphore: acquire first, release guaranteed via finally (even on throw).
+async function putBlob(repo, b64) {
+  await acquirePut()
+  try {
+    let sha = null
+    for (let attempt = 0; attempt < 2 && !sha; attempt++) {
+      const r = await shardApi({ action: 'blob', repo, b64 })
+      if (r && r.ok && r.sha) sha = r.sha
+    }
+    if (!sha) throw new Error('blob failed')
+    return sha
+  } finally {
+    releasePut()
+  }
+}
+
+// PROD BUG (2026-07-02, Matthieu): a 13 MB image (~17 MB once base64 in the JSON body sent to
+// /api/upload-shard) failed with the misleading "image too large" although GitHub accepts blobs up
+// to 100 MB. REAL cause: Vercel caps a serverless function's INCOMING body at ~4.5 MB, regardless
+// of `config.api.bodyParser.sizeLimit` (that setting only controls parsing AFTER reception, not
+// the platform wall). captureImage pushed the whole image in ONE POST — exactly the trap already
+// known and avoided for private video/media (see CHUNK_SIZE), but never applied to the PUBLIC
+// image path (.img.json).
+//
+// FIX: putBlobLarge splits anything > CHUNK_SIZE into pieces (each a normal, safe Git blob), THEN
+// asks the SERVER to reassemble them into ONE final blob ('assemble-blob', server/upload-shard.js).
+// That reassembly happens entirely SERVER -> GitHub (read each small blob + concat + one final
+// blob), never bounded by the incoming-body limit. The result stays ONE blob at the same hashed
+// path -> NO manifest schema change, still directly servable by jsDelivr.
+async function putBlobLarge(repo, ab, onProgress, onAssemble) {
+  if (ab.byteLength <= CHUNK_SIZE) {
+    const sha = await putBlob(repo, abToB64(ab))
+    onProgress?.(1)
+    return sha
+  }
+  const count = Math.ceil(ab.byteLength / CHUNK_SIZE)
+  // Each piece goes through putBlob (already capped by the global acquirePut/releasePut semaphore)
+  // -> no concurrency overload even though Promise.all fires all `count` pieces at once.
+  let transferred = 0
+  const shas = await Promise.all(Array.from({ length: count }, async (_, i) => {
+    const slice = ab.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, ab.byteLength))
+    const sha = await putBlob(repo, abToB64(slice))
+    transferred += slice.byteLength
+    onProgress?.(transferred / ab.byteLength)
+    return sha
+  }))
+  onAssemble?.()
+  const r = await shardApi({ action: 'assemble-blob', repo, chunkShas: shas })
+  if (!r || !r.ok || !r.sha) throw new Error('assemble-blob: ' + ((r && r.error) || 'fail'))
+  return r.sha
+}
+
+// Atomic commit of a {path, sha} file list into the shard.
+async function commitShard(repo, files, addBytes) {
+  const r = await shardApi({ action: 'commit', repo, files, addBytes })
+  if (!r || r.error || !r.ok) throw new Error('commit: ' + ((r && r.error) || 'fail'))
+  return r
+}
+
+// Write a node (text manifest) to the content repo via /api/page action save.
+async function writeNode(path, markdown) {
+  const r = await fetch('/api/page', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'save', path, markdown }),
+  }).then((x) => x.json()).catch(() => null)
+  if (!r || r.error || !r.ok) throw new Error('save: ' + ((r && r.error) || 'fail'))
+  return r
+}
+
+// Best-effort image dimensions.
+async function imageDims(fileOrBlob) {
+  try {
+    const bmp = await createImageBitmap(fileOrBlob)
+    const d = { w: bmp.width, h: bmp.height }
+    bmp.close && bmp.close()
+    return d
+  } catch { return {} }
+}
+
+// Best-effort audio duration via an <audio> element (metadata only, no playback).
+async function audioDuration(file) {
+  try {
+    return await new Promise((res) => {
+      const a = document.createElement('audio')
+      a.preload = 'metadata'
+      const u = URL.createObjectURL(file)
+      const done = (val) => { res(val); URL.revokeObjectURL(u) }
+      a.onloadedmetadata = () => done(Number.isFinite(a.duration) ? a.duration : 0)
+      a.onerror = () => done(0)
+      a.src = u
+      // 8 s (not 4): for audio this duration is AUTHORITATIVE (audio is not transcoded, so no
+      // ffmpeg probe as backup). A big file on a slow disk sometimes needs > 4 s to load its
+      // metadata; a short timeout would write probe.duration:0 (broken seek bar).
+      setTimeout(() => done(0), 8000)
+    })
+  } catch { return 0 }
+}
+
+// --- routing by type ---------------------------------------------------------
+
+function destFolder(folder) {
+  return String(folder || 'pages').replace(/\/$/, '')
+}
+
+// IMAGE: keep the ORIGINAL BYTES (no source conversion) + original extension, plus a derived .webp
+// thumbnail (compatibility). Then a .img.json node.
+//
+// VISIBILITY:
+//   - vis='private' (legacy default) -> img/private family, served by /api/shard.
+//       Manifest: {repo, path, vis:'private'}. ONE single file (jsDelivr not involved, proxy has no size limit).
+//   - vis='public' -> img/public family, served by jsDelivr PINNED on the commit.
+//       The original is SPLIT into pieces ≤19 MB (cdnChunks[], always at least 1) — jsDelivr
+//       refuses files > ~20 MB; the client rebuilds by concatenating before decrypting (bit-exact,
+//       never recompressed — replaces the old dispPath derivative, 2026-07-07). No human name leaks
+//       (hashed paths). The commit returned by the commit action PINS the jsDelivr URL (immutable
+//       cache, anti-blank-screen).
+async function captureImage(file, folder, onProgress, vis = 'public') {
+  const ab = await file.arrayBuffer()
+  const hash = await sha256Hex(ab)
+  const ext = extOf(file.name, file.type)
+  const path = shardPathFor(hash, ext) // PRIVATE only: single-file path (content address, plaintext hash).
+  const isPublic = vis === 'public'
+
+  const repo = isPublic ? await activeShard('img', 'public', file.size) : await activeShard()
+  if (onProgress) onProgress(0.1)
+
+  // PUBLIC: encrypt the PLAINTEXT before sending (never plaintext on a public repo). IV derived
+  //   from the plaintext hash -> deterministic ciphertext -> dedup preserved. IV (base64) goes in
+  //   the manifest.
+  // PRIVATE (legacy): push the raw bytes as before (no change, backward compat intact).
+  let iv = null
+  let uploadAb
+  if (isPublic) {
+    const { cipher, iv: ivB64 } = await encryptBytesDeterministic(ab, hash)
+    iv = ivB64
+    uploadAb = cipher.buffer
+  } else {
+    uploadAb = ab
+  }
+
+  // putBlobLarge auto-splits beyond CHUNK_SIZE (3 MB, the real Vercel body cap) and reassembles
+  // server-side into ONE final blob -> no false "too large" (2026-07-02 bug). That is TRANSPORT
+  // splitting (invisible, transparent); STORAGE splitting (cdnChunks, ≤19 MB, permanent) is one
+  // level above, applied ONLY to public (private stays ONE file, served by a proxy with no
+  // jsDelivr size limit).
+  const files = []
+  let addBytes = 0
+  let cdnChunks = null
+  if (isPublic) {
+    const slices = splitIntoChunksImg(uploadAb)
+    cdnChunks = []
+    for (let i = 0; i < slices.length; i++) {
+      let sha
+      try { sha = await putBlobLarge(repo, slices[i]) }
+      catch (e) { throw new Error(`échec d'envoi du morceau ${i + 1}/${slices.length} (${(e && e.message) || e})`) }
+      cdnChunks.push(shardChunkPathFor(hash, i))
+      files.push({ path: shardChunkPathFor(hash, i), sha })
+      addBytes += slices[i].byteLength
+    }
+  } else {
+    let binSha
+    try {
+      binSha = await putBlobLarge(repo, uploadAb)
+    } catch (e) {
+      const mb = Math.round(file.size / 1e6)
+      throw new Error(mb > 95 ? `image trop volumineuse (${mb} Mo, plafond GitHub ~100 Mo)` : `échec d'envoi (${mb} Mo) : ${(e && e.message) || e}`)
+    }
+    files.push({ path, sha: binSha })
+    addBytes += file.size
+  }
+  if (onProgress) onProgress(0.5)
+
+  // Derived .webp thumbnail, best-effort: a failure never blocks. Never chunked (always small).
+  // Public thumbnails have their OWN content hash/path (the WebP bytes differ from the original),
+  // so the final manifest MUST carry the exact pinned URL. Reusing the original hash here produced
+  // a valid encrypted file with no resolvable thumbnail for `cdnChunks` manifests.
+  // PUBLIC: the thumbnail is ENCRYPTED too, with its OWN IV derived from the hash of ITS plaintext
+  //   (the thumbnail's content differs from the image's). thumbIv goes in the manifest for display decryption.
+  let thumbIv = null
+  let thumbPath = null
+  let thumbW = 0
+  let thumbH = 0
+  // Réglages dans `config/thumbnail.js`, seul fichier à éditer. Ce commentaire annonçait « 1080px /
+  // q60 » alors que la valeur était q90 depuis longtemps et vaut 2160 depuis le 2026-08-31 : un
+  // commentaire qui répète une constante finit toujours par mentir, on renvoie donc à la source.
+  const thumb = await makeThumbWebp(file)
+  if (thumb) {
+    try {
+      const thumbAb = await thumb.arrayBuffer()
+      let thumbUploadB64
+      if (isPublic) {
+        const thumbHash = await sha256Hex(thumbAb)
+        const { cipher, iv: tIvB64 } = await encryptBytesDeterministic(thumbAb, thumbHash)
+        thumbIv = tIvB64
+        thumbUploadB64 = abToB64(cipher.buffer)
+        thumbPath = shardPathFor(thumbHash, 'webp')
+        const dims = await imageDims(thumb)
+        thumbW = dims.w || 0
+        thumbH = dims.h || 0
+      } else {
+        thumbUploadB64 = abToB64(thumbAb)
+      }
+      const thumbSha = await putBlob(repo, thumbUploadB64)
+      files.push({ path: thumbPath || shardPathFor(hash, 'webp'), sha: thumbSha })
+      addBytes += thumb.size
+    } catch { /* thumbnail is optional */ }
+  }
+  if (onProgress) onProgress(0.8)
+
+  // commitShard returns {ok, repo, commit}: the commit pins the jsDelivr URL for public.
+  const cr = await commitShard(repo, files, addBytes)
+  const commit = cr && cr.commit
+
+  const { w, h } = await imageDims(file)
+  const base = {
+    type: 'image', v: 1, name: file.name, ext,
+    w: w || 0, h: h || 0, size: file.size, tags: [], addedAt: new Date().toISOString(),
+  }
+  // Public manifest: CDN refs (repo/cdnChunks/commit) + iv/thumb/thumbnail metadata for client
+  // decryption. `thumb` is mandatory whenever thumbIv exists: chunked originals have no cdnPath
+  // from which a thumbnail URL could be inferred.
+  const manifest = isPublic
+    ? {
+        ...base, vis: 'public', cdnRepo: repo, cdnChunks, cdnCommit: commit || null,
+        alg: 'AES-GCM', iv,
+        ...(thumbIv && thumbPath && commit ? {
+          thumb: buildJsDelivrUrl(repo, commit, thumbPath), thumbIv,
+          ...(thumbW && thumbH ? { thumbW, thumbH } : {}),
+        } : {}),
+      }
+    : { ...base, vis: 'private', repo, path }
+  const nodePath = `${destFolder(folder)}/${sanitize(file.name)}.${rand()}.img.json`
+  await writeNode(nodePath, JSON.stringify(manifest))
+  if (onProgress) onProgress(1)
+  return { ok: true, type: 'image', nodePath, name: file.name }
+}
+
+// P1 (perf): number of chunk PUTs in flight at once, hard cap (GitHub quota). 1 = old sequential
+// behavior. 6 = sweet spot (network saturated without tripping the secondary rate-limit). NB: with
+// P2 (parallel captureFiles) active, the file×chunk product stays capped at ~6 total PUTs by the
+// global putBlob semaphore.
+const UP_CONCURRENCY = 6
+
+// ENCRYPTED + PUBLIC (jsDelivr) chunked upload with push rollover, for ALL non-image media
+// (doc/pdf/dmg/zip, audio…). Each 3 MB chunk is encrypted (AES-GCM, deterministic IV derived from
+// the chunk's PLAINTEXT hash) then pushed as CIPHERTEXT to the PUBLIC shard of the `kind` family
+// (server rollover via activeShard + need). 3 MB < jsDelivr limit AND < 100 MB GitHub: a file of
+// any size goes through (deconstruction). Returns what a public .media.json needs:
+// { cdnRepo, cdnCommit, dir, parts, count, size, ivs[] }.
+// P0: hashed/random paths (media/<id>/NNN.bin), no human names, no plaintext on the public repo.
+async function uploadBinaryChunksEncrypted(file, kind, onProgress, onStage) {
+  onStage?.('storage')
+  const repo = await activeShard(kind, 'public', file.size)
+  const id = `${Date.now().toString(36)}-${rand()}`
+  const dir = `media/${id}`
+  // Politique finale : chunk de STOCKAGE 19 MiB (jsDelivr) sous 95 Mo, 95 Mo (raw.github) au-delà --
+  // décidé par storageChunkFor (source unique chunkPolicy.js). perChunkEncrypted:true car ici on chiffre
+  // CHAQUE chunk séparément (tag GCM par chunk -> cible - 16). Le 3 Mo ne subsiste qu'au TRANSPORT
+  // (putBlobLarge découpe puis fait réassembler côté serveur en UN blob par chunk de stockage).
+  const chunkSize = storageChunkFor(file.size, { perChunkEncrypted: true })
+  const count = Math.ceil(file.size / chunkSize) || 1
+  const pad = (i) => String(i).padStart(3, '0')
+  const files = new Array(count)
+  const ivs = new Array(count)
+  const transferredBytes = new Array(count).fill(0)
+  let done = 0
+  // Pool borné (2 chunks de 19/95 Mo en vol max : chiffrement + transport en parallèle sans exploser
+  // la RAM mobile). files[i] ET ivs[i] indexés par i -> l'appariement IV<->chunk (critique pour le
+  // déchiffrement) survit à n'importe quel ordre d'achèvement.
+  let next = 0
+  const worker = async () => {
+    while (next < count) {
+      const i = next++
+      const slice = file.slice(i * chunkSize, Math.min((i + 1) * chunkSize, file.size))
+      const slAb = await slice.arrayBuffer()
+      const h = await sha256Hex(slAb)
+      onStage?.('encrypting')
+      const { cipher, iv } = await encryptBytesDeterministic(slAb, h)
+      onStage?.('uploading')
+      // Count accepted transport fragments, without changing storage chunk sizes. (19 October 2026, 00:51 Paris)
+      const sha = await putBlobLarge(repo, cipher.buffer, (ratio) => {
+        const accepted = Math.round(slice.size * ratio)
+        done += accepted - transferredBytes[i]
+        transferredBytes[i] = accepted
+        if (onProgress) onProgress(0.9 * done / file.size)
+      }, () => onStage?.('assembling'))
+      files[i] = { path: `${dir}/${pad(i)}.bin`, sha }
+      ivs[i] = iv
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(2, count) }, worker))
+  onStage?.('publishing')
+  const cr = await commitShard(repo, files, file.size)
+  const parts = Array.from({ length: count }, (_, i) => pad(i))
+  return { cdnRepo: repo, cdnCommit: (cr && cr.commit) || null, dir, parts, count, size: file.size, ivs, chunkSize }
+  // ── ANCIENNE VERSION (DÉPRÉCIÉE 2026-07-21, conservée en commentaire sur demande Matthieu) ──
+  // Elle posait le chunk de STOCKAGE à CHUNK_SIZE (3 Mo) : "31,5 Mo = 11 morceaux de 3 Mo", une
+  // confusion entre la contrainte de TRANSPORT Vercel et le stockage. Résultat : une pluie de
+  // mini-fichiers sans aucun bénéfice (jsDelivr accepte 20 Mo/fichier). Ne JAMAIS restaurer.
+  //   const count = Math.ceil(file.size / CHUNK_SIZE) || 1
+  //   ... const slice = file.slice(i * CHUNK_SIZE, ...) ; const sha = await putBlob(repo, abToB64(cipher.buffer))
+  //   return { ..., count, size: file.size, ivs } // (sans chunkSize : les manifestes écrivaient CHUNK_SIZE=3 Mo)
+}
+
+// VIDEO (Phase 3) — NATIVE DRAG-DROP: STREAM the file to the local server (/api/transcode-local),
+// which transcodes to encrypted HLS with the NATIVE ffmpeg (fast: remux/VideoToolbox, see
+// scripts/video-hls-lib.mjs), pushes segments + node, and streams LIVE PROGRESS back over SSE. No
+// more Terminal, no more ffmpeg.wasm. The import only blocks for the upload (loopback, fast); the
+// transcode runs in the background and the top-right notification carries the %. On server failure
+// -> clean fallback to the Terminal command.
+async function captureVideoServerHls(file, folder, onProgress) {
+  const dest = destFolder(folder)
+  const prog = notifyProgress({ icon: 'film', tint: '#d97757', label: 'Vidéo · transcodage', title: file.name, body: `Vers ${dest} · envoi au transcodeur natif…` })
+  try {
+    const r = await fetch(`/api/transcode-local?dest=${encodeURIComponent(dest)}&name=${encodeURIComponent(file.name)}`, { method: 'POST', body: file }).then((x) => x.json()).catch(() => null)
+    if (!r || !r.jobId) throw new Error((r && r.error) || 'job non démarré')
+    // SSE: live progress without blocking the import. At the end, refresh the tree (the node was
+    // created by the push).
+    const es = new EventSource(`/api/transcode-events?jobId=${r.jobId}`)
+    es.onmessage = (ev) => {
+      let d; try { d = JSON.parse(ev.data) } catch { return }
+      if (d.status === 'running') prog.set({ progress: Math.max(0.02, (d.progress || 0) / 100), body: `${d.stage}…` })
+      else if (d.status === 'done') { prog.done({ title: file.name, body: `Vidéo prête · ${dest}` }); try { es.close() } catch {}; if (typeof window !== 'undefined' && window.__zrRefreshTree) window.__zrRefreshTree() }
+      else if (d.status === 'error') { prog.fail({ title: 'Transcodage échoué', body: d.error || file.name }); try { es.close() } catch {} }
+      else if (d.status === 'unknown') { try { es.close() } catch {} }
+    }
+    es.onerror = () => { try { es.close() } catch {} }
+    return { ok: true, type: 'video-queued', name: file.name }
+  } catch (e) {
+    prog.fail({ title: 'Transcodeur natif indisponible', body: `${file.name} — repli sur la commande Terminal. ${(e && e.message) || String(e)}` })
+    return captureVideoLocalCmd(file, folder, onProgress, (e && e.message) || String(e))
+  }
+}
+
+// VIDEO: SINGLE PATH = TERMINAL, NO PLACEHOLDER. We no longer create a .media.json
+// {transcoding:true} node (the old "Transcoding · 0%" placeholder froze forever with a misleading
+// badge -> DEPRECATED, see docs/removed-video-transcode-placeholder.md). We only generate the
+// local COMMAND (/api/upload-cmd) and a 2-step onboarding. The final HLS node is created by the
+// command when it runs (video-hls.mjs --push), not before. No drive write here, no queue entry.
+async function captureVideoLocalCmd(file, folder, onProgress, reason) {
+  const dest = destFolder(folder)
+  if (onProgress) onProgress(1)
+  try {
+    const r = await fetch(`/api/upload-cmd?dest=${encodeURIComponent(dest)}&name=${encodeURIComponent(file.name)}`)
+      .then((x) => x.json()).catch(() => null)
+    if (r && r.ok && r.cmd) {
+      const copied = copyToClipboard(r.cmd)
+      const why = reason ? ' (' + reason + ')' : ''
+      notify({
+        icon: 'film', tint: '#d97757', label: 'Vidéo · transcodage local', big: true,
+        title: copied ? 'Vidéo — 2 étapes pour l’importer' : 'Copie auto bloquée — clique Copier',
+        body: `« ${file.name} »${why}\n\n1. Place le fichier dans ~/Downloads (s'il n'y est pas déjà).\n2. Colle la commande ci-dessous dans le Terminal${copied ? ' (déjà copiée dans le presse-papier)' : ' (utilise le bouton Copier)'}.\n\nLa vidéo apparaîtra dans « ${dest} » dès que le transcodage HLS est poussé.`,
+        cmd: r.cmd,
+        actions: [{ label: copied ? 'Recopier la commande' : 'Copier la commande', primary: true, onClick: () => copyToClipboard(r.cmd) }],
+      })
+    } else {
+      notify({ icon: 'exclamationmark.triangle', tint: '#FF3B30', label: 'Vidéo · transcodage local', title: 'Commande indisponible', body: `${file.name} : impossible de générer la commande (${(r && r.error) || 'endpoint injoignable'}).`, ttl: 14000 })
+    }
+  } catch (e) {
+    notify({ icon: 'exclamationmark.triangle', tint: '#FF3B30', label: 'Vidéo · transcodage local', title: 'Commande indisponible', body: `${file.name} : erreur lors de la génération de la commande. ${(e && e.message) || String(e)}`, ttl: 14000 })
+  }
+  // No node created -> no buggy placeholder, nothing to index. Dedicated type for the App.jsx toast.
+  return { ok: true, type: 'video-cmd', name: file.name }
+}
+
+// Robust shared clipboard copy. Tries the modern API (needs HTTPS + focus), falls back to
+// textarea + execCommand when blocked (http://localhost, lost focus, permission). Returns a
+// best-effort 'copied' boolean. navigator.clipboard.writeText is async: fire the modern attempt
+// without awaiting (so the notification renders immediately) and guarantee the synchronous fallback.
+function copyToClipboard(text) {
+  const s = String(text || '')
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(s).catch(() => fallbackCopy(s))
+      return true
+    }
+  } catch { /* fall through */ }
+  return fallbackCopy(s)
+}
+function fallbackCopy(s) {
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = s
+    ta.style.position = 'fixed'; ta.style.opacity = '0'
+    document.body.appendChild(ta); ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return !!ok
+  } catch { return false }
+}
+
+// Guess artist / title from an "Artist - Title.ext" filename.
+function guessMeta(name = '') {
+  const base = name.replace(/\.[^.]+$/, '')
+  const m = base.match(/^\s*(.+?)\s*-\s*(.+?)\s*$/)
+  if (m) return { artist: m[1], title: m[2] }
+  return { artist: '', title: base }
+}
+
+// AUDIO (mp3/wav/flac/m4a/opus/ogg…): nouvelles écritures au contrat v3 unique.
+// Music découvre les nœuds .media.json via l'index public ; l'ancien audio/manifest.json plat
+// n'est plus écrit (deux sources de vérité et un commit supplémentaire par import).
+async function captureAudio(file, folder, mime, onProgress) {
+  if (!file || !Number.isSafeInteger(file.size) || file.size <= 0) throw new Error('fichier audio vide ou invalide')
+  const realMime = mime || file.type || 'audio/mpeg'
+  if (!String(realMime).startsWith('audio/')) throw new Error(`type audio invalide: ${realMime}`)
+  const duration = await audioDuration(file)
+  const { cdnRepo, cdnCommit, dir, parts, size, ivs, chunkSize } = await uploadBinaryChunksEncrypted(file, 'audio', onProgress)
+  const { artist, title } = guessMeta(file.name)
+  // chunkSize RÉEL (19 MiB/95 Mo, politique 2026-07-21) -- plus jamais CHUNK_SIZE transport (3 Mo).
+  const manifest = buildAudioManifestV3({ name: file.name, title, artist, mime: realMime, size, chunkSize, cdnRepo, cdnCommit, dir, parts, ivs, duration })
+  const nodePath = `${destFolder(folder)}/${sanitize(file.name)}.${rand()}.media.json`
+  await writeNode(nodePath, JSON.stringify(manifest))
+
+  if (onProgress) onProgress(1)
+  return { ok: true, type: 'audio', nodePath, name: file.name }
+}
+
+// Generic binary media (pdf, other): chunked + .media.json node (fitting mime).
+async function captureBinaryMedia(file, folder, mime, onProgress, kind = 'doc', onStage) {
+  const { cdnRepo, cdnCommit, dir, parts, count, size, ivs, chunkSize } = await uploadBinaryChunksEncrypted(file, kind, onProgress, onStage)
+  const manifest = {
+    type: 'chunked-media', v: 1, name: file.name, mime: mime || file.type || 'application/octet-stream',
+    size, chunkSize, count, dir, parts,
+    vis: 'public', cdnRepo, cdnCommit, alg: 'AES-GCM', ivs,
+    probe: { duration: 0, audio: [], subs: [] },
+  }
+  const nodePath = `${destFolder(folder)}/${sanitize(file.name)}.${rand()}.media.json`
+  onStage?.('saving')
+  await writeNode(nodePath, JSON.stringify(manifest))
+  if (onProgress) onProgress(1)
+  return { ok: true, type: 'media', nodePath, name: file.name }
+}
+
+// TEXT (.md/.txt, text/markdown): create a .md page with the raw text.
+async function captureText(file, folder, onProgress) {
+  const text = await file.text()
+  const nodePath = `${destFolder(folder)}/${sanitize(file.name)}.md`
+  await writeNode(nodePath, text)
+  if (onProgress) onProgress(1)
+  return { ok: true, type: 'page', nodePath, name: file.name }
+}
+
+// --- main router ---------------------------------------------------------------
+
+async function routeFile(file, folder, onProgress, mode, vis) {
+  const mime = file.type || ''
+  const ext = extOf(file.name, mime)
+
+  // CLASSIFICATION: delegated 100% to classify.js (pure module, single source of truth, shared
+  // with bulk Node and mobile). routeFile no longer contains a decision cascade — it only PLUGS
+  // the pipeline into the right capturer. All side effects (localhost gating, notify, vis) stay
+  // HERE, because they cannot live in an isomorphic module (Node has neither location nor notify).
+  const { kind, pipeline } = classify({ name: file.name, mime })
+
+  switch (pipeline) {
+    case 'img':
+      return captureImage(file, folder, onProgress, vis)
+
+    case 'hls': {
+      // VIDEO = ONE local path: NATIVE DRAG-DROP. The local server transcodes with native ffmpeg
+      // (remux/VideoToolbox) and streams live progress. Outside localhost (no native server),
+      // video import is not possible: clear message. This gating + notify ARE side effects: they
+      // stay in routeFile, never in classify (Node has neither location nor notify -> would break
+      // bulk import).
+      const onLocal = typeof location !== 'undefined' && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)
+      if (onLocal) return captureVideoServerHls(file, folder, onProgress)
+      notify({ icon: 'film', tint: '#FF9F0A', label: 'Vidéo', title: 'Import vidéo : app locale requise', body: `${file.name} : le transcodage vidéo se fait par le serveur local (localhost). Ouvre l'app en local pour importer des vidéos.`, ttl: 12000 })
+      return { ok: false, type: 'video-skipped', name: file.name }
+    }
+
+    case 'media':
+      // The 'media' pipeline covers TWO kinds: audio and pdf. Distinguished by `kind` (from classify).
+      if (kind === 'pdf') {
+        return captureBinaryMedia(file, folder, 'application/pdf', onProgress, 'pdf') // dedicated pdf/public family
+      }
+      // AUDIO: if the MIME is not audio/* (bare .wav/.flac/.ogg extension), derive it from the
+      // extension. Otherwise (audio/* mime already present) pass it through — identical to the old cascade.
+      return captureAudio(file, folder, mime.startsWith('audio/') ? mime : (AUDIO_MIME_BY_EXT[ext] || 'audio/mpeg'), onProgress)
+
+    case 'text':
+      return captureText(file, folder, onProgress)
+
+    case 'chunk':
+    default:
+      // ONLY case producing raw binary pieces: non-openable formats (projects, zip, RAW, proprietary).
+      return captureBinaryMedia(file, folder, mime || 'application/octet-stream', onProgress)
+  }
+}
+
+// Add freshly created node paths to the search index (pages/.zr-search-index.json), in ONE commit
+// for the whole dropped batch. Best-effort: a failure never invalidates the import (the node is
+// already written and visible in the Finder via the current-folder refresh). Without this, the
+// global SEARCH would only see the new file after a manual index rebuild.
+async function addToSearchIndex(paths) {
+  const list = (paths || []).filter(Boolean)
+  if (!list.length) return
+  try {
+    await fetch('/api/page', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'index-add', paths: list }),
+    })
+  } catch (e) {
+    // Best-effort (the node is already written and visible in the Finder), but LEAVE A TRACE:
+    // without it, a failure would leave the file invisible to global search until the next manual
+    // rebuild, with no usable signal.
+    console.warn('[capture] mise à jour de l’index de recherche échouée', e)
+  }
+}
+
+// Public API: processes each File, resilient, returns an array of results.
+// results[i] = { ok, type, nodePath?, name, error? }
+// P2 — Files are processed IN PARALLEL by a small pool (FILE_CONCURRENCY). This is SAFE because:
+// the server already handles concurrent commits/rollover/counters (fast-forward retry + 5 GB
+// margin, see upload-shard.js), the global putBlob semaphore caps blob writes, every audio writes
+// its own .media.json, and the search index is updated only once after the batch. The win comes from
+// OVERLAPPING per-file network round-trips (activeShard, commitShard, writeNode) and
+// hash/thumbnail work. results[i] stays
+// indexed by i -> input order PRESERVED whatever the completion order. Progress is AGGREGATED
+// (mean of per-file ratios) -> smooth 0-to-1 bar over the whole batch instead of repeated 0->1 jumps.
+export async function captureFiles(files, { folder, onProgress, mode, vis } = {}) {
+  const list = Array.from(files || [])
+  const results = new Array(list.length)
+  const ratios = new Array(list.length).fill(0)
+  const report = () => {
+    if (!onProgress) return
+    let s = 0; for (let k = 0; k < list.length; k++) s += ratios[k]
+    onProgress(s / (list.length || 1))
+  }
+  let next = 0
+  const worker = async () => {
+    while (next < list.length) {
+      const i = next++
+      const file = list[i]
+      try {
+        const res = await routeFile(file, folder, (r) => { ratios[i] = typeof r === 'number' ? r : ratios[i]; report() }, mode, vis)
+        results[i] = res
+      } catch (e) {
+        // 1 RETRY (2026-07-02): an isolated failure mid-batch is often transient (network blip,
+        // GitHub conflict not covered by an internal retry). Before giving up on the file, retry
+        // ONCE after a short delay — GitHub rate-limits are already handled upstream (shardApi),
+        // this covers the rest.
+        try {
+          await new Promise((r) => setTimeout(r, 2500))
+          const res2 = await routeFile(file, folder, (r) => { ratios[i] = typeof r === 'number' ? r : ratios[i]; report() }, mode, vis)
+          results[i] = res2
+        } catch (e2) {
+          results[i] = { ok: false, type: 'error', name: file && file.name, error: (e2 && e2.message) || (e && e.message) || String(e2 || e) }
+        }
+      }
+      ratios[i] = 1; report() // file finished (success OR failure): its share is 1, the bar moves decisively
+    }
+  }
+  const FILE_CONCURRENCY = 4
+  await Promise.all(Array.from({ length: Math.min(FILE_CONCURRENCY, list.length) }, worker))
+  // Search index: 1 commit for ALL nodes created in this batch. In the background (no blocking
+  // await: the function returns immediately, the Finder refreshes without waiting for the index).
+  const nodePaths = results.filter((r) => r && r.ok && r.nodePath).map((r) => r.nodePath)
+  if (nodePaths.length) addToSearchIndex(nodePaths)
+  return results
+}
+
+// Preserve every attachment as its original bytes, including text and video. (19 October 2026, 00:32 Paris)
+export async function captureAttachment(file, { folder, onProgress, onStage } = {}) {
+  validateAttachment(file)
+  const result = await captureBinaryMedia(file, folder, file.type, onProgress, 'doc', onStage)
+  addToSearchIndex([result.nodePath])
+  return result
+}

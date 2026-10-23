@@ -1,0 +1,143 @@
+# QueueStatus.py (14 October 2026): the per-file status of an upload queue, written as UploadQueueStatus.json for the Create banner.
+# One entry per file: waiting, archive, cmaf, proof, unload, done, failed. Fed by the worker log lines, so no stage can be forgotten.
+# FR : le statut par fichier d'une file d'envoi, ecrit en UploadQueueStatus.json pour la banniere de Create.
+import json
+import os
+import re
+import threading
+from datetime import datetime
+from pathlib import Path
+
+# Every tunable value in one place (HDA rule). / FR : toutes les valeurs reglables au meme endroit.
+QUEUE_STATUS = {
+    'fileName': 'UploadQueueStatus.json',
+    'stages': ('waiting', 'archive', 'cmaf', 'push', 'proof', 'unload', 'done', 'failed'),  # 17 October 2026: 'push' = sending the streaming files to GitHub. FR : envoi vers GitHub.
+    'terminal': ('done', 'failed'),
+    # (regex on the log message, stage); the file name is the LAST group.
+    'patterns': (
+        (r'\[\d+/\d+\] Upload archive chiffree: (.+) \([\d.]+ Mio\)', 'archive'),  # greedy: a name may contain "(2012)"
+        (r'\[\d+/\d+\] Empaquetage CMAF[^:]*: (.+)$', 'cmaf'),
+        (r'\[\d+/\d+\] Verification cloud[^:]*: (.+)$', 'proof'),
+        (r'\[\d+/\d+\] Unload local[^:]*: (.+)$', 'unload'),
+        (r'^✓ \[\d+/\d+\] [^:]*: (.+) \([\d.]+ Mio/s\)', 'done'),
+        (r'^✗ Abandon \([^)]*\) de (.+?) apres', 'failed'),
+    ),
+}
+
+
+def stage_from_log_line(message):
+    """Returns (stage, file name) for a worker log message, or None."""
+    text = str(message).strip()
+    for pattern, stage in QUEUE_STATUS['patterns']:
+        found = re.search(pattern, text)
+        if found:
+            return stage, found.group(found.lastindex).strip()
+    return None
+
+
+class UploadQueue:
+    def __init__(self, directory, names=(), config=QUEUE_STATUS):
+        self.config = config
+        self.path = Path(directory) / config['fileName']
+        self.lock = threading.Lock()
+        self.closed = False
+        self.items = {}
+        for name in names:
+            self.items[name] = {'name': name, 'stage': 'waiting', 'updatedAt': self._now()}
+        self.write()
+
+    @staticmethod
+    def _now():
+        return datetime.now().astimezone().isoformat()
+
+    def set_stage(self, name, stage):
+        if stage not in self.config['stages']:
+            raise ValueError(f'unknown queue stage: {stage}')
+        with self.lock:
+            current = self.items.get(name)
+            if current is None:
+                current = self.items[name] = {'name': name, 'stage': 'waiting', 'updatedAt': self._now()}
+            # a finished file never goes back: a late log line must not reopen it
+            if current['stage'] == 'done':
+                return
+            if current['stage'] == stage:  # 17 October 2026: same stage again keeps its percentage and detail. FR : meme etape, on garde pourcentage et detail.
+                return
+            current['stage'] = stage
+            current['updatedAt'] = self._now()
+            current.pop('percent', None)  # a new stage starts without the previous stage's percentage
+            current.pop('detail', None)
+        self.write()
+
+    def set_progress(self, name, percent, detail=''):
+        """A real time percentage (0 to 100) of the current stage of one file, e.g. the CMAF packaging pass."""
+        if percent is None:
+            return
+        value = max(0, min(100, int(percent)))
+        with self.lock:
+            current = self.items.get(name)
+            if current is None or current['stage'] in self.config['terminal']:
+                return
+            if current.get('percent') == value and current.get('detail') == detail:
+                return
+            current['percent'] = value
+            if detail:
+                current['detail'] = detail
+            current['updatedAt'] = self._now()
+        self.write()
+
+    def set_detail(self, name, detail):
+        """A plain French sentence saying what the file is doing now (17 October 2026). FR : une phrase claire sur l'action en cours."""
+        with self.lock:
+            current = self.items.get(name)
+            if current is None or current['stage'] in self.config['terminal'] or current.get('detail') == detail:
+                return
+            current['detail'] = detail
+            current['updatedAt'] = self._now()
+        self.write()
+
+    def on_log(self, message):
+        found = stage_from_log_line(message)
+        if found:
+            self.set_stage(found[1], found[0])
+
+    def close(self):
+        """The worker is over: the queue is no longer running, whatever the stages say (a crash leaves nothing 'running')."""
+        self.closed = True
+        self.write()
+
+    def snapshot(self):
+        with self.lock:
+            items = list(self.items.values())
+        counts = {stage: 0 for stage in self.config['stages']}
+        for item in items:
+            counts[item['stage']] += 1
+        total = len(items)
+        finished = sum(counts[stage] for stage in self.config['terminal'])
+        return {'updatedAt': self._now(), 'pid': os.getpid(), 'total': total, 'finished': finished, 'counts': counts,
+                'running': (finished < total) and not self.closed, 'items': items}
+
+    def write(self):
+        data = json.dumps(self.snapshot(), ensure_ascii=False, indent=1) + '\n'
+        tmp = self.path.with_suffix('.tmp')
+        tmp.write_text(data, encoding='utf-8')
+        os.replace(tmp, self.path)
+
+
+def watch_progress(queue, name, progress_path, stop_event, interval=2.0):
+    """Thread body: copies <progress_path> (written by AttachVideoCmafDashHls.mjs) into the queue until stop_event is set."""
+    last = None
+    while not stop_event.is_set():
+        try:
+            data = json.loads(Path(progress_path).read_text(encoding='utf-8'))
+            if data != last and data.get('phase') in ('package', 'push'):
+                if data.get('phase') == 'push':
+                    detail = 'envoi des segments vers GitHub'
+                elif data.get('mode') == 'transcode':
+                    detail = f"conversion de la video{' a ' + str(data['bitrateMbit']) + ' Mbit/s' if data.get('bitrateMbit') else ''} pour le streaming"
+                else:
+                    detail = 'decoupage de la video en segments, sans reencodage'
+                queue.set_progress(name, data.get('percent'), detail)
+                last = data
+        except Exception:
+            pass  # the file does not exist yet, or is being replaced
+        stop_event.wait(interval)

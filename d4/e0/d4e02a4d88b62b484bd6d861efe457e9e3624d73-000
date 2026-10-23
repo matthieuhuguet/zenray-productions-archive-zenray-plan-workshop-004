@@ -1,0 +1,136 @@
+// C202 — Streaming d'un média chunké via HTTP Range : le <video>/<audio> demande un intervalle
+// d'octets, on calcule les chunks qui le couvrent, on va chercher CES chunks sur GitHub (raw),
+// on renvoie la tranche demandée en 206. Lecture instantanée + seek, zéro préchargement.
+//
+// ⚠️ DÉPRÉCIÉ COMME CHEMIN PAR DÉFAUT (2026-07-20, retour Matthieu : "je ne veux pas que mon média
+// soit streamé par Vercel" -- pastille jaune). Les manifestes PUBLICS chiffrés sont désormais lus
+// côté client via le Service Worker range-shim (public/zr-stream-sw.js + src/lib/vidStream.js
+// registerChunkedMediaPath) : octets directement depuis jsDelivr, déchiffrement AES-GCM dans le
+// navigateur, ZÉRO transit par cette fonction. Cet endpoint N'EST PAS SUPPRIMÉ car il reste le
+// SEUL chemin possible pour : (1) les manifestes PRIVÉS (vis:'private' -- leurs octets ne sont pas
+// sur le CDN public, le token serveur est requis), (2) le repli quand le SW échoue (navigation
+// privée, SW non supporté, premier chargement sans controller). Ne jamais le re-brancher comme
+// défaut pour du public -- c'est exactement la régression que cette dépréciation ferme.
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const MAX_WINDOW = 4 * 1024 * 1024 // borne la taille d'une réponse (sous le cap réponse Vercel ~4,5 Mo) — plus large = moins d'allers-retours
+
+import { parseShard } from './shard-naming.js'
+import { createDecipheriv } from 'node:crypto'
+import { loadMediaKey } from './media-key.js'
+const OWNER = (REPO.split('/')[0]) || 'matthieuhuguet'
+// Le chunk d'un média privé vit sur un shard PRIVÉ : legacy zenray-media-NN OU nouveau zenray-img-private-NN
+// (après le rename par type). parseShard accepte les deux ; on n'autorise que les shards PRIVÉS ici.
+const isPrivateShard = (repo) => { const p = parseShard(repo); return !!p && p.vis === 'private' }
+const b64d = (s) => Buffer.from(s || '', 'base64').toString('utf8')
+function gh(token, path, accept) {
+  return fetch(`https://api.github.com/repos/${REPO}/${path}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: accept || 'application/vnd.github+json', 'User-Agent': 'zenray-progress' },
+  })
+}
+// QUOTA : les parts .bin sont adressées par contenu (immuables) -> on les lit via raw.githubusercontent.com
+// (NE COMPTE PAS dans la limite REST 5000/h). Sans ça, chaque seek vidéo/audio chunké tapait l'API contents
+// (une fenêtre de 4 Mo = plusieurs GET quota) -> lecture de bout en bout = dizaines de requêtes -> 403, lecteur figé.
+// Le manifest .media.json (1 lecture par ouverture) reste sur l'API contents.
+function rawBin(token, repo, binPath) {
+  return fetch(`https://raw.githubusercontent.com/${OWNER}/${repo}/${BRANCH}/${encodeURI(binPath)}`, {
+    headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' },
+  })
+}
+// CHUNK PUBLIC CHIFFRÉ (modèle "public + chiffré + jsDelivr") : le ciphertext vit sur un repo PUBLIC, servi par
+// jsDelivr (CDN, hors quota). On le récupère par son pin de commit (immuable), puis on le déchiffre côté serveur.
+function cdnBin(repo, commit, binPath) {
+  return fetch(`https://cdn.jsdelivr.net/gh/${OWNER}/${repo}${commit ? '@' + commit : ''}/${encodeURI(binPath)}`)
+}
+// AES-256-GCM : le ciphertext WebCrypto = data || tag(16o). Node sépare le tag (setAuthTag) avant de déchiffrer.
+function decryptChunk(ctBuf, ivB64, key) {
+  const iv = Buffer.from(ivB64 || '', 'base64')
+  const tag = ctBuf.subarray(ctBuf.length - 16)
+  const data = ctBuf.subarray(0, ctBuf.length - 16)
+  const d = createDecipheriv('aes-256-gcm', key, iv)
+  d.setAuthTag(tag)
+  return Buffer.concat([d.update(data), d.final()])
+}
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(500).end()
+  const path = (req.query.path || '').toString()
+  if (!path.startsWith('pages/') || !path.endsWith('.media.json') || path.includes('..')) return res.status(400).end()
+
+  try {
+    // 1) manifest
+    const mr = await gh(token, `contents/${encodeURI(path)}?ref=${BRANCH}`)
+    if (!mr.ok) return res.status(404).end()
+    const m = JSON.parse(b64d((await mr.json()).content))
+    const size = m.size, chunkSize = m.chunkSize, mime = m.mime || 'application/octet-stream'
+    if (!Number.isFinite(size) || !Number.isFinite(chunkSize)) return res.status(500).end()
+    // Les chunks vivent dans le repo indiqué par le manifest : shard privé (capture universelle)
+    // ou zenray-data (ancien pipeline media.js). Validé pour éviter toute injection de repo.
+    const chunkRepo = (typeof m.repo === 'string' && isPrivateShard(m.repo)) ? m.repo : null
+    // MÉDIA PUBLIC CHIFFRÉ (audio/PDF/binaire de la capture universelle généralisée) : chunks ciphertext sur un
+    // repo PUBLIC (cdnRepo) servis par jsDelivr, déchiffrés ICI avec la clé maître. Sans cette branche, l'audio
+    // et le PDF chiffrés-publics étaient injouables/non ouvrables (régression). On garde le seek par Range : les
+    // offsets sont en CLAIR (chunkSize = taille du chunk déchiffré), on déchiffre juste les chunks couvrant l'intervalle.
+    const objectParts = Array.isArray(m.parts) && m.parts.length > 0 && typeof m.parts[0] === 'object'
+    const isEnc = m.vis === 'public' && m.alg === 'AES-GCM' && (objectParts || (Array.isArray(m.ivs) && typeof m.cdnRepo === 'string'))
+    const key = isEnc ? Buffer.from(loadMediaKey(), 'base64') : null
+
+    // 2) intervalle demandé (Range: bytes=start-end). Sans Range -> fenêtre depuis 0.
+    const range = req.headers.range
+    let start = 0, end = size - 1, isRange = false
+    if (range) {
+      const mt = /bytes=(\d*)-(\d*)/.exec(range)
+      if (mt) {
+        isRange = true
+        if (mt[1]) start = parseInt(mt[1], 10)
+        if (mt[2]) end = parseInt(mt[2], 10)
+      }
+    }
+    if (start >= size) { res.setHeader('Content-Range', `bytes */${size}`); return res.status(416).end() }
+    // borne la fenêtre servie (réponse <= MAX_WINDOW) ; le lecteur redemandera la suite
+    end = Math.min(end, size - 1, start + MAX_WINDOW - 1)
+
+    // 3) chunks couvrant [start, end]
+    const first = Math.floor(start / chunkSize)
+    const last = Math.floor(end / chunkSize)
+    const buffers = []
+    for (let i = first; i <= last; i++) {
+      const part = m.parts[i]
+      const binPath = objectParts ? null : m.dir + '/' + part + '.bin'
+      if (isEnc) {
+        // ciphertext public via jsDelivr -> déchiffrement avec l'iv du chunk i (manifest.ivs[i]).
+        const cr = objectParts ? await fetch(part.url) : await cdnBin(m.cdnRepo, m.cdnCommit, binPath)
+        if (!cr.ok) return res.status(502).end()
+        try { buffers.push(decryptChunk(Buffer.from(await cr.arrayBuffer()), objectParts ? part.iv : m.ivs[i], key)) }
+        catch { return res.status(502).end() } // mauvaise clé / tag invalide
+      } else {
+        // raw hors quota ; chunkRepo = shard privé indiqué par le manifest, sinon zenray-data (REPO).
+        const cr = await rawBin(token, chunkRepo || REPO.split('/')[1], binPath)
+        if (!cr.ok) return res.status(502).end()
+        buffers.push(Buffer.from(await cr.arrayBuffer()))
+      }
+    }
+    const joined = Buffer.concat(buffers)
+    // offset du début de `first` dans `joined`, puis tranche exacte [start, end]
+    const sliceStart = start - first * chunkSize
+    const sliceEnd = sliceStart + (end - start + 1)
+    const out = joined.subarray(sliceStart, sliceEnd)
+
+    res.setHeader('Content-Type', mime)
+    res.setHeader('Accept-Ranges', 'bytes')
+    // Cette réponse contient les OCTETS CLAIRS reconstruits après déchiffrement. Le ciphertext
+    // immuable peut rester au CDN, mais le clair ne doit jamais être conservé par un cache partagé.
+    // Le chemin moderne SW met déjà le plaintext dans un LRU RAM borné ; ce endpoint reste un fallback.
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0')
+    res.setHeader('Vary', 'Range, x-zr-auth')
+    res.setHeader('Content-Length', String(out.length))
+    if (isRange || end < size - 1) {
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`)
+      return res.status(206).send(out)
+    }
+    return res.status(200).send(out)
+  } catch (e) {
+    return res.status(500).end()
+  }
+}

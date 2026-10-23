@@ -1,0 +1,174 @@
+#!/usr/bin/env node
+// ZenRayMedia — SOURCE contre RENDU : la planche de travail, une seule page.
+//
+//   node scripts/zrm-sheet.mjs <theme>              # toutes les zones
+//   node scripts/zrm-sheet.mjs <theme> --faits      # seulement celles qui ont un composant
+//
+// POURQUOI ELLE REVIENT, APRÈS AVOIR ÉTÉ SUPPRIMÉE
+// ------------------------------------------------
+// Je l'avais retirée au motif qu'une planche de 307 lignes mélange le fini et le non-fini. Le
+// motif était juste, la conclusion fausse : ce qu'il fallait retirer, c'est le MÉLANGE, pas la
+// planche. Avec 307 zones, comparer une par une coûte 307 ouvertures de fichier ; on ne le fait
+// pas, donc on ne compare pas.
+//
+// Ce que celle-ci fait autrement :
+//   1. DEUX COLONNES, rien d'autre. Source à gauche, rendu à droite, même largeur, grandes. Les
+//      attributs passent SOUS les images, où ils n'écrasent rien.
+//   2. La SUPERPOSITION sous chaque paire, avec son curseur de fondu. C'est elle qui tranche :
+//      deux images côte à côte laissent croire qu'elles se ressemblent.
+//   3. L'ordre de l'INVENTAIRE, capture par capture — l'ordre dans lequel on a regardé.
+//   4. Les zones SANS composant sont là aussi, marquées « à écrire », avec leur crop. Une planche
+//      qui ne montrerait que le fini ferait croire le thème terminé.
+//   5. Un seul fichier, généré en une commande, sans rien écrire d'autre sur le disque.
+
+import { readFile, writeFile, readdir } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+import { chromium } from 'playwright'
+import { ROOT, themeDir as themeDirOf, workDir } from './zrm-paths.mjs'
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+
+async function main() {
+  const id = process.argv[2]
+  if (!id) throw new Error('usage : node scripts/zrm-sheet.mjs <T-FF-S-V--slug> [--faits]')
+  const faitsOnly = process.argv.includes('--faits')
+
+  const dir = themeDirOf(id)
+  const work = workDir(id)
+  const spec = JSON.parse(await readFile(path.join(work, 'regions.json'), 'utf8'))
+  const tokens = existsSync(path.join(dir, 'tokens.css'))
+    ? await readFile(path.join(dir, 'tokens.css'), 'utf8') : ''
+  const themeJson = JSON.parse(await readFile(path.join(dir, 'theme.json'), 'utf8'))
+
+  // Les polices du thème, embarquées avec leur VRAIE graisse : une famille statique installe un
+  // fichier par graisse, et les déclarer toutes « 100 900 » fait rendre la dernière pour tout.
+  const registry = await readFile(path.join(ROOT, 'src', 'zenraymedia', 'fonts.js'), 'utf8')
+  const weightOf = new Map()
+  for (const m of registry.matchAll(/\/zrm-fonts\/([^"']+\.woff2)"[^}]*?weight:\s*"([^"]+)"/g)) weightOf.set(m[1], m[2])
+  let faces = ''
+  for (const family of themeJson.fonts || []) {
+    const slug = family.toLowerCase().replace(/\s+/g, '-')
+    const famDir = path.join(ROOT, 'public', 'zrm-fonts', slug)
+    if (!existsSync(famDir)) continue
+    for (const f of (await readdir(famDir)).filter((f) => /^normal-latin-\d+\.woff2$/.test(f))) {
+      faces += `@font-face{font-family:'${family}';src:url(data:font/woff2;base64,${(await readFile(path.join(famDir, f))).toString('base64')}) format('woff2');font-style:normal;font-weight:${weightOf.get(`${slug}/${f}`) || '400'};font-display:block}\n`
+    }
+  }
+
+  const iconsPath = path.join(dir, 'parts', '00-icons.html')
+  // SEULE la planche de <symbol> (le bloc <svg class="zrm-signs">...</defs></svg>) doit être
+  // injectée. `00-icons.html` porte AUSSI un <div class="zrm-sheet"> : c'est son propre corps
+  // visible, affiché quand la planche est elle-même posée comme composant. L'injecter partout
+  // faisait apparaître toute la planche d'icônes en incrustation sur CHAQUE composant comparé —
+  // exactement le bug remonté par Matthieu. On n'extrait donc que les <symbol>.
+  const icons00raw = existsSync(iconsPath) ? await readFile(iconsPath, 'utf8') : ''
+  const symbolsMatch = icons00raw.match(/<svg[^>]*class="zrm-signs"[\s\S]*?<\/svg>/)
+  const icons00 = symbolsMatch ? symbolsMatch[0] : ''
+
+  const browser = await chromium.launch()
+  const page = await browser.newPage()
+  const sections = []
+  let faits = 0, total = 0
+
+  for (const [rel, zones] of Object.entries(spec.images)) {
+    const stem = rel.replace(/[/\\]/g, '__').replace(/\.(png|jpe?g)$/i, '').replace(/^raw_v2__/, '')
+    const cards = []
+    for (const z of zones) {
+      total++
+      const cropPath = path.join(work, 'crops', `${stem}__${z.name}.png`)
+      if (!existsSync(cropPath)) continue
+      // Les images sont RÉ-ENCODÉES pour la planche : 307 crops en PNG base64 pesaient 64 Mo,
+      // un fichier que le navigateur met dix secondes à ouvrir et qu'on n'ouvre donc jamais.
+      // JPEG 0,72, largeur plafonnée à 900 px : on compare des formes et des positions, pas des
+      // pixels — la mesure fine, c'est zrm-check qui la fait, sur l'image d'origine.
+      const shrink = async (u) => page.evaluate(async ([d, MAX]) => {
+        const i = new Image(); i.src = d; await i.decode()
+        const k = Math.min(1, MAX / i.naturalWidth)
+        const c = document.createElement('canvas')
+        c.width = Math.round(i.naturalWidth * k); c.height = Math.round(i.naturalHeight * k)
+        const g = c.getContext('2d'); g.fillStyle = '#05080b'; g.fillRect(0, 0, c.width, c.height)
+        g.drawImage(i, 0, 0, c.width, c.height)
+        return c.toDataURL('image/jpeg', 0.72)
+      }, [u, 900])
+      const src = await shrink('data:image/png;base64,' + (await readFile(cropPath)).toString('base64'))
+
+      let live = ''
+      if (z.html && existsSync(path.join(dir, z.html))) {
+        faits++
+        let part = await readFile(path.join(dir, z.html), 'utf8')
+        for (const [k, v] of Object.entries(z.sample || {})) {
+          part = part.replaceAll(`{{${k}}}`, v).replaceAll(`{{{${k}}}}`, v)
+        }
+        part = part.replace(/\{\{[#/]?\{?[\w.]+\}?\}\}/g, '')
+        // Chaque composant est isolé dans son propre document : deux composants dans la même page
+        // partageraient leurs styles, et un sélecteur trop large d'une pièce en repeindrait une
+        // autre. L'iframe rend l'isolement structurel plutôt que discipliné.
+        const doc = `<!doctype html><meta charset="utf-8"><style>${faces}${tokens}
+ html,body{margin:0;background:#05080b;overflow:hidden}
+ .fr{position:absolute;inset:0;display:grid;place-items:center}
+ .sc{width:${z.rect[2]}px;height:${z.rect[3]}px;container-type:size;overflow:visible}
+</style>${icons00}<div class="fr"><div class="sc">${part}</div></div>`
+        live = `<iframe class="live" style="aspect-ratio:${z.rect[2]}/${z.rect[3]}" loading="lazy" srcdoc="${esc(doc)}"></iframe>`
+      } else if (faitsOnly) { continue }
+      const i = cards.length + sections.length * 100
+      cards.push(`<article class="z${live ? '' : ' todo'}">
+  <div class="duo">
+    <figure><figcaption>source</figcaption><img src="${src}"></figure>
+    <figure><figcaption>rendu — HTML vivant</figcaption>${live || '<div class="none">à écrire</div>'}</figure>
+  </div>
+  ${live ? `<div class="sup"><figcaption>superposition — glisser pour fondre</figcaption>
+    <div class="st" id="s${i}" style="aspect-ratio:${z.rect[2]}/${z.rect[3]}"><img src="${src}">${live.replace('class="live"', 'class="live top"')}</div>
+    <input type="range" min="0" max="100" value="50" oninput="document.querySelector('#s${i} .top').style.opacity=this.value/100"></div>` : ''}
+  <div class="meta"><b>${esc(z.name)}</b><code>${z.rect.join(',')}</code>
+    <code>${esc(z.html ? z.html.replace('parts/', '') : '—')}</code>
+    ${z.valide ? '<em class="ok">validé</em>' : live ? '<em>à comparer</em>' : '<em class="no">à écrire</em>'}</div>
+</article>`)
+    }
+    if (cards.length) sections.push(`<h2>${esc(rel)} <small>${cards.length}</small></h2>${cards.join('')}`)
+  }
+  await browser.close()
+
+  const html = `<!doctype html><meta charset="utf-8"><title>${id} — source vs rendu</title>
+<style>
+ :root{color-scheme:dark}
+ body{margin:0;padding:22px 26px 70px;background:#0b0e12;color:#c9d4e0;
+   font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+ h1{font-size:19px;margin:0 0 4px;color:#fff}
+ .lead{color:#7f8fa0;max-width:80ch;margin:0 0 8px}
+ .bar{position:sticky;top:0;z-index:9;background:#0b0e12;padding:10px 0 14px;border-bottom:1px solid #1b2028;margin-bottom:20px}
+ h2{font:600 11px/1 ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase;
+   color:#5d6b7a;margin:30px 0 12px;padding-top:12px;border-top:1px solid #1b2028}
+ h2 small{color:#37414c}
+ article{background:#12161b;border:1px solid #1f252d;border-radius:10px;padding:14px 16px;margin:0 0 16px}
+ article.todo{opacity:.55}
+ iframe.live{display:block;width:100%;border:1px solid #1f252d;border-radius:4px;background:#05080b}
+ .st iframe.live.top{position:absolute;inset:0;width:100%;height:100%;opacity:.5;border:0;pointer-events:none}
+ .duo{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+ figure{margin:0}
+ figcaption{font:10px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase;color:#5d6b7a;margin:0 0 6px}
+ img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;background:#05080b;
+   border:1px solid #1f252d;border-radius:4px}
+ .none{display:grid;place-items:center;aspect-ratio:16/9;background:#05080b;border:1px dashed #2a3138;
+   border-radius:4px;color:#4a5560;font-size:12px}
+ .sup{margin-top:12px;border-top:1px solid #1b2028;padding-top:10px}
+ .sup .st{position:relative;max-width:640px}
+ .sup .st img{width:100%;height:100%;object-fit:contain}
+ .sup input{width:100%;max-width:640px;margin-top:6px;accent-color:#7fd4ff}
+ .meta{display:flex;flex-wrap:wrap;align-items:baseline;gap:12px;margin-top:12px}
+ .meta b{color:#fff;font-weight:600}
+ .meta code{font:11px ui-monospace,monospace;color:#5d6b7a}
+ .meta em{margin-left:auto;font-style:normal;font-size:11px;color:#8fa3b8}
+ .meta em.ok{color:#6fd39a}.meta em.no{color:#c98b5c}
+</style>
+<div class="bar"><h1>${id} — source vs rendu</h1>
+<p class="lead">À gauche la capture, à droite le rendu, <strong>même largeur</strong>. En dessous, les deux
+superposés : le curseur fait passer de l'un à l'autre au même endroit, et un écart de trois pixels
+devient un dédoublement. <strong>${faits} zone(s) rendue(s) sur ${total}.</strong></p></div>
+${sections.join('')}`
+
+  const out = path.join(work, 'source-vs-rendu.html')
+  await writeFile(out, html)
+  console.log(`${faits} rendue(s) sur ${total} → ${path.relative(ROOT, out)}`)
+}
+
+main().catch((e) => { console.error(e.message || e); process.exit(1) })

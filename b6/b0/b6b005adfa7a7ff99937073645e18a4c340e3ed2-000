@@ -1,0 +1,70 @@
+// @vitest-environment node
+// 2 October 2026, 15:20 CEST: content pinning must refuse unknown versions and unsafe managed trees.
+import { describe, expect, it } from 'vitest'
+import { manifestByFingerprint } from '../src/lib/archiveChunks.js'
+
+describe('immutable archive recovery', () => {
+  it('selects an older version even when the current archive changed', () => {
+    const old = 'a'.repeat(64), latest = 'b'.repeat(64)
+    const manifest = { versions: [{ sha256: old, commit: 'first', size: 14 }, { sha256: latest, commit: 'second', size: 99 }] }
+    expect(manifestByFingerprint(manifest, old).commit).toBe('first')
+    expect(manifestByFingerprint(manifest, latest).size).toBe(99)
+    expect(() => manifestByFingerprint(manifest, 'c'.repeat(64))).toThrow('unavailable')
+    expect(() => manifestByFingerprint(manifest, 'invalid')).toThrow('Invalid')
+  })
+  it('supports an unversioned manifest without substituting another file', () => {
+    const manifest = { sha256: 'd'.repeat(64), size: 14 }
+    expect(manifestByFingerprint(manifest, manifest.sha256)).toBe(manifest)
+    expect(() => manifestByFingerprint(manifest, 'e'.repeat(64))).toThrow('unavailable')
+  })
+})
+
+// 10 October 2026, 12:30 CEST: race regressions retain bytes appearing after the complete tree proof.
+import { mkdtemp, mkdir, writeFile, readFile, rm, access, realpath } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createHash } from 'node:crypto'
+import { removeVerifiedWorkspace } from './AssetsWorkspaceLifecycle.mjs'
+
+async function removalFixture(run) {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'assets-release-')))
+  const directory = path.join(root, 'copy')
+  await mkdir(directory)
+  await writeFile(path.join(directory, 'original.txt'), 'saved')
+  const files = [{ relativePath: 'original.txt', size: 5, sha256: createHash('sha256').update('saved').digest('hex') }]
+  try { await run(directory, files) } finally { await rm(root, { recursive: true, force: true }) }
+}
+
+describe('guarded workspace removal', () => {
+  it('removes only the verified tree', async () => removalFixture(async (directory, files) => {
+    await removeVerifiedWorkspace(directory, files)
+    await expect(access(directory)).rejects.toThrow()
+  }))
+  it('retains a new file added after verification', async () => removalFixture(async (directory, files) => {
+    await expect(removeVerifiedWorkspace(directory, files, { beforeRemove: () => writeFile(path.join(directory, 'new.txt'), 'new work') })).rejects.toThrow('retained')
+    expect(await readFile(path.join(directory, 'new.txt'), 'utf8')).toBe('new work')
+  }))
+  it('retains a verified file edited before its removal', async () => removalFixture(async (directory, files) => {
+    await expect(removeVerifiedWorkspace(directory, files, { beforeRemove: (target) => writeFile(target, 'new work') })).rejects.toThrow('Modified')
+    expect(await readFile(path.join(directory, 'original.txt'), 'utf8')).toBe('new work')
+  }))
+  it('retains all files on cancellation', async () => removalFixture(async (directory, files) => {
+    const controller = new AbortController(); controller.abort()
+    await expect(removeVerifiedWorkspace(directory, files, { signal: controller.signal })).rejects.toThrow('interrupted')
+    expect(await readFile(path.join(directory, 'original.txt'), 'utf8')).toBe('saved')
+  }))
+})
+
+// 10 October 2026, 12:34 CEST: missing tools, timeouts and open handles never authorize removal.
+import { assertWorkspaceIdle } from './AssetsWorkspaceLifecycle.mjs'
+describe('workspace application guard', () => {
+  it('allows only an explicit empty lsof result', async () => {
+    await expect(assertWorkspaceIdle('/copy', async () => { throw { code: 1, stdout: '', stderr: '' } })).resolves.toBeUndefined()
+  })
+  it('refuses an open handle', async () => {
+    await expect(assertWorkspaceIdle('/copy', async () => ({ stdout: 'p123\nn/copy/work.hip\n' }))).rejects.toThrow('open')
+  })
+  it('refuses a failed inspection', async () => {
+    await expect(assertWorkspaceIdle('/copy', async () => { throw new Error('timeout') })).rejects.toThrow('timeout')
+  })
+})

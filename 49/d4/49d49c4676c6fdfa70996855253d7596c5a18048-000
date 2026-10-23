@@ -1,0 +1,64 @@
+// C70/C72 — OAuth Authorization Code + PKCE (sans secret, 100% front). Garde la session via refresh_token en localStorage.
+const CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID
+const REDIRECT = import.meta.env.VITE_SPOTIFY_REDIRECT_URI
+const KEY = 'spotify:auth:v1'
+const ATTEMPT_KEY = 'spotify:pkce:v2'
+const ATTEMPT_TTL = 10 * 60 * 1000
+const SCOPES = 'streaming user-read-email user-read-private user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private user-library-read'
+
+const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+function randVerifier() { const a = new Uint8Array(48); crypto.getRandomValues(a); return b64url(a.buffer) }
+async function challenge(verifier) { const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)); return b64url(digest) }
+
+export function getAuth() { try { return JSON.parse(localStorage.getItem(KEY)) } catch { return null } }
+export function isLoggedIn() { const a = getAuth(); return !!(a && a.refresh_token) }
+export function logout() { localStorage.removeItem(KEY); sessionStorage.removeItem(ATTEMPT_KEY) }
+export function hasConfig() { return !!(CLIENT_ID && REDIRECT) }
+
+export async function login() {
+  if (!hasConfig()) { alert('Config Spotify manquante (VITE_SPOTIFY_CLIENT_ID / REDIRECT_URI).'); return }
+  const verifier = randVerifier()
+  const state = randVerifier()
+  sessionStorage.setItem(ATTEMPT_KEY, JSON.stringify({ verifier, state, createdAt: Date.now() }))
+  const ch = await challenge(verifier)
+  const params = new URLSearchParams({ client_id: CLIENT_ID, response_type: 'code', redirect_uri: REDIRECT, code_challenge_method: 'S256', code_challenge: ch, state, scope: SCOPES })
+  window.location.href = 'https://accounts.spotify.com/authorize?' + params.toString()
+}
+
+export async function exchangeCode(code, returnedState) {
+  let attempt = null
+  try { attempt = JSON.parse(sessionStorage.getItem(ATTEMPT_KEY)) } catch {}
+  sessionStorage.removeItem(ATTEMPT_KEY)
+  if (!attempt?.verifier || !attempt?.state || attempt.state !== returnedState || Date.now() - Number(attempt.createdAt || 0) > ATTEMPT_TTL) return null
+  const verifier = attempt.verifier
+  const body = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, client_id: CLIENT_ID, code_verifier: verifier })
+  const r = await fetch('https://accounts.spotify.com/api/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body }).catch(() => null)
+  if (!r || !r.ok) return null
+  const j = await r.json()
+  localStorage.setItem(KEY, JSON.stringify({ access_token: j.access_token, refresh_token: j.refresh_token, expires_at: Date.now() + j.expires_in * 1000 }))
+  return j
+}
+
+let refreshPromise = null
+async function refreshOnce() {
+  const auth = getAuth(); if (!auth || !auth.refresh_token) return null
+  const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: auth.refresh_token, client_id: CLIENT_ID })
+  const r = await fetch('https://accounts.spotify.com/api/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body }).catch(() => null)
+  if (!r || !r.ok) { logout(); return null }
+  const j = await r.json()
+  const next = { access_token: j.access_token, refresh_token: j.refresh_token || auth.refresh_token, expires_at: Date.now() + j.expires_in * 1000 }
+  localStorage.setItem(KEY, JSON.stringify(next))
+  return next.access_token
+}
+
+export function forceRefreshToken() {
+  if (!refreshPromise) refreshPromise = refreshOnce().finally(() => { refreshPromise = null })
+  return refreshPromise
+}
+
+export async function getValidToken({ force = false } = {}) {
+  if (force) return forceRefreshToken()
+  const auth = getAuth(); if (!auth) return null
+  if (Date.now() < auth.expires_at - 60000) return auth.access_token
+  return forceRefreshToken()
+}

@@ -1,0 +1,74 @@
+// 4 October 2026, 10:10 CEST: stage one new conversation and one changed conversation per pass into a private managed library.
+import { readFile, mkdir, stat, rename, rm, realpath, chmod } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
+import { projectWorkshopPath } from '../../src/lib/projectContextIndex.js'
+import { CONVERSATION_SETTINGS } from '../../src/lib/assetsConversations.js'
+
+export const CONVERSATION_LIBRARY_ID = 'agent-conversations'
+const run = promisify(execFile)
+const reader = fileURLToPath(new URL('./ReadGeminiConversation.py', import.meta.url))
+const keyFor = filename => createHash('sha256').update(filename).digest('hex').slice(0, 16)
+export function createConversationMirror({ catalog, service, atomicJson, snapshotFile, fileToken, stateDir }) {
+  const stateFile = path.join(stateDir, 'ConversationMirror.json')
+  let state = { entries: {} }, initialized = false, closed = false, pending, timer
+  async function drain() {
+    if (closed || pending) return pending
+    pending = (async () => {
+      if (!initialized) {
+        try { state = JSON.parse(await readFile(stateFile, 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+        initialized = true
+      }
+      if (service.projects.has(CONVERSATION_LIBRARY_ID) && !service.state(CONVERSATION_LIBRARY_ID).watched) return
+      const { conversations } = await catalog.list()
+      const candidates = []
+      for (const item of conversations) {
+        const signatures = []
+        for (const filename of item.originalPaths) {
+          const info = await stat(filename); signatures.push(`${filename}:${fileToken(info)}`)
+          if (item.provider === 'gemini') try { signatures.push(fileToken(await stat(`${filename}-wal`))) } catch (error) { if (error.code !== 'ENOENT') throw error }
+        }
+        const signature = createHash('sha256').update(signatures.join('\n')).digest('hex')
+        if (state.entries[item.id]?.signature !== signature) candidates.push({ item, signature })
+      }
+      const chosen = [candidates.find(({ item }) => state.entries[item.id]), candidates.find(({ item }) => !state.entries[item.id])].filter(Boolean)
+      if (!chosen.length) return
+      let library
+      if (service.projects.has(CONVERSATION_LIBRARY_ID)) library = service.snapshot(CONVERSATION_LIBRARY_ID)
+      else library = (await service.request('start', { id: CONVERSATION_LIBRARY_ID, name: 'Conversations des agents', category: 'Conversations' })).project
+      const root = projectWorkshopPath(library)
+      if (!root || await realpath(root) !== root) throw new Error('Conversation library workshop is unsafe')
+      for (const { item, signature } of chosen) {
+        if (closed) break
+        const folder = path.join(root, 'conversations', item.provider, keyFor(item.id))
+        await mkdir(folder, { recursive: true, mode: 0o700 })
+        if (await realpath(folder) !== folder) throw new Error('Conversation mirror destination contains a symlink')
+        const copies = []
+        for (const filename of item.transcriptPaths) {
+          const relativePath = `conversations/${item.provider}/${keyFor(item.id)}/${keyFor(filename)}${item.provider === 'gemini' ? '.db' : '.jsonl'}`
+          const destination = path.join(root, relativePath), temporary = `${destination}.${randomUUID()}.tmp`
+          try {
+            if (item.provider === 'gemini') { const result = await run('python3', [reader, '--snapshot', filename, temporary], { timeout: 45000, maxBuffer: 65536 }); const captured = JSON.parse(result.stdout); if (captured.title) item.title = captured.title }
+            else { const info = await stat(filename); await snapshotFile({ localPath: filename, size: info.size, changeToken: fileToken(info) }, temporary, path.dirname(filename)) }
+            await chmod(temporary, 0o600)
+            await rename(temporary, destination)
+          } finally { await rm(temporary, { force: true }) }
+          copies.push({ originalPath: filename, relativePath })
+        }
+        // 4 October 2026, 10:10 CEST: Desktop cards contribute identity only; MCP configuration and account credentials are excluded.
+        const mapping = { schemaVersion: 1, conversationId: item.id, sessionId: item.sessionId, provider: item.provider, title: item.title, projectId: item.projectId, originalPaths: item.originalPaths, copies, nativeTranscriptPresent: !!copies.length, updatedAt: item.updatedAt, stagedAt: new Date().toISOString() }
+        await atomicJson(path.join(folder, 'Conversation.json'), mapping)
+        state.entries[item.id] = { signature, copies, stagedAt: mapping.stagedAt, libraryProjectId: CONVERSATION_LIBRARY_ID, summary: { id: item.id, provider: item.provider, sessionId: item.sessionId, title: item.title, projectId: item.projectId, updatedAt: item.updatedAt } }
+        await atomicJson(stateFile, state)
+      }
+      await service.inventory(CONVERSATION_LIBRARY_ID)
+      if (service.state(CONVERSATION_LIBRARY_ID).watched) service.scheduleBackup(CONVERSATION_LIBRARY_ID)
+    })()
+    try { await pending; state.error = null } catch (error) { state.error = error.message; await atomicJson(stateFile, state); throw error }
+    finally { pending = null }
+  }
+  return { drain, state: () => state, start: () => { if (!timer) { timer = setInterval(() => drain().catch(() => {}), CONVERSATION_SETTINGS.refreshMs); timer.unref?.() } }, close: async () => { closed = true; clearInterval(timer); await pending?.catch(() => {}) } }
+}

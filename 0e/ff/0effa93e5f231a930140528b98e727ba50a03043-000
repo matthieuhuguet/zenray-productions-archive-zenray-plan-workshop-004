@@ -1,0 +1,141 @@
+import React, { useCallback, useEffect, useState } from 'react'
+import { Masonry, List } from 'masonic'
+import { PALETTE, RADII } from '../theme.js'
+import { fileToWebp } from '../api.js'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+import { ViewSwitch } from './Views.jsx'
+import { useClipboardTarget } from '../clipboard/ClipboardProvider.jsx'
+import SmartThumb from '../media/SmartThumb.jsx'
+import { prefetchOne } from '../media/prefetch.js'
+
+// Sprint 7 — galerie d'images virtualisée (masonic). Manifest gallery/manifest.json {images:[{path,w,h,thumb?}]}.
+// Thumbs servis via /api/img (avif/webp, cache edge). Gallery ET List sont virtualisées (DOM = viewport seul) :
+// tient des dizaines de milliers d'images sans lag (objectif References Eagle ~99k AVIF).
+const FONTS = { sans: "var(--zr-police-sans)" }
+
+// Vignette légère : on ne sert JAMAIS l'AVIF plein dans une grille de milliers d'items.
+// Priorité au champ `thumb` du manifest, sinon dérive le jumeau .webp (~6 Ko) comme ImageNodeViewer.
+// Repli sur l'image pleine via onError si la .webp n'existe pas encore.
+const imgUrl = (path) => `/api/img?path=${encodeURIComponent(path)}`
+const thumbUrl = (d) => {
+  const tp = d.thumb || (d.path ? d.path.replace(/\.[^./]+$/, '.webp') : null)
+  return tp ? imgUrl(tp) : imgUrl(d.path)
+}
+
+// Tuile d'image autonome : vignette instantanée (cache LRM + IntersectionObserver via SmartThumb),
+// repli automatique sur le binaire plein si la vignette .webp manque encore.
+function Thumb({ d, t, height, radius = 8, onClick, priority = false }) {
+  // au survol : on tire l'image PLEINE en priorité pour un Quick Look instantané (touche Espace / clic)
+  const onEnter = useCallback(() => prefetchOne(imgUrl(d.path)), [d.path])
+  return (
+    <div onMouseEnter={onEnter} style={{ width: '100%' }}>
+      <SmartThumb url={thumbUrl(d)} fullUrl={imgUrl(d.path)} noFullFallback width="100%" height={height} radius={radius}
+        priority={priority} bg={t.border} onClick={onClick} />
+    </div>
+  )
+}
+
+// Galerie virtualisée réutilisable. Par défaut = drive perso (gallery/). Paramétrable pour References (Eagle ~99k AVIF) etc.
+export default function Gallery({ t, manifestPath = 'gallery/manifest.json', uploadDir = 'gallery', title = 'Galerie', allowUpload = true, emptyHint }) {
+  const MANIFEST = manifestPath
+  const [images, setImages] = useState(null)
+  const [sha, setSha] = useState(null)
+  const [status, setStatus] = useState('')
+  const [over, setOver] = useState(false)
+  const [box, setBox] = useState(null)
+  const [view, setView] = useState('gallery')
+
+  useEffect(() => { let live = true; (async () => {
+    const j = await fetch(`/api/page?action=read&path=${MANIFEST}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+    if (!live) return
+    if (j && j.markdown && !j.missing) { setSha(j.sha); try { setImages(JSON.parse(j.markdown).images || []) } catch { setImages([]) } }
+    else setImages([])
+  })(); return () => { live = false } }, [MANIFEST])
+
+  async function addFiles(files) {
+    const imgs = [...files].filter((f) => f.type && f.type.startsWith('image/'))
+    if (!imgs.length) return
+    setStatus(`upload ${imgs.length}…`)
+    const added = []
+    // Encodage (bitmap + webp) PARALLÉLISÉ par lots de 4 (CPU, sans effet de bord) ; uploads gardés EN SÉRIE
+    // (chaque /api/img = un commit GitHub : on les sérialise pour éviter des conflits de commit concurrents).
+    const ENC = 4
+    for (let i = 0; i < imgs.length; i += ENC) {
+      const enc = await Promise.all(imgs.slice(i, i + ENC).map(async (f) => {
+        let w = 4, h = 3
+        try { const bmp = await createImageBitmap(f); w = bmp.width; h = bmp.height } catch {}
+        const webp = await fileToWebp(f)
+        return webp ? { webp, w, h } : null
+      }))
+      for (const e of enc) {
+        if (!e) continue
+        const j = await fetch('/api/img', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ dataUrl: e.webp, dir: uploadDir }) }).then((r) => r.json()).catch(() => null)
+        if (j && j.path) { added.push({ path: j.path, w: e.w, h: e.h }); setStatus(`${added.length}/${imgs.length} envoyée(s)…`) }
+      }
+    }
+    setImages([...(images || []), ...added]) // optimiste
+    // ANTI-PERTE : on AJOUTE sur l'état FRAIS du drive (retry sur conflit), pas sur une liste en mémoire périmée.
+    const res = await saveJsonWithRetry(MANIFEST, (cur) => {
+      const have = new Set((cur.images || []).map((x) => x.path))
+      return { ...cur, images: [...(cur.images || []), ...added.filter((a) => !have.has(a.path))] }
+    }, { sha, data: { images: images || [] } })
+    if (res.ok) { setSha(res.sha); setImages(res.data.images); setStatus(`${added.length} ajoutée(s)`) }
+    else setStatus('conflit — recharge et réessaie')
+  }
+  const onDrop = (e) => { e.preventDefault(); setOver(false); if (e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files) }
+  // C56 — coller une image dans la galerie active
+  useClipboardTarget('gallery:' + uploadDir, { onPasteImage: (files) => allowUpload && addFiles(files) }, true)
+
+  // Tuile masonry (grille). Hauteur dérivée du ratio w/h ; vignette légère + repli.
+  const Card = useCallback(({ data, width, index }) => {
+    const h = data.w && data.h ? Math.round(width * data.h / data.w) : 200
+    return <Thumb d={data} t={t} height={h} priority={index === 0} onClick={() => setBox(data)} />
+  }, [t])
+
+  // Ligne de la liste virtualisée (remplace l'ancien DataView non virtualisé : il montait les 99k lignes au DOM).
+  const Row = useCallback(({ data }) => {
+    const name = data.path.split('/').pop()
+    return (
+      <button onClick={() => setBox(data)} className="zr-treeitem"
+        style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', textAlign: 'left', padding: '8px 10px', borderRadius: RADII.sm, background: 'transparent', border: 'none', cursor: 'pointer', color: 'inherit' }}>
+        <div style={{ flex: '0 0 44px', width: 44, height: 30, borderRadius: RADII.sm, overflow: 'hidden', background: t.bg }}>
+          <SmartThumb url={thumbUrl(data)} fullUrl={imgUrl(data.path)} noFullFallback width="100%" height={30} radius={RADII.sm} bg={t.bg} />
+        </div>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-lg)', fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</div>
+          {data.w && data.h && <div style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)', color: t.textSecondary, textTransform: 'uppercase', letterSpacing: 0.5 }}>{data.w}×{data.h}</div>}
+        </div>
+      </button>
+    )
+  }, [t])
+
+  const count = images ? images.length : 0
+
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
+        <div style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', textTransform: 'uppercase', letterSpacing: 2, color: t.textSecondary, fontWeight: 700 }}>{title} <span style={{ fontSize: 'var(--zr-ui-2xs)', opacity: 0.6 }}>· {count} images · {status}</span></div>
+        <ViewSwitch t={t} view={view} onChange={setView} options={['gallery', 'list']} />
+      </div>
+      {allowUpload && <div onDragOver={(e) => { e.preventDefault(); setOver(true) }} onDragLeave={() => setOver(false)} onDrop={onDrop}
+        style={{ border: `1.5px dashed ${over ? PALETTE.primary : t.border}`, borderRadius: RADII.md, padding: 16, textAlign: 'center', color: t.textSecondary, marginBottom: 16, background: over ? PALETTE.primarySoft : 'transparent' }}>
+        Glisse des images ici
+        <label style={{ marginLeft: 8, color: PALETTE.primary, cursor: 'pointer', textDecoration: 'underline' }}>parcourir<input type="file" accept="image/*" multiple style={{ display: 'none' }} onChange={(e) => addFiles(e.target.files)} /></label>
+        <div style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)', opacity: 0.7, marginTop: 4 }}>webp · virtualisé (tient des dizaines de milliers d'images)</div>
+      </div>}
+      {images === null && <div style={{ opacity: 0.6 }}>chargement…</div>}
+      {images && count === 0 && <div style={{ opacity: 0.6 }}>{emptyHint || "Aucune image. Dépose-en, ou elles arriveront avec l'import de ta galerie Eagle."}</div>}
+      {images && count > 0 && view === 'gallery' && (
+        <Masonry items={images} columnGutter={10} columnWidth={220} overscanBy={3} itemKey={(d) => d.path} render={Card} />
+      )}
+      {images && count > 0 && view === 'list' && (
+        <List items={images} rowGutter={2} overscanBy={4} itemKey={(d) => d.path} render={Row} />
+      )}
+      {box && (
+        <div onClick={() => setBox(null)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', display: 'grid', placeItems: 'center', zIndex: 60, cursor: 'zoom-out', padding: 30 }}>
+          <img src={imgUrl(box.path)} alt={box.path.split('/').pop()} style={{ maxWidth: '95%', maxHeight: '95%', borderRadius: 10 }} />
+        </div>
+      )}
+    </>
+  )
+}

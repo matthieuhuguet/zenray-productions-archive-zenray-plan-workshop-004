@@ -1,0 +1,146 @@
+// 12 October 2026, 12:00 CEST: the data model of the Motion Design tab. It validates the cloud catalogue written by
+// scripts/Motion/PublishMotions.mjs (kind zenray-motion-catalogue) and the local catalogue of the service (schema
+// zrmd/catalog@1), turns both into one card shape, derives the filter chips from the data present, and builds an
+// iteration payload from the slider values (only what changed). Pure functions, no React, no fetch.
+// FR : le modele de donnees de l'onglet : validation des catalogues, cartes, pastilles et demande d'iteration.
+import { MOTION } from '../config/motion.js'
+
+const VERSION_RE = /^V_\d{3}$/
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+
+/** True for a catalogue the gallery can show; a transient failure must never be read as "no motion". */
+export function isMotionCatalogue(value) {
+  return !!value && typeof value === 'object' && value.kind === 'zenray-motion-catalogue' && Array.isArray(value.motions)
+}
+
+export function isLocalCatalogue(value) {
+  return !!value && typeof value === 'object' && value.schema === 'zrmd/catalog@1' && Array.isArray(value.motions)
+}
+
+/** One card, whatever the source: { id, title, version, versions, durationSec, poster, fidelity, tags, aspects, status, source }. */
+export function cardFromCloud(row) {
+  const latest = row.latest || {}
+  return {
+    id: row.id, title: row.title || row.id, source: 'cloud', version: VERSION_RE.test(latest.version || '') ? latest.version : null,
+    versionCount: num(row.versionCount) ?? 0, durationSec: num(latest.durationSec), poster: typeof latest.poster === 'string' ? latest.poster : null,
+    media: latest.media || null, zmotion: row.zmotion || null, fidelity: num(latest.fidelity?.overall), weakest: latest.fidelity?.weakest || null,
+    tags: Array.isArray(row.tags) ? row.tags.filter((t) => typeof t === 'string') : [], aspects: Array.isArray(row.aspects) ? row.aspects : [],
+    status: row.status || 'iterating', updatedAt: row.updatedAt || latest.publishedAt || null, pending: num(row.pendingRequests) ?? 0,
+  }
+}
+
+export function cardFromLocal(row) {
+  return {
+    id: row.id, title: row.title || row.id, source: 'local', version: VERSION_RE.test(row.latest || '') ? row.latest : null,
+    versionCount: Array.isArray(row.versions) ? row.versions.length : 0, durationSec: num(row.duration), poster: row.posterUrl || null,
+    render: row.renderUrl || null, fidelity: num(row.score), weakest: null, dimensions: row.dimensions || null,
+    tags: Array.isArray(row.tags) ? row.tags.filter((t) => typeof t === 'string') : [], aspects: ['16x9'],
+    status: num(row.score) !== null && row.score >= MOTION.fidelityTarget ? 'validated' : 'iterating', updatedAt: row.updated || null, pending: 0,
+  }
+}
+
+export function cardsOf(catalogue) {
+  if (isMotionCatalogue(catalogue)) return catalogue.motions.filter((m) => m && typeof m.id === 'string').map(cardFromCloud)
+  if (isLocalCatalogue(catalogue)) return catalogue.motions.filter((m) => m && typeof m.id === 'string').map(cardFromLocal)
+  return []
+}
+
+/** "1:08" for 68.05 s, "0:01" for 1.35 s; empty when unknown. */
+export function formatDuration(sec) {
+  if (num(sec) === null || sec < 0) return ''
+  const total = Math.max(1, Math.round(sec))
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`
+}
+
+/** "96,1 %" (French) or "96.1 %"; empty when unknown. */
+export function formatFidelity(value, lang = 'fr') {
+  if (num(value) === null) return ''
+  const pct = Math.round(value * 1000) / 10
+  return `${lang === 'fr' ? String(pct).replace('.', ',') : pct} %`
+}
+
+/** Chips drawn from the data present: all, validated, iterating, pending, then the most frequent tags and formats. */
+export function filterChips(cards, { maxTags = MOTION.maxTagChips } = {}) {
+  const chips = [{ key: 'all', kind: 'all', count: cards.length }]
+  const validated = cards.filter((c) => c.status === 'validated').length
+  if (validated) chips.push({ key: 'validated', kind: 'status', count: validated })
+  const iterating = cards.filter((c) => c.status !== 'validated').length
+  if (iterating) chips.push({ key: 'iterating', kind: 'status', count: iterating })
+  const pending = cards.filter((c) => c.pending > 0).length
+  if (pending) chips.push({ key: 'pending', kind: 'status', count: pending })
+  const tagCount = new Map()
+  for (const c of cards) for (const t of c.tags) tagCount.set(t, (tagCount.get(t) || 0) + 1)
+  ;[...tagCount.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, maxTags)
+    .forEach(([tag, count]) => chips.push({ key: `tag:${tag}`, kind: 'tag', label: tag, count }))
+  const aspects = new Set(cards.flatMap((c) => c.aspects))
+  if (aspects.size > 1) for (const a of [...aspects].sort()) chips.push({ key: `aspect:${a}`, kind: 'aspect', label: a.replace('x', ':'), count: cards.filter((c) => c.aspects.includes(a)).length })
+  return chips
+}
+
+export function applyChip(cards, chipKey) {
+  if (!chipKey || chipKey === 'all') return cards
+  if (chipKey === 'validated') return cards.filter((c) => c.status === 'validated')
+  if (chipKey === 'iterating') return cards.filter((c) => c.status !== 'validated')
+  if (chipKey === 'pending') return cards.filter((c) => c.pending > 0)
+  if (chipKey.startsWith('tag:')) return cards.filter((c) => c.tags.includes(chipKey.slice(4)))
+  if (chipKey.startsWith('aspect:')) return cards.filter((c) => c.aspects.includes(chipKey.slice(7)))
+  return cards
+}
+
+/**
+ * Exposed parameters, from the cloud card (zmotion.parameters) or the local service (exposed.categories): at most
+ * MOTION.maxParamsPerCategory per category, only known kinds.
+ */
+export function parameterCategories(source) {
+  const cats = source && typeof source === 'object' ? source : {}
+  const out = {}
+  for (const [cat, items] of Object.entries(cats)) {
+    if (!Array.isArray(items)) continue
+    const clean = items.filter((i) => i && typeof i.key === 'string' && ['number', 'color', 'text'].includes(i.kind)).slice(0, MOTION.maxParamsPerCategory)
+    if (clean.length) out[cat] = clean
+  }
+  return out
+}
+
+/** Only the values that differ from the version's own, coerced to their kind; empty object when nothing changed. */
+export function changedOverrides(categories, values) {
+  const out = {}
+  for (const items of Object.values(categories)) {
+    for (const item of items) {
+      if (!(item.key in values)) continue
+      let v = values[item.key]
+      if (item.kind === 'number') { v = Number(v); if (!Number.isFinite(v)) continue }
+      if (item.kind === 'color') v = String(v).toLowerCase()
+      if (v !== item.value && !(item.kind === 'color' && String(item.value).toLowerCase() === v)) out[item.key] = v
+    }
+  }
+  return out
+}
+
+/** The payload of an iteration request (the service validates it again). */
+export function buildIterationPayload({ mode, motionId, baseVersion, overrides, formats, fit, instructions }) {
+  if (!MOTION.modes.includes(mode)) throw new Error(`mode inconnu : ${mode}`)
+  const payload = { mode, motionId, ...(baseVersion ? { baseVersion } : {}) }
+  if (mode === 'params') {
+    if (!overrides || !Object.keys(overrides).length) throw new Error('Aucun réglage modifié.')
+    payload.overrides = overrides
+  }
+  if (mode === 'format') { payload.formats = formats?.length ? formats : ['16x9']; payload.fit = fit || MOTION.fits[0] }
+  if (mode === 'instruction') {
+    const text = String(instructions || '').trim()
+    if (!text) throw new Error('Consigne vide.')
+    payload.instructions = text.slice(0, MOTION.maxInstructionChars)
+  }
+  return payload
+}
+
+/** The versions of a cloud card, newest first, with their numbers only. */
+export function versionRows(zmotion) {
+  const list = Array.isArray(zmotion?.versions) ? zmotion.versions : []
+  return list.filter((v) => VERSION_RE.test(v.version || '')).map((v) => ({
+    version: v.version, parent: v.parent || null, state: v.state || 'published', note: v.note || '', publishedAt: v.publishedAt || null,
+    fidelity: num(v.fidelity?.overall), weakest: v.fidelity?.weakest || null, media: v.renders?.[0]?.media || null, poster: v.renders?.[0]?.poster || null,
+    durationSec: num(v.renders?.[0]?.durationSec), changes: v.changes || {},
+  })).sort((a, b) => b.version.localeCompare(a.version))
+}

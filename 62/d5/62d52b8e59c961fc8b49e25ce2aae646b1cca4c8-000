@@ -1,0 +1,74 @@
+// 16 October 2026: the page's button "Préparer N candidatures" reaches ZenRay Apply through the local service. This module starts
+// `Apply.mjs <N>` (never more than one at a time), reports its progress from the files the run writes, reopens the ready pages
+// in a window, and records "sent". It never submits anything. FR : le pont entre le bouton de la page et ZenRay Apply.
+import path from 'node:path'
+import { readFile, readdir } from 'node:fs/promises'
+import { execFile, spawn } from 'node:child_process'
+import os from 'node:os'
+
+export const APPLY = { minSize: 1, maxSize: 60 }
+const ID = /^job_[a-z0-9]{6,40}$/
+
+/** Pure: the compact view of one finished run (counts and one line per page), from its results.json. */
+export function summariseRun(file) {
+  const results = Array.isArray(file?.results) ? file.results : []
+  const ready = results.filter((r) => r.phase === 'ready')
+  return {
+    pages: results.length, ready: ready.length, blocked: results.length - ready.length, totalSeconds: file?.totalSeconds ?? null,
+    items: results.map((r) => ({ id: r.id, studio: r.studio, phase: r.phase, note: String(r.note || '').slice(0, 260), seconds: r.seconds })),
+  }
+}
+
+export function createApplyBridge({
+  script = new URL('../Apply.mjs', import.meta.url).pathname, node = process.execPath,
+  runsDirectory = path.join(process.env.ZENRAY_FREELANCE_HOME || path.join(os.homedir(), 'Library/Application Support/ZenRayFreelance'), 'ApplyRuns'), spawnImpl = spawn, execImpl = execFile, now = () => new Date(),
+} = {}) {
+  let running = null
+  let last = { startedAt: null, finishedAt: null, exitCode: null, size: null, error: '' }
+
+  async function latestRun() {
+    const dirs = (await readdir(runsDirectory).catch(() => [])).filter((d) => /^\d{4}-/.test(d)).sort()
+    if (!dirs.length) return null
+    const dir = path.join(runsDirectory, dirs.at(-1))
+    const file = await readFile(path.join(dir, 'results.json'), 'utf8').then(JSON.parse).catch(() => null)
+    return { id: dirs.at(-1), dir, file }
+  }
+
+  function start(size) {
+    const n = Number(size)
+    if (!Number.isInteger(n) || n < APPLY.minSize || n > APPLY.maxSize) throw new Error(`Size must be a whole number from ${APPLY.minSize} to ${APPLY.maxSize}`)
+    if (running) return { started: false, reason: 'already-running', size: running.size }
+    const child = spawnImpl(node, [script, String(n)], { stdio: ['ignore', 'ignore', 'pipe'], cwd: path.dirname(path.dirname(path.dirname(script))) })
+    let stderr = ''
+    child.stderr?.on('data', (chunk) => { stderr = (stderr + chunk).slice(-600) })
+    running = { size: n, startedAt: now().toISOString() }
+    last = { startedAt: running.startedAt, finishedAt: null, exitCode: null, size: n, error: '' }
+    child.on('close', (code) => { last = { ...last, finishedAt: now().toISOString(), exitCode: code, error: code === 0 ? '' : stderr.trim().slice(-300) }; running = null })
+    child.on('error', (error) => { last = { ...last, finishedAt: now().toISOString(), exitCode: -1, error: String(error.message).slice(0, 300) }; running = null })
+    return { started: true, size: n, startedAt: running.startedAt }
+  }
+
+  async function status() {
+    const run = await latestRun()
+    return { running: Boolean(running), ...last, runId: run?.id || null, ...(run?.file && !running ? { run: summariseRun(run.file) } : {}) }
+  }
+
+  /** Reopens the ready pages of the last run in a window to review and send by hand. Detached: it lives until the window is closed. */
+  function open() {
+    const child = spawnImpl(node, [script, 'open'], { stdio: 'ignore', detached: true, cwd: path.dirname(path.dirname(path.dirname(script))) })
+    child.unref?.()
+    return { opened: true }
+  }
+
+  /** Records the last run as sent (all, or the given ids) with the exact letters; only after Matthieu said he sent them. */
+  function sent(ids = null) {
+    if (ids !== null && (!Array.isArray(ids) || !ids.length || ids.some((id) => !ID.test(String(id))))) throw new Error('ids must be a non-empty list of offer ids')
+    const args = [script, 'sent', ...(ids ? ['--ids', ids.join(',')] : [])]
+    return new Promise((resolve, reject) => execImpl(node, args, { timeout: 120000, maxBuffer: 1 << 22, cwd: path.dirname(path.dirname(path.dirname(script))) }, (error, stdout) => {
+      if (error) return reject(new Error(String(error.message).split('\n')[0].slice(0, 300)))
+      try { resolve(JSON.parse(stdout)) } catch { resolve({ raw: String(stdout).slice(0, 300) }) }
+    }))
+  }
+
+  return { start, status, open, sent, isRunning: () => Boolean(running) }
+}

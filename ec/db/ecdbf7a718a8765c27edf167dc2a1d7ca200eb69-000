@@ -1,0 +1,110 @@
+// GET /api/hls-cli?token=<signed>[&p=<playlist.m3u8 sous le dossier Videos de la vidéo>]
+//
+// EN CLAIR (pour tout le monde) :
+//   ffmpeg/VLC lancés en ligne de commande n'ont pas le "contexte navigateur" : pas d'en-tête Origin,
+//   pas de résolution d'URL relative comme une page web. Cet endpoint leur sert une version "CLI" des
+//   playlists HLS : toutes les adresses internes sont RÉÉCRITES en URLs absolues, et l'adresse de la clé
+//   de déchiffrement reçoit le token (laissez-passer) pour que /api/hls-key l'accepte hors navigateur.
+//
+//   Pourquoi pas /api/hls directement : les playlists se référencent entre elles en chemins relatifs au
+//   site, et la clé serait bloquée par le gate Origin. On contrôle aussi l'expiration via le token.
+//
+//   Le serveur ne télécharge AUCUN segment et ne reconstruit JAMAIS la vidéo : il ne fait que servir du
+//   texte (les .m3u8) en réécrivant des URLs. ffmpeg, sur la machine de l'utilisateur, fait tout le reste.
+import { verifyToken } from './hls-token.js'
+import { siteBase } from './hls-download-info.js'
+
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+// dossier Videos de la vidéo, déduit de la fiche .media.json (pages/Foo/bar.media.json -> on lit son master).
+function videosDirFromMaster(master) {
+  // master = "pages/Videos/<base>/master.m3u8" -> base name = avant-dernier segment.
+  const m = /^pages\/(.+)\/master\.m3u8$/.exec(master || '')
+  return m ? { dir: `pages/${m[1]}`, base: m[1].split('/').pop() } : null
+}
+
+async function readText(token, path) {
+  const r = await fetch(`https://api.github.com/repos/${REPO}/contents/${encodeURI(path)}?ref=${BRANCH}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zenray-progress' },
+  })
+  if (!r.ok) return null
+  return await r.text()
+}
+
+export default async function handler(req, res) {
+  const ghToken = process.env.GITHUB_TOKEN
+  if (!ghToken) return res.status(500).end()
+  if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return res.status(405).end() }
+
+  // 1) valider le token : il porte le chemin de la fiche .media.json et sa date d'expiration.
+  const tok = (req.query.token || '').toString()
+  const v = verifyToken(tok)
+  if (!v.ok) return res.status(v.reason === 'expired' ? 410 : 403).end() // 410 = expiré (message clair côté script)
+  const mediaPath = v.path
+  if (!mediaPath.startsWith('pages/') || !mediaPath.endsWith('.media.json') || mediaPath.includes('..')) return res.status(403).end()
+
+  // 2) lire la fiche -> retrouver le master HLS (pages/Videos/<base>/master.m3u8).
+  let manifest
+  try { const t = await readText(ghToken, mediaPath); if (!t) return res.status(404).end(); manifest = JSON.parse(t) } catch { return res.status(502).end() }
+  if (!manifest || manifest.type !== 'hls' || !manifest.master) return res.status(400).end()
+  const info = videosDirFromMaster(manifest.master)
+  if (!info) return res.status(400).end()
+
+  // 3) quelle playlist sert-on ? master par défaut, sinon ?p=<nom.m3u8> borné au dossier de CETTE vidéo.
+  let playlistPath = manifest.master
+  const p = (req.query.p || '').toString()
+  if (p) {
+    // p = nom de fichier .m3u8 simple (pas de dossier, pas de '..') -> on le résout DANS le dossier de la vidéo.
+    if (p.includes('/') || p.includes('..') || !p.endsWith('.m3u8')) return res.status(400).end()
+    playlistPath = `${info.dir}/${p}`
+  }
+
+  const text = await readText(ghToken, playlistPath)
+  if (text == null) return res.status(404).end()
+
+  const base = siteBase(req)
+  const encTok = encodeURIComponent(tok)
+  // RÉÉCRITURE des URI internes :
+  //   - "/api/hls?path=pages/Videos/<base>/<x>.m3u8"  -> "<base>/api/hls-cli?token=...&p=<x>.m3u8"
+  //     (sous-playlists : on reste dans hls-cli pour propager le token et garder tout absolu)
+  //   - "/api/hls-key?v=<base>"                        -> "<base>/api/hls-key?v=<base>&token=..." (clé gated + token)
+  //   - les segments pointent déjà jsDelivr (URLs absolues publiques) -> on n'y touche pas.
+  const out = text.replace(/URI="([^"]*)"/g, (full, uri) => {
+    const u = rewriteUri(uri, base, encTok, info.dir)
+    return u ? `URI="${u}"` : full
+  }).split('\n').map((line) => {
+    // lignes "nues" (non-tag) = références directes à des playlists/segments. Réécrire les /api/hls?path=.
+    if (line.startsWith('#') || !line.trim()) return line
+    if (line.startsWith('/api/hls?path=')) { const u = rewriteHlsPath(line.trim(), base, encTok, info.dir); return u || line }
+    return line
+  }).join('\n')
+
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl')
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('Content-Disposition', 'inline; filename="playlist.m3u8"')
+  return res.status(200).send(out)
+}
+
+// Réécrit une seule URI interne (clé, sous-playlist EXT-X-MEDIA, EXT-X-MAP). Renvoie null si on ne touche pas.
+function rewriteUri(uri, base, encTok, dir) {
+  if (uri.startsWith('/api/hls-key')) {
+    // garder ?v=... existant, ajouter le token
+    const sep = uri.includes('?') ? '&' : '?'
+    return `${base}${uri}${sep}token=${encTok}`
+  }
+  if (uri.startsWith('/api/hls?path=')) return rewriteHlsPath(uri, base, encTok, dir)
+  return null
+}
+
+// "/api/hls?path=pages/Videos/<base>/<x>.m3u8" -> "<base>/api/hls-cli?token=...&p=<x>.m3u8" si dans le dossier.
+function rewriteHlsPath(uri, base, encTok, dir) {
+  const m = /^\/api\/hls\?path=(.+)$/.exec(uri)
+  if (!m) return null
+  let pathParam
+  try { pathParam = decodeURIComponent(m[1]) } catch { pathParam = m[1] }
+  if (!pathParam.startsWith(dir + '/') || !pathParam.endsWith('.m3u8')) return null
+  const name = pathParam.slice(dir.length + 1)
+  if (name.includes('/')) return null
+  return `${base}/api/hls-cli?token=${encTok}&p=${encodeURIComponent(name)}`
+}

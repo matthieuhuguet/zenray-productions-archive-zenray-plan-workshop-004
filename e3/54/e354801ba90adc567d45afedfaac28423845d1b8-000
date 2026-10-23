@@ -1,0 +1,193 @@
+// 16 October 2026: the application loop. Pick the N best open offers, build a queue (apply page + exact letter + the applicant's details),
+// let a browser step pre-fill each page WITHOUT submitting, time every step, and record "contacted" only after Matthieu says he sent it.
+// Nothing here ever sends or submits anything.
+//
+// FR : la boucle de candidature. Choisit les N meilleures offres, prépare une file (page + lettre exacte + coordonnées), un pas navigateur
+// pré-remplit chaque page SANS envoyer, chaque étape est chronométrée, et « contacté » n'est écrit qu'une fois que Matthieu a dit avoir envoyé.
+//
+//   node scripts/Freelance/ApplyLoop.mjs init-profile              # writes ApplyProfile.json (edit it: it is the single source of details)
+//   node scripts/Freelance/ApplyLoop.mjs pack --size 10 [--lang fr|en] [--min-score 40] [--forms-only]
+//   node scripts/Freelance/ApplyLoop.mjs stamp --run <dir> --id <studioId> --phase open|fill|ready [--note "..."]
+//   node scripts/Freelance/ApplyLoop.mjs report --run <dir> [--remaining 640]
+//   node scripts/Freelance/ApplyLoop.mjs mark-sent --run <dir> (--all | --ids a,b) [--dry]
+import path from 'node:path'
+import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { createCloudStore } from './CloudStore.mjs'
+import { runtimeDirectory } from './Main.mjs'
+import { parseArgs } from './RecordEmail.mjs'
+import { BATCH, pickBatch } from '../../src/lib/freelanceBatch.js'
+import { currentVersion } from '../../src/lib/freelanceEngineModel.js'
+import { addMessage, isoDay, normalizeStudio } from '../../src/lib/freelanceStudios.js'
+
+// 16 October 2026: every applicant detail lives here, never in code. Defaults come from the CV and the site; empty = the loop asks, it never invents.
+export const DEFAULT_PROFILE = {
+  fullName: 'Matthieu Huguet', firstName: 'Matthieu', lastName: 'Huguet',
+  email: 'mhzenray@gmail.com', phone: '06 14 51 00 32', phoneInternational: '+33 6 14 51 00 32',
+  city: 'Aix-en-Provence', country: 'France', postalCode: '', address: '',
+  website: 'https://matthieuhuguet.com', linkedin: 'https://www.linkedin.com/in/zenray', github: 'https://github.com/matthieuhuguet',
+  jobTitle: 'Technical Artist', salaryExpectation: '', workAuthorization: { eu: 'Yes', us: 'No' },
+}
+
+/** Pure: how a link will behave in the loop, from its host (table in apply/ApplyHosts.json). */
+export function routeOf(url, hosts) {
+  let host = ''
+  try { host = new URL(url).hostname.toLowerCase() } catch { return 'unknown' }
+  for (const route of ['form', 'login', 'hop']) if ((hosts[route] || []).some((h) => host === h || host.endsWith(`.${h}`) || host.includes(h))) return route
+  return 'unknown'
+}
+
+export const runDirectory = (home = runtimeDirectory()) => path.join(home, 'ApplyRuns')
+const readJson = async (file) => JSON.parse(await readFile(file, 'utf8'))
+const secondsBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 100) / 10
+
+/** Pure: the offers of one run, best first; formsOnly keeps only links whose host is a plain form (the best N of those). */
+export function selectOffers({ store, size, today, minScore, hosts = {}, formsOnly = false }) {
+  const pool = pickBatch(Array.isArray(store.studios) ? store.studios.map(normalizeStudio) : [], { today, size: formsOnly ? 5000 : size, minScore })
+  const routed = pool.picked.filter(({ studio }) => !formsOnly || routeOf(studio.engine?.applyUrl || studio.link, hosts) === 'form')
+  return { picked: routed.slice(0, size).map(({ studio }) => studio), waitingCount: routed.length - Math.min(size, routed.length) + pool.waiting.length }
+}
+
+/** Pure: the queue of one run from a parsed store, the letters already read, and the profile. */
+export function buildQueue({ store, letters, profile, size, lang, today, minScore, hosts = {}, formsOnly = false }) {
+  const { picked, waitingCount } = selectOffers({ store, size, today, minScore, hosts, formsOnly })
+  const items = picked.map((studio) => {
+    const version = letters[studio.id] ? currentVersion(letters[studio.id]) : null
+    const language = lang || studio.engine?.language || 'en'
+    return {
+      id: studio.id, studio: studio.name, role: studio.role || '', score: studio.engine?.score ?? null, language,
+      applyUrl: studio.engine?.applyUrl || studio.link || '', route: routeOf(studio.engine?.applyUrl || studio.link, hosts), offerUrl: studio.link || '',
+      letter: version?.text || '', letterVersion: version?.at || version?.id || '',
+      profile,
+    }
+  })
+  return { items, waitingCount }
+}
+
+async function readFresh(cloud, config) {
+  const { storePath } = config.cloud
+  let store = null
+  await cloud.commit('freelance: read for apply loop', async (tree) => {
+    const text = await tree.read(storePath)
+    if (text === null) throw new Error(`${storePath} does not exist in the data repository`)
+    store = JSON.parse(text)
+    return { files: {}, report: {} }
+  }, { dryRun: true })
+  return { store }
+}
+
+async function pack(args) {
+  const home = runtimeDirectory()
+  const config = await readJson(new URL('./FreelanceConfig.json', import.meta.url))
+  const profile = existsSync(path.join(home, 'ApplyProfile.json')) ? await readJson(path.join(home, 'ApplyProfile.json')) : DEFAULT_PROFILE
+  const size = Math.min(Number(args.size || BATCH.defaultSize), 60)
+  const today = isoDay()
+  const cloud = createCloudStore({ config, directory: path.join(home, 'DataClone') })
+  const t0 = new Date().toISOString()
+  // First read the store to choose, then read only the letters of the chosen offers.
+  const { store } = await readFresh(cloud, config)
+  const hosts = await readJson(new URL('./apply/ApplyHosts.json', import.meta.url))
+  const options = { store, size, today, minScore: Number(args['min-score'] || BATCH.minScore), hosts, formsOnly: Boolean(args['forms-only']) }
+  const chosen = selectOffers(options).picked
+  const letters = {}
+  await cloud.commit('freelance: read letters for apply loop', async (tree) => {
+    for (const studio of chosen) {
+      const text = studio.engine?.letterPath ? await tree.read(studio.engine.letterPath) : null
+      if (text) letters[studio.id] = JSON.parse(text)
+    }
+    return { files: {}, report: {} }
+  }, { dryRun: true })
+  const { items, waitingCount } = buildQueue({ ...options, letters, profile, lang: args.lang && args.lang !== true ? args.lang : '' })
+  const dir = path.join(runDirectory(home), new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19))
+  await mkdir(dir, { recursive: true })
+  await writeFile(path.join(dir, 'queue.json'), JSON.stringify({ v: 1, createdAt: t0, today, size, items, waitingCount }, null, 1) + '\n')
+  await writeFile(path.join(dir, 'timings.jsonl'), '')
+  const missing = items.filter((item) => !item.letter).map((item) => item.id)
+  console.log(JSON.stringify({ run: dir, count: items.length, withoutLetter: missing, packSeconds: secondsBetween(t0, new Date().toISOString()), routes: items.reduce((m, i) => ({ ...m, [i.route]: (m[i.route] || 0) + 1 }), {}), urls: items.map((i) => `${i.route} | ${i.studio} | ${i.role} | ${i.applyUrl}`) }, null, 2))
+}
+
+async function stamp(args) {
+  if (!args.run || !args.id || !args.phase) throw new Error('Usage: stamp --run <dir> --id <studioId> --phase open|fill|ready|blocked [--note text]')
+  if (!['open', 'fill', 'ready', 'blocked'].includes(args.phase)) throw new Error(`Unknown phase: ${args.phase}`)
+  const line = { at: new Date().toISOString(), id: args.id, phase: args.phase, note: args.note === true ? '' : String(args.note || '') }
+  await appendFile(path.join(args.run, 'timings.jsonl'), JSON.stringify(line) + '\n')
+  console.log(JSON.stringify(line))
+}
+
+/** Pure: per-offer seconds (open to ready), totals, and the projection for the remaining offers. */
+export function summarise(lines, remaining = 0) {
+  const byId = new Map()
+  for (const line of lines) { if (!byId.has(line.id)) byId.set(line.id, []); byId.get(line.id).push(line) }
+  const offers = [...byId.entries()].map(([id, steps]) => {
+    const first = steps[0], last = steps.at(-1)
+    const ready = steps.find((s) => s.phase === 'ready'), blocked = steps.find((s) => s.phase === 'blocked')
+    return { id, state: ready ? 'ready' : blocked ? 'blocked' : 'unfinished', seconds: ready || blocked ? secondsBetween(first.at, (ready || blocked).at) : null, note: (ready || blocked || last).note || '' }
+  })
+  const done = offers.filter((o) => o.state === 'ready')
+  const average = done.length ? Math.round((done.reduce((s, o) => s + o.seconds, 0) / done.length) * 10) / 10 : null
+  return { offers, ready: done.length, blocked: offers.filter((o) => o.state === 'blocked').length, averageSeconds: average, projectionMinutes: average && remaining ? Math.round((average * remaining) / 6) / 10 : null }
+}
+
+async function report(args) {
+  if (!args.run) throw new Error('Usage: report --run <dir> [--remaining 640]')
+  const raw = await readFile(path.join(args.run, 'timings.jsonl'), 'utf8')
+  const lines = raw.split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  console.log(JSON.stringify(summarise(lines, Number(args.remaining || 0)), null, 2))
+}
+
+/** Pure: records the exact letter as a dated message and moves a to_contact studio to contacted (same rule as the page's "Fait"). */
+export function applySent(store, item, today) {
+  const index = store.studios.findIndex((s) => s.id === item.id)
+  if (index < 0) throw new Error(`No studio with id ${item.id} in the store`)
+  if (!item.letter) throw new Error(`No letter text in the queue for ${item.id}`)
+  const studio = normalizeStudio(store.studios[index])
+  const next = addMessage(studio, { text: `Candidature envoyée par Matthieu via ${item.applyUrl || 'la page du studio'}. Texte de la lettre :\n\n${item.letter}`, channel: 'mail', at: today })
+  return { ...store, studios: store.studios.map((s, i) => (i === index ? next : s)) }
+}
+
+async function markSent(args) {
+  if (!args.run || (!args.all && !args.ids)) throw new Error('Usage: mark-sent --run <dir> (--all | --ids a,b) [--dry]')
+  const queue = await readJson(path.join(args.run, 'queue.json'))
+  const wanted = args.all ? queue.items : queue.items.filter((i) => String(args.ids).split(',').includes(i.id))
+  if (!wanted.length) throw new Error('No matching offer in the queue')
+  const config = await readJson(new URL('./FreelanceConfig.json', import.meta.url))
+  const cloud = createCloudStore({ config, directory: path.join(runtimeDirectory(), 'DataClone') })
+  const { storePath, maxStoreBytes } = config.cloud
+  const today = isoDay()
+  const outcome = await cloud.commit(`freelance: ${wanted.length} application(s) sent (apply loop, ${today})`, async (tree) => {
+    const text = await tree.read(storePath)
+    if (text === null) throw new Error(`${storePath} does not exist in the data repository`)
+    let store = JSON.parse(text); const skipped = []
+    for (const item of wanted) {
+      const current = store.studios.find((s) => s.id === item.id)
+      if (current && (current.messages || []).some((m) => String(m.text).startsWith('Candidature envoyée par Matthieu'))) { skipped.push(item.id); continue }
+      store = applySent(store, item, today)
+    }
+    const next = JSON.stringify(store) + '\n'
+    if (Buffer.byteLength(next) > maxStoreBytes) throw new Error(`The studio store would weigh ${Buffer.byteLength(next)} bytes, above the ${maxStoreBytes} guard; nothing was published`)
+    return { files: next === text ? {} : { [storePath]: next }, report: { recorded: wanted.length - skipped.length, alreadyRecorded: skipped } }
+  }, { dryRun: Boolean(args.dry) })
+  console.log(JSON.stringify({ dry: Boolean(args.dry), committed: outcome.committed, commit: outcome.commit || '', ...outcome.report }, null, 2))
+}
+
+async function initProfile() {
+  const file = path.join(runtimeDirectory(), 'ApplyProfile.json')
+  if (existsSync(file)) { console.log(JSON.stringify({ exists: true, file })); return }
+  await writeFile(file, JSON.stringify(DEFAULT_PROFILE, null, 2) + '\n', { mode: 0o600 })
+  console.log(JSON.stringify({ created: true, file }))
+}
+
+async function main() {
+  const [command, ...rest] = process.argv.slice(2)
+  const args = parseArgs(rest)
+  if (command === 'pack') return pack(args)
+  if (command === 'stamp') return stamp(args)
+  if (command === 'report') return report(args)
+  if (command === 'mark-sent') return markSent(args)
+  if (command === 'init-profile') return initProfile()
+  throw new Error('Usage: ApplyLoop.mjs init-profile | pack | stamp | report | mark-sent')
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => { console.error(`ApplyLoop failed: ${error.message}`); process.exitCode = 1 })
+}

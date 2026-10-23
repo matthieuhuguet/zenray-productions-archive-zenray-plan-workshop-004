@@ -1,0 +1,74 @@
+#!/usr/bin/env node
+// AppendSubtitlesFromCloud.mjs (12 October 2026): gives subtitles to films that are already unloaded from the Mac,
+// WITHOUT re-uploading the film. The original mkv is restored from the verified cloud archive (Git, no REST quota), its
+// text subtitle tracks are extracted and attached to the manifest, then the restored copy is deleted.
+// FR : ajoute les sous-titres a des films deja dechargés. Restauration par le recu verifie, extraction, ajout au manifeste,
+// suppression de la copie. Rien n'est re-uploade : seuls les sous-titres (quelques Ko) rejoignent le manifeste.
+//   node scripts/AppendSubtitlesFromCloud.mjs --receipts <dir> --match <text> --manifests <clone zenray-data> --work-root <dir> [--parallel 4] [--dry]
+import fs from 'node:fs'
+import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { restoreVideoCloud } from './lib/video-cloud-recovery.mjs'
+
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const argv = process.argv.slice(2)
+const value = (flag, fallback = '') => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : fallback }
+const dry = argv.includes('--dry')
+const receiptsDir = path.resolve(value('--receipts'))
+const match = value('--match').toLowerCase()
+const clone = path.resolve(value('--manifests'))
+const workRoot = path.resolve(value('--work-root'))
+const parallel = Number(value('--parallel', '4'))
+const MANIFEST_MARK = `${path.sep}ManifestClone${path.sep}`
+
+if (!receiptsDir || !match || !fs.existsSync(path.join(clone, 'pages'))) { console.error('need --receipts, --match and --manifests <clone with pages/>'); process.exit(2) }
+fs.mkdirSync(workRoot, { recursive: true })
+
+const jobs = []
+for (const name of fs.readdirSync(receiptsDir).filter((n) => n.endsWith('.recovery.json') && !n.includes('.dup.') && n.toLowerCase().includes(match))) {
+  const receiptPath = path.join(receiptsDir, name)
+  const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'))
+  const at = String(receipt.manifestPath || '').indexOf(MANIFEST_MARK)
+  if (at < 0) continue
+  const target = path.join(clone, receipt.manifestPath.slice(at + MANIFEST_MARK.length))
+  if (!fs.existsSync(target)) { console.log(JSON.stringify({ skip: name, reason: 'manifest_not_in_clone' })); continue }
+  const manifest = JSON.parse(fs.readFileSync(target, 'utf8'))
+  if (Array.isArray(manifest.subtitles) && manifest.subtitles.length) continue
+  // The receipt of a renamed film may point at a ManifestClone that has not pulled yet: restore against the manifest of THIS
+  // clone, through a private copy of the receipt (the original receipt is never touched).
+  const localReceiptPath = path.join(workRoot, 'receipts', name)
+  fs.mkdirSync(path.dirname(localReceiptPath), { recursive: true })
+  fs.writeFileSync(localReceiptPath, JSON.stringify({ ...receipt, manifestPath: target }, null, 2))
+  jobs.push({ name, receiptPath: localReceiptPath, receipt: { ...receipt, manifestPath: target }, target, bytes: receipt.bytes })
+}
+console.log(`films to give subtitles: ${jobs.length} (${(jobs.reduce((n, j) => n + j.bytes, 0) / 2 ** 30).toFixed(1)} GiB to restore)`)
+if (dry) process.exit(0)
+
+const token = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8' }).stdout.trim()
+let attachChain = Promise.resolve() // attach + commit one at a time: they share one git index
+const results = []
+let next = 0
+const worker = async () => {
+  while (next < jobs.length) {
+    const job = jobs[next]; next += 1
+    const restored = path.join(workRoot, `${job.name.slice(0, 60).replace(/[^A-Za-z0-9._-]+/g, '_')}-${next}.mkv`)
+    try {
+      await restoreVideoCloud({ receiptPath: job.receiptPath, manifestPath: job.receipt.manifestPath, destination: restored, token })
+      const outcome = await (attachChain = attachChain.then(() => {
+        const r = spawnSync('node', [path.join(HERE, 'AttachSubtitleTracks.mjs'), '--source', restored, '--manifest', job.target, '--commit'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
+        return { status: r.status, out: (r.stdout || '').trim().split('\n').pop(), err: (r.stderr || '').slice(-300) }
+      }))
+      results.push({ name: job.name, ok: outcome.status === 0, detail: outcome.out || outcome.err })
+    } catch (error) {
+      results.push({ name: job.name, ok: false, detail: String(error?.message || error).slice(0, 300) })
+    } finally {
+      fs.rmSync(restored, { force: true }); fs.rmSync(`${restored}.restore.json`, { force: true })
+    }
+    console.log(JSON.stringify({ done: results.length, of: jobs.length, last: results[results.length - 1].name.slice(0, 50), ok: results[results.length - 1].ok }))
+  }
+}
+await Promise.all(Array.from({ length: Math.min(parallel, jobs.length) }, worker))
+const failed = results.filter((r) => !r.ok)
+console.log(JSON.stringify({ finished: true, ok: results.length - failed.length, failed: failed.map((f) => ({ name: f.name.slice(0, 60), detail: f.detail })) }, null, 2))
+process.exitCode = failed.length ? 1 : 0

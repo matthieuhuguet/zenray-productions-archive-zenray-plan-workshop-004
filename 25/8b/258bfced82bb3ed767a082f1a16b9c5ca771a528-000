@@ -1,0 +1,902 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import Icon from '../components/Icon.jsx'
+import MiniPlayerCard from '../audio/MiniPlayerCard.jsx'
+import { PALETTE } from '../theme.js'
+import { usePersistedState } from '../lib/usePersistedState.js'
+import { prefetchMediaPaths } from '../lib/vidStream.js'
+import { getIndexPaths, getNodeThumb, loadSearchIndex } from '../search/searchIndexClient.js'
+import './ZenRayAudioWorkspace.css'
+
+const coverUrl = (value) => !value ? '' : (/^(https?:|data:|blob:|\/)/.test(value) ? value : `/api/img?path=${encodeURIComponent(value)}`)
+const fmt = (seconds) => {
+  const value = Number(seconds) || 0
+  return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}`
+}
+const trackId = (track) => track?.manifestPath || track?.streamPath || track?.uri || track?.videoId || track?.title || ''
+
+// État "fermable en fondu" (retour Matthieu 2026-07-20 : "le widget devrait disparaître avec une
+// élimination de fade out... pareil quand je clique à côté") : hide() garde la valeur montée 350ms avec
+// closing=true (le CSS .zra-closing joue zra-pop-out), puis démonte. show() annule toute fermeture en
+// vol -- rouvrir pendant le fondu de sortie ne laisse jamais un timer périmé démonter le menu frais.
+function useFading(ms = 350) {
+  const [value, setValue] = useState(null)
+  const [closing, setClosing] = useState(false)
+  const timer = useRef(null)
+  useEffect(() => () => clearTimeout(timer.current), [])
+  const show = (v) => { clearTimeout(timer.current); setClosing(false); setValue(v) }
+  const hide = () => {
+    setClosing(true)
+    clearTimeout(timer.current)
+    timer.current = setTimeout(() => { setValue(null); setClosing(false) }, ms)
+  }
+  return [value, closing, show, hide]
+}
+
+// Icône de source (2026-07-20, retour Matthieu : "tous les fichiers devraient avoir l'icône SVG
+// correspondante à sa source -- local, Spotify ou YouTube"). Un seul point de vérité pour les 3 mappings
+// (icône + titre), réutilisé sur les lignes du tableau central, les résultats de recherche et les
+// playlists Spotify de la bibliothèque.
+const SOURCE_ICON = { local: 'externaldrive', spotify: 'source.spotify', youtube: 'play.rectangle' }
+const SOURCE_LABEL = { local: 'ZenRayShards', spotify: 'Spotify', youtube: 'YouTube' }
+function SourceBadge({ source, size = 12 }) {
+  if (!source || !SOURCE_ICON[source]) return null
+  return <span title={SOURCE_LABEL[source]} style={{ display: 'inline-flex', opacity: .62, flexShrink: 0 }}>
+    <Icon name={SOURCE_ICON[source]} size={size} />
+  </span>
+}
+
+// T5 (2026-07-22) — POPOVER « changer la pochette » d'une playlist. Deux voies, comme demandé :
+//   1. une image DÉJÀ sur le site : lue via l'INDEX seul (getIndexPaths + getNodeThumb) -> ZÉRO appel
+//      REST/raw (règle anti-quota du 2026-07-20), même recette que le picker de PlanBoard ;
+//   2. une image LOCALE : fichier choisi ou collé (⌘V), réduit à 1024px en dataURL JPEG ~80 Ko (le
+//      manifeste part par l'API GitHub : jamais de brut lourd).
+// Rendu dans .zra-context (même verre + liseré que les autres menus) -> UI cohérente, 2 thèmes.
+const shrinkImageFile = (file) => new Promise((resolve) => {
+  const url = URL.createObjectURL(file)
+  const img = new Image()
+  img.onload = () => {
+    const scale = Math.min(1, 1024 / img.width)
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(img.width * scale)
+    canvas.height = Math.round(img.height * scale)
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height)
+    URL.revokeObjectURL(url)
+    resolve(canvas.toDataURL('image/jpeg', 0.82))
+  }
+  img.onerror = () => { URL.revokeObjectURL(url); resolve(null) }
+  img.src = url
+})
+
+function CoverPicker({ onPick, onClose }) {
+  const [query, setQuery] = useState('')
+  const [ready, setReady] = useState(false)
+  useEffect(() => { let live = true; loadSearchIndex().then(() => { if (live) setReady(true) }).catch(() => {}); return () => { live = false } }, [])
+  const images = useMemo(() => {
+    if (!ready) return []
+    const needle = query.trim().toLowerCase()
+    const out = []
+    for (const path of getIndexPaths()) {
+      if (!path.endsWith('.img.json')) continue
+      const name = path.split('/').pop().replace(/\.img\.json$/, '')
+      if (needle && !name.toLowerCase().includes(needle)) continue
+      const thumb = getNodeThumb(path)
+      if (!thumb?.u) continue
+      out.push({ path, name, url: thumb.u })
+      if (out.length >= 24) break
+    }
+    return out
+  }, [ready, query])
+  const takeFile = async (file) => { if (!file) return; const url = await shrinkImageFile(file); if (url) { onPick(url); onClose() } }
+  return (
+    <div className="zra-cover-picker" onPointerDown={(event) => event.stopPropagation()}>
+      <div className="zra-picker-head">Pochette de la playlist</div>
+      <input className="zra-cover-search" autoFocus value={query} placeholder="Chercher une image du site… ou coller (⌘V)"
+        onChange={(event) => setQuery(event.target.value)}
+        onPaste={async (event) => {
+          const file = [...(event.clipboardData?.files || [])][0]
+          if (file && file.type.startsWith('image/')) { event.preventDefault(); await takeFile(file) }
+        }} />
+      <label className="zra-cover-upload">
+        <Icon name="arrow.down.right" size={14} />Importer une image
+        <input type="file" accept="image/*" hidden onChange={(event) => takeFile(event.target.files?.[0])} />
+      </label>
+      <div className="zra-cover-grid">
+        {!ready && <div className="zra-picker-empty">Chargement de l’index…</div>}
+        {ready && !images.length && <div className="zra-picker-empty">Aucune image trouvée.</div>}
+        {images.map((image) => (
+          <button key={image.path} title={image.name} onClick={() => { onPick(image.url); onClose() }}>
+            <img src={image.url} alt="" loading="lazy" />
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function Artwork({ src, size = 48, radius = 7, className = '' }) {
+  const iconSize = typeof size === 'number' ? Math.max(16, size * .36) : 34
+  // FLICKER CORRIGÉ (2026-07-22) : sans onError, une pochette absente/cassée (fréquent : audio uploadé sans
+  // --cover) laissait le navigateur retenter le chargement de l'<img> 404 à chaque re-render de la liste
+  // (fréquents pendant la lecture) -> la vignette clignotait plusieurs fois au survol/à la lecture. On bascule
+  // DÉFINITIVEMENT sur l'icône dès la première erreur (plus de retry), et on réarme au changement de `src`.
+  const [failed, setFailed] = useState(false)
+  useEffect(() => { setFailed(false) }, [src])
+  // Bug réel corrigé le 2026-07-19 ("pochette de droite en 9:16 au lieu de carré") : size="100%" posait
+  // `height:100%`, qui ne se résout QUE si un ancêtre a une hauteur définie -- ici .zra-now n'en a pas
+  // (overflow:auto en flux normal), donc le navigateur retombait sur la hauteur INTRINSÈQUE de l'image
+  // (souvent portrait). aspect-ratio:1 force le carré indépendamment de toute hauteur ancêtre.
+  const dimStyle = size === '100%'
+    ? { width: '100%', aspectRatio: '1 / 1', borderRadius: radius }
+    : { width: size, height: size, borderRadius: radius }
+  return <span className={`zra-art ${className}`} style={dimStyle}>
+    {src && !failed ? <img src={coverUrl(src)} alt="" onError={() => setFailed(true)} /> : <Icon name="music.note" size={iconSize} color="#a7a7a7" />}
+  </span>
+}
+
+// Recherche multi-source : les deux premiers résultats restent calmes par défaut. Chaque groupe se
+// développe indépendamment à six résultats, avec pagination propre. Le clic principal lit immédiatement ;
+// le + est la seule action qui importe ou ajoute à la file.
+function SearchGroup({ id, label, items, searching, getKey, getCover, getTitle, getSubtitle, onPlay, onQueue, onAddPlaylist, onDragTrack, toDragTrack }) {
+  const source = id === 'youtube' ? 'youtube' : id === 'spotify' ? 'spotify' : 'local'
+  const [expanded, setExpanded] = useState(false)
+  const [page, setPage] = useState(0)
+  const perPage = 6
+  const pageCount = Math.max(1, Math.ceil(items.length / perPage))
+  const visible = expanded ? items.slice(page * perPage, page * perPage + perPage) : items.slice(0, 2)
+  const select = (item) => onPlay(item)
+
+  return <section className="zra-search-group" aria-labelledby={`zra-search-${id}`}>
+    <div className="zra-search-group-head">
+      <h4 id={`zra-search-${id}`}>{label}</h4>
+      {items.length > 2 && <button type="button" className="zra-search-more" onClick={() => { setExpanded((value) => !value); setPage(0) }} title={expanded ? 'Réduire' : 'Afficher jusqu’à 6 résultats'}>
+        <Icon name={expanded ? 'chevron.up' : 'chevron.down'} size={12} />
+      </button>}
+    </div>
+    {searching ? <div className="zra-search-note">Recherche…</div>
+      : items.length ? <>
+        {visible.map((item) => <div key={getKey(item)} className="zra-search-row" role="button" tabIndex={0}
+          draggable onDragStart={(event) => onDragTrack?.(event, toDragTrack(item))}
+          onClick={() => select(item)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(item) } }}>
+          <Artwork src={getCover(item)} size={32} radius={4} />
+          <span><strong>{getTitle(item)}</strong><small><SourceBadge source={source} size={10} />{getSubtitle(item)}</small></span>
+          {/* Playlist multi-source (retour 2026-07-19, prompt initial jamais traité) : chemin distinct de
+              "ajouter à la file" (lecture temporaire) -- celui-ci PERSISTE dans une playlist ZenRay,
+              n'importe quelle source mélangée dans la même liste. */}
+          <button type="button" className="zra-search-playlist" title="Ajouter à la playlist" aria-label={`Ajouter ${getTitle(item)} à la playlist`} onClick={(event) => { event.stopPropagation(); onAddPlaylist(event, item) }}><Icon name="rectangle.grid.1x2" size={13} /></button>
+          <button type="button" className="zra-search-add" title="Ajouter à la file" aria-label={`Ajouter ${getTitle(item)} à la file`} onClick={(event) => { event.stopPropagation(); onQueue(item) }}><Icon name="plus" size={14} /></button>
+        </div>)}
+        {expanded && pageCount > 1 && <div className="zra-search-pagination">
+          <button type="button" disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))} title="Résultats précédents"><Icon name="chevron.left" size={12} /></button>
+          <span>{page + 1}/{pageCount}</span>
+          <button type="button" disabled={page === pageCount - 1} onClick={() => setPage((value) => Math.min(pageCount - 1, value + 1))} title="Résultats suivants"><Icon name="chevron.right" size={12} /></button>
+        </div>}
+      </> : <div className="zra-search-note">Aucun résultat.</div>}
+  </section>
+}
+
+// videoToTrack : même conversion que onQueueYoutube/onAddPlaylistYoutube plus bas -- un seul point de
+// vérité pour transformer un résultat YouTube brut en objet track (utilisé aussi pour le drag & drop).
+const videoToTrack = (video) => ({ source: 'youtube', videoId: video.videoId, uri: `https://www.youtube.com/watch?v=${video.videoId}`, title: video.title || 'YouTube', artist: video.channel || 'YouTube', cover: video.thumbnail || '', dur: Number(video.duration) || 0 })
+
+function SearchDrop({ localMatches, spotifyResults, spotifySearching, youtubeResults, youtubeSearching, onPlaySpotify, onQueueSpotify, onPlayYoutube, onQueueYoutube, onPlayLocal, onQueueLocal, onAddPlaylistYoutube, onAddPlaylistSpotify, onAddPlaylistLocal, onDragTrack }) {
+  // PAS de onMouseDown preventDefault ici : il empêchait le NAVIGATEUR d'initier le drag natif des
+  // lignes de résultat (preventDefault sur mousedown tue dragstart) -- glisser un résultat de recherche
+  // vers une playlist ne partait donc jamais (bug réel 2026-07-20). Il ne servait qu'à éviter un blur
+  // de l'input, or la visibilité du popup ne dépend que de la longueur de la query, pas du focus.
+  return <div className="zra-search-drop">
+    <SearchGroup id="youtube" label="YouTube" items={youtubeResults} searching={youtubeSearching}
+      getKey={(video) => video.videoId} getCover={(video) => video.thumbnail} getTitle={(video) => video.title} getSubtitle={(video) => video.channel || 'YouTube'} onPlay={onPlayYoutube} onQueue={onQueueYoutube} onAddPlaylist={onAddPlaylistYoutube} onDragTrack={onDragTrack} toDragTrack={videoToTrack} />
+    <SearchGroup id="spotify" label="Spotify" items={spotifyResults} searching={spotifySearching}
+      getKey={(track) => track.uri} getCover={(track) => track.cover} getTitle={(track) => track.title} getSubtitle={(track) => track.artist || 'Spotify'} onPlay={onPlaySpotify} onQueue={onQueueSpotify} onAddPlaylist={onAddPlaylistSpotify} onDragTrack={onDragTrack} toDragTrack={(track) => track} />
+    <SearchGroup id="local" label="Fichiers locaux" items={localMatches} searching={false}
+      getKey={trackId} getCover={(track) => track.cover} getTitle={(track) => track.title} getSubtitle={(track) => track.artist || 'ZenRay'} onPlay={onPlayLocal} onQueue={onQueueLocal} onAddPlaylist={onAddPlaylistLocal} onDragTrack={onDragTrack} toDragTrack={(track) => track} />
+  </div>
+}
+
+export default function ZenRayAudioWorkspace({
+  t,
+  rows,
+  tracks,
+  allTracks,
+  allTracksLoading,
+  onLoadAllTracks,
+  playlists,
+  loading,
+  query,
+  setQuery,
+  section,
+  setSection,
+  selected,
+  toggleRow,
+  playTracks,
+  playRow,
+  player,
+  onAddAudio,
+  scope,
+  reload,
+  fileInput,
+  spotifyUrl,
+  setSpotifyUrl,
+  importProvider,
+  localMatches,
+  spotifyResults,
+  spotifySearching,
+  onPlaySpotifyResult,
+  youtubeResults,
+  youtubeSearching,
+  onPlayYoutubeResult,
+  busy,
+  selectedTracks,
+  newName,
+  setNewName,
+  savePlaylist,
+  onClose,
+  spotifyConnected,
+  spotifyProfile,
+  spotifyPlaylistsData,
+  spotifyLibraryLoading,
+  onConnectSpotify,
+  onPlaySpotifyPlaylist,
+  spotifyLikedTracks,
+  onPlaySpotifyLiked,
+  activePlaylist,
+  onClearPlaylist,
+  onAddToPlaylist,
+  onAddTrackToPlaylistPath,
+  onRemoveTrackFromActivePlaylist,
+  onDeletePlaylistPath,
+  onCreatePlaylistWithTrack,
+  onReorderPlaylist,
+  activeArtist,
+  onOpenArtist,
+  onOpenArtistByName,
+  onSaveTrackToFolder,
+  onSetPlaylistCover,
+  onClearArtist,
+  onOpenArtistAlbum,
+}) {
+  // 2 presets pilotés par le thème global de l'app (retour Matthieu 2026-07-16 : "le thème light Apple
+  // Music... toujours non intégré"). dark = Spotify (noir/vert), light = Apple Music (clair/accent app).
+  const dark = t && t.textPrimary === PALETTE.textPrimaryDark
+  // Les 4 menus (Ajouter, Créer, clic droit, sélecteur de playlist) se ferment en FONDU 0.35s (useFading)
+  // -- ouverture/fermeture toujours via show*/hide*, jamais un setState direct qui démonterait sans
+  // animation (retour Matthieu 2026-07-20).
+  const [addOpen, addClosing, showAdd, hideAdd] = useFading()
+  const [creatingPlaylist, createClosing, showCreate, hideCreate] = useFading()
+  const [context, contextClosing, showContext, hideContext] = useFading()
+  const [createName, setCreateName] = useState('')
+  const [dragging, setDragging] = useState(false)
+  // Titres likés ZenRay (retour 2026-07-19 : "2 différents un propre à zenray audio et celui de spotify")
+  // -- distinct des Liked Songs Spotify (spotifyLikedTracks, réels, en lecture seule). Purement local,
+  // même mécanisme de persistance que savedAlbums.
+  //
+  // Bug réel corrigé le 2026-07-20 ("ajouter aux titres likés ne marche pas") : l'ancien stockage ne
+  // gardait qu'un SET D'IDS, et la liste affichée (zenrayLikedTracks) filtrait `tracks` -- la bibliothèque
+  // déjà IMPORTÉE -- avec ces ids. Résultat : liker un résultat de recherche brut (Spotify/YouTube/local
+  // jamais ajouté à ZenRay) enregistrait bien son id, mais il n'apparaissait JAMAIS dans "Titres likés"
+  // puisqu'il n'existe dans aucune row importée. Stockage changé en MAP id -> track complet (assez de
+  // data pour l'afficher et le jouer directement), la vue "Titres likés" lit cette map, plus `tracks`.
+  const [likedTracksMap, setLikedTracksMap] = useState(() => {
+    try { return new Map(Object.entries(JSON.parse(localStorage.getItem('zr-audio:liked-tracks-v2') || '{}'))) } catch { return new Map() }
+  })
+  const isLiked = (track) => likedTracksMap.has(trackId(track))
+  const toggleLiked = (track) => {
+    const id = trackId(track)
+    if (!id) return
+    setLikedTracksMap((before) => {
+      const next = new Map(before)
+      next.has(id) ? next.delete(id) : next.set(id, track)
+      localStorage.setItem('zr-audio:liked-tracks-v2', JSON.stringify(Object.fromEntries(next)))
+      return next
+    })
+  }
+  // Groupes de la section Playlists repliables (retour 2026-07-20), état persisté ; ZenRay d'abord.
+  const [libGroups, setLibGroups] = usePersistedState('zr-audio:libGroups', {}, { json: true })
+  const toggleLibGroup = (key) => setLibGroups((before) => ({ ...(before || {}), [key]: !before?.[key] }))
+  // Recherche cachable (retour 2026-07-19, même logique que la sidebar/Create : bouton "Search").
+  const [searchOpen, setSearchOpen] = usePersistedState('zr-audio:searchOpen', true)
+  // Panneaux gauche/droite cachables, état sauvegardé (retour 2026-07-19 : "possibilité de cacher barre
+  // de gauche et barre de droite... avec un save state ui").
+  const [leftOpen, setLeftOpen] = usePersistedState('zr-audio:leftOpen', true)
+  const [rightOpen, setRightOpen] = usePersistedState('zr-audio:rightOpen', true)
+  // Bug réel corrigé le 2026-07-19 ("la recherche pour accéder à une playlist ne fonctionne pas") :
+  // .zra-library-search n'était qu'un BOUTON (changeait juste `section`), aucun champ pour taper un
+  // nom -- impossible de filtrer playlists/albums par texte. Devient un vrai input filtrant la liste.
+  const [librarySearch, setLibrarySearch] = useState('')
+  const libNeedle = librarySearch.trim().toLowerCase()
+  const matchesLib = (name) => !libNeedle || String(name || '').toLowerCase().includes(libNeedle)
+
+  // Drag & drop centre -> gauche (retour Matthieu 2026-07-20 : "pouvoir draguer un fichier, qu'il soit
+  // local, spotify ou youtube, directement dans un titre liké mais aussi dans une playlist customisée").
+  // Un seul type MIME transporte la piste en JSON, posé par toute ligne SOURCE (résultat de recherche OU
+  // ligne du tableau central) ; toute ligne CIBLE (Titres likés, une playlist ZenRay) le lit au drop.
+  // `types` (pas `getData`) est lisible pendant dragover -- getData ne l'est qu'au drop, restriction du
+  // navigateur -- donc la détection "cette zone accepte-t-elle ce drag" passe par `types.includes(...)`.
+  // DEUX MIME de piste coexistent dans l'app (bug réel corrigé le 2026-07-22 : « le drag depuis le lecteur ne
+  // dépose rien dans les playlists ») :
+  //   - 'application/x-zenray-track'  : posé par les lignes de CE workspace (dragTrackStart) ;
+  //   - 'application/zenray-track'    : posé par le LECTEUR (MiniPlayerCard.startTrackDrag) et attendu par les
+  //     cibles de Create dans App.jsx (tuiles/dossiers) -- on ne peut donc pas le renommer.
+  // Les cibles d'ICI acceptent désormais les DEUX (lecture via readDragTrack) ; les sources gardent chacune le
+  // leur. Ne JAMAIS remettre un seul MIME sans migrer App.jsx en même temps.
+  const DRAG_MIME = 'application/x-zenray-track'
+  const DRAG_MIME_PLAYER = 'application/zenray-track'
+  const hasDragTrack = (event) => {
+    const types = [...(event.dataTransfer?.types || [])]
+    return types.includes(DRAG_MIME) || types.includes(DRAG_MIME_PLAYER)
+  }
+  const readDragTrack = (event) => {
+    const raw = event.dataTransfer.getData(DRAG_MIME) || event.dataTransfer.getData(DRAG_MIME_PLAYER)
+    try { return JSON.parse(raw || 'null') } catch { return null }
+  }
+  const [dropTarget, setDropTarget] = useState(null)
+  const [coverPickerOpen, setCoverPickerOpen] = useState(false) // T5 : popover de pochette de playlist
+  // Fermeture au clic AILLEURS + Échap (même contrat que les autres menus du workspace). Le popover
+  // stoppe la propagation de son propre pointerdown, donc cliquer dedans ne le referme pas.
+  useEffect(() => {
+    if (!coverPickerOpen) return undefined
+    const away = () => setCoverPickerOpen(false)
+    const esc = (event) => { if (event.key === 'Escape') setCoverPickerOpen(false) }
+    document.addEventListener('pointerdown', away)
+    document.addEventListener('keydown', esc)
+    return () => { document.removeEventListener('pointerdown', away); document.removeEventListener('keydown', esc) }
+  }, [coverPickerOpen])
+  // Pulsation 0.35s de confirmation sur la cible après un drop réussi (retour Matthieu : "animations sur
+  // les playlists et les sons ajoutés").
+  const [justAdded, setJustAdded] = useState(null)
+  const flashAdded = (key) => { setJustAdded(key); window.setTimeout(() => setJustAdded((prev) => (prev === key ? null : prev)), 400) }
+  // Pendant qu'une piste est en vol, la bibliothèque bascule d'elle-même sur les PLAYLISTS (cibles de
+  // drop) : depuis la refonte Tracks/This Folder/Playlists, les playlists ne sont listées que dans leur
+  // section -- sans cette bascule, glisser une piste depuis le centre n'offrait AUCUNE cible visible
+  // ("impossible de drag and drop vers les playlists", retour Matthieu 2026-07-20). Reset garanti par
+  // le dragend GLOBAL (window) : il se déclenche même si le drop aboutit hors de la bibliothèque.
+  const [trackDragging, setTrackDragging] = useState(false)
+  useEffect(() => {
+    if (!trackDragging) return undefined
+    const end = () => setTrackDragging(false)
+    const onKey = (event) => { if (event.key === 'Escape') end() }
+    window.addEventListener('dragend', end)
+    window.addEventListener('drop', end)
+    // Filets : si la source du drag a été démontée (bascule de section), dragend ne remonte plus --
+    // mouseup/Escape garantissent que la bibliothèque ne reste jamais figée sur les playlists.
+    window.addEventListener('mouseup', end)
+    window.addEventListener('keydown', onKey)
+    return () => { window.removeEventListener('dragend', end); window.removeEventListener('drop', end); window.removeEventListener('mouseup', end); window.removeEventListener('keydown', onKey) }
+  }, [trackDragging])
+  const dragTrackStart = (event, track) => {
+    event.dataTransfer.effectAllowed = 'copyMove'
+    event.dataTransfer.setData(DRAG_MIME, JSON.stringify(track))
+    // setTimeout : un setState SYNCHRONE ici re-rend la liste pendant que Chrome capture l'image de
+    // drag -> le drag est annulé immédiatement (bug réel 2026-07-20, "impossible de drag and drop").
+    // Différé d'un tick, la capture est faite, la bascule de la bibliothèque ne tue plus le geste.
+    window.setTimeout(() => setTrackDragging(true), 0)
+  }
+  const onRowDragOver = (event, key) => {
+    if (!hasDragTrack(event)) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+    if (dropTarget !== key) setDropTarget(key)
+  }
+  const onRowDragLeave = (key) => setDropTarget((prev) => (prev === key ? null : prev))
+  const onRowDrop = (event, key, handler) => {
+    if (!hasDragTrack(event)) return
+    event.preventDefault()
+    event.stopPropagation()
+    setDropTarget(null)
+    const track = readDragTrack(event)
+    if (track) { handler(track); flashAdded(key) }
+  }
+  // Ajout AUX titres likés (contrairement à toggleLiked, un drop n'enlève jamais -- il ajoute seulement,
+  // idempotent si la piste y est déjà).
+  const addLiked = (track) => {
+    const id = trackId(track)
+    if (!id) return
+    setLikedTracksMap((before) => {
+      if (before.has(id)) return before
+      const next = new Map(before)
+      next.set(id, track)
+      localStorage.setItem('zr-audio:liked-tracks-v2', JSON.stringify(Object.fromEntries(next)))
+      return next
+    })
+  }
+  // Sélecteur "Ajouter à une playlist" (bug réel corrigé le 2026-07-20 : le clic droit et le "+" playlist
+  // d'un résultat de recherche ne menaient nulle part -- soit no-op sur un résultat pas encore importé,
+  // soit une simple sélection Finder qui ne permettait de créer QU'une playlist neuve, jamais d'ajouter à
+  // une EXISTANTE). Petit menu façon .zra-context : liste les playlists ZenRay existantes + un champ pour
+  // en créer une à la volée avec cette piste.
+  const [picker, pickerClosing, showPicker, hidePicker] = useFading()
+  const [pickerName, setPickerName] = useState('')
+  const createRef = useRef(null)
+  const openPicker = (event, track) => { event.preventDefault(); event.stopPropagation(); showPicker({ x: event.clientX, y: event.clientY, track }) }
+  const addRef = useRef(null)
+
+  // Section effective de la LISTE de bibliothèque (voir dragTrackStart) : drag en vol => playlists.
+  const libSection = trackDragging ? 'playlists' : section
+  const now = player.current || tracks[0] || null
+  const zenrayLikedTracks = useMemo(() => [...likedTracksMap.values()], [likedTracksMap])
+  const visibleTracks = useMemo(() => {
+    // Bug réel corrigé le 2026-07-20 ("parfois cliquer sur une playlist ne la lance pas dans le panneau
+    // principal") : section 'liked' et la recherche passaient AVANT la playlist ouverte -- cliquer une
+    // playlist depuis la vue Titres likés (ou avec une recherche en cours) posait bien activePlaylist,
+    // mais le centre continuait d'afficher l'ancienne liste. La playlist OUVERTE prime sur tout.
+    if (activePlaylist) return activePlaylist.tracks || []
+    if (section === 'liked') return zenrayLikedTracks
+    // Base par section (refonte Tracks/This Folder/Playlists) : Tracks = tout le site, sinon le dossier.
+    const base = section === 'tracks' ? allTracks : tracks
+    if (query.trim()) {
+      const needle = query.trim().toLowerCase()
+      return base.filter((track) => `${track.title} ${track.artist} ${track.album}`.toLowerCase().includes(needle))
+    }
+    return base
+  }, [activePlaylist, allTracks, query, section, tracks, zenrayLikedTracks])
+  // PRÉCHARGEMENT (2026-07-22, comme les images à l'ouverture d'un dossier) : dès que la liste centrale
+  // s'affiche, on réchauffe le 1er chunk des ~12 premières pistes LOCALES (celles qui ont un manifeste
+  // .media.json), pour que le clic démarre sans clipping. Fenêtre bornée (parts[0] = ~19 Mo) ; prefetchMediaPaths
+  // dédoublonne par chemin (une piste réchauffée une seule fois par session). Best-effort, jamais bloquant.
+  useEffect(() => {
+    const paths = (visibleTracks || [])
+      .map((track) => track && (track.manifestPath || track.streamPath || track.path))
+      .filter((p) => typeof p === 'string' && p.endsWith('.media.json'))
+    if (paths.length) prefetchMediaPaths(paths, { window: 24 }).catch(() => {})
+  }, [visibleTracks])
+  // En-tête du panneau central : même ordre de priorité que visibleTracks (playlist ouverte d'abord).
+  const folderName = (scope || '').split('/').pop() || 'This Folder'
+  const centerTitle = activePlaylist?.name || (section === 'liked' ? 'Titres likés' : section === 'tracks' ? 'Tracks' : folderName)
+  const centerSubtitle = activePlaylist ? (activePlaylist.owner || 'Playlist') : (section === 'tracks' ? 'Tout le site' : 'ZenRay')
+  const centerCover = activePlaylist?.cover || now?.cover
+
+  // Clic à côté = fermeture en fondu, pour les 4 menus (retour Matthieu 2026-07-20 : "quand je clique
+  // à côté du widget qui permet de créer des playlists, ça ne ferme toujours pas").
+  useEffect(() => {
+    if (!addOpen && !creatingPlaylist) return undefined
+    const onDown = (event) => {
+      if (addOpen && addRef.current && !addRef.current.contains(event.target)) hideAdd()
+      if (creatingPlaylist && createRef.current && !createRef.current.contains(event.target)) hideCreate()
+    }
+    window.addEventListener('pointerdown', onDown)
+    return () => window.removeEventListener('pointerdown', onDown)
+  }, [addOpen, creatingPlaylist]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!context) return undefined
+    const close = () => hideContext()
+    window.addEventListener('pointerdown', close)
+    window.addEventListener('blur', close)
+    return () => {
+      window.removeEventListener('pointerdown', close)
+      window.removeEventListener('blur', close)
+    }
+  }, [context])
+
+  useEffect(() => {
+    if (!picker) return undefined
+    setPickerName('')
+    const close = () => hidePicker()
+    window.addEventListener('pointerdown', close)
+    window.addEventListener('blur', close)
+    return () => {
+      window.removeEventListener('pointerdown', close)
+      window.removeEventListener('blur', close)
+    }
+  }, [picker])
+
+  const importFiles = async (files) => {
+    const audioFiles = [...files].filter((file) => (file.type || '').startsWith('audio/') || /\.(wav|mp3|m4a|aac|flac|ogg|opus)$/i.test(file.name))
+    if (!audioFiles.length) return
+    hideAdd()
+    await onAddAudio?.(audioFiles, scope)
+    await reload()
+  }
+
+  const rowFor = (track) => rows.find((row) => row.track === track)
+  const openContext = (event, track) => {
+    event.preventDefault()
+    event.stopPropagation()
+    showContext({ x: event.clientX, y: event.clientY, track, row: rowFor(track) })
+  }
+
+  // CLIGNOTEMENT CORRIGÉ (2026-07-22) : AVANT, `TrackRows` était un COMPOSANT défini EN LIGNE dans le parent
+  // (`const TrackRows = ({list}) => {...}`) AVEC des hooks. Sa référence changeant à chaque render, React
+  // DÉMONTAIT/REMONTAIT toute la tracklist à chaque re-render du parent -- et le parent re-render ~4×/s en
+  // lecture (setLTime sur <audio onTimeUpdate>) -> les lignes clignotaient en permanence, pire au survol. Devenu
+  // une FONCTION DE RENDU PURE (aucun hook) appelée via {renderTrackList(x)} : plus de frontière de composant,
+  // donc les lignes (clés stables) sont réconciliées SANS remontage. dupIds = boucle O(n) (négligeable même sur
+  // des milliers de titres) ; dragIndexRef remonté au parent (persiste entre dragstart et drop malgré les re-renders).
+  const dragIndexRef = useRef(null)
+  const renderTrackList = (list) => {
+    const dupIds = new Map()
+    for (const t of list) { const id = trackId(t); dupIds.set(id, (dupIds.get(id) || 0) + 1) }
+    const reorderable = activePlaylist?.kind === 'zenray' && list === visibleTracks
+    return <div className="zra-track-table" role="list">
+    <div className="zra-track-head"><span>#</span><span>Titre</span><span>Source</span><span><Icon name="arrow.clockwise" size={14} /></span></div>
+    {list.map((track, index) => {
+      const row = rowFor(track)
+      // Repère d'abord par RÉFÉRENCE exacte (now === track : le même objet JS que celui réellement chargé
+      // dans le lecteur -- playMixedQueue conserve la référence du tableau telle quelle, cf.
+      // PlayerContext.jsx `setQueue(list)` puis `queue[idx]` sans clonage). Fiable même avec des doublons.
+      // Ne retombe sur la comparaison par contenu QUE si ce trackId est unique dans cette liste (lecture
+      // Spotify pure hors file mixte, où `now` est reconstruit par le SDK et n'est jamais le même objet).
+      const current = now === track || ((dupIds.get(trackId(track)) || 0) <= 1 && trackId(now) === trackId(track))
+      const picked = row && selected.has(row.path)
+      return <button
+        key={`${trackId(track)}:${index}`}
+        className={`zra-track-row${current ? ' is-current' : ''}${picked ? ' is-selected' : ''}`}
+        onClick={(event) => {
+          // Retour Matthieu 2026-07-16 : cliquer sur un titre doit lancer la lecture directement, pas
+          // seulement le sélectionner (l'ancien comportement demandait un DOUBLE clic, peu découvrable).
+          // Un modificateur clavier garde son sens Finder : construire une sélection multiple pour créer
+          // une playlist, sans déclencher de lecture pendant qu'on sélectionne.
+          if (event.metaKey || event.ctrlKey || event.shiftKey) { row && toggleRow(row, event); return }
+          // Bug réel corrigé le 2026-07-20 ("il manque la fonctionnalité pause") : cliquer sur la ligne
+          // DÉJÀ en cours de lecture relançait le morceau depuis 0 au lieu de le mettre en pause/reprendre
+          // -- comportement Spotify standard, cliquer une 2e fois bascule play/pause sur place.
+          if (current) player.toggle()
+          else playTracks(list, index)
+        }}
+        onDoubleClick={(event) => { event.preventDefault(); playTracks(list, index) }}
+        onContextMenu={(event) => openContext(event, track)}
+        role="listitem"
+        draggable
+        onDragStart={(event) => { dragTrackStart(event, track); if (reorderable) dragIndexRef.current = index }}
+        onDragOver={(event) => { if (reorderable && dragIndexRef.current != null) event.preventDefault() }}
+        onDrop={(event) => {
+          if (!reorderable || dragIndexRef.current == null) return
+          event.preventDefault()
+          const from = dragIndexRef.current
+          dragIndexRef.current = null
+          if (from === index) return
+          const next = list.slice()
+          const [moved] = next.splice(from, 1)
+          next.splice(index, 0, moved)
+          onReorderPlaylist?.(activePlaylist.key, next)
+        }}
+      >
+        <span className="zra-track-index">{current && player.playing ? <Icon name="speaker.wave.2" size={14} /> : index + 1}</span>
+        <span className="zra-track-title"><Artwork src={track.cover} size={30} radius={4} /><span><strong>{track.title}</strong><small>{track.artist}</small></span></span>
+        <span className="zra-track-source"><SourceBadge source={track.source} />{SOURCE_LABEL[track.source] || 'Spotify'}</span>
+        <span className="zra-track-duration">{track.dur ? fmt(track.dur) : '—'}</span>
+      </button>
+    })}
+  </div>
+  }
+
+  // Wrapper .zra-portal + classe de thème : ces menus sont portalés sur document.body, HORS de
+  // .zra-shell et hors du conteneur .zr-dark de l'app -- sans ce wrapper, --zra-*/--g9-* se résolvaient
+  // en valeurs light/inexistantes, d'où le rendu gris-bleu délavé signalé (captures 2026-07-20).
+  const portalTheme = `zra-portal${dark ? ' zr-dark' : ' zra-light'}`
+  // "Retirer de la playlist" (retour Matthieu 2026-07-20 : "bouton de suppression des tracklists sur
+  // le clic droit") : n'apparaît QUE quand la liste ouverte au centre est une playlist ZenRay -- retirer
+  // un titre d'un album ou d'une playlist Spotify (lecture seule) n'a pas de sens.
+  const contextMenuItems = context ? [
+    ['Lire maintenant', () => playTracks([context.track])],
+    ['Lire ensuite', () => player.playNext(context.track)],
+    ['Ajouter à la file', () => player.addToQueue(context.track)],
+    [isLiked(context.track) ? 'Retirer des titres likés' : 'Ajouter aux titres likés', () => toggleLiked(context.track)],
+    ['Ajouter à une playlist', () => showPicker({ x: context.x, y: context.y, track: context.track })],
+    ...(activePlaylist?.kind === 'zenray' ? [['Retirer de la playlist', () => onRemoveTrackFromActivePlaylist?.(context.track)]] : []),
+    // « Supprimer la playlist » DÉPLACÉ ici (2026-07-22, décision Matthieu) : les 2 boutons du header
+    // (corbeille + « Ajouter des titres ») sont retirés ; la suppression vit dans le menu ••• / clic droit.
+    ...(activePlaylist?.kind === 'zenray' ? [['Supprimer la playlist', () => { if (window.confirm(`Supprimer la playlist « ${activePlaylist.name} » ?`)) onDeletePlaylistPath?.(activePlaylist.key) }]] : []),
+    ['Copier le lien', () => navigator.clipboard?.writeText(context.track.uri || context.track.manifestPath || '')],
+    ['Ouvrir la source', () => context.track.uri && window.open(context.track.uri, '_blank', 'noopener,noreferrer')],
+  ] : []
+  const contextMenu = context && createPortal(<div className={portalTheme}><div className={`zra-context${contextClosing ? ' zra-closing' : ''}`} role="menu" style={{ left: Math.min(context.x, window.innerWidth - 250), top: Math.min(context.y, window.innerHeight - 300) }} onPointerDown={(event) => event.stopPropagation()}>
+    {contextMenuItems.map(([label, action]) => <button key={label} role="menuitem" onClick={() => { action(); hideContext() }} disabled={label === 'Ouvrir la source' && !context.track.uri}>{label}</button>)}
+  </div></div>, document.body)
+
+  const playlistPicker = picker && createPortal(
+    <div className={portalTheme}><div className={`zra-context zra-picker${pickerClosing ? ' zra-closing' : ''}`} role="menu"
+      style={{ left: Math.min(picker.x, window.innerWidth - 260), top: Math.min(picker.y, window.innerHeight - 340) }}
+      onPointerDown={(event) => event.stopPropagation()}>
+      <div className="zra-picker-head">Add to playlist</div>
+      <div className="zra-picker-list">
+        {playlists.length === 0 && <div className="zra-picker-empty">No playlist yet.</div>}
+        {playlists.map((row) => (
+          <button key={row.path} role="menuitem" onClick={async () => { await onAddTrackToPlaylistPath?.(picker.track, row.path); flashAdded(row.path); hidePicker() }}>
+            <Artwork src={row.manifest?.cover} size={26} radius={4} />
+            <span>{row.manifest?.title || row.manifest?.name || 'Playlist'}</span>
+          </button>
+        ))}
+      </div>
+      <form className="zra-picker-new" onSubmit={async (event) => {
+        event.preventDefault()
+        if (!pickerName.trim() || busy) return
+        await onCreatePlaylistWithTrack?.(pickerName.trim(), picker.track)
+        hidePicker()
+      }}>
+        <input autoFocus value={pickerName} onChange={(event) => setPickerName(event.target.value)} placeholder="New playlist…" />
+        <button type="submit" disabled={!pickerName.trim() || !!busy} aria-label="Create"><Icon name="plus" size={14} /></button>
+      </form>
+    </div></div>, document.body)
+
+  return <section
+    className={`zra-shell${dark ? '' : ' zra-light'}${dragging ? ' is-dragging' : ''}`}
+    onDragEnter={(event) => { if ([...event.dataTransfer.types].includes('Files')) { event.preventDefault(); setDragging(true) } }}
+    onDragOver={(event) => { if ([...event.dataTransfer.types].includes('Files')) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; setDragging(true) } }}
+    onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false) }}
+    onDrop={(event) => { event.preventDefault(); setDragging(false); importFiles(event.dataTransfer.files) }}
+  >
+    <header className="zra-topbar">
+      {!searchOpen ? (
+        <button className="zra-search-toggle-closed" onClick={() => setSearchOpen(true)} title="Afficher la recherche"><Icon name="magnifyingglass" size={14} style={{ opacity: .6 }} />Search</button>
+      ) : (
+      <label className="zra-search">
+        <Icon name="magnifyingglass" size={18} />
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search" />
+        <button type="button" onClick={(event) => { event.preventDefault(); setSearchOpen(false) }} title="Masquer la recherche" className="zra-search-toggle"><Icon name="chevron.left" size={12} /></button>
+        {/* onAddPlaylist* : ouvre le sélecteur "Ajouter à une playlist" (choix d'une playlist existante ou
+            création à la volée) au lieu de l'ancien onAddToPlaylist, qui ajoutait en silence à la playlist
+            "active" ou en créait une nouvelle sans jamais demander -- bug réel corrigé le 2026-07-20. */}
+        {query.trim().length >= 2 && <SearchDrop key={query}
+          localMatches={localMatches}
+          spotifyResults={spotifyResults}
+          spotifySearching={spotifySearching}
+          youtubeResults={youtubeResults}
+          youtubeSearching={youtubeSearching}
+          onPlayLocal={(track) => { playTracks(localMatches, Math.max(0, localMatches.findIndex((candidate) => trackId(candidate) === trackId(track)))); setQuery('') }}
+          onQueueLocal={player.addToQueue}
+          onPlaySpotify={(track) => { onPlaySpotifyResult(track); setQuery('') }}
+          onQueueSpotify={player.addToQueue}
+          onPlayYoutube={(video) => { onPlayYoutubeResult(video); setQuery('') }}
+          onQueueYoutube={(video) => player.addToQueue(videoToTrack(video))}
+          onAddPlaylistLocal={(event, track) => openPicker(event, track)}
+          onAddPlaylistSpotify={(event, track) => openPicker(event, track)}
+          onAddPlaylistYoutube={(event, video) => openPicker(event, videoToTrack(video))}
+          onDragTrack={dragTrackStart}
+        />}
+      </label>
+      )}
+      {/* Contraste inversé (retour Matthieu 2026-07-20) : les panneaux sont VISIBLES par défaut (état
+          normal, pas une action spéciale) -- le style .is-on (fort, blanc-sur-dark/noir-sur-light) ne
+          représente donc plus "visible" mais "je viens de le CACHER" (un vrai écart par rapport au
+          défaut, qui mérite d'attirer l'œil). !leftOpen/!rightOpen, pas leftOpen/rightOpen. */}
+      <button className={`zra-round${leftOpen ? '' : ' is-on'}`} title={leftOpen ? 'Cacher la bibliothèque' : 'Afficher la bibliothèque'} onClick={() => setLeftOpen((v) => !v)}><Icon name="sidebar.left" size={17} /></button>
+      <button className={`zra-round${rightOpen ? '' : ' is-on'}`} title={rightOpen ? 'Cacher le contexte' : 'Afficher le contexte'} onClick={() => setRightOpen((v) => !v)}><Icon name="sidebar.left" size={17} style={{ transform: 'scaleX(-1)' }} /></button>
+      <div className="zra-add" ref={addRef}>
+        <button className="zra-create" onClick={() => { if (addOpen && !addClosing) hideAdd(); else showAdd(true) }}><Icon name="plus" size={18} />Ajouter</button>
+        {addOpen && <div className={`zra-add-menu${addClosing ? ' zra-closing' : ''}`}>
+          <button onClick={() => fileInput.current?.click()}><Icon name="music.note" size={16} />Importer des fichiers audio</button>
+          <div className="zra-url-row"><input value={spotifyUrl} onChange={(event) => setSpotifyUrl(event.target.value)} placeholder="Lien Spotify ou YouTube" /><button onClick={() => importProvider()} disabled={!spotifyUrl || !!busy}>Ajouter</button></div>
+          <small>Le lien ajoute le contenu à ZenRay Audio. Aucune interface Spotify n’est embarquée.</small>
+        </div>}
+      </div>
+      <input ref={fileInput} type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.flac,.ogg,.opus" multiple hidden onChange={(event) => { const files = event.target.files; event.target.value = ''; importFiles(files) }} />
+    </header>
+
+    <div className={`zra-columns${leftOpen ? '' : ' no-left'}${rightOpen ? '' : ' no-right'}`}>
+      {leftOpen && <aside className="zra-library" aria-label="Bibliothèque ZenRay Audio">
+        <div className="zra-library-head">
+          <strong>Ta bibliothèque</strong>
+          <div className="zra-create-wrap" ref={createRef}>
+            {/* Retour Matthieu 2026-07-16 : "Créer" ouvrait par erreur le menu d'IMPORT (même bouton que
+                "Ajouter" en haut) -- confusion totale. Il doit poser une NOUVELLE VUE (playlist vide),
+                qu'on remplit ensuite en sélectionnant des titres existants. */}
+            <button onClick={() => { if (creatingPlaylist && !createClosing) hideCreate(); else showCreate(true) }}><Icon name="plus" size={18} />Créer</button>
+            {/* T6 (2026-07-22) : vraie UI de popover pour la création (avant : un input nu + un bouton, sans
+                titre ni repère). Le MATÉRIAU (fond popover v14 opaque + liserés, 2 thèmes) existait déjà sur
+                .zra-create-menu -- on ne le refait pas, on lui donne la STRUCTURE : titre, champ, aide sur la
+                suite (multi-source), et une rangée d'actions Annuler/Créer. */}
+            {creatingPlaylist && <div className={`zra-create-menu${createClosing ? ' zra-closing' : ''}`}>
+              <div className="zra-create-title">Nouvelle playlist</div>
+              <input autoFocus value={createName} onChange={(event) => setCreateName(event.target.value)}
+                onKeyDown={(event) => { if (event.key === 'Enter' && createName.trim()) { savePlaylist(createName.trim(), [], {}, true); setCreateName(''); hideCreate() } if (event.key === 'Escape') hideCreate() }}
+                placeholder="Nom de la playlist" />
+              <div className="zra-create-hint">Ensuite : glisse des titres dessus, ou clic droit → « Ajouter à une playlist ». Spotify, YouTube et fichiers locaux peuvent cohabiter.</div>
+              <div className="zra-create-actions">
+                <button type="button" className="zra-create-ghost" onClick={() => { setCreateName(''); hideCreate() }}>Annuler</button>
+                <button disabled={!createName.trim() || !!busy} onClick={() => { savePlaylist(createName.trim(), [], {}, true); setCreateName(''); hideCreate() }}>Créer</button>
+              </div>
+            </div>}
+          </div>
+        </div>
+        {/* 3 sections, uniquement (retour Matthieu 2026-07-20, Albums SUPPRIMÉ) : Tracks = tous les
+            médias audio du site (scan lazy au 1er clic), This Folder = le dossier Create ouvert,
+            Playlists = les playlists (Spotify + ZenRay). */}
+        <div className="zra-filter-chips">
+          <button className={section === 'tracks' ? 'is-active' : ''} onClick={() => { onClearPlaylist?.(); onClearArtist?.(); setSection('tracks'); setQuery(''); onLoadAllTracks?.() }}>Tracks</button>
+          {/* T7 (2026-07-22) : ce chip est AUSSI une cible de drop -- y déposer un morceau (depuis la pochette
+              ou le titre du lecteur, ou une ligne du panneau central) CRÉE un média dans le dossier courant,
+              comme un upload, ensuite visible dans This Folder et dans Create. */}
+          <button className={`${section === 'folder' ? 'is-active' : ''}${dropTarget === 'folder' ? ' is-drop-target' : ''}${justAdded === 'folder' ? ' zra-just-added' : ''}`}
+            onDragOver={(event) => onRowDragOver(event, 'folder')} onDragLeave={() => onRowDragLeave('folder')}
+            onDrop={(event) => onRowDrop(event, 'folder', async (track) => {
+              const result = await onSaveTrackToFolder?.(track)
+              // Un morceau LOCAL est déjà un média du site : rien à créer, on bascule juste sur This Folder.
+              if (result && result.reason === 'already-local') { onClearPlaylist?.(); setSection('folder') }
+            })}
+            onClick={() => { onClearPlaylist?.(); onClearArtist?.(); setSection('folder'); setQuery('') }}>This Folder</button>
+          <button className={section === 'playlists' ? 'is-active' : ''} onClick={() => setSection('playlists')}>Playlists</button>
+        </div>
+        <label className="zra-library-search">
+          <Icon name="magnifyingglass" size={16} />
+          <input value={librarySearch} onChange={(event) => setLibrarySearch(event.target.value)} placeholder="Rechercher" />
+        </label>
+        {/* Bibliothèque Spotify RÉELLE (retour 2026-07-19 : "chargé pour la gauche depuis mon profil
+            spotify directement"). Sans connexion, un seul CTA -- pas de placeholder mensonger. */}
+        {!spotifyConnected && <button className="zra-spotify-connect" onClick={onConnectSpotify}>
+          <Icon name="link" size={16} /><span><strong>Connecter Spotify</strong><small>Charge tes playlists et titres likés</small></span>
+        </button>}
+        {/* Bug réel corrigé le 2026-07-19 ("boutons Tout/Playlists/Albums fonctionnent pas") : les 3
+            boutons changeaient bien `section`, mais RIEN ci-dessous ne lisait cette valeur -- la liste
+            entière (playlists Spotify + titres + albums + playlists ZenRay) s'affichait TOUJOURS en
+            entier, quel que soit le bouton actif. Chaque bloc est maintenant conditionné à `section`. */}
+        <div className="zra-library-list">
+          {/* Liked Songs = playlist OMNIPRÉSENTE (retour 2026-07-19), jamais filtrée par Tout/Playlists/
+              Albums ni par la recherche -- deux entrées distinctes : Spotify réel (lecture seule, "aimé"
+              sur le vrai compte) et ZenRay natif (propre à l'app, titres toutes sources confondues). */}
+          {spotifyConnected && matchesLib('Liked Songs') && <button className={activePlaylist?.key === 'spotify-liked' ? 'is-current' : ''} onClick={onPlaySpotifyLiked} disabled={!spotifyLikedTracks?.length}>
+            <span className="zra-liked" style={{ background: 'linear-gradient(135deg,#450af5,#c4efd9)' }}><Icon name="heart.fill" size={17} color="#fff" /></span>
+            <span><strong>Liked Songs</strong><small>{spotifyLikedTracks?.length || 0} titres · Spotify</small></span>
+          </button>}
+          {matchesLib('Titres likés') && <button
+            className={`${section === 'liked' ? 'is-current' : ''}${dropTarget === 'liked' ? ' is-drop-target' : ''}${justAdded === 'liked' ? ' zra-just-added' : ''}`}
+            onClick={() => { onClearPlaylist?.(); onClearArtist?.(); setSection('liked'); setQuery('') }}
+            onDragOver={(event) => onRowDragOver(event, 'liked')} onDragLeave={() => onRowDragLeave('liked')}
+            onDrop={(event) => onRowDrop(event, 'liked', addLiked)}>
+            <span className="zra-liked"><Icon name="heart.fill" size={17} color="#fff" /></span>
+            <span><strong>Titres likés</strong><small>{zenrayLikedTracks.length} titres · ZenRay</small></span>
+          </button>}
+          {/* Section Playlists : ZenRay D'ABORD (les playlists de Matthieu avant celles importées de
+              Spotify -- retour 2026-07-20), chaque groupe REPLIABLE (chevron, état persisté).
+              Sections Tracks / This Folder : les PISTES elles-mêmes, cliquables. libSection : pendant
+              un drag de piste, la liste montre les playlists (cibles de drop). */}
+          {libSection === 'playlists' && <button type="button" className="zra-group-head" onClick={() => toggleLibGroup('zenray')}>
+            <Icon name={libGroups?.zenray ? 'chevron.right' : 'chevron.down'} size={11} />ZenRay
+          </button>}
+          {(libSection === 'tracks' || libSection === 'folder') && allTracksLoading && libSection === 'tracks' && <div className="zra-library-note">Scan du site…</div>}
+          {(libSection === 'tracks' || libSection === 'folder') && (libSection === 'tracks' ? allTracks : tracks).filter((track) => matchesLib(`${track.title} ${track.artist}`)).map((track, index, list) => (
+            <button key={`${trackId(track)}:${index}`} className={now === track ? 'is-current' : ''}
+              onClick={() => playTracks(list, index)} onContextMenu={(event) => openContext(event, track)}
+              draggable onDragStart={(event) => dragTrackStart(event, track)}>
+              <Artwork src={track.cover} size={40} radius={4} />
+              <span><strong>{track.title}</strong><small><SourceBadge source={track.source} size={10} />{track.artist}</small></span>
+            </button>
+          ))}
+          {libSection === 'playlists' && !libGroups?.zenray && playlists.filter((playlist) => matchesLib(playlist.manifest.title || playlist.manifest.name)).map((playlist) => <button key={playlist.path}
+            className={`${activePlaylist?.key === playlist.path ? 'is-current' : ''}${dropTarget === playlist.path ? ' is-drop-target' : ''}${justAdded === playlist.path ? ' zra-just-added' : ''}`}
+            onClick={() => playRow(playlist)}
+            onDragOver={(event) => onRowDragOver(event, playlist.path)} onDragLeave={() => onRowDragLeave(playlist.path)}
+            onDrop={(event) => onRowDrop(event, playlist.path, (track) => onAddTrackToPlaylistPath?.(track, playlist.path))}>
+            <Artwork src={playlist.manifest?.cover} size={40} radius={4} /><span><strong>{playlist.manifest?.title || playlist.manifest?.name || 'Playlist'}</strong><small>Playlist · ZenRay</small></span></button>)}
+          {libSection === 'playlists' && spotifyConnected && <button type="button" className="zra-group-head" onClick={() => toggleLibGroup('spotify')}>
+            <Icon name={libGroups?.spotify ? 'chevron.right' : 'chevron.down'} size={11} />{spotifyProfile?.display_name ? `Spotify · ${spotifyProfile.display_name}` : 'Spotify'}
+          </button>}
+          {libSection === 'playlists' && spotifyConnected && !libGroups?.spotify && spotifyLibraryLoading && <div className="zra-library-note">Chargement…</div>}
+          {libSection === 'playlists' && spotifyConnected && !libGroups?.spotify && spotifyPlaylistsData.filter((playlist) => matchesLib(playlist.name)).map((playlist) => <button key={playlist.id} className={activePlaylist?.key === playlist.id ? 'is-current' : ''} onClick={() => onPlaySpotifyPlaylist(playlist)}><Artwork src={playlist.images?.[0]?.url} size={40} radius={4} /><span><strong>{playlist.name}</strong><small><SourceBadge source="spotify" size={10} />Playlist · {playlist.owner?.display_name || 'Spotify'}</small></span></button>)}
+        </div>
+      </aside>}
+
+      <main className="zra-center" aria-label="Album et titres"
+        onDragOver={(event) => { if (activePlaylist?.kind === 'zenray' && hasDragTrack(event)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy' } }}
+        onDrop={(event) => {
+          // DOUBLON AU RÉORDONNANCEMENT corrigé (2026-07-22) : quand on re-glisse une ligne DÉJÀ dans la
+          // playlist pour la déplacer, si le drop n'atterrit pas pile sur une autre ligne il remontait
+          // jusqu'ici et AJOUTAIT la piste une 2e fois. Un drag qui PART de cette liste (dragIndexRef posé)
+          // est un RÉORDONNANCEMENT : cette zone l'ignore, seule la ligne cible le traite.
+          if (dragIndexRef.current != null) { dragIndexRef.current = null; return }
+          if (activePlaylist?.kind === 'zenray') onRowDrop(event, activePlaylist.key, (track) => onAddTrackToPlaylistPath?.(track, activePlaylist.key))
+        }}>
+        {loading ? <div className="zra-loading">Synchronisation de la bibliothèque…</div> : activeArtist ? (
+          // Page artiste (2026-07-19, feature "cliquer sur l'artiste") : bandeau + titres populaires +
+          // albums, comme la vue officielle Spotify (référence donnée par Matthieu). Remplace la vue
+          // album/playlist tant qu'un artiste est ouvert -- jamais empilée dessus.
+          <section className="zra-artist-body">
+            <header className="zra-artist-hero" style={activeArtist.image ? { backgroundImage: `linear-gradient(180deg, rgba(0,0,0,.15), var(--zra-bg)), url(${coverUrl(activeArtist.image)})` } : undefined}>
+              <h1>{activeArtist.name || 'Artiste'}</h1>
+              {activeArtist.followers != null && <span className="zra-artist-followers">{activeArtist.followers.toLocaleString('fr-FR')} auditeurs mensuels</span>}
+            </header>
+            <div className="zra-album-actions">
+              {/* Bug réel corrigé le 2026-07-20 ("il manque la fonctionnalité pause") : l'onClick relançait
+                  TOUJOURS playTracks depuis le début, même quand cette liste jouait déjà -- impossible de
+                  mettre en pause depuis ce bouton. isActiveHere (référence exacte, pas juste le titre)
+                  détermine si le morceau en cours appartient à CETTE liste : si oui, le bouton bascule
+                  play/pause via player.toggle() ; sinon il démarre la liste. */}
+              <button className="zra-play-large" onClick={() => { if (now && activeArtist.topTracks.includes(now)) player.toggle(); else playTracks(activeArtist.topTracks) }} disabled={!activeArtist.topTracks.length}>
+                <Icon name={player.playing && now && activeArtist.topTracks.includes(now) ? 'pause' : 'play.fill'} size={22} />
+              </button>
+              <button className={player.shuffle ? 'is-on' : ''} onClick={() => player.setShuffle(!player.shuffle)} title="Lecture aléatoire"><Icon name="shuffle" size={21} /></button>
+            </div>
+            {activeArtist.loading
+              ? <div className="zra-loading">Chargement de l’artiste…</div>
+              : <>
+                  <h2 className="zra-artist-section-title">Popular</h2>
+                  {renderTrackList(activeArtist.topTracks)}
+                  {activeArtist.albums.length > 0 && <>
+                    <h2 className="zra-artist-section-title">Albums</h2>
+                    <div className="zra-artist-albums">
+                      {activeArtist.albums.map((album) => (
+                        <button key={album.id} className="zra-artist-album" onClick={() => onOpenArtistAlbum?.(album)}>
+                          <Artwork src={album.cover} size={140} radius={6} />
+                          <strong>{album.title}</strong>
+                          {album.year && <small>{album.year}</small>}
+                        </button>
+                      ))}
+                    </div>
+                  </>}
+                </>}
+          </section>
+        ) : <>
+          {/* Plus de hero pleine largeur avec grosse pochette (retour 2026-07-19 : "la grosse pochette
+              avec les images qui ne sert à rien") -- un bandeau compact garde le contexte (titre, nombre
+              de titres) sans manger l'espace vertical que les lignes de titres doivent occuper. */}
+          <section className="zra-album-body">
+            <header className="zra-album-header">
+              {/* T5 : la pochette d'une playlist ZenRay est CLIQUABLE -> popover de changement d'image
+                  (image du site via l'index, ou upload/⌘V). Sur un album/playlist Spotify (lecture seule),
+                  elle reste un simple visuel. */}
+              {activePlaylist?.kind === 'zenray' ? (
+                <div className="zra-cover-anchor">
+                  {/* stopPropagation du pointerdown : sans lui, le listener global de fermeture (ci-dessus)
+                      passait AVANT le onClick -> il fermait, puis le toggle rouvrait aussitôt = popover
+                      impossible à refermer en recliquant la pochette. */}
+                  <button type="button" className="zra-cover-btn" title="Changer la pochette"
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={() => setCoverPickerOpen((v) => !v)}>
+                    <Artwork src={centerCover} size={44} radius={5} />
+                    <span className="zra-cover-edit"><Icon name="pencil" size={12} /></span>
+                  </button>
+                  {coverPickerOpen && <CoverPicker onClose={() => setCoverPickerOpen(false)}
+                    onPick={(url) => onSetPlaylistCover?.(activePlaylist.key, url)} />}
+                </div>
+              ) : <Artwork src={centerCover} size={44} radius={5} />}
+              <div className="zra-album-header-copy"><strong>{centerTitle}</strong><span>{centerSubtitle} · {activePlaylist?.loading ? 'chargement…' : `${visibleTracks.length} titre${visibleTracks.length > 1 ? 's' : ''}`}</span></div>
+            </header>
+            <div className="zra-album-actions">
+              {/* Même correction que la page artiste ci-dessus : toggle play/pause si CETTE liste joue
+                  déjà (référence exacte dans visibleTracks), sinon on la démarre. L'ancien test sur le
+                  TITRE d'album (now?.album === activeAlbum?.title) était en plus faux pour une playlist
+                  ouverte (activeAlbum n'a alors rien à voir avec ce qui joue). */}
+              <button className="zra-play-large" onClick={() => { if (now && visibleTracks.includes(now)) player.toggle(); else playTracks(visibleTracks) }} disabled={!visibleTracks.length}><Icon name={player.playing && now && visibleTracks.includes(now) ? 'pause' : 'play.fill'} size={22} /></button>
+              <button className={player.shuffle ? 'is-on' : ''} onClick={() => player.setShuffle(!player.shuffle)} title="Lecture aléatoire"><Icon name="shuffle" size={21} /></button>
+              {/* SEUL bouton d'action secondaire conservé (décision Matthieu 2026-07-22 : « garde les 3 petits
+                  points, supprime les 2 autres »). Les anciens « Ajouter des titres » (zra-add-tracks) et la
+                  corbeille ont été RETIRÉS ici -- inutiles/bugués ; « Supprimer la playlist » vit maintenant
+                  dans ce menu ••• (contextMenuItems, conditionnel playlist ZenRay). L'ajout de titres se fera
+                  au DRAG-AND-DROP (chantier en cours) et via la recherche. */}
+              <button title="Plus d’actions" onClick={(event) => {
+                // Playlist NON vide : menu ••• sur le 1er titre (contient « Supprimer la playlist »).
+                if (visibleTracks[0]) { openContext(event, visibleTracks[0]); return }
+                // Playlist VIDE (0 titre) : pas de track à cibler -> la seule action playlist = suppression directe
+                // (sinon une playlist vide devenait indestructible après retrait de la corbeille du header).
+                if (activePlaylist?.kind === 'zenray' && window.confirm(`Supprimer la playlist « ${activePlaylist.name} » ?`)) onDeletePlaylistPath?.(activePlaylist.key)
+              }}><Icon name="ellipsis" size={18} /></button>
+              <span className="zra-list-mode">Liste <Icon name="list.bullet" size={14} /></span>
+            </div>
+            {renderTrackList(visibleTracks)}
+          </section>
+        </>}
+      </main>
+
+      {/* Sidebar droite réduite au strict minimum (retour 2026-07-19 : "pochette carré + l'artiste rien
+          d'autres") -- plus de carte "à propos de l'artiste" ni de file d'attente visible ici. */}
+      {rightOpen && <aside className="zra-now" aria-label="Contexte de lecture">
+        <Artwork src={now?.cover} size="100%" radius={8} className="zra-now-art" />
+        <div className="zra-now-meta">
+          {/* Nom d'artiste cliquable (2026-07-19, panneau de droite -- 2e des 3 emplacements demandés) :
+              même règle que le lecteur (MiniPlayerCard.jsx ArtistLink) -- seul un titre Spotify avec un
+              ID d'artiste connu ouvre sa page, surlignage au survol pour confirmer que ça fonctionne. */}
+          {/* Artiste cliquable : ID Spotify direct si dispo, SINON (titre local/YouTube) recherche Spotify par
+              NOM (2026-07-22). Reste non cliquable seulement si aucun nom d'artiste. */}
+          {now?.artists?.[0]?.id
+            ? <button type="button" className="zra-artist-link" onClick={() => onOpenArtist?.(now.artists[0].id, now.artist)} title={`Voir la page de ${now.artist}`}><strong>{now.artist}</strong></button>
+            : (now?.artist && onOpenArtistByName)
+              ? <button type="button" className="zra-artist-link" onClick={() => onOpenArtistByName(now.artist)} title={`Chercher ${now.artist} sur Spotify`}><strong>{now.artist}</strong></button>
+              : <strong>{now?.artist || 'ZenRay Audio'}</strong>}
+          {now?.title && <small>{now.title}</small>}
+        </div>
+        {player.playError && <div className="zra-error" role="alert">{player.playError}</div>}
+      </aside>}
+    </div>
+
+    <footer className="zra-player-wrap" aria-label="Lecteur transversal">
+      <MiniPlayerCard dark={dark} mode="horizontal" onClose={onClose} maxWidth={1400} onOpenArtist={onOpenArtist} onOpenArtistByName={onOpenArtistByName}
+        rateNode={now?.source === 'local' && <button className="zra-rate" onClick={() => player.setRate(([1, 1.25, 1.5, 1.75, 2])[(([1, 1.25, 1.5, 1.75, 2]).indexOf(player.rate || 1) + 1) % 5])}>{player.rate || 1}×</button>} />
+    </footer>
+
+    {dragging && <div className="zra-drop"><Icon name="music.note" size={44} /><strong>Déposer pour importer dans ZenRay Audio</strong><small>ZenRayShards · streamable</small></div>}
+    {selectedTracks.length > 0 && <div className="zra-selection"><input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="Nom de la playlist" /><button onClick={() => savePlaylist(newName, selectedTracks)} disabled={!newName.trim() || !!busy}>Créer avec {selectedTracks.length}</button></div>}
+    {contextMenu}
+    {playlistPicker}
+  </section>
+}

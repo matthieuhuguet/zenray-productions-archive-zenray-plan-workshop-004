@@ -1,0 +1,144 @@
+// Journal des operations Git/drive (ecritures GitHub API) — en memoire, anneau borne.
+// But : tracer chaque ecriture distante (PUT/POST/DELETE contents, git/blobs, git/trees,
+// git/commits, git/refs, pulls...) pour un panneau "Repo Commands" dans l'UI.
+//
+// CONTRAINTE P0 (anti-fuite) : JAMAIS de nom de media humain dans `command`/`detail`.
+// Les chemins exposes sont anonymises : on garde la structure (repo, type de ressource,
+// dossier de tete) mais le segment terminal (basename, qui peut contenir un titre humain
+// sous pages/) est remplace par un hash court non reversible. Les chemins deja haches
+// (ab/cd/<sha>) passent tels quels — ils ne portent aucun nom humain.
+//
+// Stockage en memoire process : suffisant en local (node scripts/local-server.mjs) et
+// acceptable en serverless (le log se vide entre cold starts, ce n'est qu'un fil d'activite
+// recent, pas une source de verite). Aucune persistance disque/repo voulue.
+
+import crypto from 'node:crypto' // préfixe `node:` OBLIGATOIRE sur Workers : la forme nue ne se résout pas
+
+const MAX = 300
+/** @type {Array<object>} anneau : on push en fin, on shift en tete au-dela de MAX */
+const ring = []
+let seq = 0
+
+// --- Anonymisation des chemins ----------------------------------------------
+// Un segment "haché" = uniquement [A-Za-z0-9] et long (>= 16), ou un sha hex >= 7.
+const isHashy = (s) => /^[A-Fa-f0-9]{7,}$/.test(s) || (/^[A-Za-z0-9._-]+$/.test(s) && s.replace(/[._-]/g, '').length >= 24)
+
+function shortHash(s) {
+  return crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 8)
+}
+
+// Anonymise un chemin de contenu : garde les segments structurels (dossiers connus,
+// segments deja haches) et masque tout segment "humain" (titre de page, nom de fichier
+// lisible) en `~<hash8>` + extension preservee.
+export function anonPath(p) {
+  if (typeof p !== 'string' || !p) return p
+  // git refs / endpoints non-contents : pas de nom humain, laisser tel quel
+  if (!p.includes('/')) return p
+  let path = p
+  let query = ''
+  const q = path.indexOf('?')
+  if (q >= 0) { query = path.slice(q); path = path.slice(0, q) }
+  try { path = decodeURI(path) } catch {}
+  const segs = path.split('/')
+  const out = segs.map((seg, i) => {
+    if (!seg) return seg
+    // 1er segment = dossier de tete structurel (pages, media, build, ab/cd hash...) -> garder s'il est court & connu
+    if (isHashy(seg)) return seg
+    if (i < segs.length - 1) {
+      // segment intermediaire : si court & sans espace, c'est structurel (dossier) -> garder
+      if (seg.length <= 12 && !/\s/.test(seg) && /^[A-Za-z0-9._-]+$/.test(seg)) return seg
+      return `~${shortHash(seg)}`
+    }
+    // dernier segment (basename) : preserver l'extension, masquer le nom
+    const dot = seg.lastIndexOf('.')
+    const ext = dot > 0 ? seg.slice(dot) : ''
+    const base = dot > 0 ? seg.slice(0, dot) : seg
+    if (isHashy(base)) return seg
+    return `~${shortHash(base)}${ext}`
+  })
+  return out.join('/') + query
+}
+
+// Construit la representation lisible d'une commande : "<METHOD> <ressource anonymisee>".
+export function describeCommand(method, resourcePath) {
+  const m = (method || 'GET').toUpperCase()
+  // git/* et user/* et pulls : endpoints structurels, pas de chemin contenu -> brut
+  if (/^(git\/|pulls$|pulls\b|user\/|repos$)/.test(resourcePath) || !resourcePath.includes('contents/')) {
+    return `${m} ${resourcePath.split('?')[0]}`
+  }
+  // contents/<path> -> anonymiser la partie <path>
+  const idx = resourcePath.indexOf('contents/')
+  const head = resourcePath.slice(0, idx + 'contents/'.length)
+  const tail = resourcePath.slice(idx + 'contents/'.length)
+  return `${m} ${head}${anonPath(tail)}`
+}
+
+// Enregistre une operation au statut "pending". Retourne un handle id.
+export function logStart({ repo, dir, action, command }) {
+  const id = ++seq
+  const entry = {
+    id,
+    ts: Date.now(),
+    repo: repo || null,
+    dir: dir ? anonPath(dir) : null,
+    action: action || null,
+    command: command || null,
+    status: 'pending',
+    httpStatus: null,
+    detail: null,
+  }
+  ring.push(entry)
+  while (ring.length > MAX) ring.shift()
+  return id
+}
+
+// Cloture une operation (success/failed). detail = court extrait lisible (jamais de nom humain).
+export function logEnd(id, { status, httpStatus, detail } = {}) {
+  const e = ring.find((x) => x.id === id)
+  if (!e) return
+  e.status = status || (httpStatus && httpStatus < 400 ? 'success' : 'failed')
+  if (httpStatus != null) e.httpStatus = httpStatus
+  if (detail != null) e.detail = String(detail).slice(0, 400)
+}
+
+// Enveloppe un wrapper fetch existant (ex: gh(token, path, init)) pour journaliser
+// AUTOMATIQUEMENT toute ecriture (PUT/POST/DELETE). Les lectures (GET) ne sont pas loggees.
+//   raw  : la fonction fetch d'origine
+//   meta : { repoOf(args) -> string, pathOf(args) -> string, initOf(args) -> init }
+// Retourne une fonction de meme signature qui logge puis delegue.
+export function instrument(raw, meta) {
+  return async function (...args) {
+    let id = null
+    let path = ''
+    let method = 'GET'
+    try {
+      path = meta.pathOf(args) || ''
+      const init = meta.initOf ? meta.initOf(args) : (args.find((a) => a && a.method) || {})
+      method = (init && init.method) || 'GET'
+      if (method !== 'GET' && method !== 'HEAD') {
+        const repo = meta.repoOf ? meta.repoOf(args) : null
+        const dir = path.includes('contents/') ? path.slice(path.indexOf('contents/') + 9) : path
+        id = logStart({ repo, dir, action: method.toLowerCase(), command: describeCommand(method, path) })
+      }
+    } catch {}
+    try {
+      const res = await raw(...args)
+      if (id != null) {
+        let detail = null
+        if (res && res.status >= 400) {
+          try { detail = (await res.clone().text()).slice(0, 300) } catch {}
+        }
+        logEnd(id, { httpStatus: res ? res.status : null, detail })
+      }
+      return res
+    } catch (err) {
+      if (id != null) logEnd(id, { status: 'failed', detail: err && err.message })
+      throw err
+    }
+  }
+}
+
+// Snapshot pour l'API : du plus recent au plus ancien.
+export function snapshot() {
+  return ring.slice().reverse()
+}

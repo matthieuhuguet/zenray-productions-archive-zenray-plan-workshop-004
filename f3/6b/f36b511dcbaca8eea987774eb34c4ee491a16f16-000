@@ -1,0 +1,109 @@
+#!/usr/bin/env node
+// AttachSidecarSubtitles.mjs (12 October 2026): put a subtitle file that already sits in the cloud (a *.srt.file.json next to the
+// film, uploaded as an ordinary file) INSIDE the film's manifest, so the player offers it. Nothing is re-downloaded from a film.
+// FR : range dans le manifeste d'un film un sous-titre deja dans le cloud (fichier adjacent), sans toucher a la video.
+//
+//   node scripts/AttachSidecarSubtitles.mjs --clone <zenray-data clone> --map <map.json> [--commit] [--dry]
+//   map.json = [{ "manifest": "pages/.../Film.mkv.media.json", "sidecar": "pages/.../Film.fr.srt.file.json", "lang": "fre" }]
+// Three checks before anything is written: the bytes match the sidecar's SHA-256, the text really is in the announced language,
+// and the last cue ends within the film's duration (a subtitle of another release is refused).
+import fs from 'node:fs'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { gzipSync } from 'node:zlib'
+import { SUB_ENCODING } from '../src/lib/subtitleSidecar.js'
+import { withCloneLock } from './lib/clone-lock.mjs'
+
+const LABELS = { fre: 'Français', eng: 'English', jpn: '日本語' }
+const WORDS = {
+  fre: /\b(le|la|les|des|est|pas|vous|je|nous|une|dans|pour|qui|que|mais|avec|c'est|il|elle)\b/gi,
+  eng: /\b(the|you|and|is|to|of|that|it|in|for|with|this|are|was)\b/gi,
+}
+
+export function detectLanguage(text) {
+  const score = (re) => (text.match(re) || []).length
+  const fre = score(WORDS.fre)
+  const eng = score(WORDS.eng)
+  return fre > eng * 1.3 ? 'fre' : eng > fre * 1.3 ? 'eng' : 'und'
+}
+
+export function lastCueEnd(srt) {
+  let last = 0
+  for (const m of srt.matchAll(/(\d+):(\d\d):(\d\d)[,.](\d{3})\s*-->\s*(\d+):(\d\d):(\d\d)[,.](\d{3})/g)) {
+    last = Math.max(last, Number(m[5]) * 3600 + Number(m[6]) * 60 + Number(m[7]) + Number(m[8]) / 1000)
+  }
+  return last
+}
+
+export function timingFits(lastEnd, duration) {
+  if (!duration || !lastEnd) return false
+  return lastEnd <= duration * 1.02 && lastEnd >= duration * 0.6
+}
+
+async function fetchSidecar(file, token) {
+  const chunks = []
+  for (const part of file.parts) {
+    for (const chunk of part.chunks) {
+      const url = `https://raw.githubusercontent.com/matthieuhuguet/${part.repo}/${part.commit}/${chunk}`
+      const res = await fetch(url, { headers: { Authorization: `token ${token}` } })
+      if (!res.ok) throw new Error(`chunk ${chunk}: HTTP ${res.status}`)
+      chunks.push(Buffer.from(await res.arrayBuffer()))
+    }
+  }
+  const bytes = Buffer.concat(chunks)
+  if (crypto.createHash('sha256').update(bytes).digest('hex') !== file.sha256) throw new Error('sidecar SHA-256 mismatch')
+  return bytes
+}
+
+async function main() {
+  const argv = process.argv.slice(2)
+  const value = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : '' }
+  const clone = path.resolve(value('--clone'))
+  const entries = JSON.parse(fs.readFileSync(value('--map'), 'utf8'))
+  const dry = argv.includes('--dry')
+  const token = process.env.GITHUB_TOKEN || execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim()
+  const report = []
+  const touched = []
+  for (const entry of entries) {
+    const row = { manifest: path.basename(entry.manifest), lang: entry.lang }
+    try {
+      const manifestPath = path.join(clone, entry.manifest)
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+      if ((manifest.subtitles || []).some((s) => s.lang === entry.lang)) { row.status = 'already_has_language'; report.push(row); continue }
+      const file = JSON.parse(fs.readFileSync(path.join(clone, entry.sidecar), 'utf8'))
+      const bytes = await fetchSidecar(file, token)
+      const text = bytes.toString('utf8')
+      const detected = detectLanguage(text)
+      const end = lastCueEnd(text)
+      Object.assign(row, { detected, lastCueEnd: Math.round(end), duration: Math.round(manifest.duration || 0) })
+      if (detected !== entry.lang) { row.status = `refused_language_${detected}`; report.push(row); continue }
+      if (!timingFits(end, manifest.duration)) { row.status = 'refused_timing'; report.push(row); continue }
+      row.status = dry ? 'would_attach' : 'attached'
+      if (!dry) {
+        const tracks = manifest.subtitles || []
+        tracks.unshift({ id: `sub-sidecar-${entry.lang}`, lang: entry.lang, label: LABELS[entry.lang] || entry.lang, format: 'srt',
+          encoding: SUB_ENCODING || 'gzip+base64', data: gzipSync(bytes, { level: 9 }).toString('base64') })
+        manifest.subtitles = tracks
+        manifest.subtitlesAttachedAt = new Date().toISOString()
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+        touched.push(entry.manifest)
+      }
+    } catch (error) { row.status = `error: ${String(error.message).slice(0, 120)}` }
+    report.push(row)
+  }
+  console.log(JSON.stringify(report, null, 1))
+  if (argv.includes('--commit') && touched.length) {
+    await withCloneLock(clone, 'sidecar subtitles', async () => {
+      const git = (...a) => execFileSync('git', ['-C', clone, ...a], { stdio: 'pipe' })
+      git('add', '--', ...touched)
+      git('-c', 'user.name=ZenRay Bot', '-c', 'user.email=bot@zenray.local', 'commit', '-q', '-m', `subtitles: ${touched.length} sidecar track(s) attached`)
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        try { git('push', 'origin', 'HEAD:main'); break } catch (error) { if (attempt === 3) throw error; git('pull', '--rebase', 'origin', 'main') }
+      }
+    })
+    console.log(`committed ${touched.length}`)
+  }
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) main()

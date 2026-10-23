@@ -1,0 +1,53 @@
+// attach-subtitles.mjs : put the restyled ASS track of each episode INSIDE its video manifest.
+// Usage: GITHUB_TOKEN=.. node scripts/attach-subtitles.mjs "<dest folder in Create>" "<dir with the soft-sub mkv>" [--dry]
+//   dest example: pages/Anime/Bleach/S17    (manifests are "<base>.<ext>.media.json", ext of the uploaded file)
+// For each <base>.mkv in the dir: ffmpeg extracts subtitle track 0, gzip + base64, written to
+// manifest.subtitles = [{ lang, label, format, encoding, data }] in zenray-data, by ONE git commit
+// (bulk rule: git only, never the REST API in a loop). The player (VideoPlayer2 + JASSUB/libass) reads it.
+// FR : range la piste ASS restylee de chaque episode DANS son manifeste video, en un seul commit git.
+import { execFileSync } from 'node:child_process'
+import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs'
+import { gzipSync } from 'node:zlib'
+import path from 'node:path'
+import { SUB_ENCODING } from '../src/lib/subtitleSidecar.js'
+
+const token = process.env.GITHUB_TOKEN
+const [dest, dir] = process.argv.slice(2).filter((a) => !a.startsWith('--'))
+const dry = process.argv.includes('--dry')
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+if (!token || !dest || !dir) { console.error('usage: GITHUB_TOKEN=.. node attach-subtitles.mjs <dest> <mkvDir> [--dry]'); process.exit(1) }
+
+const work = path.join(process.env.HOME, '.zr-archive-work-subs')
+const repoDir = path.join(work, 'zenray-data')
+const git = (args, opts = {}) => execFileSync('git', ['-C', repoDir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts })
+
+if (!existsSync(repoDir)) {
+  mkdirSync(work, { recursive: true })
+  execFileSync('git', ['clone', '--filter=blob:none', '--sparse', '--depth=1', `https://x-access-token:${token}@github.com/${OWNER}/zenray-data.git`, repoDir], { stdio: 'inherit' })
+}
+git(['sparse-checkout', 'set', dest])
+git(['pull', '--ff-only'])
+
+const episodes = readdirSync(dir).filter((f) => /\.mkv$/i.test(f)).sort()
+const changed = []
+for (const file of episodes) {
+  const ext = path.extname(file).slice(1).toLowerCase()
+  const base = path.basename(file, path.extname(file))
+  const manifestFile = path.join(repoDir, dest, `${base}.${ext}.media.json`)
+  if (!existsSync(manifestFile)) { console.log(`  - ${base}: manifest not online yet, skipped`); continue }
+  const ass = execFileSync('ffmpeg', ['-v', 'error', '-i', path.join(dir, file), '-map', '0:s:0', '-f', 'ass', '-'], { maxBuffer: 1 << 28 })
+  if (ass.length < 1000 || !ass.includes(Buffer.from('[Events]'))) throw new Error(`${base}: extracted subtitle looks empty`)
+  const manifest = JSON.parse(readFileSync(manifestFile, 'utf8'))
+  if (manifest.type !== 'video-raw') throw new Error(`${base}: unexpected manifest type ${manifest.type}`)
+  manifest.subtitles = [{ lang: 'fre', label: 'Français', format: 'ass', encoding: SUB_ENCODING, data: gzipSync(ass, { level: 9 }).toString('base64') }]
+  writeFileSync(manifestFile, JSON.stringify(manifest))
+  changed.push(base)
+  console.log(`  + ${base}: ${(ass.length / 1024).toFixed(0)} KB ASS -> ${(manifest.subtitles[0].data.length / 1024).toFixed(0)} KB in manifest`)
+}
+if (!changed.length) { console.log('nothing to commit'); process.exit(0) }
+if (dry) { git(['checkout', '--', '.']); console.log('dry run: reverted'); process.exit(0) }
+git(['add', '--', dest])
+git(['commit', '-m', `subtitles ${changed.length} episode(s) ${dest.split('/').slice(-2).join('/')}`])
+git(['push'])
+console.log(`✓ pushed ${changed.length} manifest(s) with subtitles`)
+process.exit(0)

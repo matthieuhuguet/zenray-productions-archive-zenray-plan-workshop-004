@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+# Dump COMPLET des transcripts d'un (ou plusieurs) run Workflow : pour chaque sous-agent,
+# on capture son intention (1er message), tout son TEXTE assistant, et ses sorties
+# structurees (StructuredOutput / findings). Ecrit un markdown lisible + un JSON des findings.
+# Usage: python3 scripts/dump_transcripts.py <dir1> [<dir2> ...]
+
+import json, glob, os, sys
+
+DIRS = sys.argv[1:]
+OUT_MD = "docs/AUDIT-2026-06-06-transcripts.md"
+OUT_FINDINGS = "docs/AUDIT-2026-06-06-findings.json"
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, dict):
+                if b.get("type") == "text" and b.get("text"):
+                    out.append(b["text"])
+                elif b.get("type") == "tool_use" and b.get("name"):
+                    nm = b["name"]
+                    if "StructuredOutput" in nm or "structured" in nm.lower():
+                        try:
+                            out.append("[StructuredOutput]\n" + json.dumps(b.get("input", {}), ensure_ascii=False, indent=2))
+                        except Exception:
+                            pass
+        return "\n".join(out)
+    return ""
+
+def collect_findings(obj, sink, seen):
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            f = cur.get("findings")
+            if isinstance(f, list) and f and isinstance(f[0], dict) and "title" in f[0]:
+                for fnd in f:
+                    if isinstance(fnd, dict):
+                        k = (fnd.get("id") or "") + "|" + (fnd.get("title") or "")
+                        if k.strip("|") and k not in seen:
+                            seen.add(k); sink.append(fnd)
+            for v in cur.values():
+                if isinstance(v, (dict, list)): stack.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)): stack.append(v)
+
+findings = []
+seen = set()
+agents = []  # {file, intent, text, chars}
+
+for D in DIRS:
+    for fp in sorted(glob.glob(os.path.join(D, "**", "agent-*.jsonl"), recursive=True)):
+        intent = ""
+        texts = []
+        try:
+            with open(fp, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line: continue
+                    try: obj = json.loads(line)
+                    except Exception: continue
+                    collect_findings(obj, findings, seen)
+                    # message structure: {message:{role, content}} ou {role, content}
+                    msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+                    role = msg.get("role")
+                    content = msg.get("content")
+                    if role == "user" and not intent:
+                        t = text_of(content)
+                        if t: intent = t[:400]
+                    if role == "assistant":
+                        t = text_of(content)
+                        if t and t.strip(): texts.append(t)
+        except Exception:
+            continue
+        full = "\n\n".join(texts).strip()
+        agents.append({"file": os.path.basename(fp), "intent": intent, "text": full, "chars": len(full)})
+
+# Ecriture findings (re-affirme le json deja sauve, dedupe)
+os.makedirs("docs", exist_ok=True)
+with open(OUT_FINDINGS, "w", encoding="utf-8") as fh:
+    json.dump(findings, fh, ensure_ascii=False, indent=2)
+
+# Ecriture markdown des transcripts (agents avec du contenu utile)
+agents.sort(key=lambda a: -a["chars"])
+lines = ["# Transcripts complets — runs workflow zenray-audit-improve (2026-06-06)", ""]
+lines.append(f"Dossiers: {', '.join(DIRS)}")
+lines.append(f"Agents parses: {len(agents)} · avec texte: {sum(1 for a in agents if a['chars']>40)} · findings dedup: {len(findings)}")
+lines.append("")
+for a in agents:
+    if a["chars"] <= 40:  # agents vides / echoues (ex 'session limit')
+        continue
+    lines.append(f"## {a['file']}  ({a['chars']} chars)")
+    if a["intent"]:
+        lines.append(f"_Intent_: {a['intent'].splitlines()[0][:200]}")
+    lines.append("")
+    lines.append(a["text"])
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+with open(OUT_MD, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines))
+
+import collections
+nonempty = [a for a in agents if a["chars"] > 40]
+print(f"agents total: {len(agents)}")
+print(f"agents avec contenu: {len(nonempty)}")
+print(f"findings dedup: {len(findings)}")
+print(f"chars total ecrits: {sum(a['chars'] for a in nonempty)}")
+print(f"-> {OUT_MD}")
+print(f"-> {OUT_FINDINGS}")

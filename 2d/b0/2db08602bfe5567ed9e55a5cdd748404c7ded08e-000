@@ -1,0 +1,132 @@
+// cdnFallbackLoader.test.js (14 October 2026)
+import { describe, it, expect, vi } from 'vitest'
+import { CDN_POLICY, cdnKeyOf, createCdnHealth, createCdnFallbackLoader } from './cdnFallbackLoader.js'
+
+const COMMIT = '2428e268e33e7f097bd5ba7237d0f929edab7957'
+const CDN = (n) => `https://cdn.jsdelivr.net/gh/matthieuhuguet/zenray-vid-public-80@${COMMIT}/film/chunk_0_${String(n).padStart(5, '0')}.m4s`
+const RAW = (n) => `https://raw.githubusercontent.com/matthieuhuguet/zenray-vid-public-80/${COMMIT}/film/chunk_0_${String(n).padStart(5, '0')}.m4s`
+
+// Fake hls.js loader: the outcome of a URL is given by the `outcomes` map, one instance can be used once.
+function fakeLoaderFactory(outcomes, calls) {
+  return class FakeLoader {
+    constructor() { this.stats = { loading: { start: 0 }, aborted: false }; this.destroyed = false }
+    getResponseHeader() { return null }
+    abort() { this.aborted = true }
+    destroy() { this.destroyed = true }
+    load(context, config, callbacks) {
+      if (this.stats.loading.start) throw new Error('Loader can only be used once.')
+      this.stats.loading.start = 1
+      calls.push({ url: context.url, loadPolicy: config.loadPolicy })
+      const outcome = outcomes[context.url] || 'ok'
+      queueMicrotask(() => {
+        if (outcome === 'ok') callbacks.onSuccess({ url: context.url, data: 'bytes' }, this.stats, context, null)
+        else if (outcome === 'timeout') callbacks.onTimeout(this.stats, context, null)
+        else callbacks.onError({ code: 404, text: 'nope' }, context, null, this.stats)
+      })
+    }
+  }
+}
+
+const baseConfig = () => ({ loadPolicy: { maxTimeToFirstByteMs: 15000, maxLoadTimeMs: 120000, timeoutRetry: { maxNumRetry: 4 }, errorRetry: { maxNumRetry: 10 } } })
+const run = (loader, context, config = baseConfig()) => new Promise((resolve) => {
+  loader.load(context, config, {
+    onSuccess: (response) => resolve({ ok: true, response }),
+    onError: (error) => resolve({ ok: false, error }),
+    onTimeout: () => resolve({ ok: false, timeout: true }),
+    onAbort: () => resolve({ ok: false, aborted: true }),
+  })
+})
+
+describe('cdnKeyOf', () => {
+  it('names the commit of a jsDelivr URL and ignores anything else', () => {
+    expect(cdnKeyOf(CDN(1))).toBe(`matthieuhuguet/zenray-vid-public-80@${COMMIT}`)
+    expect(cdnKeyOf('/api/hls?path=pages%2Fx.m3u8')).toBeNull()
+    expect(cdnKeyOf(RAW(1))).toBeNull()
+  })
+})
+
+describe('createCdnHealth', () => {
+  it('sends a commit to raw after the configured failures, then probes jsDelivr again', () => {
+    let now = 1000
+    const health = createCdnHealth({ ...CDN_POLICY, failuresBeforeRaw: 2, rawFirstMs: 5000 }, () => now)
+    const key = cdnKeyOf(CDN(1))
+    expect(health.preferRaw(key)).toBe(false)
+    health.fail(key)
+    expect(health.preferRaw(key)).toBe(false)
+    health.fail(key)
+    expect(health.preferRaw(key)).toBe(true)
+    now += 5001
+    expect(health.preferRaw(key)).toBe(false) // window over: probe
+    health.fail(key)                          // the probe failed: straight back to raw
+    expect(health.preferRaw(key)).toBe(true)
+    health.ok(key)
+    expect(health.preferRaw(key)).toBe(false)
+  })
+})
+
+describe('createCdnFallbackLoader', () => {
+  it('uses jsDelivr once when it answers, with a short first byte window and no retry', async () => {
+    const calls = []
+    const Loader = createCdnFallbackLoader(fakeLoaderFactory({}, calls), { health: createCdnHealth() })
+    const result = await run(new Loader({}), { url: CDN(1) })
+    expect(result.ok).toBe(true)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe(CDN(1))
+    expect(calls[0].loadPolicy.maxTimeToFirstByteMs).toBe(CDN_POLICY.firstByteMs)
+    expect(calls[0].loadPolicy.errorRetry).toBeNull()
+    expect(calls[0].loadPolicy.timeoutRetry).toBeNull()
+  })
+
+  it('asks GitHub raw at once when jsDelivr refuses, with the original retry policy', async () => {
+    const calls = []
+    const Loader = createCdnFallbackLoader(fakeLoaderFactory({ [CDN(2)]: 'error' }, calls), { health: createCdnHealth() })
+    const result = await run(new Loader({}), { url: CDN(2) })
+    expect(result.ok).toBe(true)
+    expect(calls.map((c) => c.url)).toEqual([CDN(2), RAW(2)])
+    expect(calls[1].loadPolicy.errorRetry).toEqual({ maxNumRetry: 10 })
+    expect(calls[1].loadPolicy.maxTimeToFirstByteMs).toBe(15000)
+  })
+
+  it('also falls back when jsDelivr gives no byte in time', async () => {
+    const calls = []
+    const Loader = createCdnFallbackLoader(fakeLoaderFactory({ [CDN(3)]: 'timeout' }, calls), { health: createCdnHealth() })
+    const result = await run(new Loader({}), { url: CDN(3) })
+    expect(result.ok).toBe(true)
+    expect(calls.map((c) => c.url)).toEqual([CDN(3), RAW(3)])
+  })
+
+  it('goes straight to raw for a commit that failed twice (no jsDelivr wait left)', async () => {
+    const calls = []
+    const health = createCdnHealth()
+    const Loader = createCdnFallbackLoader(fakeLoaderFactory({ [CDN(4)]: 'error', [CDN(5)]: 'error' }, calls), { health })
+    await run(new Loader({}), { url: CDN(4) })
+    await run(new Loader({}), { url: CDN(5) })
+    calls.length = 0
+    const result = await run(new Loader({}), { url: CDN(6) })
+    expect(result.ok).toBe(true)
+    expect(calls.map((c) => c.url)).toEqual([RAW(6)])
+  })
+
+  it('leaves a non CDN request (playlist through /api/hls) untouched', async () => {
+    const calls = []
+    const Loader = createCdnFallbackLoader(fakeLoaderFactory({}, calls), { health: createCdnHealth() })
+    const config = baseConfig()
+    const result = await run(new Loader({}), { url: '/api/hls?path=pages%2Fx.m3u8' }, config)
+    expect(result.ok).toBe(true)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe('/api/hls?path=pages%2Fx.m3u8')
+    expect(calls[0].loadPolicy).toBe(config.loadPolicy)
+  })
+
+  it('does not start the raw attempt after an abort', async () => {
+    const calls = []
+    const Loader = createCdnFallbackLoader(fakeLoaderFactory({ [CDN(7)]: 'error' }, calls), { health: createCdnHealth() })
+    const loader = new Loader({})
+    const done = vi.fn()
+    loader.load({ url: CDN(7) }, baseConfig(), { onSuccess: done, onError: done, onTimeout: done, onAbort: done })
+    loader.abort()
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(calls.map((c) => c.url)).toEqual([CDN(7)])
+    expect(done).not.toHaveBeenCalled()
+  })
+})

@@ -1,0 +1,312 @@
+// MIGRATION VIDÉO EAGLE -> SHARD LOCAL PUIS PUSH UNIQUE (plan validé Matthieu 2026-06-10).
+//
+// POURQUOI : ni l'API GitHub (5000 req/h) ni le git push sur un gros shard existant (hang) ne tiennent
+// sur des milliers de vidéos. SOLUTION : on construit chaque shard NEUF en local (git init, repo vide
+// distant), on y empile les segments fMP4 de plusieurs vidéos jusqu'à ~4,5 Go, puis UN SEUL git push
+// (pousser un repo frais vers un remote vide = propre, jamais de hang). Une fois le commit obtenu, on
+// écrit les manifestes (URL jsDelivr@commit) en LOT via arbre Git inline (3 appels API/shard), on vérifie
+// que les segments répondent 200, puis on purge les sources du shard. Disque libéré par paquets de ~4,5 Go.
+//
+// ORDRE : plus PETITES vidéos d'abord (vide vite l'inventaire). Arborescence Eagle (pages/References/<dossier>).
+// Séquentiel strict, 1 ffmpeg à la fois, segments sur disque (RAM minimale), /tmp purgé après chaque vidéo.
+import { readdir, readFile, rename, writeFile, appendFile, mkdir, rm, stat, copyFile, symlink } from 'node:fs/promises'
+import { existsSync, createReadStream } from 'node:fs'
+import { execFile, spawnSync } from 'node:child_process'
+import { promisify } from 'node:util'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+const exec = promisify(execFile)
+
+// HASH PAR FLUX : ne charge JAMAIS le fichier entier en RAM (RAM bornée, demande Matthieu, 48 Go).
+function sha256File(p) {
+  return new Promise((res, rej) => { const h = createHash('sha256'); const s = createReadStream(p); s.on('data', (c) => h.update(c)); s.on('end', () => res(h.digest('hex'))); s.on('error', rej) })
+}
+// kill défensif des orphelins (ffmpeg/git d'un run précédent qui hangerait et bouffe la RAM)
+function killOrphans() { try { spawnSync('pkill', ['-9', '-x', 'ffmpeg']); } catch {} try { spawnSync('pkill', ['-9', '-x', 'git']); } catch {} }
+
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN requis'); process.exit(1) }
+const OWNER = 'matthieuhuguet', DATA = 'zenray-data', BRANCH = 'main'
+const LIB = '/Users/zenray/Create/Media/References/References.library'
+const TRASH = '/Users/zenray/.zr-eagle-trash/video'
+const PROG = '/Users/zenray/.zr-eagle-trash/video-migration.json'
+const RESTORE = '/Users/zenray/.zr-eagle-trash/restore-video.tsv'
+const TMP = '/tmp/zr_fmp4'
+const WORK = '/tmp/zr-vid-bulk'   // shard local en construction
+const FFMPEG = '/opt/homebrew/bin/ffmpeg', FFPROBE = '/opt/homebrew/bin/ffprobe'
+// SHARD_CAP abaissé 2,5 -> 1,5 Go (2026-06-10) : GitHub REJETTE les pushes amenant un repo à ~4 Go (shards 3,88 Go OK,
+// 4,00 Go rejetés en série, reproductible). À 2,5 Go, deux vidéos de 2 Go empilaient un shard à 4 Go avant flush.
+// À 1,5 Go, une grosse vidéo (2 Go) dépasse le cap et flushe SEULE sur son shard (~2 Go, sous la zone de rejet).
+const HLS_TIME = 6, SEG_MAX = 19 * 1024 * 1024, SHARD_CAP = 1.5 * 1024 ** 3
+const LIMIT = process.argv.includes('--limit') ? Number(process.argv[process.argv.indexOf('--limit') + 1]) : 0
+const MAX_SIZE = process.argv.includes('--max-size') ? Number(process.argv[process.argv.indexOf('--max-size') + 1]) : Infinity
+const sha256 = (b) => createHash('sha256').update(b).digest('hex')
+const shardPathFor = (h, ext) => `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.${ext}`
+const sanitize = (s) => String(s || '').replace(/[^\p{L}\p{N} ._-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 80) || '_'
+const slug = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+const GENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/usr/bin/true' }
+const git = (dir, a, timeout = 0) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', env: GENV, timeout: timeout || undefined, killSignal: 'SIGKILL' })
+const VIDEXT = ['mp4', 'webm', 'mov', 'mkv']
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// --- API throw-safe (manifestes texte uniquement) ---
+async function gh(p, init = {}, tries = 5) {
+  for (let i = 0; i < tries; i++) {
+    try { return await fetch(`https://api.github.com/${p}`, { ...init, headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zr-vid-bulk', ...(init.headers || {}) } }) }
+    catch { await sleep(1500 * (i + 1)) }
+  }
+  return { ok: false, status: 0, json: async () => ({}), text: async () => '' }
+}
+// commit d'un lot de fichiers TEXTE (manifestes/playlists) via arbre inline : 1 tree + 1 commit + 1 ref.
+async function commitInline(repo, files, msg) {
+  for (let a = 0; a < 8; a++) {
+    const ref = await (await gh(`repos/${OWNER}/${repo}/git/ref/heads/${BRANCH}`)).json(); const head = ref.object?.sha; if (!head) { await sleep(1500); continue }
+    const base = (await (await gh(`repos/${OWNER}/${repo}/git/commits/${head}`)).json()).tree?.sha; if (!base) { await sleep(1500); continue }
+    const tree = files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', content: f.content }))
+    const nt = await (await gh(`repos/${OWNER}/${repo}/git/trees`, { method: 'POST', body: JSON.stringify({ base_tree: base, tree }) })).json(); if (!nt.sha) { await sleep(2000); continue }
+    const nc = await (await gh(`repos/${OWNER}/${repo}/git/commits`, { method: 'POST', body: JSON.stringify({ message: msg, tree: nt.sha, parents: [head] }) })).json(); if (!nc.sha) { await sleep(2000); continue }
+    const up = await gh(`repos/${OWNER}/${repo}/git/refs/heads/${BRANCH}`, { method: 'PATCH', body: JSON.stringify({ sha: nc.sha, force: false }) })
+    if (up.ok) return true
+    await sleep(1500)
+  }
+  return false
+}
+const headStatus = async (url, auth = false) => { try { const r = await fetch(url, { method: 'HEAD', headers: auth ? { Authorization: `Bearer ${TOKEN}` } : {} }); return r.status } catch { return 0 } }
+const repoExistsRemote = (name) => { try { spawnSync('git', ['ls-remote', `https://x-access-token:${TOKEN}@github.com/${OWNER}/${name}.git`, 'HEAD'], { stdio: 'ignore', timeout: 60000 }); return true } catch { return false } }
+
+// --- arbre des dossiers Eagle ---
+const meta = JSON.parse(await readFile(path.join(LIB, 'metadata.json'), 'utf8'))
+const fmap = new Map(); (function walk(arr, prefix) { for (const f of arr || []) { const p2 = prefix ? `${prefix}/${sanitize(f.name)}` : sanitize(f.name); fmap.set(f.id, p2); if (f.children) walk(f.children, p2) } })(meta.folders, '')
+
+// --- progress (réutilise le même fichier, skip done) ---
+let prog = { startedAt: Date.now(), updatedAt: Date.now(), running: true, current: null, done: [], failed: [], savedBytes: 0, purgedBytes: 0, totalVideos: 0, totalBytes: 0, shards: [] }
+try { prog = { ...prog, ...JSON.parse(await readFile(PROG, 'utf8')), running: true } } catch {}
+const doneIds = new Set(prog.done.map((d) => d.id))
+const save = async () => { prog.updatedAt = Date.now(); await writeFile(PROG, JSON.stringify(prog, null, 2)) }
+
+// --- inventaire : plus petites d'abord ---
+const dirs = (await readdir(path.join(LIB, 'images'), { withFileTypes: true })).filter((d) => d.isDirectory() && d.name.endsWith('.info')).map((d) => d.name)
+let vids = []
+for (const d of dirs) {
+  let m; try { m = JSON.parse(await readFile(path.join(LIB, 'images', d, 'metadata.json'), 'utf8')) } catch { continue }
+  const ext = (m.ext || '').toLowerCase()
+  if (!VIDEXT.includes(ext) || doneIds.has(m.id)) continue
+  if ((m.size || 0) > MAX_SIZE) continue
+  vids.push({ dir: d, id: m.id, name: m.name || m.id, ext, size: m.size || 0, folders: m.folders || [] })
+}
+vids.sort((a, b) => a.size - b.size)
+if (LIMIT) vids = vids.slice(0, LIMIT)
+prog.totalVideos = vids.length + prog.done.length
+await save()
+console.log(`${vids.length} vidéos à migrer (plus petites d'abord, ${(vids.reduce((s, v) => s + v.size, 0) / 1073741824).toFixed(1)} Go)`)
+
+async function findVideoFile(dirAbs) {
+  let best = null, bestSize = -1
+  for (const f of await readdir(dirAbs)) { if (!VIDEXT.includes(f.split('.').pop().toLowerCase()) || f.includes('_thumbnail')) continue; const s = (await stat(path.join(dirAbs, f))).size; if (s > bestSize) { bestSize = s; best = f } }
+  return best ? path.join(dirAbs, best) : null
+}
+
+// --- transcode une vidéo -> segments fMP4 dans outDir (garde-fou 19 Mo). Renvoie {segs, init, duration, vcodec, acodec} ou null. ---
+async function transcode(input, outDir) {
+  await rm(outDir, { recursive: true, force: true }); await mkdir(outDir, { recursive: true })
+  let probe; try { probe = JSON.parse((await exec(FFPROBE, ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type,codec_name', '-of', 'json', input])).stdout) } catch { return null }
+  const vcodec = (probe.streams.find((s) => s.codec_type === 'video') || {}).codec_name || ''
+  const acodec = (probe.streams.find((s) => s.codec_type === 'audio') || {}).codec_name || ''
+  const duration = Number(probe.format?.duration) || 0
+  const baseCmd = (vargs, t = HLS_TIME) => ['-y', '-loglevel', 'error', '-i', input, ...vargs, '-f', 'hls', '-hls_time', String(t), '-hls_playlist_type', 'vod', '-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', 'init.mp4', '-hls_segment_filename', path.join(outDir, 'seg_%03d.m4s'), path.join(outDir, 'stream.m3u8')]
+  let strat = 'copy'
+  try { await exec(FFMPEG, baseCmd(['-c', 'copy']), { maxBuffer: 1 << 23 }) }
+  catch { strat = 'hw'; try { await exec(FFMPEG, baseCmd(['-c:v', 'h264_videotoolbox', '-b:v', '6M', '-c:a', 'aac', '-ac', '2', '-b:a', '160k', '-force_key_frames', `expr:gte(t,n_forced*${HLS_TIME})`]), { maxBuffer: 1 << 23 }) } catch { return null } }
+  // garde-fou 19 Mo (limite service jsDelivr)
+  let files = await readdir(outDir), segs = files.filter((f) => /\.m4s$/.test(f)).sort()
+  const maxSeg = async () => Math.max(...(await Promise.all(segs.map((f) => stat(path.join(outDir, f)).then((x) => x.size)))), 0)
+  for (const r of [{ t: 3 }, { t: 2 }, { t: 1 }, { t: 6, reenc: true }]) {
+    if ((await maxSeg()) <= SEG_MAX) break
+    for (const f of files) if (/\.m4s$|\.m3u8$|init\.mp4/.test(f)) await rm(path.join(outDir, f), { force: true })
+    const vargs = (r.reenc || strat !== 'copy') ? ['-c:v', 'h264_videotoolbox', '-b:v', '6M', '-c:a', 'aac', '-ac', '2', '-b:a', '160k', '-force_key_frames', `expr:gte(t,n_forced*${r.t})`] : ['-c', 'copy']
+    if (r.reenc) strat = 'hw'
+    try { await exec(FFMPEG, baseCmd(vargs, r.t), { maxBuffer: 1 << 23 }) } catch { return null }
+    files = await readdir(outDir); segs = files.filter((f) => /\.m4s$/.test(f)).sort()
+  }
+  if (!existsSync(path.join(outDir, 'init.mp4')) || !segs.length) return null
+  return { segs, init: 'init.mp4', duration, vcodec, acodec, strat }
+}
+
+// --- shard local : ouvrir / fermer (push unique + manifestes + vérif + purge) ---
+let shardNum = 0
+function nextFreeShard() {
+  // UN seul appel : liste les repos zenray-vid-public-* et prend max(NN)+1. Pas de boucle ls-remote (hang).
+  try {
+    const out = spawnSync('gh', ['api', '--paginate', 'user/repos?per_page=100', '--jq', '.[].name'], { encoding: 'utf8', timeout: 60000 }).stdout || ''
+    let max = 22
+    for (const m of out.matchAll(/zenray-vid-public-(\d{2,})/g)) max = Math.max(max, parseInt(m[1], 10))
+    return max + 1
+  } catch { return 23 }
+}
+let shard = null, shardDir = null, shardBytes = 0, sincePush = 0, pending = []  // pending: [{v, base, dest, segMap{name->shardPath}, init, segs(localnames), duration, vcodec, acodec}]
+const PUSH_CHUNK = 150 * 1024 * 1024 // pousse tous les ~150 Mo (RAM git bornée ~170 Mo, mesuré)
+
+async function openShard() {
+  shardNum = shardNum ? shardNum + 1 : nextFreeShard()
+  shard = `zenray-vid-public-${String(shardNum).padStart(2, '0')}`
+  shardDir = path.join(WORK, shard)
+  await rm(shardDir, { recursive: true, force: true }); await mkdir(shardDir, { recursive: true })
+  git(shardDir, ['init', '-q']); git(shardDir, ['branch', '-M', 'main'])
+  // ANTI-RAM (vidéo déjà compressée = delta inutile et coûteux) : git ne doit NI deltifier NI zlib-compresser.
+  // ANTI-RAM CRITIQUE : gc.auto 0 (l'auto-gc repack TOUT le repo en RAM = 40 Go observés) + zéro delta/compression.
+  for (const [k, v] of [['user.email', 'bot@zenray'], ['user.name', 'zenray-bot'],
+    ['gc.auto', '0'], ['gc.autoDetach', 'false'], ['maintenance.auto', 'false'],
+    ['core.bigFileThreshold', '1m'], ['core.compression', '0'], ['core.looseCompression', '0'], ['pack.compression', '0'],
+    ['pack.window', '0'], ['pack.depth', '0'], ['pack.threads', '1'], ['pack.windowMemory', '32m'],
+    // http.version HTTP/1.1 (2026-06-10) : sur certains réseaux (nouveau wifi), le HTTP/2 par défaut de git CASSE
+    // les gros pushes (erreur 500 + « unexpected disconnect while reading sideband packet »), alors que les petits
+    // passent. Testé : un push de 144 Mo échoue en HTTP/2, réussit en HTTP/1.1. postBuffer monté à 512 Mo.
+    ['pack.deltaCacheSize', '1m'], ['http.postBuffer', '524288000'], ['http.version', 'HTTP/1.1']]) git(shardDir, ['config', k, v])
+  await writeFile(path.join(shardDir, 'README.md'), `# ${shard}\nZenRay drive — shard vidéo public (segments fMP4/CMAF, hashés, servis via jsDelivr).\n`)
+  // créer le repo distant VIDE + établir origin avec le commit README (push minuscule)
+  // ROBUSTE : un 401/timeout transitoire de l'API GitHub (auth gh momentanément KO) ne doit PLUS tuer toute la
+  // migration. On retente la création 5× avec backoff ; un « already exists » = succès ; sinon fallback REST direct
+  // (POST /user/repos) qui n'utilise pas GraphQL. N'échoue qu'après épuisement de toutes les voies.
+  const repoExists = () => spawnSync('gh', ['repo', 'view', `${OWNER}/${shard}`, '--json', 'name'], { encoding: 'utf8' }).status === 0
+  let created = false
+  for (let attempt = 1; attempt <= 5 && !created; attempt++) {
+    const r = spawnSync('gh', ['repo', 'create', `${OWNER}/${shard}`, '--public', '-d', 'ZenRay drive — shard vidéo public (fMP4/jsDelivr)'], { encoding: 'utf8' })
+    if (r.status === 0 || /already exists|Name already/i.test((r.stderr || '') + (r.stdout || ''))) { created = true; break }
+    // fallback REST (pas de GraphQL) avec le token capturé
+    const rest = spawnSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', '-H', `Authorization: Bearer ${TOKEN}`, 'https://api.github.com/user/repos', '-d', JSON.stringify({ name: shard, private: false, description: 'ZenRay drive — shard vidéo public (fMP4/jsDelivr)' })], { encoding: 'utf8' })
+    if (/^(201|422)$/.test((rest.stdout || '').trim()) || repoExists()) { created = true; break }
+    console.error(`repo create tentative ${attempt}/5 échec (${shard}):`, ((r.stderr || '').slice(0, 100)) + ' | REST ' + (rest.stdout || ''))
+    await sleep(3000 * attempt)
+  }
+  if (!created) { console.error('repo create épuisé', shard); throw new Error('repo-create') }
+  await sleep(1500)
+  git(shardDir, ['add', '-A']); git(shardDir, ['commit', '-q', '-m', 'init'])
+  git(shardDir, ['remote', 'add', 'origin', `https://x-access-token:${TOKEN}@github.com/${OWNER}/${shard}.git`])
+  git(shardDir, ['push', '-q', 'origin', 'HEAD:main'], 120000)
+  if (!prog.shards.includes(shard)) prog.shards.push(shard)
+  shardBytes = 0; sincePush = 0; pending = []
+  console.log(`\n>>> SHARD ${shard} ouvert (remote créé, push incrémental 150 Mo)`)
+}
+
+// PUSH INCRÉMENTAL : commit + push ce qui s'est accumulé (~150 Mo) -> pack petit -> RAM ~170 Mo (mesuré).
+// Jamais un gros pack d'un coup (git deltifie/repack en RAM = explose). Retour false si push échoue.
+async function pushChunk() {
+  const st = git(shardDir, ['status', '--porcelain'])
+  if (!st.stdout.trim()) return true
+  git(shardDir, ['add', '-A']); git(shardDir, ['commit', '-q', '-m', `+segments`])
+  for (let a = 0; a < 4; a++) { const ps = git(shardDir, ['push', '-q', 'origin', 'HEAD:main'], 300000); if (ps.status === 0) { sincePush = 0; return true } console.error(`  push retry ${a + 1}/4`, (ps.stderr || '').slice(-140)); await sleep(3000 * (a + 1)) }
+  return false
+}
+
+async function flushShard() {
+  if (!pending.length) return
+  // push final de ce qui reste, puis on fige le commit
+  if (!await pushChunk()) { console.error('PUSH FINAL ÉCHEC — sources conservées', shard); for (const p of pending) prog.failed.push({ id: p.v.id, name: p.v.name, reason: 'push-shard' }); await save(); pending = []; return }
+  const commit = git(shardDir, ['rev-parse', 'HEAD']).stdout.trim()
+  console.log(`  ✓ shard ${shard} poussé (commit ${commit.slice(0, 7)}, ${(shardBytes / 1073741824).toFixed(2)} Go, ${pending.length} vidéos)`)
+
+  // 2) manifestes + playlists -> zenray-data (1 commit inline)
+  const jsd = (sp) => `https://cdn.jsdelivr.net/gh/${OWNER}/${shard}@${commit}/${sp}`
+  const textBlobs = []
+  for (const p of pending) {
+    // réécrit la playlist (gardée en RAM) avec les URLs jsDelivr finales
+    let pl = p.plRaw.split('\n').map((line) => {
+      const mm = line.match(/^#EXT-X-MAP:URI="([^"]+)"/); if (mm) return line.replace(mm[1], jsd(p.segMap['init.mp4']))
+      const t = line.trim(); if (/^seg_\d+\.m4s$/.test(t)) return jsd(p.segMap[t]); return line
+    }).join('\n')
+    const baseDir = `${p.dest}/${p.base}`
+    const masterPath = `${baseDir}/master.m3u8`, mediaPath = `${baseDir}/stream.m3u8`
+    const master = `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=6000000,CODECS="${p.vcodec === 'vp9' ? 'vp09.00.50.08' : 'avc1.640028'}"\n/api/hls?path=${encodeURIComponent(mediaPath)}\n`
+    const manifest = { type: 'hls', v: 1, name: `${p.base}.mp4`, mime: 'application/vnd.apple.mpegurl', duration: p.duration, master: masterPath, enc: 'none', container: 'fmp4', vcodec: p.vcodec, acodec: p.acodec, publicRepo: shard, commitPublic: commit, segments: p.segs.length, count: p.segs.length, size: p.bytes, createdAt: new Date().toISOString() }
+    textBlobs.push({ path: mediaPath, content: pl }, { path: masterPath, content: master }, { path: `${baseDir}/${p.base}.mp4.media.json`, content: JSON.stringify(manifest, null, 2) })
+    p.firstSegUrl = jsd(p.segMap[p.segs[0]]); p.mfPath = `${baseDir}/${p.base}.mp4.media.json`
+  }
+  let ok = true
+  for (let i = 0; i < textBlobs.length; i += 600) { if (!await commitInline(DATA, textBlobs.slice(i, i + 600), `vidéos fMP4 ${shard}`)) { ok = false; break } }
+  if (!ok) { console.error('MANIFESTES ÉCHEC — sources conservées'); for (const p of pending) prog.failed.push({ id: p.v.id, name: p.v.name, reason: 'manifest' }); await save(); pending = []; return }
+
+  // 3) VÉRIF RAPIDE = le segment est-il sur GITHUB (raw) ? (vérité backup ; jsDelivr ne fait que servir
+  //    plus tard, cold cache lent). En PARALLÈLE ×16 -> ~3 s au lieu de 30 min. 200 raw -> purge sûre.
+  const rawOf = (u) => u.replace(/^https:\/\/cdn\.jsdelivr\.net\/gh\/([^/]+)\/([^@]+)@([^/]+)\//, 'https://raw.githubusercontent.com/$1/$2/$3/')
+  let vi = 0
+  const verdicts = new Array(pending.length)
+  await Promise.all(Array.from({ length: 16 }, async () => {
+    while (vi < pending.length) { const k = vi++; const p = pending[k]
+      let code = 0; for (let i = 0; i < 3 && code !== 200; i++) { code = await headStatus(rawOf(p.firstSegUrl), true); if (code !== 200) await sleep(1000) }
+      verdicts[k] = code }
+  }))
+  for (let k = 0; k < pending.length; k++) {
+    const p = pending[k]
+    if (verdicts[k] !== 200) { console.error(`  vérif KO (${verdicts[k]}) ${p.base} — source conservée`); prog.failed.push({ id: p.v.id, name: p.v.name, reason: 'verify-' + verdicts[k] }); continue }
+    try {
+      await rm(path.join(LIB, 'images', p.v.dir), { recursive: true, force: true })
+      await appendFile(RESTORE, `${p.v.dir}\t${p.v.id}\t${(p.v.name || '').replace(/\t/g, ' ')}\t${p.v.size}\tPURGED\n`)
+      prog.done.push({ id: p.v.id, name: p.v.name, size: p.v.size, base: p.base, dest: p.dest, shard })
+      prog.savedBytes += p.v.size; prog.purgedBytes += p.v.size
+    } catch (e) { prog.failed.push({ id: p.v.id, name: p.v.name, reason: 'purge:' + String(e).slice(0, 50) }) }
+  }
+  await save()
+  console.log(`  ✓ ${pending.length} manifestes + vérif + purge. Total purgé: ${(prog.purgedBytes / 1073741824).toFixed(1)} Go`)
+  await rm(shardDir, { recursive: true, force: true })
+  pending = []
+}
+
+// --- boucle principale ---
+await mkdir(WORK, { recursive: true }); await mkdir(TMP, { recursive: true })
+await openShard()
+let n = 0
+for (const v of vids) {
+  n++
+  const dirAbs = path.join(LIB, 'images', v.dir)
+  const real = await findVideoFile(dirAbs)
+  if (!real) { prog.failed.push({ id: v.id, name: v.name, reason: 'no-video-file' }); continue }
+  prog.current = { id: v.id, name: v.name, size: v.size }; await save()
+  const base = `${slug(v.name) || 'video'}-${v.id.slice(-5).toLowerCase()}`
+  const outDir = path.join(TMP, base)
+  const res = await transcode(real, outDir)
+  if (!res) { prog.failed.push({ id: v.id, name: v.name, reason: 'transcode' }); await rm(outDir, { recursive: true, force: true }); continue }
+  // taille du fMP4 — hash PAR FLUX + copyFile (OS, zéro RAM). On ne charge jamais un segment entier en mémoire.
+  // PUSH INTRA-VIDÉO (2026-06-10) : on pousse tous les ~150 Mo PENDANT la copie des segments, plus jamais la vidéo
+  // entière d'un coup. Avant : une vidéo de 2 Go = UN git push de 2 Go, que le réseau coupe (500 à mi-POST, retries
+  // ratés en boucle = dizaines de Go re-émis pour rien). Un push de 150 Mo passe partout. Les segments d'une vidéo
+  // non finalisée sont pousser-ables sans risque : blobs adressés par hash, le manifeste n'arrive qu'au flushShard.
+  let vbytes = 0; let copiedSincePush = 0; let pushKO = false; const segMap = {}
+  for (const f of [res.init, ...res.segs]) {
+    const src = path.join(outDir, f)
+    const fsz = (await stat(src)).size; vbytes += fsz
+    const sp = shardPathFor(await sha256File(src), f.endsWith('.mp4') ? 'mp4' : 'm4s'); segMap[f] = sp
+    const dst = path.join(shardDir, sp); await mkdir(path.dirname(dst), { recursive: true }); await copyFile(src, dst)
+    copiedSincePush += fsz
+    if (copiedSincePush >= PUSH_CHUNK) { if (!await pushChunk()) { pushKO = true; break } copiedSincePush = 0 }
+  }
+  if (pushKO) {
+    console.error(`push intra-vidéo échec — abandon shard ${shard}, ${v.name} retentée plus tard, on continue`)
+    prog.failed.push({ id: v.id, name: v.name, reason: 'push-shard' })
+    for (const p of pending) prog.failed.push({ id: p.v.id, name: p.v.name, reason: 'push-shard' })
+    await save(); pending = []; await rm(outDir, { recursive: true, force: true })
+    await openShard(); continue
+  }
+  const folderPath = v.folders.length ? (fmap.get(v.folders[0]) || '_Unsorted') : '_Unsorted'
+  const plRaw = await readFile(path.join(outDir, 'stream.m3u8'), 'utf8') // gardé en RAM (Ko) -> outDir purgeable de suite
+  pending.push({ v, base, dest: `pages/References/${folderPath}`, segMap, init: res.init, segs: res.segs, duration: res.duration, vcodec: res.vcodec, acodec: res.acodec, bytes: vbytes, plRaw })
+  shardBytes += vbytes; sincePush += vbytes
+  console.log(`  [${n}/${vids.length}] ${v.name} (${(v.size / 1048576).toFixed(0)} Mo src -> ${(vbytes / 1048576).toFixed(0)} Mo fMP4) [shard ${(shardBytes / 1073741824).toFixed(2)} Go]`)
+  await rm(outDir, { recursive: true, force: true }) // temp libéré tout de suite (segments copiés dans le shard, playlist gardée en RAM via plRaw)
+  // Push raté (réseau / rejet GitHub) : ON NE TUE PLUS toute la run. On abandonne le shard courant (ses vidéos =
+  // sources CONSERVÉES, marquées 'push-shard' donc retentées au prochain lancement après nettoyage), et on repart
+  // sur un shard frais pour continuer la file. Avant : `break` mettait fin à TOUT au premier hoquet.
+  if (sincePush >= PUSH_CHUNK) {
+    if (!await pushChunk()) {
+      console.error(`push incrément échec — abandon shard ${shard}, vidéos retentées plus tard, on continue`)
+      for (const p of pending) prog.failed.push({ id: p.v.id, name: p.v.name, reason: 'push-shard' })
+      await save(); pending = []; shardBytes = 0; sincePush = 0
+      await openShard(); continue
+    }
+  }
+  if (shardBytes >= SHARD_CAP) { await flushShard(); await openShard() }
+}
+await flushShard()
+prog.running = false; prog.current = null; await save()
+// purge des outDir de ce run
+for (const d of await readdir(TMP).catch(() => [])) await rm(path.join(TMP, d), { recursive: true, force: true }).catch(() => {})
+console.log(`\n=== TERMINÉ — ${prog.done.length} vidéos, ${(prog.purgedBytes / 1073741824).toFixed(1)} Go purgés, ${prog.failed.length} échecs ===`)

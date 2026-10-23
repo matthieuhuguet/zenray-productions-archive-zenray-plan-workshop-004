@@ -1,0 +1,87 @@
+import { rawFallbackUrl } from '../../src/lib/streamFiles.js'
+// film-poster.mjs (11 October 2026): the poster (thumbnail) of a film must be a PUBLIC jsDelivr URL.
+// FR : le poster d'un film doit etre une URL publique jsDelivr. Les URL /api/raw-proxy d'un shard prive exigent
+// ZENRAY_RAW_TOKEN, absent de la production Cloudflare : toutes les miniatures sortaient noires (11 October 2026).
+import fs from 'node:fs'
+import { execFileSync } from 'node:child_process'
+
+// 11 October 2026: every tunable value of the film poster in one place.
+export const FILM_POSTER = {
+  proxyPrefix: '/api/raw-proxy',
+  cdnBase: 'https://cdn.jsdelivr.net/gh',
+  cdnHost: 'cdn.jsdelivr.net',
+  fileName: 'poster.jpg',
+  repairDir: 'posters',
+  repairRepo: 'zenray-poster-public-01',
+  widthPx: 640,
+  jpegQuality: '3',
+  fallbackAtSec: 1,
+  ffmpegTimeoutMs: 60000,
+  minBytes: 2048,
+  maxBytes: 8 * 1024 * 1024,
+  // 14 October 2026: jsDelivr answered HTTP 403 for a poster pushed seconds earlier (propagation of a new commit), which threw away an 18 minute
+  // push of 5.6 GB and made the next attempt repackage and push everything again. The check now waits up to about 5 minutes (12 attempts, 5 s
+  // growing to 30 s) before it fails. FR : jsDelivr repond 403 quelques secondes apres un push ; on attend jusqu'a 5 minutes avant d'echouer.
+  verifyAttempts: 12,
+  verifyDelayMs: 5000,
+  verifyDelayMaxMs: 30000,
+  // a local HLS playlist whose segments are https URLs needs https in the whitelist (ffmpeg default is file,crypto,data)
+  protocolWhitelist: 'file,crypto,data,https,tls,tcp',
+  ffmpeg: fs.existsSync('/opt/homebrew/bin/ffmpeg') ? '/opt/homebrew/bin/ffmpeg' : 'ffmpeg',
+}
+
+export const isProxiedPoster = (url) => typeof url === 'string' && url.startsWith(FILM_POSTER.proxyPrefix)
+
+// Reads {owner, repo, commit, path} out of /api/raw-proxy?u=<raw.githubusercontent.com url>; null when it is not one.
+export function parseProxiedPoster(url) {
+  if (!isProxiedPoster(url)) return null
+  try {
+    const target = new URL(new URL(url, 'https://x.invalid').searchParams.get('u') || '')
+    if (target.hostname !== 'raw.githubusercontent.com') return null
+    const [owner, repo, commit, ...rest] = target.pathname.split('/').filter(Boolean)
+    if (!owner || !repo || !commit || !rest.length) return null
+    return { owner, repo, commit, path: rest.join('/') }
+  } catch { return null }
+}
+
+export const publicPosterUrl = ({ owner, repo, commit, relPath }) => `${FILM_POSTER.cdnBase}/${owner}/${repo}@${commit}/${relPath}`
+
+// A poster is acceptable only when it is a clear jsDelivr URL pinned on a commit (never a proxy, never raw.github).
+export function isPublicPosterUrl(url) {
+  try {
+    const u = new URL(url)
+    return u.protocol === 'https:' && u.hostname === FILM_POSTER.cdnHost && /^\/gh\/[^/]+\/[^/@]+@[a-f0-9]{7,40}\//i.test(u.pathname)
+  } catch { return false }
+}
+
+// One JPEG frame of the film (middle when the duration is known), best effort: returns false when nothing was written.
+export function makeFilmPoster(sourcePath, outFile, durationSec = 0) {
+  const at = durationSec > 0 ? durationSec / 2 : FILM_POSTER.fallbackAtSec
+  try {
+    execFileSync(FILM_POSTER.ffmpeg, ['-y', '-v', 'error', '-protocol_whitelist', FILM_POSTER.protocolWhitelist, '-ss', String(Math.max(0, at)), '-i', sourcePath, '-frames:v', '1',
+      '-vf', `scale=${FILM_POSTER.widthPx}:-2`, '-q:v', FILM_POSTER.jpegQuality, outFile], { timeout: FILM_POSTER.ffmpegTimeoutMs })
+  } catch { return false }
+  return fs.existsSync(outFile) && fs.statSync(outFile).size >= FILM_POSTER.minBytes
+}
+
+// HEAD on the CDN until it answers an image (a commit pushed seconds ago may need a short wait).
+export async function verifyPublicPoster(url, { fetchImpl = fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  if (!isPublicPosterUrl(url)) return { ok: false, url, reason: 'not_a_public_jsdelivr_url' }
+  let last = 'no_attempt'
+  for (let attempt = 0; attempt < FILM_POSTER.verifyAttempts; attempt += 1) {
+    try {
+      const res = await fetchImpl(url, { method: 'HEAD' })
+      const type = String(res.headers?.get?.('content-type') || '')
+      if (res.ok && /^image\//i.test(type)) return { ok: true, url, status: res.status }
+      last = `http_${res.status}_${type || 'no_type'}`
+      // 14 October 2026: same bytes at the same commit on GitHub raw when jsDelivr refuses a fresh commit. FR : repli raw.
+      const raw = rawFallbackUrl(url)
+      if (raw) {
+        const second = await fetchImpl(raw, { method: 'HEAD' })
+        if (second.ok && /^image\//i.test(String(second.headers?.get?.('content-type') || ''))) return { ok: true, url, status: second.status, via: 'raw' }
+      }
+    } catch (error) { last = `fetch_${error?.message || error}` }
+    await sleep(Math.min(FILM_POSTER.verifyDelayMaxMs, FILM_POSTER.verifyDelayMs * (attempt + 1)))
+  }
+  return { ok: false, url, reason: last }
+}

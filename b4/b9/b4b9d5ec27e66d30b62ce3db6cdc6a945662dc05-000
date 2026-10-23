@@ -1,0 +1,93 @@
+// fix-thumb-manifests-git.mjs — patch FINAL des manifestes vignettes 1080p, 100% EN GIT (zéro API REST,
+// zéro quota — leçon du 2026-07-13 : deux runs API ont épuisé les 5000 req/h de Matthieu pour rien).
+// Les 2552 vignettes sont DÉJÀ sur GitHub (zenrayshards-img-0b3c4b555907@31cfd5f). Ici :
+//   1. git pull du clone sparse existant (~/.zr-thumb-bulk/zdata-clone) -> manifestes frais SUR DISQUE ;
+//   2. recalcul local des vignettes (déterministe -> même hash -> même chemin shard), parallèle x14, pur CPU ;
+//   3. patch des 4 champs (thumb/thumbIv/thumbW/thumbH) DANS les fichiers du clone ;
+//   4. UN git commit + push (transport git, hors quota). Retry pull --rebase si push rejeté (écrivains concurrents).
+// Idempotent : un manifeste déjà patché produit zéro diff -> absent du commit.
+import { sha256Hex, encryptDeterministic, loadMasterKey, shardPathFor, jsDelivrUrl } from './lib/img-pipeline.mjs'
+import { readFileSync, existsSync } from 'node:fs'
+import { readFile, writeFile } from 'node:fs/promises'
+import { execFile, execFileSync } from 'node:child_process'
+import { promisify } from 'node:util'
+import path from 'node:path'
+
+const execFileP = promisify(execFile)
+const OWNER = 'matthieuhuguet'
+const REPO_ROOT = '/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress'
+const CLONE = '/Users/zenray/.zr-thumb-bulk/zdata-clone'
+const KNOWN_REPO = 'zenrayshards-img-0b3c4b555907'
+const KNOWN_COMMIT = '31cfd5f5d46b93b2b501dcea86e8251bbbf2c6fe'
+const MAX_SHORT = 1080, QUALITY = 60, CONCURRENCY = 14
+const GENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/usr/bin/true' }
+const git = (args, timeout = 300000) => execFileSync('git', ['-C', CLONE, ...args], { env: GENV, timeout, encoding: 'utf8' })
+
+const key = loadMasterKey(REPO_ROOT, { readFileSync })
+const table = JSON.parse(await readFile('/Users/zenray/.zr-thumb-bulk/thumb-assoc-table.json', 'utf8'))
+
+console.log('\n=== PATCH MANIFESTES 100% GIT — pull du clone...')
+// un run précédent tué peut laisser des patchs valides non-committés -> les committer AVANT le pull
+// (sinon `pull --rebase` refuse). Ils fusionneront avec ceux de ce run dans le push final.
+if (git(['status', '--porcelain']).trim()) {
+  git(['add', '-A'])
+  git(['commit', '-q', '-m', 'fix: vignettes 1080p/q60 — patchs du run précédent (reprise)'])
+  console.log('  (patchs non-committés du run précédent committés)')
+}
+git(['pull', '--rebase', '-q'])
+console.log(`=== ${table.associated.length} manifestes à traiter (recalcul local x${CONCURRENCY}, zéro réseau) ===`)
+
+async function makeThumb(abs) {
+  try {
+    const { stdout: dims } = await execFileP('/usr/bin/sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', abs], { timeout: 30000 })
+    const w = parseInt((dims.match(/pixelWidth:\s*(\d+)/) || [])[1] || '0', 10)
+    const h = parseInt((dims.match(/pixelHeight:\s*(\d+)/) || [])[1] || '0', 10)
+    if (!w || !h) return null
+    const scale = Math.min(1, MAX_SHORT / Math.min(w, h))
+    const neww = Math.max(1, Math.round(w * scale)), newh = Math.max(1, Math.round(h * scale))
+    const { stdout } = await execFileP('magick', [abs, '-auto-orient', '-resize', `${neww}x${newh}!`, '-quality', String(QUALITY), '-strip', 'webp:-'], { timeout: 60000, maxBuffer: 1 << 27, encoding: 'buffer' })
+    return stdout && stdout.length ? { buf: stdout, w: neww, h: newh } : null
+  } catch { return null }
+}
+
+let idx = 0, patched = 0, skipped = 0, gone = 0, failed = 0
+async function worker() {
+  while (true) {
+    const i = idx++
+    if (i >= table.associated.length) return
+    const item = table.associated[i]
+    try {
+      const mp = path.join(CLONE, `${item.sitePath}.img.json`)
+      if (!existsSync(mp)) { gone++; continue }
+      const m = JSON.parse(await readFile(mp, 'utf8'))
+      const t = await makeThumb(item.localPath)
+      if (!t) { failed++; continue }
+      if (m.thumbW === t.w && m.thumbH === t.h && m.thumb && m.thumb.includes(KNOWN_REPO)) { skipped++; continue }
+      const tHash = sha256Hex(t.buf)
+      const enc = encryptDeterministic(t.buf, key, tHash)
+      m.thumb = jsDelivrUrl(OWNER, KNOWN_REPO, KNOWN_COMMIT, shardPathFor(tHash, 'webp'))
+      m.thumbIv = enc.iv; m.thumbW = t.w; m.thumbH = t.h
+      await writeFile(mp, JSON.stringify(m))
+      patched++
+    } catch { failed++ }
+    const done = patched + skipped + gone + failed
+    if (done % 200 === 0) console.log(`  ${done}/${table.associated.length} — ${patched} patchés, ${skipped} déjà OK, ${gone} absents, ${failed} échecs`)
+  }
+}
+await Promise.all(Array.from({ length: CONCURRENCY }, worker))
+console.log(`\nrésultat local : ${patched} patchés, ${skipped} déjà OK, ${gone} absents du clone, ${failed} échecs`)
+
+if (patched) {
+  git(['add', '-A'])
+  git(['commit', '-q', '-m', `fix: vignettes 1080p/q60 — repointe ${patched} manifestes (transport git, hors quota)`])
+  for (let a = 0; a < 5; a++) {
+    try { git(['push', '-q', 'origin', 'HEAD:main'], 600000); console.log('push OK'); break }
+    catch (e) {
+      console.log(`push rejeté (concurrent), pull --rebase et retry ${a + 1}/5`)
+      git(['pull', '--rebase', '-q'])
+      if (a === 4) throw e
+    }
+  }
+}
+console.log(`\n✓✓ TERMINÉ — ${patched} manifestes patchés et poussés en UN commit git. Quota REST consommé : 0.`)
+process.exit(0)

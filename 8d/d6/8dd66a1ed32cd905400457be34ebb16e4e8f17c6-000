@@ -1,0 +1,168 @@
+// 14 October 2026, 11:55 CEST: atomic Memory commits keep Japanese1 as the only session chronology.
+import { createHash } from 'node:crypto'
+import { CORPUS_CONFIG, canonicalLessonContent, cookCorpusLesson, originalExamples } from '../src/learn/japaneseCorpusModel.js'
+import { STUDY_CONFIG, emptyStudyState, nextStudyStage, validateStudyPreferences } from '../src/learn/japaneseStudyModel.js'
+import { commitGitTree } from './gitDataCommit.js'
+import { applyPersonalEvent } from './japanesePersonal.js'
+
+const dateLabel = now => new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Paris' }).format(new Date(now))
+const timeLabel = now => new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Europe/Paris' }).format(new Date(now))
+export function requireStudyApproval(record) {
+  const approval = record?.lessonValidation
+  const digest = createHash('sha256').update(canonicalLessonContent(record || {})).digest('hex')
+  if (record?.lessonContentVersion !== '1' || approval?.status !== 'approved' || approval.contentVersion !== '1'
+    || digest !== record.lessonContentHash || digest !== approval.contentHash
+    || !Array.isArray(approval.reviewerIds) || approval.reviewerIds.some(id => typeof id !== 'string' || !id.trim())
+    || new Set(approval.reviewerIds.map(id => id.trim())).size < 2
+    || !Array.isArray(approval.evidenceUrls) || !approval.evidenceUrls.length || approval.evidenceUrls.some(url => { try { return new URL(url).protocol !== 'https:' } catch { return true } })
+    || !Array.isArray(approval.unresolvedFindings) || approval.unresolvedFindings.length) throw new Error('Leçon bloquée : validation absente, modifiée ou incomplète.')
+}
+
+export function applyStudyEvent(state, record, body, now, cards) {
+  const next = structuredClone(state)
+  const eventId = body.eventId
+  if (typeof eventId !== 'string' || !/^[a-zA-Z0-9-]{8,80}$/.test(eventId)) throw new Error('Identifiant de séance invalide.')
+  if (next.eventIds.includes(eventId)) return { state: next, duplicate: true }
+  if (applyPersonalEvent(next, body, now)) { /* 16 October 2026: personal organization never changes learner mastery. */ }
+  else if (body.action === 'preferences') next.preferences = { ...next.preferences, ...validateStudyPreferences(body.updates || {}) }
+  else if (body.action === 'gap') {
+    const query = String(body.query || '').trim()
+    if (!query || query.length > 500) throw new Error('Décris la notion à rechercher en moins de 500 caractères.')
+    if (!next.gaps.some(gap => gap.query === query)) next.gaps.push({ query, date: dateLabel(now), status: 'research-required' })
+  } else {
+    requireStudyApproval(record)
+    if (!originalExamples(record).length || originalExamples(record).some(example => !example.reading)) throw new Error('Cette référence ne contient pas un exercice oral validé complet.')
+    const previous = next.progress[record.id]
+    if (body.action === 'expose') {
+      if (previous?.contentHash === record.lessonContentHash) throw new Error('Cette leçon est déjà commencée.')
+      const missing = (record.prerequisites || []).filter(id => {
+        const prerequisite = cards.find(card => card.id === id)
+        const progress = next.progress[id]
+        if (!prerequisite || !progress || progress.contentHash !== prerequisite.lessonContentHash) return true
+        try { requireStudyApproval(prerequisite) } catch { return true }
+        return !(progress.placementPassed || ['green', 'mastered'].includes(progress.stage))
+      })
+      if (missing.length) throw new Error('Consolide les prérequis avant ce nouveau point. La fiche reste consultable.')
+      next.progress[record.id] = { stage: 'red', due: now, greenSuccesses: 0, reviews: 0, exposedAt: now, contentHash: record.lessonContentHash }
+    } else if (body.action === 'placement') {
+      if (previous?.contentHash === record.lessonContentHash) throw new Error('Cette fiche est déjà suivie. Utilise sa révision due.')
+      if (body.grades?.length !== originalExamples(record).slice(0, CORPUS_CONFIG.lesson.maxDrills).length) throw new Error('Chaque exercice doit être restitué.')
+      const assessed = nextStudyStage({ stage: 'red', reviews: 0, greenSuccesses: 0, contentHash: record.lessonContentHash }, body.grades, body.elapsed, now)
+      next.progress[record.id] = { ...assessed, placementPassed: assessed.stage === 'orange', exposedAt: now }
+    } else if (body.action === 'review') {
+      if (!previous || previous.contentHash !== record.lessonContentHash || previous.stage === 'mastered' || previous.due > now
+        || body.expectedReviews !== previous.reviews) throw new Error('Révision prématurée, périmée ou déjà enregistrée.')
+      if (body.grades?.length !== originalExamples(record).slice(0, CORPUS_CONFIG.lesson.maxDrills).length) throw new Error('Chaque exercice doit être restitué.')
+      next.progress[record.id] = nextStudyStage(previous, body.grades, body.elapsed, now)
+    } else throw new Error('Action inconnue.')
+  }
+  next.eventIds.push(eventId)
+  next.updatedAt = now
+  return { state: next, duplicate: false }
+}
+
+export function appendStudyHistory(history, record, body, state, now, markdown = '') {
+  const date = dateLabel(now), time = timeLabel(now)
+  const marker = `<!-- japanese-study-event:${body.eventId} -->`
+  if (history.includes(marker)) throw new Error('La séance existe dans Japanese1 mais son état dérivé doit être reconstruit.')
+  const lastNumber = Math.max(111, ...Array.from(history.matchAll(/^#{2,3}\s+L(\d+)\b/gm), match => Number(match[1])))
+  const number = lastNumber + 1
+  const heading = body.action === 'expose' ? `## L${number} : ${date} ${time} : ${record.title}` : `## Révision orale : ${date} ${time} : ${record.title}`
+  const lines = [heading, '', marker, '', `Fiche : ${record.id}. Empreinte : ${record.lessonContentHash}. (${date})`, '',
+    body.action === 'expose' ? `Exposition consignée, aucun acquis déclaré. (${date})` : `Restitution orale autoévaluée après comparaison, sans reconnaissance vocale ni validation extérieure. (${date})`, '']
+  if (body.action === 'expose') lines.push(markdown, '')
+  else {
+    lines.push('| Exercice | Restitution déclarée |', '|---|---|')
+    originalExamples(record).slice(0, CORPUS_CONFIG.lesson.maxDrills).forEach((example, index) => lines.push(`| ${example.fr.replaceAll('|', '\\|')} | ${body.grades[index]} ; ${body.elapsed[index]} ms. (${date}) |`))
+    lines.push('', `État des révisions : ${state.progress[record.id].stage}. (${date})`, '', `Sources : ${(record.sources || []).map(source => source.url).join(', ')}. (${date})`)
+  }
+  return { text: history.trimEnd() + '\n\n' + lines.join('\n') + '\n', heading, number }
+}
+
+export function createJapaneseHandler({ request, clock = Date.now, config = STUDY_CONFIG }) {
+  async function read(path, ref, optional = false) {
+    const response = await request(`contents/${encodeURI(path)}?ref=${encodeURIComponent(ref)}`)
+    if (response.status === 404 && optional) return null
+    if (!response.ok) throw new Error(`Lecture Memory indisponible (${response.status}).`)
+    const entry = await response.json()
+    if (entry.encoding === 'base64' && entry.content) return Buffer.from(entry.content, 'base64').toString('utf8')
+    if (!entry.sha) throw new Error('Empreinte du fichier absente.')
+    const blobResponse = await request(`git/blobs/${entry.sha}`)
+    if (!blobResponse.ok) throw new Error('Lecture du contenu Memory impossible.')
+    const blob = await blobResponse.json()
+    if (blob.encoding !== 'base64' || typeof blob.content !== 'string') throw new Error('Contenu Memory illisible.')
+    return Buffer.from(blob.content, 'base64').toString('utf8')
+  }
+  return async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store')
+    try {
+      if (req.method === 'GET') {
+        if (req.query?.view === 'history') {
+          const ref = String(req.query.ref || '')
+          if (!/^[a-f0-9]{40}$/.test(ref)) throw new Error('Version du journal invalide.')
+          return res.status(200).json({ markdown: await read(config.historyPath, ref), source: config.historyPath, ref })
+        }
+        const text = await read(config.statePath, 'main', true)
+        return res.status(200).json({ state: text ? JSON.parse(text) : emptyStudyState(), store: 'Memory', history: config.historyPath })
+      }
+      if (req.method !== 'POST') return res.status(405).json({ error: 'method-not-allowed' })
+      const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body
+      if (!body || JSON.stringify(body).length > 16384) throw new Error('Requête invalide ou trop grande.')
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const headResponse = await request('git/ref/heads/main')
+        if (!headResponse.ok) throw new Error('Branche Memory indisponible.')
+        const head = (await headResponse.json()).object.sha
+        const text = await read(config.statePath, head, true)
+        const state = text ? JSON.parse(text) : emptyStudyState()
+        const teaching = ['expose', 'review', 'placement'].includes(body.action)
+        const catalogue = teaching ? JSON.parse(await read(config.cataloguePath, head)) : null
+        const record = catalogue?.cards.find(card => card.id === body.recordId)
+        const now = clock()
+        const result = applyStudyEvent(state, record, body, now, catalogue?.cards || [])
+        if (result.duplicate) return res.status(200).json({ ok: true, state, duplicate: true, commit: head,
+          ...(body.action === 'expose' ? { index: JSON.parse(await read(config.indexPath, head)) } : {}) })
+        const files = { [config.statePath]: JSON.stringify(result.state) + '\n' }
+        if (teaching) {
+          const history = await read(config.historyPath, head)
+          const prepared = body.action === 'expose' ? await cookCorpusLesson([record], { learner: catalogue.learner, date: dateLabel(now) }) : null
+          const appended = appendStudyHistory(history, record, body, result.state, now, prepared?.markdown || '')
+          files[config.historyPath] = appended.text
+          const tracker = await read(config.trackerPath, head)
+          files[config.trackerPath] = tracker.trimEnd() + `\n\n### Révisions web : ${dateLabel(now)} ${timeLabel(now)}\n\n${record.title} : ${result.state.progress[record.id].stage}, prochaine révision ${dateLabel(result.state.progress[record.id].due)}. Autoévaluation orale. (${dateLabel(now)})\n`
+          if (body.action === 'expose') {
+            const index = JSON.parse(await read(config.indexPath, head))
+            const start = history.trimEnd().split('\n').length + 2
+            if (index.lecons?.length) index.lecons.at(-1).fin = start - 1
+            index.lecons.push({ id: `L${appended.number}`, numero: appended.number, titre: record.title, date: dateLabel(now), ligne: start, ancre: appended.heading, fin: appended.text.trimEnd().split('\n').length })
+            index.corpusLignes = appended.text.split('\n').length
+            if (index.resume) {
+              index.resume.tranches = index.lecons.length
+              index.resume.leconsDistinctes = new Set(index.lecons.map(lesson => lesson.id)).size
+            }
+            files[config.indexPath] = JSON.stringify(index) + '\n'
+          }
+        }
+        const entries = []
+        for (const [path, content] of Object.entries(files)) {
+          const response = await request('git/blobs', { method: 'POST', body: JSON.stringify({ content, encoding: 'utf-8' }) })
+          if (!response.ok) throw new Error('Écriture de la séance impossible.')
+          entries.push({ path, mode: '100644', type: 'blob', sha: (await response.json()).sha })
+        }
+        const committed = await commitGitTree({ request, branch: 'main', entries, message: `Japanese study ${body.action} (${dateLabel(now)})`, tries: 1, beforeCommit: current => current === head, sleepImpl: async () => {} })
+        if (committed.ok) return res.status(200).json({ ok: true, state: result.state, commit: committed.commit, store: 'Memory',
+          ...(files[config.indexPath] ? { index: JSON.parse(files[config.indexPath]) } : {}) })
+        if (!committed.conflict && !/ref-update (409|422)/.test(committed.error || '')) throw new Error('Sauvegarde refusée : ' + committed.error)
+      }
+      return res.status(409).json({ error: 'Memory change pendant la sauvegarde. Réessaie ; aucune progression perdue n’est déclarée enregistrée.' })
+    } catch (error) { return res.status(400).json({ error: error.message || 'Séance non enregistrée.' }) }
+  }
+}
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(503).json({ error: 'Memory est indisponible : jeton serveur absent.' })
+  const repo = process.env.MEMORY_REPO || 'matthieuhuguet/Memory'
+  const request = (path, init = {}) => fetch(`https://api.github.com/repos/${repo}/${path}`, { ...init,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-japanese', ...init.headers } })
+  return createJapaneseHandler({ request })(req, res)
+}

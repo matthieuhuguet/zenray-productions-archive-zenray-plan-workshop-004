@@ -1,0 +1,199 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { api, collectSpotifyPages, spotifyAlbum, spotifyPlaylist } from './spotifyApi.js'
+
+const AUTH_KEY = 'spotify:auth:v1'
+
+function seedAuth(accessToken = 'old-token') {
+  localStorage.setItem(AUTH_KEY, JSON.stringify({
+    access_token: accessToken,
+    refresh_token: 'refresh-token',
+    expires_at: Date.now() + 60 * 60 * 1_000,
+  }))
+}
+
+function memoryStorage() {
+  const values = new Map()
+  return {
+    getItem: (key) => values.has(String(key)) ? values.get(String(key)) : null,
+    setItem: (key, value) => values.set(String(key), String(value)),
+    removeItem: (key) => values.delete(String(key)),
+    clear: () => values.clear(),
+  }
+}
+
+function response(status, body = null, headers = {}) {
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    headers: new Headers(headers),
+    json: vi.fn().mockResolvedValue(body),
+  }
+}
+
+function authorization(init) {
+  return new Headers(init?.headers || {}).get('Authorization')
+}
+
+function tracks(from, count) {
+  return Array.from({ length: count }, (_, index) => ({ id: `track-${from + index}` }))
+}
+
+describe('Spotify API transport', () => {
+  beforeEach(() => {
+    vi.stubGlobal('localStorage', memoryStorage())
+    vi.stubGlobal('sessionStorage', memoryStorage())
+    seedAuth()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  })
+
+  it('partage un seul refresh force entre plusieurs 401 concurrents', async () => {
+    let oldCalls = 0
+    let releaseOld
+    const bothOldStarted = new Promise((resolve) => { releaseOld = resolve })
+    const fetchMock = vi.fn(async (url, init) => {
+      if (url === 'https://accounts.spotify.com/api/token') {
+        return response(200, { access_token: 'new-token', expires_in: 3_600 })
+      }
+      if (authorization(init) === 'Bearer old-token') {
+        oldCalls += 1
+        if (oldCalls === 2) releaseOld()
+        await bothOldStarted
+        return response(401)
+      }
+      return response(200, { token: authorization(init) })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const [first, second] = await Promise.all([api('/v1/me'), api('/v1/me')])
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    expect(fetchMock.mock.calls.filter(([url]) => url === 'https://accounts.spotify.com/api/token')).toHaveLength(1)
+    expect(fetchMock.mock.calls.filter(([, init]) => authorization(init) === 'Bearer old-token')).toHaveLength(2)
+    expect(fetchMock.mock.calls.filter(([, init]) => authorization(init) === 'Bearer new-token')).toHaveLength(2)
+  })
+
+  it('ne rejoue une requete 401 qu une seule fois', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      if (url === 'https://accounts.spotify.com/api/token') {
+        return response(200, { access_token: 'still-rejected', expires_in: 3_600 })
+      }
+      return response(401)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await api('/v1/me')
+
+    expect(result.status).toBe(401)
+    expect(fetchMock.mock.calls.filter(([url]) => url.startsWith('https://api.spotify.com/'))).toHaveLength(2)
+    expect(fetchMock.mock.calls.filter(([url]) => url === 'https://accounts.spotify.com/api/token')).toHaveLength(1)
+  })
+
+  it('ne rafraichit pas deux fois lorsqu un ancien 401 arrive en retard', async () => {
+    let releaseDelayed
+    let delayedStarted
+    const delayedGate = new Promise((resolve) => { releaseDelayed = resolve })
+    const delayedReady = new Promise((resolve) => { delayedStarted = resolve })
+    const fetchMock = vi.fn(async (url, init) => {
+      if (url === 'https://accounts.spotify.com/api/token') {
+        return response(200, { access_token: 'new-token', expires_in: 3_600 })
+      }
+      if (authorization(init) === 'Bearer old-token' && url.endsWith('/v1/delayed')) {
+        delayedStarted()
+        await delayedGate
+        return response(401)
+      }
+      if (authorization(init) === 'Bearer old-token') return response(401)
+      return response(200, { ok: true })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const delayed = api('/v1/delayed')
+    await delayedReady
+    const fast = await api('/v1/fast')
+    releaseDelayed()
+    const late = await delayed
+
+    expect(fast.ok).toBe(true)
+    expect(late.ok).toBe(true)
+    expect(fetchMock.mock.calls.filter(([url]) => url === 'https://accounts.spotify.com/api/token')).toHaveLength(1)
+  })
+
+  it('borne les reprises 429 et respecte Retry-After', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(429, null, { 'Retry-After': '0' }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await api('/v1/me')
+
+    expect(result.status).toBe(429)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('importe toutes les pages d une playlist de plus de 100 titres', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      const parsed = new URL(url)
+      if (parsed.pathname === '/v1/playlists/playlist-id' && !parsed.searchParams.has('offset')) {
+        return response(200, {
+          id: 'playlist-id',
+          tracks: { items: tracks(0, 40), next: 'https://api.spotify.com/v1/playlists/playlist-id/tracks?offset=40', total: 105 },
+        })
+      }
+      if (parsed.searchParams.get('offset') === '40') {
+        return response(200, { items: tracks(40, 40), next: 'https://api.spotify.com/v1/playlists/playlist-id/tracks?offset=80', total: 105 })
+      }
+      if (parsed.searchParams.get('offset') === '80') {
+        return response(200, { items: tracks(80, 25), next: null, total: 105 })
+      }
+      return response(404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const playlist = await spotifyPlaylist('playlist-id')
+
+    expect(playlist.tracks.items).toHaveLength(105)
+    expect(playlist.tracks.items.at(-1).id).toBe('track-104')
+    expect(playlist.tracks.next).toBeNull()
+  })
+
+  it('importe aussi toutes les pages d un album', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      const parsed = new URL(url)
+      if (parsed.pathname === '/v1/albums/album-id') {
+        return response(200, {
+          id: 'album-id',
+          tracks: { items: tracks(0, 2), next: 'https://api.spotify.com/v1/albums/album-id/tracks?offset=2', total: 4 },
+        })
+      }
+      return response(200, { items: tracks(2, 2), next: null, total: 4 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const album = await spotifyAlbum('album-id')
+
+    expect(album.tracks.items.map((item) => item.id)).toEqual(['track-0', 'track-1', 'track-2', 'track-3'])
+  })
+
+  it('refuse une URL next hors de api.spotify.com avant tout fetch', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(collectSpotifyPages({ items: [], next: 'https://example.com/v1/tracks', total: 1 }))
+      .rejects.toMatchObject({ code: 'invalid-api-url' })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('echoue sans resultat partiel lorsque la borne explicite est depassee', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(200, { items: tracks(2, 2), next: null, total: 4 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(collectSpotifyPages({
+      items: tracks(0, 2),
+      next: 'https://api.spotify.com/v1/albums/album-id/tracks?offset=2',
+      total: 4,
+    }, { maxItems: 3 })).rejects.toMatchObject({ code: 'pagination-limit' })
+  })
+})

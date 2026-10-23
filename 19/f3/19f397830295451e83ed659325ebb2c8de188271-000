@@ -1,0 +1,105 @@
+#!/usr/bin/env node
+// SIMULATE GUESTS against a live site (2 October 2026): « Marie » and « Anne » each add a 16:9 picture carrying their own name, through the
+// REAL uploader core (src/guest/uploadCore.js) and the REAL /api/guest-upload route, exactly as the browser does it.
+// Then it checks, from the public side only, what a visitor of the share link sees: the listing, the thumbnail and the FULL image (bytes
+// compared with the original), and it prints how many GitHub REST and GraphQL calls the whole thing cost the account.
+//
+//   node scripts/simulate-guests.mjs --site https://zenray-progress.pages.dev --token <share token>  [--names Marie,Anne] [--extra 0] [--big]
+// Needs ImageMagick (`magick`) and, for the quota figures, ZENRAY_API_SECRET (the drive code) in the environment.
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createGuestUploader } from '../src/guest/uploadCore.js'
+
+const args = process.argv.slice(2)
+const opt = (n, d) => (args.includes(n) ? args[args.indexOf(n) + 1] : d)
+const site = opt('--site', 'https://zenray-progress.pages.dev').replace(/\/$/, '')
+const token = opt('--token', '')
+const names = opt('--names', 'Marie,Anne').split(',')
+const extra = Number(opt('--extra', '0'))            // extra random photos per guest, to exercise batching
+const big = args.includes('--big')                   // add one ~30 MB photo to the first guest (several chunks)
+const photoMB = Number(opt('--photo-mb', '0'))       // 0 = small gradient pictures; N = realistic photos of about N MB (noisy, 4032x3024)
+if (!token) { console.error('--token <share token> is required'); process.exit(2) }
+
+const work = mkdtempSync(path.join(tmpdir(), 'zr-guests-'))
+const sha = (b) => createHash('sha256').update(b).digest('hex')
+// The quota that matters is the one of the TOKEN THE SITE USES (not the one of `gh`): the site reports its own counters, REST and GraphQL.
+const rate = async () => { try { const j = await (await fetch(`${site}/api/page?action=ratelimit`, { headers: { 'x-zr-auth': process.env.ZENRAY_API_SECRET || '' } })).json(); return { core: j.remaining, graphql: j.graphql && j.graphql.remaining } } catch { return { core: NaN, graphql: NaN } } }
+
+function makePicture(label, i = 0, w = 1920, h = 1080) {
+  const out = path.join(work, `${label}-${i}.jpg`)
+  if (photoMB && i > 0) { execFileSync('magick', ['-size', '4032x3024', `plasma:fractal`, '-quality', String(photoMB >= 6 ? 97 : 90), out]); return out }
+  const hue = (label.charCodeAt(0) * 37 + i * 53) % 360
+  execFileSync('magick', ['-size', `${w}x${h}`, `gradient:hsl(${hue},70%,45%)-hsl(${(hue + 60) % 360},70%,20%)`, '-gravity', 'center', '-font', '/System/Library/Fonts/Supplemental/Arial Bold.ttf', '-pointsize', String(Math.round(h / 4.5)), '-fill', 'white', '-annotate', '0', i ? `${label} ${i}` : label, '-quality', '88', out])
+  return out
+}
+const dims = (file) => { const [w, h] = execFileSync('identify', ['-auto-orient', '-format', '%w %h', file], { encoding: 'utf8' }).split(' ').map(Number); return { w, h } }
+function thumbOf(file) {
+  const { w, h } = dims(file)
+  const scale = Math.min(1, 1080 / Math.min(w, h)); const tw = Math.round(w * scale), th = Math.round(h * scale)
+  const out = execFileSync('magick', [file, '-auto-orient', '-resize', `${tw}x${th}!`, '-quality', '60', 'webp:-'], { maxBuffer: 64 * 1024 * 1024 })
+  return { bytes: new Uint8Array(out), mime: 'image/webp', w, h, thumbW: tw, thumbH: th }
+}
+const adapters = {
+  readBlob: async (f, a, b) => f.bytes.subarray(a, b),
+  hashBytes: async (u8) => sha(u8),
+  makeThumb: async (f) => thumbOf(f.path),
+  send: async (frame) => { const r = await fetch(`${site}/api/guest-upload`, { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: frame }); if (!r.ok) throw new Error(`http ${r.status}`); return r.json() },
+  sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 3000))),
+  isOnline: () => true,
+}
+
+const before = await rate()
+const t0 = Date.now()
+const originals = []     // { guest, name, sha }
+const uploaders = names.map((guestName, gi) => {
+  const files = []
+  const base = makePicture(guestName, 0)
+  files.push({ path: base, name: `${guestName}.jpg` })
+  for (let i = 1; i <= extra; i++) files.push({ path: makePicture(guestName, i), name: `${guestName}-${i}.jpg` })
+  if (big && gi === 0) { const p = path.join(work, 'big.jpg'); execFileSync('magick', ['-size', '6000x4000', 'plasma:fractal', '-quality', '97', p]); files.push({ path: p, name: 'BIG_6000x4000.jpg' }) }
+  const entries = files.map((f) => { const bytes = new Uint8Array(readFileSync(f.path)); originals.push({ guest: guestName, name: f.name, sha: sha(bytes), size: bytes.length }); return { file: { name: f.name, size: bytes.length, bytes, path: f.path, lastModified: 1, webkitRelativePath: '' } } })
+  const up = createGuestUploader({ token, adapters, onChange: () => {} })
+  up.setName(guestName)
+  return { guestName, up, entries }
+})
+console.log(`site ${site}\nguests: ${names.join(', ')} — ${originals.length} photo(s), ${(originals.reduce((n, o) => n + o.size, 0) / 1048576).toFixed(1)} MB`)
+await Promise.all(uploaders.map(async ({ guestName, up, entries }) => {
+  up.add(entries)
+  for (;;) { await up.idle(); const s = up.snapshot(); if (s.idle) { console.log(`  ${guestName}: ${s.counts.done}/${s.counts.total} done, folder « ${s.folder} », ${s.stats.requests} request(s), ${s.stats.failures} retried, notice=${s.notice}`); break } }
+}))
+console.log(`upload finished in ${((Date.now() - t0) / 1000).toFixed(1)} s`)
+const afterUpload = await rate()
+console.log(`quota of the site's GitHub token, during the UPLOAD alone: REST ${before.core - afterUpload.core} call(s), GraphQL ${before.graphql - afterUpload.graphql} point(s)`)
+
+// ── what a visitor sees ───────────────────────────────────────────────────────────────────────
+const shareInfo = await (await fetch(`${site}/api/share-token?action=resolve&token=${encodeURIComponent(token)}&kind=folder`)).json()
+const root = shareInfo.path
+const tree = await (await fetch(`${site}/api/page?action=tree&dir=${encodeURIComponent(root)}&share=${encodeURIComponent(token)}`)).json()
+const manifests = (tree.paths || []).filter((p) => p.endsWith('.img.json'))
+console.log(`visitor listing: ${manifests.length} image(s) under ${root}`)
+let ok = 0, bad = 0
+for (const o of originals) {
+  const guestFolder = `${root}/${o.guest}/`
+  const stem = o.name.replace(/\.[^.]+$/, '')
+  // the drive never overwrites: a name already taken by another picture gets a hash suffix, so find the manifest by CONTENT, not by name
+  let mp = null
+  for (const cand of manifests.filter((p) => p.startsWith(guestFolder) && p.slice(guestFolder.length).startsWith(stem))) {
+    const r = await (await fetch(`${site}/api/page?action=read&raw=1&path=${encodeURIComponent(cand)}&share=${encodeURIComponent(token)}`)).json()
+    try { if (JSON.parse(r.markdown).contentHash === o.sha) { mp = cand; break } } catch { /* not a manifest yet */ }
+  }
+  if (!mp) { console.log(`  ✗ ${o.guest}/${o.name}: not in the listing`); bad++; continue }
+  const q = `path=${encodeURIComponent(mp)}&share=${encodeURIComponent(token)}`
+  const th = await fetch(`${site}/api/shared-media?${q}&kind=thumb`)
+  const full = await fetch(`${site}/api/shared-media?${q}&kind=full`)
+  const fb = new Uint8Array(await full.arrayBuffer())
+  const same = full.ok && sha(fb) === o.sha
+  console.log(`  ${th.ok && same ? '✓' : '✗'} ${o.guest}/${o.name}: thumb ${th.status} ${th.headers.get('content-type')} · full ${full.status} ${(fb.length / 1048576).toFixed(2)} MB · bytes ${same ? 'IDENTICAL to the original' : 'DIFFERENT'}`)
+  if (th.ok && same) ok++; else bad++
+}
+const after = await rate()
+console.log(`quota of the site's GitHub token, whole run (upload + visitor checks): REST ${before.core - after.core} call(s), GraphQL ${before.graphql - after.graphql} point(s)`)
+console.log(bad ? `FAILED: ${bad} problem(s)` : `ALL GOOD: ${ok}/${originals.length} photos verified end to end`)
+process.exit(bad ? 1 : 0)

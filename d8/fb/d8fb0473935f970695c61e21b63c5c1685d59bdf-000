@@ -1,0 +1,91 @@
+// 2 October 2026 Folder style: file format, search ranking, and the "a failure is never cached" law.
+import { describe, it, expect, beforeEach } from 'vitest'
+import { splitStyleFile, joinStyleFile, remapKeys, styleKeyOf, isFolderEntry, searchIcons, loadIconRegistry, resetIconRegistry, fetchIconRecord, glyphVariant, svgMaskUrl, IconSourceError } from './folderStyle.js'
+import { FOLDER_ICON_SOURCE } from '../config/colors.js'
+
+const svg = '<svg viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg>'
+const icons = [
+  { slug: 'github', title: 'GitHub', aliases: [], variants: ['default', 'mono'] },
+  { slug: 'github-actions', title: 'GitHub Actions', aliases: ['gha'], variants: ['default'] },
+  { slug: 'octocat', title: 'Octocat', aliases: ['github mascot'], variants: ['default'] },
+  { slug: 'figma', title: 'Figma', aliases: [], variants: ['default', 'mono'] },
+]
+const okJson = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) })
+
+describe('folder style file', () => {
+  it('reads the legacy string format and the object format', () => {
+    const { colors, icons: ic } = splitStyleFile({ 'a.md': 'red', 'Photos/Trips': { color: 'blue', icon: { slug: 'github', svg } }, 'B': { icon: { slug: 'figma', svg } }, junk: 42 })
+    expect(colors).toEqual({ 'a.md': 'red', 'Photos/Trips': 'blue' })
+    expect(ic['Photos/Trips'].slug).toBe('github')
+    expect(ic.B.slug).toBe('figma')
+    expect(Object.keys(ic)).toHaveLength(2)
+  })
+  it('round-trips, and keeps a colour-only path as a plain string', () => {
+    const colors = { 'a.md': 'red', F: 'blue' }
+    const ic = { F: { slug: 'github', svg } }
+    const joined = joinStyleFile(colors, ic)
+    expect(joined['a.md']).toBe('red')
+    expect(joined.F).toEqual({ color: 'blue', icon: { slug: 'github', svg } })
+    expect(splitStyleFile(joined)).toEqual({ colors, icons: ic })
+  })
+  it('tolerates garbage input', () => {
+    expect(splitStyleFile(null)).toEqual({ colors: {}, icons: {} })
+    expect(splitStyleFile({ x: { icon: { slug: 3, svg: 'nope' } } })).toEqual({ colors: {}, icons: {} })
+  })
+  it('keys a pure folder by its dir and a page by its contentPath', () => {
+    expect(styleKeyOf({ dir: 'Photos/Trips', contentPath: null, hasKids: true })).toBe('Photos/Trips')
+    expect(styleKeyOf({ dir: 'a', contentPath: 'a.md' })).toBe('a.md')
+    expect(isFolderEntry({ dir: 'a', contentPath: null })).toBe(true)
+    expect(isFolderEntry({ dir: 'a', contentPath: 'a.md', hasKids: false })).toBe(false)
+  })
+  it('remaps a moved folder, its own key and its descendants', () => {
+    const m = { 'Old': 'red', 'Old/x.md': 'blue', 'Other': 'green' }
+    expect(remapKeys(m, 'Old', 'New', true)).toEqual({ New: 'red', 'New/x.md': 'blue', Other: 'green' })
+    expect(remapKeys(m, 'Nope', 'New', true)).toBe(m)
+    expect(remapKeys(m, 'Old/x.md', 'Old/y.md', false)).toEqual({ Old: 'red', 'Old/y.md': 'blue', Other: 'green' })
+  })
+})
+
+describe('thesvg search', () => {
+  beforeEach(() => resetIconRegistry())
+  it('ranks exact, then prefix, then word match, bounded by limit', async () => {
+    const index = await loadIconRegistry({ fetchImpl: async () => okJson({ icons }) })
+    const r = searchIcons(index, 'github')
+    expect(r.map((i) => i.slug)).toEqual(['github', 'github-actions', 'octocat'])
+    expect(searchIcons(index, 'github', 1)).toHaveLength(1)
+    expect(searchIcons(index, 'GHA')[0].slug).toBe('github-actions')
+    expect(searchIcons(index, '  ')).toEqual([])
+  })
+  it('never caches a failure, then caches the success', async () => {
+    let calls = 0
+    const flaky = async () => { calls++; if (calls === 1) throw new Error('offline'); return okJson({ icons }) }
+    await expect(loadIconRegistry({ fetchImpl: flaky })).rejects.toBeInstanceOf(IconSourceError)
+    await expect(loadIconRegistry({ fetchImpl: flaky })).resolves.toHaveLength(4)
+    await loadIconRegistry({ fetchImpl: flaky })
+    expect(calls).toBe(2)
+  })
+  it('rejects an HTTP error and an empty manifest', async () => {
+    await expect(loadIconRegistry({ fetchImpl: async () => ({ ok: false, status: 503 }) })).rejects.toThrow(/503/)
+    await expect(loadIconRegistry({ fetchImpl: async () => okJson({ icons: [] }) })).rejects.toThrow(/empty/)
+  })
+})
+
+describe('thesvg glyph download', () => {
+  it('prefers the mono variant and returns the record that gets stored', async () => {
+    let asked = ''
+    const rec = await fetchIconRecord(icons[0], { fetchImpl: async (u) => { asked = u; return { ok: true, status: 200, text: async () => svg } } })
+    expect(glyphVariant(icons[0])).toBe('mono')
+    expect(glyphVariant(icons[1])).toBe('default')
+    expect(asked).toBe('https://thesvg.org/icons/github/mono.svg')
+    expect(rec).toEqual({ slug: 'github', svg })
+  })
+  it('refuses a non SVG body, an oversized SVG and a network failure, visibly', async () => {
+    await expect(fetchIconRecord(icons[0], { fetchImpl: async () => ({ ok: true, status: 200, text: async () => '<html>' }) })).rejects.toThrow(/not an SVG/)
+    const big = '<svg>' + 'x'.repeat(FOLDER_ICON_SOURCE.maxSvgBytes) + '</svg>'
+    await expect(fetchIconRecord(icons[0], { fetchImpl: async () => ({ ok: true, status: 200, text: async () => big }) })).rejects.toThrow(/too heavy/)
+    await expect(fetchIconRecord(icons[0], { fetchImpl: async () => { throw new Error('x') } })).rejects.toThrow(/unreachable/)
+  })
+  it('turns a stored svg into a css mask url', () => {
+    expect(svgMaskUrl(svg)).toMatch(/^url\("data:image\/svg\+xml;utf8,%3Csvg/)
+  })
+})

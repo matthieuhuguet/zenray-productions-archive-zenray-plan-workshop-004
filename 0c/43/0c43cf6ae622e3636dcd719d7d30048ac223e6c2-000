@@ -1,0 +1,79 @@
+// public-shard.mjs (11 October 2026): the public jsDelivr shard helpers shared by the CMAF packager and the poster repair.
+// FR : helpers du shard public (jsDelivr) partages par l'empaquetage CMAF et la reparation des posters.
+import fs from 'node:fs'
+import path from 'node:path'
+import { execFileSync } from 'node:child_process'
+
+// 11 October 2026: every tunable value of the public shard handling in one place.
+export const PUBLIC_SHARD = {
+  owner: 'matthieuhuguet',
+  stateFile: path.join('pages', '.zr-vid-drive.json'),
+  defaultActive: 'zenray-vid-public-33',
+  activePattern: /^zenray-vid-public-\d+$/,
+  binBytes: Math.floor(4.2 * 1024 ** 3), // rotation of the active shard at 4.2 GiB
+  description: 'ZenRay public video CMAF shard (10 October 2026)',
+  userAgent: 'zenray-cmaf-packager',
+}
+
+// GitHub token from the environment or `gh auth token` (10 October 2026).
+export function resolveToken() {
+  if (process.env.GITHUB_TOKEN) return process.env.GITHUB_TOKEN.trim()
+  return execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim()
+}
+
+// Creates the public shard repo on GitHub when a rollover opens a new number (10 October 2026).
+export async function ensurePublicShardRepo(token, repoName, { description = PUBLIC_SHARD.description, fetchImpl = fetch } = {}) {
+  const headers = { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': PUBLIC_SHARD.userAgent }
+  const check = await fetchImpl(`https://api.github.com/repos/${PUBLIC_SHARD.owner}/${repoName}`, { headers })
+  if (check.status === 200) {
+    // 14 October 2026: GitHub answers 200 for a RENAMED repository (redirect). The zenray-vid-public-33..90 repositories were renamed to
+    // zenrayshards-vid-<hash> (v2 convention): pushing there lands the segments in an old, full repository that jsDelivr cannot find by
+    // this name. A name whose canonical name differs is TAKEN: never reuse it. FR : un depot renomme repond 200 mais n'est pas le notre.
+    const body = await check.json().catch(() => ({}))
+    const canonical = String(body.full_name || '').toLowerCase()
+    if (canonical && canonical !== `${PUBLIC_SHARD.owner}/${repoName}`.toLowerCase()) return 'renamed'
+    return 'exists'
+  }
+  const create = await fetchImpl('https://api.github.com/user/repos', {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: repoName, private: false, auto_init: true, description }),
+  })
+  if (!create.ok && create.status !== 422) throw new Error(`Failed to create public shard ${repoName}: HTTP ${create.status}`)
+  return 'created'
+}
+
+// Allocates the active public shard through pages/.zr-vid-drive.json in the manifest clone (10 October 2026).
+// 12 October 2026: with { persist: false } the clone is NOT touched (the counter file stays clean for the several minutes
+// a push lasts); the caller writes the returned state inside its commit section with persistPublicShardState.
+// FR : { persist: false } ne touche pas le clone ; l'appelant ecrit le compteur au moment du commit, sous verrou.
+export async function allocatePublicShard(manifestClone, addBytes, token, { persist = true, fetchImpl = fetch } = {}) {
+  const statePath = path.join(manifestClone, PUBLIC_SHARD.stateFile)
+  let state = { active: PUBLIC_SHARD.defaultActive, bytes: 0 }
+  if (fs.existsSync(statePath)) {
+    try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')) } catch {}
+  }
+  if (!state.active || !PUBLIC_SHARD.activePattern.test(state.active)) state.active = PUBLIC_SHARD.defaultActive
+  state.bytes = Number(state.bytes || 0)
+  if (state.bytes > 0 && state.bytes + addBytes > PUBLIC_SHARD.binBytes) {
+    const num = parseInt(state.active.replace('zenray-vid-public-', ''), 10) + 1
+    state.active = `zenray-vid-public-${String(num).padStart(2, '0')}`
+    state.bytes = 0
+  }
+  // a renamed name is skipped, the counter moves to the next number until a name is ours (14 October 2026). FR : un nom renomme est saute.
+  for (let guard = 0; guard < 300; guard += 1) {
+    const outcome = await ensurePublicShardRepo(token, state.active, { fetchImpl })
+    if (outcome !== 'renamed') break
+    const next = parseInt(state.active.replace('zenray-vid-public-', ''), 10) + 1
+    state.active = `zenray-vid-public-${String(next).padStart(2, '0')}`
+    state.bytes = 0
+  }
+  state.bytes += addBytes
+  if (persist) persistPublicShardState(statePath, state)
+  return { repo: state.active, statePath, state }
+}
+
+export function persistPublicShardState(statePath, state) {
+  fs.mkdirSync(path.dirname(statePath), { recursive: true })
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n')
+}

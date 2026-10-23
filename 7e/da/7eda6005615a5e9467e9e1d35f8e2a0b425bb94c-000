@@ -1,0 +1,116 @@
+import React from 'react'
+import { act, cleanup, render } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { useLinkImportModal } from './useLinkImportModal.js'
+
+let hook
+
+function Probe({ createBatchFn, ctx }) {
+  hook = useLinkImportModal(createBatchFn, ctx)
+  return null
+}
+
+function mount(createBatchFn, ctx) {
+  return render(<Probe createBatchFn={createBatchFn} ctx={ctx} />)
+}
+
+function makeCtx(overrides = {}) {
+  return {
+    folder: 'pages/Videos',
+    pathsRef: { current: ['pages/Videos/existing.media.json'] },
+    setPaths: vi.fn(),
+    dropDirCache: vi.fn(),
+    loadDir: vi.fn(),
+    onImported: vi.fn(),
+    ...overrides,
+  }
+}
+
+describe('useLinkImportModal', () => {
+  beforeEach(() => { hook = null })
+  afterEach(() => cleanup())
+
+  it('démarre fermé, vide, non occupé', () => {
+    mount(vi.fn(), makeCtx())
+    expect(hook.open).toBe(false)
+    expect(hook.text).toBe('')
+    expect(hook.busy).toBe(false)
+    expect(hook.progress).toBe(0)
+  })
+
+  it('submit ne fait rien si le texte est vide (pas d\'appel au batch creator)', async () => {
+    const createBatchFn = vi.fn()
+    mount(createBatchFn, makeCtx())
+    await act(async () => { await hook.submit() })
+    expect(createBatchFn).not.toHaveBeenCalled()
+  })
+
+  it('submit ne relance pas le batch creator tant que le précédent est en vol', async () => {
+    let resolveFirst
+    const createBatchFn = vi.fn(() => new Promise((resolve) => { resolveFirst = resolve }))
+    const ctx = makeCtx()
+    mount(createBatchFn, ctx)
+    act(() => hook.setText('https://youtu.be/abc'))
+
+    let firstSubmit
+    await act(async () => {
+      firstSubmit = hook.submit() // passe busy=true puis suspend sur createBatchFn (pas encore résolu)
+      await Promise.resolve() // laisse React flusher setBusy(true) avant la suite du test
+    })
+    expect(hook.busy).toBe(true)
+
+    await act(async () => { await hook.submit() }) // 2e appel : la closure courante voit busy=true -> no-op
+    expect(createBatchFn).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveFirst([{ ok: true, nodePath: 'pages/Videos/a.media.json' }])
+      await firstSubmit
+    })
+    expect(hook.busy).toBe(false)
+  })
+
+  it('en cas de succès : ferme la modale, vide le texte, fusionne les nouveaux chemins et rafraîchit le dossier', async () => {
+    const results = [{ ok: true, nodePath: 'pages/Videos/a.media.json' }, { ok: true, nodePath: 'pages/Videos/b.media.json' }]
+    const createBatchFn = vi.fn().mockResolvedValue(results)
+    const ctx = makeCtx()
+    mount(createBatchFn, ctx)
+    act(() => { hook.setOpen(true); hook.setText('https://youtu.be/a\nhttps://youtu.be/b') })
+
+    await act(async () => { await hook.submit() })
+
+    expect(createBatchFn).toHaveBeenCalledWith('https://youtu.be/a\nhttps://youtu.be/b', 'pages/Videos', expect.any(Function))
+    expect(hook.open).toBe(false)
+    expect(hook.text).toBe('')
+    expect(hook.busy).toBe(false)
+    expect(ctx.pathsRef.current).toEqual(['pages/Videos/existing.media.json', 'pages/Videos/a.media.json', 'pages/Videos/b.media.json'])
+    expect(ctx.setPaths).toHaveBeenCalledWith(ctx.pathsRef.current)
+    expect(ctx.dropDirCache).toHaveBeenCalledWith('pages/Videos')
+    expect(ctx.loadDir).toHaveBeenCalledWith('pages/Videos')
+    expect(ctx.onImported).toHaveBeenCalledWith(results, [])
+  })
+
+  it("n'écrit rien dans paths/dir si aucun résultat n'a réussi, mais appelle quand même onImported", async () => {
+    const results = [{ ok: false, error: 'lien non reconnu' }]
+    const createBatchFn = vi.fn().mockResolvedValue(results)
+    const ctx = makeCtx()
+    mount(createBatchFn, ctx)
+    act(() => hook.setText('bogus'))
+
+    await act(async () => { await hook.submit() })
+
+    expect(ctx.setPaths).not.toHaveBeenCalled()
+    expect(ctx.dropDirCache).not.toHaveBeenCalled()
+    expect(ctx.loadDir).not.toHaveBeenCalled()
+    expect(ctx.onImported).toHaveBeenCalledWith([], results)
+  })
+
+  it('remet busy à false même si le batch creator rejette', async () => {
+    const createBatchFn = vi.fn().mockRejectedValue(new Error('réseau'))
+    const ctx = makeCtx()
+    mount(createBatchFn, ctx)
+    act(() => hook.setText('https://youtu.be/a'))
+
+    await act(async () => { await expect(hook.submit()).rejects.toThrow('réseau') })
+    expect(hook.busy).toBe(false)
+  })
+})

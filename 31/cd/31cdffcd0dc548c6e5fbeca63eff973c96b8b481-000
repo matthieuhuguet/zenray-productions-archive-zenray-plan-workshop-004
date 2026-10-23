@@ -1,0 +1,254 @@
+// 4 October 2026: one engine pass = CV, collection, merge, archived offers, letters, one commit.
+// FR : une passe du moteur = CV, collecte, fusion, offres archivees, lettres, un seul commit.
+import { collectAll } from './sources/Index.mjs'
+import { addProspects, mergeStore, isClosed } from './StoreMerge.mjs'
+import { refreshLegacyEngine } from './lib/Offer.mjs'
+import { SEED_TEMPLATE, composeLetter, letterKind, updateArchive, studioKey } from './Letters.mjs'
+import { loadCv, latestPublished } from './CvSource.mjs'
+import { createHookWriter } from './Hooks.mjs'
+import { canonicalUrl, englishDay, isoDay, readable } from './lib/Text.mjs'
+import { createSeenCache } from './lib/SeenCache.mjs'
+import { slotAfter } from './lib/Schedule.mjs'
+import { applySearches } from './lib/MySearches.mjs'
+
+const json = (value) => JSON.stringify(value, null, 2) + '\n'
+// The store is written compact: the page reads it through the contents API, which returns an EMPTY body above 1 MiB.
+// FR : le fichier des studios s'ecrit compact : la page le lit par l'API contents, qui rend un corps VIDE au-dessus de 1 Mio.
+const compact = (value) => JSON.stringify(value) + '\n'
+
+/** Search links for the boards that forbid scraping: built here once, rendered by the page. */
+export function manualSearchLinks(config) {
+  const { linkedin, ...others } = config.manualSearches
+  const links = linkedin.queries.map((query) => ({
+    board: linkedin.label, label: query.label,
+    url: `${linkedin.base}?keywords=${encodeURIComponent(query.keywords)}&location=${encodeURIComponent(query.location)}&f_TPR=${linkedin.recent}&sortBy=DD`,
+  }))
+  for (const [key, entry] of Object.entries(others)) if (key !== '_comment') links.push({ board: entry.label, label: entry.label, url: entry.url })
+  // Index sites that cannot be read by program (a script-rendered portal, a 403, a recruiter's search): kept as links with the reason.
+  // FR : les index qu'un programme ne peut pas lire (portail rendu par script, 403, recherche d'un cabinet) : gardes en liens avec la raison.
+  for (const entry of config.linkOnlyIndexes || []) links.push({ board: 'Index à ouvrir', label: entry.label, url: entry.url, why: entry.why })
+  const games = links.map((link) => ({ ...link, lane: 'games' }))
+  // The other lane: freelance platforms and non-game searches, only ever opened by hand.
+  // FR : l'autre voie : plateformes freelance et recherches hors jeu, jamais lues par le moteur, seulement ouvertes a la main.
+  const other = (config.manualSearchesOther || []).map((link) => ({ ...link, lane: 'other' }))
+  return [...games, ...other]
+}
+
+export function createEngine({ config, cloud, gh, http, collect = collectAll, cvLoader = loadCv, cvCache = null, now = () => new Date(), log = () => {}, env = process.env, hookWriter = null, refreshEnv = async () => {}, seenCache = createSeenCache() }) {
+  const writer = hookWriter || (config.letters.provider === 'claude' ? createHookWriter({ config, env }) : null)
+  const cloudPaths = config.cloud
+
+  async function currentCv() {
+    try {
+      const cv = await cvLoader({ gh, config })
+      if (cvCache) await cvCache.write(cv).catch(() => {})
+      return { cv, stale: false }
+    } catch (error) {
+      const cached = cvCache ? await cvCache.read().catch(() => null) : null
+      if (!cached) throw new Error(`CV unreadable and no cached copy: ${error.message}`)
+      log(`CV read failed, using the cached copy: ${error.message}`)
+      return { cv: cached, stale: true, reason: error.message }
+    }
+  }
+
+  const eligibleForLetter = (studio, template, today) => {
+    if (isClosed(studio, today) || studio.status !== 'to_contact') return false
+    if (studio.engine?.lane === 'other') return false // the letter template is written for studios; a tender or another trade needs its own words
+    if (template.hooks?.[studioKey(studio.name)]) return true
+    const engine = studio.engine
+    if (engine && engine.source === 'prospect') return true
+    return Boolean(engine && (engine.source || String(studio.id).startsWith('job_')) && engine.score >= config.letters.minScoreForAutoLetter)
+  }
+
+  // When the model says its usage limit is reached, stop asking until it has had time to reset: one refusal, not twelve slow ones.
+  // FR : quand le modele annonce sa limite d'usage, on cesse de demander le temps qu'elle se renouvelle : un refus, pas douze lents.
+  let limitSince = 0
+  const LIMIT = /session limit|usage limit|rate.?limit|quota|resets? \d/i
+
+  /**
+   * Claude's paragraph when signed in, else nothing; the previous one is kept while the vacancy and the CV are unchanged.
+   * A model answer is remembered for the whole run: a refused push recomputes the plan, and must never pay for the same answer twice.
+   * FR : un paragraphe repondu par le modele est retenu pour toute la passe : un push refuse recalcule le plan et ne repaie jamais la meme reponse.
+   */
+  async function claudeHook({ studio, cv, archive, tree, explicit, template, files = {}, memo = new Map() }) {
+    // Standby: no model call, but a paragraph the model already wrote stays in the letter while the vacancy and the CV are unchanged.
+    // FR : en veille, aucun appel au modele, mais un paragraphe deja ecrit reste dans la lettre tant que l'annonce et le CV ne changent pas.
+    if (!writer) {
+      const kept = (archive?.versions || []).at(-1)
+      return kept && kept.by === 'engine' && kept.hookSource === 'claude' && kept.hookText ? { hookOverride: { text: kept.hookText, source: 'claude' } } : { hookOverride: null }
+    }
+    if (!(await writer.available())) return { hookOverride: null }
+    if (!explicit && limitSince && now().getTime() - limitSince < 30 * 60 * 1000) return { hookOverride: null }
+    const kind = letterKind(studio)
+    if (kind === 'spontaneous' || template.hooks?.[studioKey(studio.name)]) return { hookOverride: null }
+    const last = (archive?.versions || []).at(-1)
+    if (!explicit && last && last.by === 'engine' && last.hookSource === 'claude' && last.hookText) return { hookOverride: { text: last.hookText, source: 'claude' } }
+    let offerText = studio.notes || ''
+    if (studio.offerDetailsPath) {
+      const pending = files[studio.offerDetailsPath]
+      const detail = pending ? JSON.parse(pending) : await tree.json(studio.offerDetailsPath).catch(() => null)
+      if (detail && Array.isArray(detail.sections)) offerText = detail.sections.filter((section) => section.heading !== 'Recensement du moteur').map((section) => section.text).join('\n\n')
+    }
+    const language = studio.engine?.language || 'fr'
+    const memoKey = `${studio.id}|${language}|${cv.fingerprint}|${offerText.length}`
+    if (!explicit && memo.has(memoKey)) { const again = memo.get(memoKey); return again.text ? { hookOverride: { text: again.text, source: 'claude' }, wrote: true } : { hookOverride: null, skipped: again.skipped, attempted: true } }
+    const result = await writer.write({ studio, offerText, cv, language, offerSkills: studio.engine?.skills || [] })
+    memo.set(memoKey, result)
+    if (result.skipped && LIMIT.test(result.skipped)) limitSince = now().getTime()
+    return result.text ? { hookOverride: { text: result.text, source: 'claude' }, wrote: true } : { hookOverride: null, skipped: result.skipped, attempted: true }
+  }
+
+  async function run({ trigger = 'manual', only = null, dryRun = false, onStage = () => {} } = {}) {
+    await refreshEnv()
+    const started = now()
+    onStage('cv')
+    const { cv, stale, reason: cvReason } = await currentCv()
+    onStage('collecte')
+    // His own searches, read from the freshest copy of the data repo; a missing or unreadable file only means "none".
+    // FR : ses recherches, lues depuis la copie la plus fraiche du depot ; un fichier absent ou illisible veut seulement dire "aucune".
+    let mine = null
+    try { if (cloud.sync && cloud.tree) { await cloud.sync(); mine = await cloud.tree.json(cloudPaths.searchesPath) } } catch (error) { log(`my searches not read: ${error.message}`) }
+    const own = applySearches(config, mine)
+    // Links already in the store: the index readers do not fetch their pages again (impolite for the site, slow for the pass).
+    // FR : les liens deja dans le fichier : les lecteurs d'index ne relisent pas leurs pages (impoli pour le site, lent pour la passe).
+    const known = new Set()
+    try { if (cloud.tree) { const stored = JSON.parse((await cloud.tree.read(cloudPaths.storePath)) || '{}'); for (const studio of stored.studios || []) if (studio.link) known.add(canonicalUrl(studio.link)) } } catch (error) { log(`known links not read: ${error.message}`) }
+    const boards = await collect({ http, config: own.config, only, context: { known, seen: seenCache, extraPages: own.indexPages, now: started }, onSource: (name, outcome) => log(`source ${name}: ${JSON.stringify(outcome)}`) })
+    onStage('publication')
+    const memo = new Map()
+    const listingByUrl = new Map()
+    for (const board of boards) for (const listing of board.listings) listingByUrl.set(listing.url, listing)
+
+    const result = await cloud.commit(`freelance engine: ${englishDay(started)} ${started.toISOString().slice(11, 16)}Z (${trigger})`, async (tree) => {
+      const stamp = now()
+      const today = isoDay(stamp)
+      const originalText = await tree.read(cloudPaths.storePath)
+      if (originalText === null) throw new Error(`${cloudPaths.storePath} is missing; refusing to create a new store`)
+      const store = JSON.parse(originalText)
+      const storedTemplate = await tree.json(cloudPaths.templatePath)
+      // A template he never edited follows the seed's corrections; one he saved is never replaced.
+      // FR : un modele qu'il n'a jamais edite suit les corrections de la graine ; un modele qu'il a enregistre n'est jamais remplace.
+      const staleSeed = storedTemplate && storedTemplate.status === 'seed' && (storedTemplate.seedVersion || 0) < SEED_TEMPLATE.seedVersion
+      const template = !storedTemplate || staleSeed ? SEED_TEMPLATE : storedTemplate
+      const files = {}
+      if (!storedTemplate || staleSeed) files[cloudPaths.templatePath] = json(SEED_TEMPLATE)
+      const { store: withOffers, report } = mergeStore(store, boards, config, { now: stamp })
+      const { store: merged, added: prospects } = addProspects(withOffers, config.prospects?.studios || [], { now: stamp })
+
+      // New vacancies: archive the advertisement text next to the store, the way the 244 earlier ones are.
+      const addedIds = new Set(report.added)
+      const detailed = []
+      for (const studio of merged.studios) {
+        if (!addedIds.has(studio.id) || studio.offerDetailsPath) continue
+        const listing = listingByUrl.get(studio.link)
+        const text = listing ? readable(listing.text) : ''
+        if (text.length < 150) continue
+        const file = `${cloudPaths.offersFolder}/${studio.id}.json`
+        // The 14 census lines live next to the advertisement; the studio record keeps one line, so the store stays small.
+        // FR : les 14 lignes de recensement vivent avec l'annonce ; la fiche garde une ligne, pour que le fichier reste leger.
+        files[file] = json({ title: studio.role, studio: studio.name, sourceUrl: studio.link, capturedAt: englishDay(stamp), sections: [{ heading: 'Annonce, missions et profil', text }, { heading: 'Recensement du moteur', text: studio.notes.replace(/\n\n/g, '\n') }] })
+        studio.notes = `Recensement du ${englishDay(stamp)} : ${studio.engine.sourceLabel}. Le détail complet est dans l’annonce archivée, section « Recensement du moteur ».`
+        studio.offerDetailsPath = file
+        detailed.push(studio.id)
+      }
+
+      // Letters that Matthieu wrote himself (a saved studio paragraph) are archived once, word for word, as his own version.
+      // FR : les lettres ecrites par Matthieu lui-meme (paragraphe de studio enregistre) sont archivees une fois, mot pour mot.
+      let written = 0
+      let storeBytes = 0
+      for (const [key, hook] of Object.entries(template.hooks || {})) {
+        if (hook.source !== 'matthieu') continue
+        const studio = merged.studios.find((entry) => studioKey(entry.name) === key)
+        if (!studio) continue
+        const file = `${cloudPaths.lettersFolder}/${studio.id}.json`
+        if (await tree.json(file)) continue
+        const original = composeLetter({ template, studio, cv, config: { ...config, latestWork: { ...config.latestWork, publishedCount: 0 } } })
+        const at = `${hook.at}T00:00:00.000Z`
+        files[file] = json({ v: 1, studioId: studio.id, versions: [{ at, by: 'matthieu', subject: original.subject, text: original.text, lang: original.lang, kind: original.kind, hookSource: original.hookSource, reason: 'sent-template', fingerprint: `matthieu|${studio.id}|${at}` }] })
+        studio.engine = { ...(studio.engine || {}), letterPath: file }
+        written += 1
+      }
+
+      // Letters: every open, uncontacted vacancy that fits; new ones capped, refreshes free.
+      const wantsLetter = merged.studios.filter((studio) => eligibleForLetter(studio, template, today)).sort((a, b) => (b.engine?.score || 0) - (a.engine?.score || 0))
+      let createdBudget = config.letters.maxGeneratedPerRun
+      let hookBudget = config.letters.maxClaudeHooksPerRun
+      const hooks = { written: 0, skipped: {} }
+      for (const studio of wantsLetter) {
+        const file = `${cloudPaths.lettersFolder}/${studio.id}.json`
+        const existing = await tree.json(file)
+        if (!existing) { if (createdBudget <= 0) continue; createdBudget -= 1 }
+        let hookOverride = null
+        const claudeAsked = hookBudget > 0 || (existing && (existing.versions || []).at(-1)?.hookSource === 'claude')
+        if (claudeAsked) {
+          const outcome = await claudeHook({ studio, cv, archive: existing, tree, explicit: false, template, files, memo })
+          hookOverride = outcome.hookOverride
+          if (outcome.attempted) { hookBudget -= 1; hooks.skipped[outcome.skipped] = (hooks.skipped[outcome.skipped] || 0) + 1 }
+          if (outcome.wrote) { hookBudget -= 1; hooks.written += 1 }
+        }
+        const letter = composeLetter({ template, studio, cv, config, hookOverride })
+        const update = updateArchive(existing, letter, { at: stamp.toISOString(), studioId: studio.id, templateStatus: template.status || 'custom' })
+        if (!update.changed) { if (!studio.engine.letterPath) studio.engine.letterPath = file; continue }
+        files[file] = json(update.archive)
+        studio.engine = { ...studio.engine, letterPath: file }
+        written += 1
+      }
+
+      const nextStore = compact(merged)
+      if (Buffer.byteLength(nextStore) > cloudPaths.maxStoreBytes) throw new Error(`The studio store would weigh ${Buffer.byteLength(nextStore)} bytes, above the ${cloudPaths.maxStoreBytes} guard; nothing was published`)
+      if (nextStore !== originalText) files[cloudPaths.storePath] = nextStore
+      storeBytes = Buffer.byteLength(nextStore)
+
+      const previous = (await tree.json(cloudPaths.enginePath)) || {}
+      const summary = { startedAt: started.toISOString(), finishedAt: stamp.toISOString(), trigger, ok: boards.every((board) => board.complete || board.partial), added: report.added.length, closed: report.closed.length, reopened: report.reopened.length, letters: written, details: detailed.length, prospects: prospects.length, belowFloor: report.belowFloor || 0, hooks }
+      const sources = boards.map((board) => ({ key: board.key, label: board.label, listed: board.listed, matched: board.matched, complete: board.complete, partial: Boolean(board.partial), errors: (board.errors || []).slice(0, 3).map((entry) => String(entry.error).slice(0, 200)), added: report.boards[board.key]?.added || 0, checkedAt: stamp.toISOString() }))
+      const kept = new Map((previous.sources || []).map((entry) => [entry.key, entry]))
+      for (const entry of sources) kept.set(entry.key, entry)
+      files[cloudPaths.enginePath] = json({
+        v: 1, updatedAt: stamp.toISOString(), intervalHours: config.service.intervalHours, nextRunDue: slotAfter(stamp, config.service.schedule).toISOString(),
+        lastRun: summary, history: [summary, ...(previous.history || [])].slice(0, 20), sources: [...kept.values()],
+        cv: { fingerprint: cv.fingerprint, updated: cv.updated, pdf: cv.pdf, commit: cv.source?.commit, stale, staleReason: cvReason || '' },
+        latestWork: latestPublished(cv, config.latestWork.publishedCount, 'fr').map((item) => ({ title: item.title, url: item.url })),
+        template: { status: template.status || 'custom', hooks: Object.keys(template.hooks || {}).length }, storeBytes,
+        claude: { enabled: Boolean(writer && await writer.available()), via: writer && writer.via ? await writer.via() : 'none', model: config.letters.claude.model, effort: config.letters.claude.effort, hooksThisPass: hooks.written, skipped: hooks.skipped },
+        manualSearches: [...manualSearchLinks(config), ...own.links], mySearches: own.status,
+      })
+      // The newest finds with what is needed to decide in one look; it goes to the notifier, never into the published data.
+      // FR : les trouvailles du jour avec de quoi decider d'un coup d'oeil ; pour le notificateur, jamais dans les donnees publiees.
+      const byId = new Map(merged.studios.map((studio) => [studio.id, studio]))
+      const addedSummary = report.added.map((id) => byId.get(id)).filter(Boolean).map((studio) => ({ id: studio.id, name: studio.name, role: studio.role, score: studio.engine?.score ?? null, tier: studio.engine?.tier ?? null, lane: studio.engine?.lane || 'games', source: studio.engine?.sourceLabel || '', country: studio.engine?.country || '', applyUrl: studio.engine?.applyUrl || studio.link || '' }))
+        .sort((a, b) => (b.score ?? -1) - (a.score ?? -1)).slice(0, 40)
+      return { files, report: { ...summary, boards: report.boards, addedIds: report.added, closedIds: report.closed, addedSummary } }
+    }, { dryRun })
+    return { ...result.report, committed: result.committed, commit: result.commit || '', durationMs: now() - started, ...(dryRun ? { files: result.files } : {}) }
+  }
+
+  /** On demand from the page: (re)write one letter, whichever studio, in the language asked. */
+  async function letter({ studioId, lang = null }) {
+    await refreshEnv()
+    const { cv } = await currentCv()
+    const result = await cloud.commit(`freelance letter: ${studioId}`, async (tree) => {
+      const store = JSON.parse(await tree.read(cloudPaths.storePath))
+      const index = store.studios.findIndex((studio) => studio.id === studioId)
+      if (index < 0) throw new Error(`Unknown studio ${studioId}`)
+      const template = (await tree.json(cloudPaths.templatePath)) || SEED_TEMPLATE
+      let studio = store.studios[index]
+      if (String(studio.id).startsWith('job_') && (!studio.engine || (studio.engine.legacy && !studio.engine.source))) studio = { ...studio, engine: refreshLegacyEngine(studio, config) }
+      const file = `${cloudPaths.lettersFolder}/${studioId}.json`
+      const archive = await tree.json(file)
+      const asked = await claudeHook({ studio, cv, archive, tree, explicit: true, template })
+      const drafted = composeLetter({ template, studio, cv, config, lang, hookOverride: asked.hookOverride })
+      const update = updateArchive(archive, drafted, { at: now().toISOString(), studioId, templateStatus: template.status || 'custom', explicit: true })
+      const files = { [file]: json(update.archive) }
+      if (studio.engine?.letterPath !== file) {
+        const next = { ...studio, engine: { ...(studio.engine || {}), letterPath: file } }
+        store.studios[index] = next
+        files[cloudPaths.storePath] = compact(store)
+      }
+      return { files, report: { letterPath: file, versions: update.archive.versions.length } }
+    })
+    return { ...result.report, committed: result.committed, commit: result.commit || '' }
+  }
+
+  return { run, letter, currentCv }
+}

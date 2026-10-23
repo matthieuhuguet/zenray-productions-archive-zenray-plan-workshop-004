@@ -1,0 +1,126 @@
+// @vitest-environment node
+// 6 October 2026, 22:10 CEST: conversations are linked to projects by EXACT PATH EVIDENCE, never by intuition; the digest filter never leaks what is not about the project.
+import { it, expect } from 'vitest'
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm } from 'node:fs/promises'
+import path from 'node:path'
+import os from 'node:os'
+import { LINK_SETTINGS, projectMarkers, scanJsonl, scanDecoded, linkConversations, suggestions, renderConversationIndex, citingProject, renderDigest } from './ConversationLinks.mjs'
+
+const TILES = '/Users/zenray/Create/Build/Productions/ZenRayHoudini/CeramicTiles01', LILY = '/Users/zenray/Create/Build/Productions/ZenRayHoudini/VegetationCollection01'
+const index = { projects: { tiles: { locations: { houdini: [{ localPath: TILES }], tmp: [{ localPath: '/Users/zenray/.claude/tmp/tmp-tiles-01' }] } }, lily: { locations: { houdini: [{ localPath: LILY }], short: [{ localPath: '/tmp/a' }] } } } }
+const line = value => JSON.stringify(value) + '\n'
+const claudeUser = (text, at) => line({ type: 'user', timestamp: at, message: { role: 'user', content: text } })
+const claudeAssistant = (text, at) => line({ type: 'assistant', timestamp: at, message: { role: 'assistant', content: [{ type: 'text', text }] } })
+const claudeResult = (text, at) => line({ type: 'user', timestamp: at, message: { role: 'user', content: [{ type: 'tool_result', content: text }] } })
+
+it('builds markers from exact paths, ignores short ones and credits a shared path to every project', () => {
+  const markers = projectMarkers(index)
+  expect(markers.map(item => item.marker)).toContain(LILY)
+  expect(markers.map(item => item.marker)).toContain('pages/ZenRayAssets/lily/')
+  expect(markers.map(item => item.marker)).not.toContain('/tmp/a')
+  const shared = projectMarkers({ projects: { one: { locations: { x: [{ localPath: LILY }] } }, two: { locations: { x: [{ localPath: LILY }] } } } }).find(item => item.marker === LILY)
+  expect(shared.projects.sort()).toEqual(['one', 'two'])
+  expect(LINK_SETTINGS.minimumMarkerLength).toBeGreaterThan('/tmp/a'.length)
+})
+
+it('counts prompts, work and tool results of a Claude transcript, and resumes from the saved offset', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'links-claude-'))
+  try {
+    const file = path.join(dir, 'session.jsonl'), markers = projectMarkers(index)
+    await writeFile(file, claudeUser(`open ${LILY}/hip`, '2026-10-05T08:00:00Z') + claudeAssistant(`I edit ${LILY}/Scripts/a.py`, '2026-10-05T08:01:00Z') + claudeResult(`${LILY}/out`, '2026-10-05T08:02:00Z') + claudeUser('unrelated', '2026-10-05T08:03:00Z'))
+    const first = await scanJsonl(file, 'claude', markers, null)
+    expect(first.hits.lily).toMatchObject({ lines: 3, work: 1, prompts: 1, first: '2026-10-05T08:00:00Z', last: '2026-10-05T08:02:00Z' })
+    expect(first.hits.tiles).toBeUndefined()
+    await appendFile(file, claudeAssistant(`again ${LILY}/x`, '2026-10-05T09:00:00Z'))
+    const second = await scanJsonl(file, 'claude', markers, first)
+    expect(second.hits.lily).toMatchObject({ lines: 4, work: 2, prompts: 1, last: '2026-10-05T09:00:00Z' })
+    expect(second.offset).toBe((await readFile(file)).length)
+    // a last line that is still being written (no newline) is not consumed, the next scan reads it again once complete
+    await appendFile(file, claudeUser(`partial ${LILY}`, '2026-10-05T10:00:00Z').trimEnd())
+    const third = await scanJsonl(file, 'claude', markers, second)
+    expect(third.hits.lily.lines).toBe(4)
+    expect(third.offset).toBe(second.offset)
+    // a different set of markers invalidates the cache instead of mixing two meanings
+    const other = await scanJsonl(file, 'claude', projectMarkers({ projects: { lily: { locations: { x: [{ localPath: LILY + '/Scripts' }] } } } }), third)
+    expect(other.hits.lily.lines).toBe(1)   // only the line that cites <project>/Scripts; a stale cache would have kept 4
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+it('classifies Codex user prompts and function calls', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'links-codex-'))
+  try {
+    const file = path.join(dir, 'rollout.jsonl')
+    await writeFile(file, line({ timestamp: '2026-10-05T11:00:00Z', type: 'response_item', payload: { role: 'user', content: [{ type: 'input_text', text: `read ${TILES}` }] } }) + line({ timestamp: '2026-10-05T11:01:00Z', type: 'response_item', payload: { type: 'function_call', name: 'exec_command', arguments: `ls ${TILES}` } }))
+    const result = await scanJsonl(file, 'codex', projectMarkers(index), null)
+    expect(result.hits.tiles).toMatchObject({ lines: 2, work: 1, prompts: 1 })
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+it('reads decoded Gemini pages across several windows and counts only the messages that cite the project', async () => {
+  const pages = { undefined: { messages: [{ kind: 'prompt', text: `build a video from ${LILY}/versions`, timestamp: '2026-10-05T23:45:00Z' }, { kind: 'answer', text: 'an unrelated answer' }], nextBefore: 10 }, 10: { messages: [{ kind: 'answer', text: `wrote ${LILY}/out.mp4`, timestamp: '2026-10-05T23:47:00Z' }], nextBefore: null } }
+  const hits = await scanDecoded('gemini:x', projectMarkers(index), async (id, before) => pages[before])
+  expect(hits.lily).toMatchObject({ lines: 2, prompts: 1, work: 1, first: '2026-10-05T23:45:00.000Z' })
+})
+
+it('links conversations by evidence, rates it, caches it and only suggests unbound strong single-project rows', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'links-all-'))
+  try {
+    const state = path.join(dir, 'state'); await mkdir(state)
+    const strong = path.join(dir, 'strong.jsonl'), weak = path.join(dir, 'weak.jsonl'), both = path.join(dir, 'both.jsonl'), bound = path.join(dir, 'bound.jsonl'), gem = path.join(dir, 'gem.db'), gemRaw = path.join(dir, 'gemraw.db')
+    await writeFile(strong, claudeUser(`work in ${LILY}`, '2026-10-05T08:00:00Z') + claudeAssistant(`edit ${LILY}/a`, '2026-10-05T08:01:00Z'))
+    await writeFile(weak, claudeAssistant(`only one look at ${LILY}`, '2026-10-05T08:00:00Z'))
+    await writeFile(both, [1, 2, 3].map(n => claudeAssistant(`edit ${LILY}/${n} and ${TILES}/${n}`, '2026-10-05T08:0' + n + ':00Z')).join(''))
+    await writeFile(bound, claudeUser(`work in ${LILY}`, '2026-10-05T08:00:00Z') + claudeAssistant(`edit ${LILY}/a`, '2026-10-05T08:01:00Z'))
+    await writeFile(gem, Buffer.from(`binary ${LILY} binary`)); await writeFile(gemRaw, Buffer.from(`binary ${LILY} hidden injected context only`))
+    const conversations = [
+      { id: 'claude:strong', provider: 'claude', sessionId: 'strong', readable: true, localPath: strong, title: 'Strong', updatedAt: 1, bytes: 10 },
+      { id: 'claude:weak', provider: 'claude', sessionId: 'weak', readable: true, localPath: weak, title: 'Weak', updatedAt: 1, bytes: 10 },
+      { id: 'claude:both', provider: 'claude', sessionId: 'both', readable: true, localPath: both, title: 'Both', updatedAt: 1, bytes: 10 },
+      { id: 'claude:bound', provider: 'claude', sessionId: 'bound', readable: true, localPath: bound, title: 'Bound', updatedAt: 1, bytes: 10 },
+      { id: 'gemini:gem', provider: 'gemini', sessionId: 'gem', readable: true, localPath: gem, title: 'Gem', updatedAt: 1, bytes: 10 },
+      { id: 'gemini:raw', provider: 'gemini', sessionId: 'raw', readable: true, localPath: gemRaw, title: 'Raw', updatedAt: 1, bytes: 10 },
+      { id: 'claude:hidden', provider: 'claude', sessionId: 'hidden', readable: false, localPath: strong, title: 'Not readable', updatedAt: 1, bytes: 10 },
+    ]
+    const decoded = { 'gemini:gem': { messages: [{ kind: 'prompt', text: `make a video of ${LILY}/versions`, timestamp: '2026-10-05T23:45:00Z' }, { kind: 'answer', text: `done in ${LILY}/video`, timestamp: '2026-10-05T23:46:00Z' }] }, 'gemini:raw': { messages: [{ kind: 'prompt', text: 'a question with no project path at all', timestamp: '2026-10-05T23:45:00Z' }] } }
+    const calls = []
+    const links = await linkConversations({ conversations, index, stateDir: state, bindings: { bound: 'lily' }, readConversation: async id => { calls.push(id); return decoded[id] } })
+    const by = Object.fromEntries(links.rows.map(row => [row.id, row]))
+    expect(by['claude:strong'].evidence[0]).toMatchObject({ projectId: 'lily', strength: 'strong', prompts: 1, work: 1 })
+    expect(by['claude:weak'].evidence[0].strength).toBe('weak')
+    expect(by['claude:both'].evidence.map(item => item.projectId).sort()).toEqual(['lily', 'tiles'])
+    expect(by['gemini:gem'].evidence[0]).toMatchObject({ projectId: 'lily', strength: 'strong' })
+    expect(by['gemini:raw']).toBeUndefined()
+    expect(by['claude:hidden']).toBeUndefined()
+    expect(by['claude:bound'].boundProject).toBe('lily')
+    expect(suggestions(links.rows).map(item => item.conversationId).sort()).toEqual(['claude:strong', 'gemini:gem'])
+    // cache: a second run reads nothing again and decodes no Gemini conversation
+    calls.length = 0
+    const again = await linkConversations({ conversations, index, stateDir: state, bindings: {}, readConversation: async id => { calls.push(id); return decoded[id] } })
+    expect(calls).toEqual([])
+    expect(again.rows.length).toBe(links.rows.length)
+    expect(JSON.parse(await readFile(path.join(state, 'ConversationLinks.json'), 'utf8')).files[strong].offset).toBeGreaterThan(0)
+    expect(by['claude:strong'].boundProject).toBeNull()
+    // the readable index of the project memory
+    const markdown = renderConversationIndex('lily', links, '6 October 2026')
+    expect(markdown).toContain('# Conversations that worked on lily')
+    expect(markdown).toContain('`claude:strong`')
+    expect(markdown).toContain('| claude | Bound | strong |')
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+it('digests keep ONLY the messages that cite the project and say so', () => {
+  const messages = [
+    { id: 1, kind: 'prompt', text: `build the video from ${LILY}/versions`, timestamp: '2026-10-05T23:45:00Z' },
+    { id: 2, kind: 'prompt', text: 'my private job application answers', timestamp: '2026-10-05T23:46:00Z' },
+    { id: 3, kind: 'answer', text: `done: ${LILY}/video/a.mp4 ` + 'x'.repeat(50), timestamp: '2026-10-05T23:47:00Z' },
+  ]
+  const kept = citingProject(messages, index, 'lily')
+  expect(kept.map(item => item.id)).toEqual([1, 3])
+  expect(() => citingProject(messages, index, 'unknown')).toThrow('No registered path')
+  const markdown = renderDigest({ id: 'gemini:x', conversation: { title: 'T', provider: 'gemini' }, messages: [...kept].reverse(), pages: 2, project: 'lily', maxChars: 20 })
+  expect(markdown).toContain('that cite the paths of lily')
+  expect(markdown).not.toContain('private job')
+  expect(markdown.indexOf('2026-10-05T23:45:00Z')).toBeLessThan(markdown.indexOf('2026-10-05T23:47:00Z'))
+  expect(markdown).toMatch(/\[\.\.\. \d+ more characters in the original\]/)
+  expect(renderDigest({ id: 'x', messages: [], project: undefined })).not.toContain('deliberately left out')
+})

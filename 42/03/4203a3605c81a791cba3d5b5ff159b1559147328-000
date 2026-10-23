@@ -1,0 +1,59 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { exchangeCode, forceRefreshToken, getAuth, getValidToken } from './spotifyAuth.js'
+
+const ATTEMPT_KEY = 'spotify:pkce:v2'
+const AUTH_KEY = 'spotify:auth:v1'
+
+describe('Spotify PKCE session', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.restoreAllMocks()
+  })
+
+  it('refuse un callback dont le state ne correspond pas sans appeler Spotify', async () => {
+    sessionStorage.setItem(ATTEMPT_KEY, JSON.stringify({ verifier: 'verifier', state: 'attendu', createdAt: Date.now() }))
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+
+    await expect(exchangeCode('code', 'attaque')).resolves.toBeNull()
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(sessionStorage.getItem(ATTEMPT_KEY)).toBeNull()
+  })
+
+  it('refuse une tentative PKCE expirée', async () => {
+    sessionStorage.setItem(ATTEMPT_KEY, JSON.stringify({ verifier: 'verifier', state: 'ok', createdAt: Date.now() - 11 * 60_000 }))
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+
+    await expect(exchangeCode('code', 'ok')).resolves.toBeNull()
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('lie le callback à la tentative et conserve la rotation du refresh token', async () => {
+    sessionStorage.setItem(ATTEMPT_KEY, JSON.stringify({ verifier: 'verifier', state: 'ok', createdAt: Date.now() }))
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ access_token: 'access-1', refresh_token: 'refresh-1', expires_in: 3600 }),
+    })
+
+    await expect(exchangeCode('code', 'ok')).resolves.toMatchObject({ access_token: 'access-1' })
+    expect(getAuth()).toMatchObject({ access_token: 'access-1', refresh_token: 'refresh-1' })
+  })
+
+  it('partage un seul refresh entre plusieurs 401 concurrents', async () => {
+    localStorage.setItem(AUTH_KEY, JSON.stringify({ access_token: 'old', refresh_token: 'refresh-1', expires_at: 0 }))
+    let release
+    const pending = new Promise((resolve) => { release = resolve })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      await pending
+      return { ok: true, json: async () => ({ access_token: 'new', expires_in: 3600 }) }
+    })
+
+    const a = forceRefreshToken()
+    const b = getValidToken({ force: true })
+    release()
+
+    await expect(Promise.all([a, b])).resolves.toEqual(['new', 'new'])
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(getAuth()).toMatchObject({ access_token: 'new', refresh_token: 'refresh-1' })
+  })
+})

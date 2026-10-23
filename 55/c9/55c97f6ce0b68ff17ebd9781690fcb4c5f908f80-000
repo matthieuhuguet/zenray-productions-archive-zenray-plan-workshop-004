@@ -1,0 +1,212 @@
+// ZenRayMedia — L8 : le document `.zmedia.json` dans Create.
+//
+// DEUX CHOSES DIFFÉRENTES, souvent confondues (retour Matthieu 2026-07-25) :
+//
+//   1. ENREGISTRER  = ranger le document dans MON index, à un endroit que je choisis, pour le
+//      rouvrir et continuer à travailler. C'est ce fichier-ci. Le contenu est la SOURCE
+//      (brief + blocs + thème + format), pas le rendu.
+//   2. PUBLIER      = produire une page figée et partageable. C'est `exporters.js`.
+//
+// Même hiérarchie de dossiers, deux affichages et deux intentions distinctes. On peut enregistrer
+// sans jamais publier, et republier sans réenregistrer.
+//
+// Le fichier reste volontairement LISIBLE et MINUSCULE : aucun HTML compilé n'y est stocké, il se
+// recompile en quelques millisecondes. Stocker le rendu créerait deux vérités qui divergeraient.
+
+import { readJson, saveJson, listChildren } from '../ref/content.js'
+import { emptyBrief, makeId, validate, checksumOf, DOCUMENT_SCHEMA_VERSION } from './contracts.js'
+import { DEFAULT_THEME_ID } from './themes/registry.js'
+
+export const ZMEDIA_EXT = '.zmedia.json'
+export const ZMEDIA_VERSION = DOCUMENT_SCHEMA_VERSION
+export const DEFAULT_MEDIA_DIR = 'pages/Media'
+
+export function isZMediaPath(path) { return typeof path === 'string' && path.endsWith(ZMEDIA_EXT) }
+
+export function slugify(text) {
+  return String(text || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+    .toLowerCase().slice(0, 60) || 'media'
+}
+
+// Chemin proposé pour un projet dans un dossier donné. Le suffixe court évite d'écraser un
+// homonyme sans avoir à interroger le serveur avant d'afficher une proposition.
+export function suggestPath(dir, title, salt = 0) {
+  // Normaliser D'ABORD, se servir de la valeur normalisée PARTOUT ensuite.
+  // Bug réel (2026-07-25) : l'empreinte était calculée sur `dir` brut alors que le chemin final
+  // utilisait `dir` nettoyé -> « pages/Media » et « pages/Media/ » désignent le même dossier mais
+  // produisaient deux noms de fichier différents. Un même document enregistré deux fois depuis
+  // deux points d'entrée aurait créé deux fichiers au lieu d'un.
+  const folder = String(dir || DEFAULT_MEDIA_DIR).replace(/\/+$/, '')
+  const base = slugify(title)
+  const suffix = makeId('', `${folder}/${base}`, salt).replace(/^-/, '').slice(-4)
+  return `${folder}/${base}-${suffix}${ZMEDIA_EXT}`
+}
+
+// --- Migrations (AUDIT R3) ------------------------------------------------------------------------
+// Trois versions se sont réellement succédé sur ce format, jamais nommées ni testées comme des
+// migrations avant ce lot : la V1 (implicite, `v` absent des tout premiers documents) portait une
+// COMPOSITION unique ; la V2 l'a remplacée par `compositions`, une par thème (`fromDocument` la
+// lisait déjà, tolérée en ligne, sans jamais l'appeler une migration) ; la V3 (AUDIT T2) ajoute
+// l'identité et l'empreinte que le contrat Document exige désormais. Fonction PURE, sans I/O :
+// c'est ce qui la rend testable sur fixture sans jamais toucher au réseau.
+export function migrateDocument(raw, path) {
+  if (!raw || typeof raw !== 'object') return { document: raw, futureVersion: false }
+  const version = Number.isFinite(raw.v) ? raw.v : 1
+  // Une version FUTURE, que ce code ne comprend pas encore, reste lisible mais INTACTE : jamais
+  // réécrite, jamais devinée, pour ne perdre aucun champ qu'une version plus récente aurait ajouté.
+  if (version > DOCUMENT_SCHEMA_VERSION) return { document: raw, futureVersion: true }
+
+  let doc = raw
+  if (version < 2) {
+    const { composition, ...reste } = doc
+    doc = {
+      ...reste,
+      v: 2,
+      compositions: doc.compositions && typeof doc.compositions === 'object'
+        ? doc.compositions
+        : (composition?.themeId ? { [composition.themeId]: composition } : {}),
+    }
+  }
+  if (version < 3) {
+    // Déterministes depuis le CONTENU réellement présent, jamais `Date.now()` (même discipline que
+    // `makeId`, déjà établie dans ce dépôt) : rejouer la migration sur le même fichier reproduit
+    // exactement les mêmes identifiants, jamais des doublons à chaque rechargement.
+    const contentKey = JSON.stringify({ brief: doc.brief, notes: doc.notes, cut: doc.cut, compositions: doc.compositions })
+    doc = {
+      ...doc,
+      v: 3,
+      documentId: doc.documentId || makeId('doc', path || doc.title || 'zmedia', 0),
+      revisionId: doc.revisionId || makeId('rev', contentKey, 0),
+      savedHash: doc.savedHash || checksumOf(contentKey),
+    }
+  }
+  return { document: doc, futureVersion: false }
+}
+
+// --- Sérialisation ------------------------------------------------------------------------------
+export function toDocument(project, { themeId, formatId, path }) {
+  const contentKey = JSON.stringify({ brief: project.brief, notes: project.notes, cut: project.cut, compositions: project.compositions })
+  return {
+    type: 'zenraymedia',
+    v: ZMEDIA_VERSION,
+    title: project.brief?.title || 'Sans titre',
+    path: path || null,
+    brief: project.brief,
+    notes: project.notes || '',
+    cut: project.cut || null,
+    compositions: project.compositions || {},
+    themeId: themeId || DEFAULT_THEME_ID,
+    formatId: formatId || 'F-web-article',
+    seed: project.seed ?? 1,
+    // AUDIT T2/R3 : documentId reste STABLE tant que le chemin ne change pas (déterministe, donc
+    // reproductible d'un enregistrement à l'autre sans état supplémentaire à faire vivre sur
+    // `project`) ; revisionId/savedHash dérivés du contenu réellement écrit, un enregistrement
+    // identique au précédent reproduit donc le même identifiant plutôt que d'en fabriquer un sans
+    // raison. Le chaînage complet des révisions (baseRevisionId, autosauvegarde, brouillon local)
+    // reste porté par R2, carte distincte de ce même backlog — volontairement pas construit ici.
+    documentId: project.documentId || makeId('doc', path || project.brief?.title || 'zmedia', 0),
+    revisionId: makeId('rev', contentKey, 0),
+    savedHash: checksumOf(contentKey),
+  }
+}
+
+// Tolérant en LECTURE (migration comprise), strict en écriture : un document écrit par une version
+// future ne doit pas faire planter l'application, ni être réécrit avec ce que ce code ne comprend
+// pas encore — juste rester lisible, marqué, pour que l'appelant refuse de l'écraser.
+export function fromDocument(doc, path) {
+  if (!doc || doc.type !== 'zenraymedia') return null
+  const { document: migre, futureVersion } = migrateDocument(doc, path)
+  if (futureVersion) {
+    return {
+      project: {
+        id: makeId('project', path || doc.title || 'zmedia', 0),
+        brief: { ...emptyBrief(), id: makeId('brief', path || doc.title || 'zmedia', 0), title: doc.title || 'Document plus récent' },
+        notes: '', cut: null, compositions: {}, seed: 1, path: path || doc.path || null,
+      },
+      themeId: doc.themeId || DEFAULT_THEME_ID,
+      formatId: doc.formatId || 'F-web-article',
+      futureVersion: true,
+    }
+  }
+  const brief = { ...emptyBrief(), ...(migre.brief || {}) }
+  if (!brief.id) brief.id = makeId('brief', path || migre.title || 'zmedia', 0)
+  return {
+    project: {
+      id: makeId('project', path || migre.title || 'zmedia', 0),
+      brief,
+      notes: typeof migre.notes === 'string' ? migre.notes : '',
+      cut: migre.cut && Array.isArray(migre.cut.beats) && migre.cut.beats.length ? migre.cut : null,
+      // Une composition par thème : essayer une autre famille ne détruit jamais le montage Lego.
+      compositions: migre.compositions && typeof migre.compositions === 'object' ? migre.compositions : {},
+      seed: Number.isFinite(migre.seed) ? migre.seed : 1,
+      path: path || migre.path || null,
+      documentId: migre.documentId, revisionId: migre.revisionId, savedHash: migre.savedHash,
+    },
+    themeId: migre.themeId || DEFAULT_THEME_ID,
+    formatId: migre.formatId || 'F-web-article',
+    futureVersion: false,
+  }
+}
+
+// --- Entrées / sorties ---------------------------------------------------------------------------
+/** Lit un document. `{ ok, project, themeId, formatId, sha, error }` — ne lève jamais. */
+export async function loadDocument(path) {
+  if (!isZMediaPath(path)) return { ok: false, error: 'Chemin qui n’est pas un document ZenRayMedia.' }
+  const { data, sha, missing, error } = await readJson(path)
+  if (missing) return { ok: false, error: 'Document introuvable.' }
+  if (error) return { ok: false, error: error === 'parse' ? 'Document illisible (JSON invalide).' : 'Lecture impossible (réseau).' }
+  const parsed = fromDocument(data, path)
+  if (!parsed) return { ok: false, error: 'Ce fichier n’est pas un document ZenRayMedia.' }
+  return { ok: true, ...parsed, sha }
+}
+
+/**
+ * Écrit un document. `sha` est celui lu précédemment : c'est lui qui permet à GitHub de refuser
+ * une écriture concurrente plutôt que d'écraser le travail d'un autre onglet.
+ */
+export async function saveDocument(path, project, { themeId, formatId, sha } = {}) {
+  const errors = validate('brief', project?.brief || null)
+  if (errors.length) return { ok: false, error: `Document incomplet : ${errors[0].message}` }
+  const doc = toDocument(project, { themeId, formatId, path })
+  const res = await saveJson(path, doc, sha)
+  if (res.conflict) return { ok: false, conflict: true, error: 'Ce document a été modifié ailleurs. Recharge-le avant d’enregistrer.' }
+  if (!res.ok) return { ok: false, error: res.error === 'network' ? 'Enregistrement impossible (réseau).' : `Enregistrement refusé (${res.error || 'inconnu'}).` }
+  return { ok: true, sha: res.sha }
+}
+
+// --- Navigation de dossiers (le fil d'Ariane) -------------------------------------------------
+/** Sous-dossiers directs d'un dossier, triés. `listChildren` passe par l'API `children`. */
+export async function listFolders(dir) {
+  const entries = await listChildren(dir)
+  return entries
+    .filter((e) => e && e.type === 'dir')
+    .map((e) => ({ name: e.name, path: e.path }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'fr'))
+}
+
+/** Documents ZenRayMedia directement dans un dossier. */
+export async function listDocuments(dir) {
+  const entries = await listChildren(dir)
+  return entries
+    .filter((e) => e && e.type !== 'dir' && isZMediaPath(e.path || e.name))
+    .map((e) => ({ name: String(e.name).replace(ZMEDIA_EXT, ''), path: e.path }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'fr'))
+}
+
+/** Segments d'un chemin de dossier, pour l'affichage du fil d'Ariane. */
+export function crumbsOf(dir) {
+  const parts = String(dir || '').split('/').filter(Boolean)
+  return parts.map((name, i) => ({ name, path: parts.slice(0, i + 1).join('/') }))
+}
+
+export function parentOf(dir) {
+  const parts = String(dir || '').split('/').filter(Boolean)
+  return parts.length > 1 ? parts.slice(0, -1).join('/') : parts[0] || 'pages'
+}
+
+export function dirOf(path) {
+  const i = String(path || '').lastIndexOf('/')
+  return i > 0 ? path.slice(0, i) : DEFAULT_MEDIA_DIR
+}

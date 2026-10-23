@@ -1,0 +1,517 @@
+// backup-mirror.mjs — SECOND exemplaire indépendant (backup froid) de tout le contenu binaire de ZenRayShards.
+//
+// EN CLAIR : ZenRayShards stocke aujourd'hui chaque image/fichier/base/vidéo-non-YouTube en un seul exemplaire,
+// réparti sur des dépôts GitHub « primaires » (zenray-img-public-NN, zenray-productions-archive-*, etc.). Si un
+// de ces dépôts est perdu (suppression accidentelle, ban GitHub, corruption), le contenu est perdu. Ce script
+// fabrique un DEUXIÈME jeu de dépôts, totalement indépendant, qui contient les MÊMES octets (miroir bit-exact),
+// pour survivre à la perte du primaire. Pas de re-chiffrement, pas de transformation : on télécharge le binaire
+// primaire tel qu'il est aujourd'hui (chiffré ou non, selon son état actuel), on le redécoupe en chunks de 95 Mo
+// (taille fixe pour CE backup, indépendante du découpage d'origine), et on le pousse sur un repo de backup.
+//
+// CE QUI EST COUVERT (binaires ayant un vrai contenu à dupliquer) :
+//   .img.json (images), .file.json (archives chunkées/blob-raw), .db.json / .canvas.json / .embed.json
+//   (petits JSON de métadonnées — pas de binaire externe, mais le JSON lui-même est mirroré comme un blob),
+//   .media.json de type video-raw / dash / hls (vidéos RESTÉES sur ZenRayShards, pas sur YouTube).
+// CE QUI EST IGNORÉ (rien à dupliquer, pas de binaire référencé) :
+//   .media.json {type:'youtube'} (juste un videoId, le binaire vit chez YouTube)
+//   .media.json {type:'gmaps'}   (juste une URL Google Maps, aucun stockage)
+//
+// NOMMAGE DES REPOS DE BACKUP : zenrayshards-backup-<hex12> (hex aléatoire, convention v2, PAS de
+// numérotation séquentielle -> un
+// visiteur GitHub ne peut pas déduire l'échelle du backup). Nouveau repo dès que le précédent atteint 5 Go
+// (même invariant dur que server/shard.js). TOUJOURS PRIVÉS (stockage froid, pas de CDN jsDelivr nécessaire,
+// le backup peut contenir des binaires sensibles qu'on ne veut pas exposer publiquement une 2e fois).
+//
+// INDEX DE CORRESPONDANCE : pages/_backup-index/index.json dans zenray-data (repo privé existant, chemin caché
+// sous underscore pour ne jamais apparaître comme un nœud Finder normal — le Finder ne liste que les extensions
+// connues .md/.db.json/.media.json/etc, donc ce chemin est déjà invisible de l'UI). Contient, par chemin source :
+// { sha256 du fichier original reconstitué, taille, liste ordonnée des chunks (repo+path backup), date }.
+// Permet de VÉRIFIER (retélécharger + recalculer le sha256) et de RESTAURER (retrouver les chunks) sans
+// dépendre du primaire. On ne touche JAMAIS aux manifestes existants dans zenray-data : lecture seule côté primaire.
+//
+// IDEMPOTENT / REPRENABLE : avant de traiter un chemin, on regarde si l'index a déjà une entrée avec le MÊME
+// sha256 que le manifeste primaire actuel -> on saute (déjà backupé, rien n'a changé). Une interruption
+// (Ctrl-C, coupure réseau) n'oblige donc jamais à repartir de zéro : relancer le script reprend où il s'était arrêté.
+//
+// RATE-LIMIT : chaque réponse GitHub REST porte x-ratelimit-remaining. Sous un plancher de sécurité, on
+// ATTEND jusqu'à x-ratelimit-reset plutôt que de continuer et de se faire jeter (403). Les lectures raw.
+// githubusercontent.com (téléchargement des octets) NE comptent PAS dans ce quota (cf. server/shard.js).
+//
+// ── USAGE (TEST, SANS DANGER) ──────────────────────────────────────────────────────────────────────────
+//   GITHUB_TOKEN=$(gh auth token) node scripts/backup-mirror.mjs --dry-run --limit=5
+//   GITHUB_TOKEN=$(gh auth token) node scripts/backup-mirror.mjs --limit=3
+//   GITHUB_TOKEN=$(gh auth token) node scripts/backup-mirror.mjs --path="pages/Archives/MonDossier" --limit=10
+//
+// ── USAGE (RUN COMPLET, PLUS TARD, EN TÂCHE DE FOND — NE PAS LANCER SANS VALIDATION EXPLICITE DE MATTHIEU) ─
+// Modèle : le re-upload DJI en tâche de fond (archive-folder.mjs via nohup, log persistant, reprenable).
+//   mkdir -p ~/.zr-runs
+//   nohup env GITHUB_TOKEN=$(gh auth token) node scripts/backup-mirror.mjs --i-know-what-im-doing \
+//     > ~/.zr-runs/backup-mirror-$(date +%Y%m%d-%H%M).log 2>&1 &
+//   disown
+// Suivi :   tail -f ~/.zr-runs/backup-mirror-*.log
+// Reprise après coupure : relancer LA MÊME commande (sans --limit/--path) — l'index déjà écrit fait sauter
+// tout ce qui est déjà backupé (comparaison sha256), le script continue exactement où il s'était arrêté.
+// Le run complet peut durer des heures (100k+ éléments) et consommer une grosse part du quota GitHub 5000/h :
+// c'est attendu, le script attend le reset automatiquement plutôt que de planter.
+
+import { mkdir, open, rm, writeFile } from 'node:fs/promises'
+import { sharedBatchAdapter } from './lib/push-batch-policy.mjs'
+const batchPolicy = sharedBatchAdapter()  // 14 October 2026. FR : politique de lots partagee.
+import { spawnSync } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN requis (ex: GITHUB_TOKEN=$(gh auth token) node scripts/backup-mirror.mjs ...)'); process.exit(1) }
+
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const DATA = 'zenray-data'
+const BRANCH = 'main'
+const INDEX_PATH = 'pages/_backup-index/index.json'
+
+const CHUNK = 95 * 1024 * 1024          // 95 Mo : taille FIXE du backup, indépendante du découpage d'origine.
+const SHARD_CAP = 4.5 * 1024 ** 3        // rollover < 5 Go GitHub (même marge que archive-folder.mjs SHARD_CAP).
+const WORK = process.env.ZR_BACKUP_WORK || `${process.env.HOME}/.zr-backup-work`
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+// ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────
+const argv = process.argv.slice(2)
+const DRY = argv.includes('--dry-run') || argv.includes('--dry')
+const LIMIT = (() => { const a = argv.find((x) => x.startsWith('--limit=')); return a ? Math.max(0, parseInt(a.split('=')[1], 10) || 0) : Infinity })()
+const ONLY_PATH = (() => { const a = argv.find((x) => x.startsWith('--path=')); return a ? a.slice('--path='.length).replace(/\/+$/, '') : null })()
+if (LIMIT === Infinity && !ONLY_PATH) {
+  console.error('REFUS DE SÉCURITÉ : run complet sans --limit ni --path (100k+ éléments dans le drive).')
+  console.error('  Test : node scripts/backup-mirror.mjs --dry-run --limit=5')
+  console.error('  Run complet volontaire : ajouter --i-know-what-im-doing (voir commentaire en tête de fichier pour le nohup).')
+  if (!argv.includes('--i-know-what-im-doing')) process.exit(1)
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const sha256Buf = (buf) => createHash('sha256').update(buf).digest('hex')
+
+// ── GitHub REST avec respect du rate-limit ──────────────────────────────────────────────────────────
+let rlRemaining = Infinity, rlReset = 0
+async function waitForQuota() {
+  if (rlRemaining > 50) return
+  const waitMs = Math.max(0, rlReset * 1000 - Date.now()) + 2000
+  if (waitMs > 0) { console.log(`  ⏳ quota GitHub bas (${rlRemaining} restant) — attente ${Math.ceil(waitMs / 1000)}s jusqu'au reset`); await sleep(waitMs) }
+}
+async function gh(p, init = {}, tries = 5) {
+  await waitForQuota()
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(`https://api.github.com/${p}`, { ...init, signal: AbortSignal.timeout(30000), headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zr-backup-mirror', ...(init.headers || {}) } })
+      const rem = r.headers.get('x-ratelimit-remaining'); const reset = r.headers.get('x-ratelimit-reset')
+      if (rem != null) rlRemaining = Number(rem)
+      if (reset != null) rlReset = Number(reset)
+      if (r.status === 403 && rem === '0') { await waitForQuota(); continue }
+      if (r.status === 429) { await sleep(3000 * (i + 1)); continue }
+      return r
+    } catch { await sleep(1500 * (i + 1)) }
+  }
+  return { ok: false, status: 0, json: async () => ({}), text: async () => '' }
+}
+const rawGet = async (repo, filePath, tries = 5) => {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(`https://raw.githubusercontent.com/${OWNER}/${repo}/${BRANCH}/${String(filePath).split('/').map(encodeURIComponent).join('/')}`, { headers: { Authorization: `Bearer ${TOKEN}`, 'User-Agent': 'zr-backup-mirror' }, signal: AbortSignal.timeout(30000) })
+      if (r.ok || r.status === 404) return r
+    } catch {}
+    await sleep(1200 * (i + 1))
+  }
+  return { ok: false, status: 0 }
+}
+// Téléchargement d'une URL directe (jsDelivr/raw déjà résolue par un manifeste), avec retries.
+// Les nouvelles vidéos/blob-raw vivent sur des repos PRIVÉS : raw.githubusercontent exige donc le token.
+async function fetchUrlResponse(url, tries = 5) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const isRawGithub = /^https:\/\/raw\.githubusercontent\.com\//.test(url)
+      const r = await fetch(url, {
+        headers: isRawGithub ? { Authorization: `Bearer ${TOKEN}`, 'User-Agent': 'zr-backup-mirror' } : undefined,
+        signal: AbortSignal.timeout(60000),
+      })
+      if (r.ok) return r
+    } catch {}
+    await sleep(1500 * (i + 1))
+  }
+  throw new Error('fetchUrl échec: ' + url.slice(0, 120))
+}
+
+// Assemble les sources dans un fichier de staging tout en calculant le sha256. Mémoire bornée : même une
+// vidéo de 16 Go ne garde jamais que le chunk réseau courant en RAM, au lieu d'un Buffer.concat géant.
+async function downloadUrlsToFile(urls, stagedPath) {
+  await mkdir(path.dirname(stagedPath), { recursive: true })
+  const fh = await open(stagedPath, 'w')
+  const hash = createHash('sha256')
+  let size = 0
+  try {
+    for (const url of urls) {
+      const r = await fetchUrlResponse(url)
+      if (!r.body) throw new Error('réponse sans body: ' + url.slice(0, 120))
+      for await (const chunk of r.body) {
+        const buf = Buffer.from(chunk)
+        await fh.write(buf)
+        hash.update(buf)
+        size += buf.length
+      }
+    }
+  } finally { await fh.close() }
+  return { size, sha256: hash.digest('hex') }
+}
+
+// commit d'un LOT de fichiers texte sur zenray-data (arbre inline, pattern archive-folder.mjs commitInline).
+async function commitInline(files, msg) {
+  for (let a = 0; a < 8; a++) {
+    const refR = await gh(`repos/${OWNER}/${DATA}/git/ref/heads/${BRANCH}`); const ref = refR.ok ? await refR.json() : null
+    const head = ref?.object?.sha; if (!head) { await sleep(1500); continue }
+    const baseR = await gh(`repos/${OWNER}/${DATA}/git/commits/${head}`); const base = baseR.ok ? (await baseR.json()).tree?.sha : null
+    if (!base) { await sleep(1500); continue }
+    const tree = files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', content: f.content }))
+    const ntR = await gh(`repos/${OWNER}/${DATA}/git/trees`, { method: 'POST', body: JSON.stringify({ base_tree: base, tree }) })
+    const nt = ntR.ok ? await ntR.json() : null; if (!nt?.sha) { await sleep(2000); continue }
+    const ncR = await gh(`repos/${OWNER}/${DATA}/git/commits`, { method: 'POST', body: JSON.stringify({ message: msg, tree: nt.sha, parents: [head] }) })
+    const nc = ncR.ok ? await ncR.json() : null; if (!nc?.sha) { await sleep(2000); continue }
+    const up = await gh(`repos/${OWNER}/${DATA}/git/refs/heads/${BRANCH}`, { method: 'PATCH', body: JSON.stringify({ sha: nc.sha, force: false }) })
+    if (up.ok) return true
+    await sleep(1500)
+  }
+  return false
+}
+
+// ── INDEX DE CORRESPONDANCE (lecture + écriture) ────────────────────────────────────────────────────
+// Format : { v:1, updatedAt, entries: { "<chemin source .xxx.json>": { sha256, size, chunkSize, repos:[...],
+//            chunks:[{repo, path}], sourceManifestSha256 (hash du MANIFESTE primaire au moment du backup, pour
+//            détecter un changement sans re-télécharger le binaire), backedUpAt } } }
+async function readIndex() {
+  const r = await rawGet(DATA, INDEX_PATH)
+  if (r.ok) {
+    const text = await r.text()
+    try { return JSON.parse(text) } catch {}
+    // Compatibilité avec l'index v1 écrit avant 2026-07-12 : commitInline attendait du texte UTF-8 mais
+    // writeIndex lui passait du Base64, donc le dépôt contient littéralement "eyJ2..." au lieu de JSON.
+    try { return JSON.parse(Buffer.from(text.trim(), 'base64').toString('utf8')) } catch {}
+  }
+  return { v: 1, updatedAt: null, entries: {} }
+}
+async function writeIndex(index) {
+  index.updatedAt = new Date().toISOString()
+  return commitInline([{ path: INDEX_PATH, content: JSON.stringify(index) }], `backup-index ${Object.keys(index.entries).length} entrées`)
+}
+
+// ── REPOS DE BACKUP (zenrayshards-backup-<hex12>, privés, rollover 5 Go) ───────────────────────────
+const GENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/usr/bin/true' }
+const git = (dir, a, timeout = 240000) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', env: GENV, timeout, killSignal: 'SIGKILL' })
+const newHex = () => randomBytes(6).toString('hex') // 12 caractères hex
+const BACKUP_README = (repo) => `# ${repo}
+
+Dépôt de **backup froid** ZenRay (2e exemplaire indépendant des binaires primaires).
+
+Contenu : morceaux binaires de 95 Mo, nommés par hachage (\`ab/cd/<hash>-NNN\`). Aucun nom d'origine, aucune
+arborescence humaine. Le mapping complet (chemin réel -> morceaux, empreinte sha256 du fichier) vit dans
+l'index privé \`zenray-data:${INDEX_PATH}\`, jamais dans ce dépôt.
+
+Ne rien committer à la main : toutes les écritures passent par \`scripts/backup-mirror.mjs\`.
+`
+
+let bctx = null // { repo, dir, bytes, pending }
+async function openBackupShard() {
+  const repo = `zenrayshards-backup-${newHex()}`
+  const dir = path.join(WORK, repo)
+  await rm(dir, { recursive: true, force: true })
+  await mkdir(dir, { recursive: true })
+  git(dir, ['init', '-q']); git(dir, ['branch', '-M', BRANCH])
+  git(dir, ['config', 'user.email', 'bot@zenray']); git(dir, ['config', 'user.name', 'zenray-bot'])
+  git(dir, ['config', 'http.version', 'HTTP/1.1']); git(dir, ['config', 'http.postBuffer', '524288000'])
+  git(dir, ['config', 'gc.auto', '0'])
+  await writeFile(path.join(dir, 'README.md'), BACKUP_README(repo))
+  let created = false
+  for (let attempt = 1; attempt <= 5 && !created; attempt++) {
+    const r = spawnSync('gh', ['repo', 'create', `${OWNER}/${repo}`, '--private', '-d', 'ZenRay backup shard (miroir froid, privé)'], { encoding: 'utf8' })
+    if (r.status === 0 || /already exists|Name already/i.test((r.stderr || '') + (r.stdout || ''))) { created = true; break }
+    console.error(`  repo create ${attempt}/5 échec (${repo})`); await sleep(3000 * attempt)
+  }
+  if (!created) throw new Error('backup repo-create: ' + repo)
+  git(dir, ['add', '-A']); git(dir, ['commit', '-q', '-m', 'init'])
+  git(dir, ['remote', 'add', 'origin', `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`])
+  const ps = git(dir, ['push', '-q', '-f', 'origin', `HEAD:${BRANCH}`], 120000)
+  if (ps.status !== 0) throw new Error('backup push-init: ' + (ps.stderr || '').slice(-200))
+  console.log(`  >>> nouveau repo de backup ${repo} (privé)`)
+  return { repo, dir, bytes: 0, pending: 0 }
+}
+async function pushBackupShard(ctx) {
+  const st = git(ctx.dir, ['status', '--porcelain'])
+  if (!st.stdout.trim()) return true
+  git(ctx.dir, ['add', '-A']); git(ctx.dir, ['commit', '-q', '-m', '+chunks'])
+  const sent = ctx.pending
+  const track = batchPolicy.track(sent)
+  for (let a = 0; a < 30; a++) {
+    const startedAt = Date.now()
+    const ps = git(ctx.dir, ['push', '-q', 'origin', `HEAD:${BRANCH}`], batchPolicy.timeoutMs(sent))
+    if (ps.status === 0) { track.ok(Date.now() - startedAt); ctx.pending = 0; return true }
+    track.fail(Date.now() - startedAt, (ps.stderr || '') + (ps.stdout || ''))
+    console.error(`  backup push retry ${a + 1}/30`, (ps.stderr || '').slice(-140))
+    await sleep(Math.min(60000, 3000 * (a + 1)))
+  }
+  return false
+}
+async function backupCommitSha(ctx) { return git(ctx.dir, ['rev-parse', 'HEAD']).stdout.trim() }
+
+// Écrit un chunk sur le shard de backup courant (rollover AVANT écriture si plein). Renvoie {repo, path}.
+async function writeBackupChunk(hashedPath, buf) {
+  if (!bctx) bctx = await openBackupShard()
+  if (bctx.bytes >= SHARD_CAP) { await pushBackupShard(bctx); bctx = await openBackupShard() }
+  const dst = path.join(bctx.dir, hashedPath)
+  await mkdir(path.dirname(dst), { recursive: true })
+  await writeFile(dst, buf)
+  bctx.bytes += buf.length; bctx.pending += buf.length
+  // 14 October 2026: follows the push batch policy instead of a fixed 400 MiB. FR : suit la politique de lots.
+  if (bctx.pending >= batchPolicy.budgetBytes()) { if (!await pushBackupShard(bctx)) throw new Error('backup push-incr') }
+  return { repo: bctx.repo, path: hashedPath }
+}
+async function flushBackupShard() {
+  if (!bctx) return
+  if (!await pushBackupShard(bctx)) throw new Error('backup push-final ' + bctx.repo)
+  console.log(`  ✓ backup ${bctx.repo} poussé (${(bctx.bytes / 1073741824).toFixed(2)} Go)`)
+}
+
+// ── RÉSOLUTION DES URLs DE TÉLÉCHARGEMENT PAR TYPE DE MANIFESTE ─────────────────────────────────────
+// Reprend la logique de src/lib/archiveChunks.js (downloadUrls) pour .file.json (v2/v3/v4, blob-raw), et
+// étend au même principe pour .img.json (cdnRepo/cdnPath/cdnCommit unique, chiffré ou non — on prend les
+// octets TELS QUELS, jamais déchiffrés) et .media.json (video-raw : parts[].url direct ; dash/hls : le MP4
+// muxé complet via manifest.download.parts, seule représentation en un seul flux binaire téléchargeable).
+const rawOf = (repo, commit, p) => `https://raw.githubusercontent.com/${OWNER}/${repo}/${commit}/${String(p).split('/').map(encodeURIComponent).join('/')}`
+function chunkRefsOfFile(m) {
+  return (Array.isArray(m.parts) && m.parts.length)
+    ? m.parts.flatMap((pt) => (pt.chunks || []).map((c) => ({ repo: pt.repo, commit: pt.commit, path: c })))
+    : (m.chunks || []).map((c) => ({ repo: m.repo, commit: m.commit, path: c }))
+}
+function downloadUrlsFor(nodeType, m) {
+  if (nodeType === 'file') {
+    if (m && m.type === 'blob-raw' && Array.isArray(m.parts) && m.parts.length && m.parts[0]?.url) return m.parts.map((p) => p.url)
+    if (m.mode === 'raw') return [rawOf(m.repo, m.commit, m.path)]
+    return chunkRefsOfFile(m).map((r) => rawOf(r.repo, r.commit, r.path))
+  }
+  if (nodeType === 'img') {
+    // Schéma actuel (depuis 2026-07-07) : ciphertext découpé en cdnChunks[] ≤19 Mo. On concatène ces octets
+    // dans l'ordre, sans déchiffrer. Ancien schéma cdnPath et legacy privé gardés en lecture.
+    if (m.cdnRepo && Array.isArray(m.cdnChunks) && m.cdnChunks.length && m.cdnCommit) {
+      return m.cdnChunks.map((p) => rawOf(m.cdnRepo, m.cdnCommit, p))
+    }
+    if (m.cdnRepo && m.cdnPath && m.cdnCommit) return [rawOf(m.cdnRepo, m.cdnCommit, m.cdnPath)]
+    if (m.repo && m.path) return [rawOf(m.repo, m.commit || BRANCH, m.path)] // legacy privé éventuel
+    return []
+  }
+  if (nodeType === 'media') {
+    if (m.type === 'video-raw' && Array.isArray(m.parts) && m.parts.length && m.parts[0]?.url) return m.parts.map((p) => p.url)
+    if ((m.type === 'dash' || m.type === 'hls') && m.download && Array.isArray(m.download.parts) && m.download.parts.length) return m.download.parts
+    return [] // pas de flux binaire unique exploitable (ex. manifeste dash sans download{} généré) -> skip signalé
+  }
+  return []
+}
+
+// ── PARCOURS DU DRIVE (action=tree équivalent, direct via git/trees) ───────────────────────────────
+async function treeShaForDir(dir) {
+  const refR = await gh(`repos/${OWNER}/${DATA}/git/ref/heads/${BRANCH}`)
+  const head = refR.ok ? (await refR.json())?.object?.sha : null
+  if (!head) throw new Error('treeShaForDir: ref main introuvable')
+  const commitR = await gh(`repos/${OWNER}/${DATA}/git/commits/${head}`)
+  let treeSha = commitR.ok ? (await commitR.json())?.tree?.sha : null
+  if (!treeSha) throw new Error('treeShaForDir: arbre racine introuvable')
+  for (const segment of dir.split('/').filter(Boolean)) {
+    const treeR = await gh(`repos/${OWNER}/${DATA}/git/trees/${treeSha}`)
+    const tree = treeR.ok ? await treeR.json() : null
+    const next = (tree?.tree || []).find((entry) => entry.type === 'tree' && entry.path === segment)
+    if (!next?.sha) throw new Error(`treeShaForDir: dossier introuvable ${dir}`)
+    treeSha = next.sha
+  }
+  return treeSha
+}
+async function listAllNodes(rootDir) {
+  const dir = (rootDir || 'pages').replace(/^\/+|\/+$/g, '')
+  // Résout d'abord le SHA DU SOUS-ARBRE demandé. Avant ce fix, --path filtrait après un appel récursif sur
+  // tout zenray-data déjà tronqué : un sous-dossier absent de la réponse globale restait donc invisible.
+  const subtreeSha = await treeShaForDir(dir)
+  const r = await gh(`repos/${OWNER}/${DATA}/git/trees/${subtreeSha}?recursive=1`)
+  if (!r.ok) throw new Error('listAllNodes: git/trees échec')
+  const j = await r.json()
+  if (j.truncated) console.error(`  ⚠ sous-arbre ${dir} encore TRONQUÉ — cibler un --path plus profond pour tout couvrir`)
+  const NODE_RE = /\.(img|file|db|canvas|embed|media)\.json$/
+  return (j.tree || [])
+    .filter((x) => x.type === 'blob' && NODE_RE.test(x.path))
+    .map((x) => `${dir}/${x.path}`)
+}
+const typeOfNode = (p) => (p.match(/\.(img|file|db|canvas|embed|media)\.json$/) || [, null])[1]
+
+// ── TRAITEMENT D'UN NŒUD ─────────────────────────────────────────────────────────────────────────────
+async function backupOneNode(nodePath, index, stats) {
+  const type = typeOfNode(nodePath) // 'img' | 'file' | 'db' | 'canvas' | 'embed' | 'media'
+  const raw = await rawGet(DATA, nodePath)
+  if (!raw.ok) { stats.skippedUnreadable.push(nodePath); return }
+  const text = await raw.text()
+  let m; try { m = JSON.parse(text) } catch { stats.skippedUnreadable.push(nodePath); return }
+
+  // Nœuds sans binaire à dupliquer : liens YouTube / Google Maps.
+  if (m && (m.type === 'youtube' || m.type === 'gmaps')) { stats.skippedNoBinary++; return }
+
+  // IDEMPOTENCE : le manifeste primaire actuel est-il identique (même hash de SON JSON) à la dernière fois
+  // qu'on a backupé ce chemin ? Si oui, on saute sans re-télécharger le binaire (rapide, gratuit en réseau).
+  const manifestSha = sha256Buf(Buffer.from(text, 'utf8'))
+  const existing = index.entries[nodePath]
+  if (existing && existing.sourceManifestSha256 === manifestSha) { stats.skippedAlreadyBackedUp++; return }
+
+  let urls
+  if (type === 'db' || type === 'canvas' || type === 'embed') {
+    // Pas de binaire externe : le JSON lui-même EST le contenu à mirroirer (petit, 1 seul "chunk" en pratique).
+    urls = null // traité à part ci-dessous (bytes déjà en main, pas de fetch)
+  } else {
+    urls = downloadUrlsFor(type, m)
+    if (!urls.length) { stats.skippedNoDownloadUrl.push(nodePath); return }
+  }
+
+  if (DRY) { console.log(`  [dry] ${nodePath} (${type}) — ${urls ? urls.length + ' segment(s) source' : 'JSON inline'}`); stats.wouldProcess++; return }
+
+  // 1) reconstituer le primaire sur disque, dans l'ordre, avec mémoire bornée.
+  const stagedPath = path.join(WORK, 'stage', sha256Buf(Buffer.from(nodePath, 'utf8')) + '.bin')
+  let staged
+  if (urls === null) {
+    const inline = Buffer.from(text, 'utf8')
+    await mkdir(path.dirname(stagedPath), { recursive: true })
+    await writeFile(stagedPath, inline)
+    staged = { size: inline.length, sha256: sha256Buf(inline) }
+  } else {
+    staged = await downloadUrlsToFile(urls, stagedPath)
+  }
+  const { sha256, size } = staged
+
+  // Réutilise aussi une entrée d'un ANCIEN chemin : un rename de manifeste ne doit pas recopier le binaire.
+  const sameBinary = (existing && existing.sha256 === sha256 && existing.size === size)
+    ? existing
+    : Object.values(index.entries).find((e) => e && e.sha256 === sha256 && e.size === size && Array.isArray(e.chunks))
+  if (sameBinary) {
+    index.entries[nodePath] = { ...sameBinary, type, sourceManifestSha256: manifestSha }
+    stats.skippedBinaryUnchanged++
+    stats.indexUpdated++
+    await rm(stagedPath, { force: true }).catch(() => {})
+    return
+  }
+
+  // 2) redécouper en chunks de 95 Mo EXACTEMENT et uploader vers le repo de backup courant.
+  const chunkRefs = []
+  const fh = await open(stagedPath, 'r')
+  const buffer = Buffer.alloc(CHUNK)
+  try {
+    let off = 0
+    while (off < size) {
+      const { bytesRead } = await fh.read(buffer, 0, Math.min(CHUNK, size - off), off)
+      if (!bytesRead) break
+      const slice = Buffer.from(buffer.subarray(0, bytesRead))
+      const h = sha256Buf(slice)
+      const hp = `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}-${String(chunkRefs.length).padStart(3, '0')}`
+      chunkRefs.push(await writeBackupChunk(hp, slice))
+      off += bytesRead
+    }
+    if (!size) {
+      const empty = Buffer.alloc(0); const h = sha256Buf(empty)
+      chunkRefs.push(await writeBackupChunk(`${h.slice(0, 2)}/${h.slice(2, 4)}/${h}-000`, empty))
+    }
+  } finally {
+    await fh.close()
+    await rm(stagedPath, { force: true }).catch(() => {})
+  }
+
+  index.entries[nodePath] = {
+    type, size, sha256, sourceManifestSha256: manifestSha,
+    chunkSize: CHUNK, chunks: chunkRefs, backedUpAt: new Date().toISOString(),
+  }
+  stats.backedUp++
+  stats.indexUpdated++
+  stats.justBackedUpPaths.push(nodePath)
+  console.log(`  ✓ ${nodePath} — ${(size / 1048576).toFixed(1)} Mo, ${chunkRefs.length} chunk(s), sha256 ${sha256.slice(0, 12)}…`)
+}
+
+// ── VÉRIFICATION D'INTÉGRITÉ (re-télécharge le backup, recompare le sha256) ─────────────────────────
+async function verifyEntry(nodePath, entry) {
+  const hash = createHash('sha256')
+  let size = 0
+  for (const c of entry.chunks) {
+    const r = await rawGet(c.repo, c.path)
+    if (!r.ok) return { ok: false, reason: `chunk introuvable ${c.repo}/${c.path}` }
+    if (!r.body) return { ok: false, reason: `chunk sans body ${c.repo}/${c.path}` }
+    for await (const chunk of r.body) {
+      const buf = Buffer.from(chunk)
+      hash.update(buf)
+      size += buf.length
+    }
+  }
+  const sha = hash.digest('hex')
+  return { ok: sha === entry.sha256 && size === entry.size, sha256: sha, size, expectedSha256: entry.sha256, expectedSize: entry.size }
+}
+
+// ── MAIN ──────────────────────────────────────────────────────────────────────────────────────────────
+async function main() {
+  console.log(`backup-mirror ${DRY ? '(DRY-RUN, aucune écriture réseau)' : ''} ${ONLY_PATH ? `path=${ONLY_PATH}` : 'path=pages (défaut)'} limit=${LIMIT === Infinity ? '∞' : LIMIT}`)
+  await mkdir(WORK, { recursive: true }).catch(() => {})
+  const index = await readIndex()
+  const rootDir = ONLY_PATH || 'pages'
+  const allNodes = await listAllNodes(rootDir)
+  console.log(`${allNodes.length} nœud(s) trouvé(s) sous ${rootDir}`)
+  const toProcess = allNodes.slice(0, LIMIT === Infinity ? allNodes.length : LIMIT)
+  console.log(`traitement de ${toProcess.length} nœud(s)${LIMIT !== Infinity ? ` (--limit=${LIMIT})` : ''}`)
+
+  const stats = { backedUp: 0, skippedNoBinary: 0, skippedAlreadyBackedUp: 0, skippedBinaryUnchanged: 0, skippedNoDownloadUrl: [], skippedUnreadable: [], wouldProcess: 0, indexUpdated: 0, justBackedUpPaths: [] }
+  let checkpointedUpdates = 0
+  let i = 0
+  for (const nodePath of toProcess) {
+    i++
+    try { await backupOneNode(nodePath, index, stats) }
+    catch (e) { console.error(`  ⚠ ERREUR ${nodePath}: ${(e.message || e).toString().slice(0, 160)}`) ; stats.skippedUnreadable.push(nodePath) }
+    if (i % 25 === 0) {
+      console.log(`  ... ${i}/${toProcess.length}`)
+      // Un crash tardif ne doit pas faire perdre l'index de tout le run : checkpoint borné tous les 25 nœuds.
+      if (!DRY && stats.indexUpdated > checkpointedUpdates) {
+        await flushBackupShard()
+        if (await writeIndex(index)) checkpointedUpdates = stats.indexUpdated
+        else console.error('  ⚠ checkpoint index échoué — nouvelle tentative en fin de run')
+      }
+    }
+  }
+
+  if (!DRY) {
+    await flushBackupShard()
+    if (stats.indexUpdated > checkpointedUpdates) {
+      const ok = await writeIndex(index)
+      console.log(ok ? `index écrit (${Object.keys(index.entries).length} entrées totales) -> zenray-data:${INDEX_PATH}` : `⚠ ÉCHEC écriture index — RELANCER (les chunks sont déjà poussés, rien n'est perdu, juste pas encore indexé)`)
+    } else {
+      console.log('rien de nouveau à indexer (tout déjà backupé ou aucun binaire éligible).')
+    }
+  }
+
+  console.log(`\n=== RÉSUMÉ ===`)
+  console.log(`backupés : ${stats.backedUp}${DRY ? ` (dry-run: ${stats.wouldProcess} auraient été traités)` : ''}`)
+  console.log(`sans binaire (youtube/gmaps) : ${stats.skippedNoBinary}`)
+  console.log(`déjà backupés (manifeste inchangé) : ${stats.skippedAlreadyBackedUp}`)
+  console.log(`déjà backupés (binaire inchangé, manifeste renommé) : ${stats.skippedBinaryUnchanged}`)
+  if (stats.skippedNoDownloadUrl.length) console.log(`sans URL de téléchargement exploitable (${stats.skippedNoDownloadUrl.length}) : ${stats.skippedNoDownloadUrl.slice(0, 10).join(', ')}${stats.skippedNoDownloadUrl.length > 10 ? '…' : ''}`)
+  if (stats.skippedUnreadable.length) console.log(`illisibles/erreur (${stats.skippedUnreadable.length}) : ${stats.skippedUnreadable.slice(0, 10).join(', ')}${stats.skippedUnreadable.length > 10 ? '…' : ''}`)
+
+  // VÉRIFICATION : seulement les entrées tout juste backupées dans CE run (pas tout l'index, qui serait
+  // coûteux sur un run complet — la vérification exhaustive est un script séparé si besoin un jour).
+  if (!DRY && stats.backedUp > 0) {
+    console.log(`\nvérification d'intégrité des ${stats.backedUp} entrée(s) tout juste backupée(s)...`)
+    let vOk = 0, vKo = 0
+    const justDone = stats.justBackedUpPaths
+    for (const p of justDone) {
+      const entry = index.entries[p]
+      const v = await verifyEntry(p, entry)
+      if (v.ok) { vOk++; console.log(`  ✓ ${p} — sha256 recalculé = ${v.sha256.slice(0, 16)}… (identique à l'index)`) }
+      else { vKo++; console.error(`  ✗ ${p} — MISMATCH (${v.reason || `sha ${v.sha256} != attendu ${v.expectedSha256}`})`) }
+    }
+    console.log(`vérification : ${vOk}/${justDone.length} OK${vKo ? `, ${vKo} EN ÉCHEC` : ''}`)
+  }
+
+  await rm(WORK, { recursive: true, force: true }).catch(() => {})
+}
+
+main().catch((e) => { console.error('FATAL:', e.stack || e.message || e); process.exit(1) })

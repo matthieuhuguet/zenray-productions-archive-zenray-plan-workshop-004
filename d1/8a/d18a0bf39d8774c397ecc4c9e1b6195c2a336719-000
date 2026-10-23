@@ -1,0 +1,123 @@
+// 4 October 2026: the letter loads from the archive, is edited and copied, is saved as a NEW version, and is logged only when he says so.
+import React from 'react'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+
+vi.mock('../Notifications.jsx', () => ({ notify: vi.fn() }))
+vi.mock('../../lib/saveJson.js', () => ({ saveJsonWithRetry: vi.fn(), readJson: vi.fn() }))
+import { saveJsonWithRetry } from '../../lib/saveJson.js'
+import FreelanceLetter from './FreelanceLetter.jsx'
+
+const t = { border: 'gray', surface: 'transparent', textPrimary: 'black', textSecondary: 'gray', bg: 'white' }
+const version = (extra = {}) => ({ at: '2026-10-04T08:00:00Z', by: 'engine', subject: 'Candidature Technical Artist : Matthieu Huguet', text: 'Bonjour Studio,\n\nMa lettre.', lang: 'fr', kind: 'offer', hookSource: 'offer', reason: 'initial', ...extra })
+const archive = (extra = {}) => ({ v: 1, studioId: 'job_1', versions: [version()], ...extra })
+const studio = { id: 'job_1', name: 'Studio X', role: 'Technical Artist', link: 'https://studio.example/job', status: 'to_contact', messages: [], history: [], notes: '', engine: { letterPath: 'freelance/letters/job_1.json', contactEmails: ['jobs@studio.example'], applyUrl: 'https://studio.example/apply', employerUrl: 'https://studio.example', careersUrl: 'https://careers.studio.example', language: 'fr' } }
+const engineFile = { cv: { pdf: { fr: 'https://cdn/cv-fr.pdf', en: 'https://cdn/cv-en.pdf' } } }
+const template = { v: 1, status: 'seed', fr: {}, hooks: {} }
+const reply = (data) => ({ ok: true, json: async () => ({ markdown: JSON.stringify(data) }) })
+const props = (over = {}) => ({ t, studio, engine: engineFile, template, bridge: { letter: vi.fn() }, onSent: vi.fn(), onTemplateSaved: vi.fn(), templatePath: 'freelance/letter-template.json', ...over })
+
+beforeEach(() => { Object.assign(navigator, { clipboard: { writeText: vi.fn().mockResolvedValue() } }) })
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.clearAllMocks() })
+
+it('loads the archived letter outside the quota and offers every way to use it', async () => {
+  const fetch = vi.fn().mockResolvedValue(reply(archive()))
+  vi.stubGlobal('fetch', fetch)
+  render(<FreelanceLetter {...props()} />)
+  expect(await screen.findByLabelText('Lettre')).toHaveValue('Bonjour Studio,\n\nMa lettre.')
+  expect(fetch.mock.calls[0][0]).toContain('raw=1')
+  expect(screen.getByLabelText('Objet')).toHaveValue('Candidature Technical Artist : Matthieu Huguet')
+  expect(screen.getByRole('link', { name: /Page de candidature/ }).href).toBe('https://studio.example/apply')
+  expect(screen.getByRole('link', { name: /Site du studio/ }).href).toBe('https://studio.example/')
+  expect(screen.getByRole('link', { name: /Toutes les offres du studio/ }).href).toBe('https://careers.studio.example/')
+  expect(screen.getByRole('link', { name: /Ouvrir dans Mail/ }).href).toContain('mailto:jobs@studio.example?subject=')
+  expect(screen.getByRole('link', { name: /CV \(FR\)/ }).href).toBe('https://cdn/cv-fr.pdf')
+  fireEvent.click(screen.getByRole('button', { name: 'Copier la lettre' }))
+  expect(navigator.clipboard.writeText).toHaveBeenCalledWith('Bonjour Studio,\n\nMa lettre.')
+  fireEvent.click(screen.getByRole('button', { name: 'jobs@studio.example' }))
+  expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith('jobs@studio.example')
+})
+
+it('saves an edit as a new version by Matthieu and never overwrites the automatic one', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(archive())))
+  saveJsonWithRetry.mockImplementation(async (path, mutate) => ({ ok: true, data: mutate(archive()) }))
+  render(<FreelanceLetter {...props()} />)
+  const box = await screen.findByLabelText('Lettre')
+  expect(screen.getByRole('button', { name: 'Enregistrée' })).toBeDisabled()
+  fireEvent.change(box, { target: { value: 'Ma version à moi.' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Enregistrer mes modifications' }))
+  await waitFor(() => expect(saveJsonWithRetry).toHaveBeenCalledTimes(1))
+  expect(saveJsonWithRetry.mock.calls[0][0]).toBe('freelance/letters/job_1.json')
+  const saved = saveJsonWithRetry.mock.calls[0][1](archive())
+  expect(saved.versions.map((v) => v.by)).toEqual(['engine', 'matthieu'])
+  expect(saved.versions[0].text).toBe('Bonjour Studio,\n\nMa lettre.')
+  await waitFor(() => expect(screen.getByLabelText('Lettre')).toHaveValue('Ma version à moi.'))
+})
+
+it('marks the exact edited text as sent only on his click, saving it first', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(archive())))
+  saveJsonWithRetry.mockImplementation(async (path, mutate) => ({ ok: true, data: mutate(archive()) }))
+  const onSent = vi.fn()
+  render(<FreelanceLetter {...props({ onSent })} />)
+  const box = await screen.findByLabelText('Lettre')
+  expect(onSent).not.toHaveBeenCalled()
+  fireEvent.change(box, { target: { value: 'Texte final envoyé.' } })
+  fireEvent.click(screen.getByRole('button', { name: 'linkedin' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Marquer comme envoyée' }))
+  await waitFor(() => expect(onSent).toHaveBeenCalledWith({ text: 'Texte final envoyé.', channel: 'linkedin' }))
+  expect(saveJsonWithRetry).toHaveBeenCalledTimes(1)
+})
+
+it('prepares a letter on demand when none exists, then shows it', async () => {
+  const fetch = vi.fn().mockResolvedValue(reply(archive()))
+  vi.stubGlobal('fetch', fetch)
+  const bridge = { letter: vi.fn().mockResolvedValue({ letterPath: 'freelance/letters/job_1.json' }) }
+  render(<FreelanceLetter {...props({ bridge, studio: { ...studio, engine: { ...studio.engine, letterPath: '' } } })} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Préparer la lettre' }))
+  await waitFor(() => expect(bridge.letter).toHaveBeenCalledWith('job_1', null))
+  expect(await screen.findByLabelText('Lettre')).toHaveValue('Bonjour Studio,\n\nMa lettre.')
+})
+
+it('says so when the service cannot write the letter', async () => {
+  const bridge = { letter: vi.fn().mockRejectedValue(new Error('Service local indisponible')) }
+  render(<FreelanceLetter {...props({ bridge, studio: { ...studio, engine: { ...studio.engine, letterPath: '' } } })} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Préparer la lettre' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent('Service local indisponible')
+})
+
+it('offers the newer automatic version without replacing his, and accepts it on request', async () => {
+  const withSuggestion = archive({ versions: [version(), version({ by: 'matthieu', text: 'Ma version', reason: 'edit' })], suggested: version({ text: 'Version neuve', at: '2026-10-05T08:00:00Z', reason: 'refresh' }) })
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(withSuggestion)))
+  saveJsonWithRetry.mockImplementation(async (path, mutate) => ({ ok: true, data: mutate(withSuggestion) }))
+  render(<FreelanceLetter {...props()} />)
+  expect(await screen.findByLabelText('Lettre')).toHaveValue('Ma version')
+  expect(screen.getByRole('status')).toHaveTextContent('Ta version reste en place')
+  fireEvent.click(screen.getByRole('button', { name: 'Remplacer par la nouvelle' }))
+  await waitFor(() => expect(screen.getByLabelText('Lettre')).toHaveValue('Version neuve'))
+})
+
+it('saves a personal paragraph for the studio into the template, then regenerates the letter', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(archive())))
+  saveJsonWithRetry.mockImplementation(async (path, mutate) => ({ ok: true, data: mutate({ ...template, fr: { blocks: {} } }) }))
+  const bridge = { letter: vi.fn().mockResolvedValue({ letterPath: 'freelance/letters/job_1.json' }) }
+  const onTemplateSaved = vi.fn()
+  render(<FreelanceLetter {...props({ bridge, onTemplateSaved })} />)
+  await screen.findByLabelText('Lettre')
+  fireEvent.click(screen.getByText(/Paragraphe personnel pour Studio X/))
+  fireEvent.change(screen.getByLabelText('Paragraphe personnel pour ce studio'), { target: { value: 'J’ai étudié votre dernier jeu.' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Enregistrer et régénérer' }))
+  await waitFor(() => expect(bridge.letter).toHaveBeenCalledWith('job_1', 'fr'))
+  expect(saveJsonWithRetry.mock.calls[0][0]).toBe('freelance/letter-template.json')
+  const saved = onTemplateSaved.mock.calls[0][0]
+  expect(saved.hooks.x.fr.text).toBe('J’ai étudié votre dernier jeu.')
+  expect(saved.status).toBe('custom')
+})
+
+it('warns about a translated template and an imposed subject line', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(archive({ versions: [version({ translated: true, subjectMayBeImposed: true, lang: 'en' })] }))))
+  render(<FreelanceLetter {...props()} />)
+  await screen.findByLabelText('Lettre')
+  expect(screen.getByText(/Traduction du gabarit/)).toBeTruthy()
+  expect(screen.getByText(/imposer un objet précis/)).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Version française' })).toBeTruthy()
+})

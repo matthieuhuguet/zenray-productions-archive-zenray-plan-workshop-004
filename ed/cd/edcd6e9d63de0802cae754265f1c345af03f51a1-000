@@ -1,0 +1,54 @@
+// 16 October 2026: the bridge starts one preparation at a time, validates what it is given, and reads progress from the run files.
+import { describe, expect, it } from 'vitest'
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { EventEmitter } from 'node:events'
+import { createApplyBridge, summariseRun } from './ApplyBridge.mjs'
+
+const fakeChild = () => Object.assign(new EventEmitter(), { stderr: new EventEmitter(), unref() {} })
+
+describe('start', () => {
+  it('refuses a size outside 1..60 and a second run while one is going', () => {
+    const child = fakeChild(); const calls = []
+    const bridge = createApplyBridge({ runsDirectory: '/nowhere', script: '/x/Apply.mjs', spawnImpl: (...args) => { calls.push(args); return child } })
+    for (const bad of [0, 61, 2.5, 'abc', null]) expect(() => bridge.start(bad)).toThrow(/Size must be/)
+    expect(bridge.start(20)).toMatchObject({ started: true, size: 20 })
+    expect(calls[0][1]).toEqual(['/x/Apply.mjs', '20'])
+    expect(bridge.start(10)).toMatchObject({ started: false, reason: 'already-running' })
+    child.emit('close', 0)
+    expect(bridge.isRunning()).toBe(false)
+    expect(bridge.start(10).started).toBe(true)
+  })
+  it('keeps the tail of stderr when a run fails', async () => {
+    const child = fakeChild()
+    const bridge = createApplyBridge({ runsDirectory: '/nowhere', spawnImpl: () => child })
+    bridge.start(3); child.stderr.emit('data', 'boom: no profile'); child.emit('close', 1)
+    expect(await bridge.status()).toMatchObject({ running: false, exitCode: 1, error: 'boom: no profile' })
+  })
+})
+
+describe('status', () => {
+  it('summarises the newest finished run', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'apply-'))
+    await mkdir(path.join(dir, '2026-10-16T10-00-00')); await mkdir(path.join(dir, '2026-10-16T12-00-00'))
+    await writeFile(path.join(dir, '2026-10-16T12-00-00', 'results.json'), JSON.stringify({ totalSeconds: 9, results: [{ id: 'job_a', studio: 'A', phase: 'ready', note: 'ok', seconds: 3 }, { id: 'job_b', studio: 'B', phase: 'blocked', note: 'bot wall', seconds: 9 }] }))
+    const status = await createApplyBridge({ runsDirectory: dir }).status()
+    expect(status.runId).toBe('2026-10-16T12-00-00'); expect(status.run).toMatchObject({ pages: 2, ready: 1, blocked: 1, totalSeconds: 9 })
+  })
+  it('has no run when nothing ever ran', async () => {
+    expect(await createApplyBridge({ runsDirectory: '/does/not/exist' }).status()).toMatchObject({ running: false, runId: null })
+  })
+  it('summariseRun tolerates an empty file', () => { expect(summariseRun(null)).toMatchObject({ pages: 0, ready: 0, blocked: 0 }) })
+})
+
+describe('sent', () => {
+  it('passes only well-formed offer ids to the command', async () => {
+    const seen = []
+    const bridge = createApplyBridge({ script: '/x/Apply.mjs', execImpl: (cmd, args, options, done) => { seen.push(args); done(null, '{"committed":true,"recorded":2}') } })
+    expect(await bridge.sent(['job_abc123', 'job_def456'])).toMatchObject({ recorded: 2 })
+    expect(seen[0]).toEqual(['/x/Apply.mjs', 'sent', '--ids', 'job_abc123,job_def456'])
+    await bridge.sent(); expect(seen[1]).toEqual(['/x/Apply.mjs', 'sent'])
+    for (const bad of [[], ['x; rm -rf /'], 'job_abc123']) expect(() => bridge.sent(bad)).toThrow(/ids must be/)
+  })
+})

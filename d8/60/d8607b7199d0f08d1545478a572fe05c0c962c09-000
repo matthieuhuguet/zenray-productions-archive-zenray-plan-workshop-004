@@ -1,0 +1,196 @@
+// regen-thumbs-bulk.mjs — régénération EN MASSE des vignettes 1080p/webp/q60 (voir scripts/regen-thumbs-hd.mjs
+// pour le pilote 74 images + le raisonnement complet). Ici : TOUT le site, en associant chaque manifeste déjà
+// en ligne à son fichier original LOCAL sous /Users/zenray/Downloads/DJI par NOM, puis en VÉRIFIANT par le
+// CONTENU (pas juste le nom) avant de toucher quoi que ce soit — zéro association devinée.
+//
+// POURQUOI UN CLONE GIT SPARSE ET PAS L'API : action=tree (et l'API contents en boucle) TRONQUE sur un repo
+// de cette taille (~118k chemins, découvert le 2026-07-11 en construisant MoveToDialog) — un clone
+// --filter=blob:none --sparse pages/ donne la liste COMPLÈTE et FRAÎCHE (git, hors quota REST), et permet de
+// LIRE chaque manifeste DIRECTEMENT SUR DISQUE (zéro requête réseau par image, contre ~118k appels sinon).
+//
+// VÉRIFICATION PAR LE CONTENU (pas juste le nom) : img-pipeline.mjs dérive l'IV de chiffrement du SHA-256 du
+// clair (ivFromHash = 12 premiers octets du hash). Donc pour un candidat local, recalculer sha256 -> en
+// dériver l'IV -> le comparer à manifest.iv PROUVE que c'est le même fichier, octet pour octet — pas une
+// coïncidence de nom. Matthieu a prévenu que des dossiers ont pu être déplacés sur le site (paths différents
+// du disque) : le nom sert à trouver un CANDIDAT, le hash confirme ou rejette, jamais de pari sur le nom seul.
+//
+// 3 PHASES, chacune persistée sur disque AVANT la suivante (jamais de travail perdu si une phase plante) :
+//   1) ASSOCIATION — construit et écrit le tableau complet (associé / déjà HD / sans original local /
+//      collision de hash) dans <dest>/thumb-assoc-table.json. Rien n'est modifié sur le site à cette étape.
+//   2) RÉGÉNÉRATION — pour chaque entrée "associée", régénère la vignette (scripts/img-ingest.mjs:regenThumbAt,
+//      1080px petit côté, jamais d'upscale, q60), en lots de ~900 Mo (writeBinary régule déjà ce seuil), commit
+//      groupé sur zenray-data (pushBlobs, tranches de 150). Idempotent : une image déjà à la résolution cible
+//      est resautée (même logique que regen-thumbs-hd.mjs).
+//   3) RAPPORT — compte-rendu final écrit dans <dest>/thumb-regen-report.json + résumé console.
+//
+// Usage :
+//   GITHUB_TOKEN=$(gh auth token) node scripts/regen-thumbs-bulk.mjs --scan   (phase 1 seule, aucune écriture)
+//   GITHUB_TOKEN=$(gh auth token) node scripts/regen-thumbs-bulk.mjs --apply  (phases 1+2+3)
+
+import { makeImgShardCtx, regenThumbAt, thumbUrlForRegen } from './img-ingest.mjs'
+import { THUMB_MAX_SHORT, THUMB_QUALITY } from './lib/img-pipeline.mjs'
+import { pushBlobs } from './video-mse-lib.mjs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { readFile, readdir, writeFile, mkdir, rm, stat } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
+const token = process.env.GITHUB_TOKEN
+const OWNER = 'matthieuhuguet'
+const DATA = 'zenray-data'
+const REPO = '/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress'
+const LOCAL_ROOT = process.argv[3] || '/Users/zenray/Downloads/DJI'
+const MAX_SHORT = THUMB_MAX_SHORT
+const QUALITY = THUMB_QUALITY
+const APPLY = process.argv.includes('--apply')
+const DEST_DIR = path.join(process.env.HOME, '.zr-thumb-bulk')
+if (!token) { console.error('usage: GITHUB_TOKEN=.. node regen-thumbs-bulk.mjs --scan|--apply [racine locale]'); process.exit(1) }
+
+const ivFromHash = (hashHex) => Buffer.from(hashHex.slice(0, 24), 'hex')
+const sha256Hex = (buf) => createHash('sha256').update(buf).digest('hex')
+
+// ── PHASE 1 : ASSOCIATION ───────────────────────────────────────────────────────────────────────────────
+async function walkLocal(dir) {
+  const out = []
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (e.name.startsWith('.')) continue
+    const p = path.join(dir, e.name)
+    if (e.isDirectory()) out.push(...await walkLocal(p))
+    else if (/\.(jpe?g|png)$/i.test(e.name)) out.push(p)
+  }
+  return out
+}
+async function walkClone(dir) {
+  const out = []
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (e.name === '.git') continue
+    const p = path.join(dir, e.name)
+    if (e.isDirectory()) out.push(...await walkClone(p))
+    else if (e.name.endsWith('.img.json')) out.push(p)
+  }
+  return out
+}
+
+async function buildAssociationTable() {
+  await mkdir(DEST_DIR, { recursive: true })
+
+  console.log(`\n=== PHASE 1/3 — ASSOCIATION ===`)
+  console.log(`racine locale : ${LOCAL_ROOT}`)
+  const localFiles = await walkLocal(LOCAL_ROOT)
+  console.log(`${localFiles.length} image(s) locale(s) trouvée(s).`)
+  const byBasenameLower = new Map() // basename (lowercase) -> [chemins locaux]
+  for (const f of localFiles) {
+    const key = path.basename(f).toLowerCase()
+    if (!byBasenameLower.has(key)) byBasenameLower.set(key, [])
+    byBasenameLower.get(key).push(f)
+  }
+  const collisions = [...byBasenameLower.entries()].filter(([, v]) => v.length > 1)
+  if (collisions.length) console.log(`  ⚠ ${collisions.length} nom(s) local(-aux) en double (départagés par hash au moment de l'association) : ${collisions.slice(0, 5).map(([k]) => k).join(', ')}${collisions.length > 5 ? '…' : ''}`)
+
+  console.log(`clone frais de zenray-data (pages/) pour lister TOUS les manifestes sans troncature...`)
+  const clone = path.join(DEST_DIR, 'zdata-clone')
+  await rm(clone, { recursive: true, force: true })
+  const cloneUrl = `https://x-access-token:${token}@github.com/${OWNER}/${DATA}.git`
+  const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/usr/bin/true' }
+  let r = spawnSync('git', ['clone', '--filter=blob:none', '--sparse', cloneUrl, clone], { env: gitEnv, timeout: 300000, stdio: ['ignore', 'ignore', 'pipe'] })
+  if (r.status !== 0) throw new Error('clone zenray-data: ' + (r.stderr || '').toString().slice(-300))
+  r = spawnSync('git', ['-C', clone, 'sparse-checkout', 'set', 'pages'], { env: gitEnv, timeout: 60000 })
+  if (r.status !== 0) throw new Error('sparse-checkout: ' + (r.stderr || '').toString().slice(-300))
+
+  const manifestPaths = await walkClone(path.join(clone, 'pages'))
+  console.log(`${manifestPaths.length} manifeste(s) image trouvé(s) sur le site (frais, complet).`)
+
+  const associated = []      // { sitePath, localPath, hash, w, h, alreadyThumbW }
+  const alreadyHD = []       // déjà régénérée à la cible ou plus grande
+  const noLocal = []         // aucun candidat local par nom
+  const hashMismatch = []    // candidat(s) local(aux) trouvé(s) MAIS aucun ne correspond par contenu
+  const unreadable = []      // manifeste illisible/JSON invalide
+
+  for (const mp of manifestPaths) {
+    let m
+    try { m = JSON.parse(await readFile(mp, 'utf8')) } catch { unreadable.push(path.relative(clone, mp)); continue }
+    if (!m || m.type !== 'image' || !m.iv) { unreadable.push(path.relative(clone, mp)); continue }
+    const already = m.thumbW && m.thumbH && Math.min(m.thumbW, m.thumbH) >= Math.min(MAX_SHORT, Math.min(m.w || 1e9, m.h || 1e9))
+    const relSite = path.relative(clone, mp).replace(/\\/g, '/').replace(/\.img\.json$/, '')
+    const base = path.basename(relSite).toLowerCase()
+    const candidates = byBasenameLower.get(base) || []
+    if (already) { alreadyHD.push(relSite); continue }
+    if (!candidates.length) { noLocal.push(relSite); continue }
+    let matched = null
+    for (const c of candidates) {
+      const buf = await readFile(c)
+      const hash = sha256Hex(buf)
+      if (ivFromHash(hash).toString('base64') === m.iv) { matched = { localPath: c, hash }; break }
+    }
+    if (matched) associated.push({ sitePath: relSite, localPath: matched.localPath, hash: matched.hash, w: m.w, h: m.h })
+    else hashMismatch.push({ sitePath: relSite, candidates })
+  }
+
+  const table = { builtAt: new Date().toISOString(), localRoot: LOCAL_ROOT, maxShort: MAX_SHORT, quality: QUALITY,
+    counts: { manifestsScanned: manifestPaths.length, localFiles: localFiles.length, associated: associated.length, alreadyHD: alreadyHD.length, noLocal: noLocal.length, hashMismatch: hashMismatch.length, unreadable: unreadable.length },
+    associated, alreadyHD, noLocal, hashMismatch, unreadable }
+  await writeFile(path.join(DEST_DIR, 'thumb-assoc-table.json'), JSON.stringify(table, null, 1))
+  console.log(`\n=== TABLEAU D'ASSOCIATION (écrit sur disque : ${path.join(DEST_DIR, 'thumb-assoc-table.json')}) ===`)
+  console.log(`  manifestes scannés      : ${manifestPaths.length}`)
+  console.log(`  associés (à régénérer)  : ${associated.length}`)
+  console.log(`  déjà en 1080p (sautés)  : ${alreadyHD.length}`)
+  console.log(`  sans original local     : ${noLocal.length}`)
+  console.log(`  candidat(s) mais hash ≠ : ${hashMismatch.length}${hashMismatch.length ? ' -> ' + hashMismatch.slice(0, 5).map((x) => x.sitePath).join(', ') : ''}`)
+  console.log(`  manifeste illisible     : ${unreadable.length}`)
+  return { table, clone }
+}
+
+// ── PHASE 2 : RÉGÉNÉRATION (batches ~900 Mo déjà régulés par writeBinary) ──────────────────────────────
+async function regenerate(associated) {
+  console.log(`\n=== PHASE 2/3 — RÉGÉNÉRATION (${associated.length} image(s), 1080px/q${QUALITY}) ===`)
+  const ctx = makeImgShardCtx({ token, work: path.join(DEST_DIR, 'shard-work'), repoRoot: REPO, log: (...a) => console.log('   ', ...a) })
+  await ctx.openShard()
+
+  const resolved = []
+  const failed = []
+  let done = 0
+  for (const item of associated) {
+    try {
+      const r = await regenThumbAt(item.localPath, ctx, MAX_SHORT, QUALITY)
+      if (!r) { failed.push(item.sitePath); continue }
+      resolved.push({ sitePath: item.sitePath, repo: r.repo, thumbPath: r.thumbPath, thumbIv: r.thumbIv, thumbW: r.thumbW, thumbH: r.thumbH })
+      done++
+      if (done % 200 === 0) {
+        console.log(`  ${done}/${associated.length} régénérées — sauvegarde intermédiaire…`)
+        await writeFile(path.join(DEST_DIR, 'thumb-regen-progress.json'), JSON.stringify({ done, total: associated.length, resolved: resolved.length, failed }, null, 1))
+      }
+    } catch (e) { failed.push(item.sitePath); console.log(`  ✗ ÉCHEC ${item.sitePath} : ${(e && e.message || e).toString().slice(0, 140)}`) }
+  }
+  await ctx.flush()
+
+  // patch des manifestes : lit le manifeste ACTUEL (API, pour avoir le bon sha/contenu le plus frais possible),
+  // fusionne juste thumb/thumbIv/thumbW/thumbH, commit groupé (tranches de 150, comme regen-thumbs-oriented.mjs).
+  console.log(`  résolution des ${resolved.length} manifeste(s) mis à jour...`)
+  const blobs = []
+  for (const r of resolved) {
+    const mp = `${r.sitePath}.img.json` // r.sitePath porte DÉJÀ le préfixe pages/ (relatif à la racine du clone) — un
+    // second "pages/" ici doublait le chemin -> 404 systématique sur les 2552 (bug trouvé 2026-07-13, run réel)
+    const enc = encodeURIComponent(mp).replace(/%2F/g, '/')
+    const resp = await fetch(`https://api.github.com/repos/${OWNER}/${DATA}/contents/${enc}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zr' } })
+    if (resp.status !== 200) { failed.push(r.sitePath); continue }
+    let m; try { m = JSON.parse(await resp.text()) } catch { failed.push(r.sitePath); continue }
+    m.thumb = thumbUrlForRegen(ctx, r.repo, r.thumbPath)
+    m.thumbIv = r.thumbIv; m.thumbW = r.thumbW; m.thumbH = r.thumbH
+    blobs.push({ path: mp, content: JSON.stringify(m) })
+  }
+  for (let i = 0; i < blobs.length; i += 150) await pushBlobs(token, DATA, blobs.slice(i, i + 150), `regen thumb HD bulk (${Math.min(150, blobs.length - i)})`, () => {})
+  return { done: blobs.length, failed }
+}
+
+// ── MAIN ────────────────────────────────────────────────────────────────────────────────────────────────
+try {
+  const { table, clone } = await buildAssociationTable()
+  if (!APPLY) { console.log(`\n(mode --scan : aucune écriture. Relance avec --apply pour régénérer.)`); process.exit(0) }
+  const { done, failed } = await regenerate(table.associated)
+  const report = { finishedAt: new Date().toISOString(), ...table.counts, regenerated: done, regenFailed: failed.length, regenFailedList: failed }
+  await writeFile(path.join(DEST_DIR, 'thumb-regen-report.json'), JSON.stringify(report, null, 1))
+  console.log(`\n✓✓ BULK REGEN COMPLET — ${done}/${table.associated.length} vignettes régénérées et poussées${failed.length ? `, ${failed.length} échec(s) (voir thumb-regen-report.json)` : ''}.`)
+} finally {
+  await rm(path.join(DEST_DIR, 'shard-work'), { recursive: true, force: true }).catch(() => {})
+}
+process.exit(0)

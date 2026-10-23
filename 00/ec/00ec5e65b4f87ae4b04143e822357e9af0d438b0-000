@@ -1,0 +1,181 @@
+// /api/share-cover?d=<jeton> — the PREVIEW IMAGE of a shared folder, composed ON REQUEST (2 October 2026).
+//
+// HISTORY. 2026-08-05: the 2x2 mosaic was composed by the BROWSER when the link was created and stored next to the folder,
+// because « a Worker has no canvas ». Consequences seen on 2 October: a gallery of Eagle links never got one (links have
+// no index thumbnail), the stored copy went stale as soon as the gallery changed, and WhatsApp fell back to the site
+// icon « Z ». Demand of Matthieu: the link itself must return the first/four images, dynamically.
+//
+// NOW. The Worker lists the folder, picks images spread over it, follows Eagle links to their targets, fetches and
+// decrypts four thumbnails, decodes them with WebAssembly libwebp, builds the 2x2 square and encodes it with mozjpeg
+// (see shareMosaic.js / mosaicCodecs.workers.js). The result is cached at the edge for ten minutes, so a gallery pays
+// the CPU once per ten minutes however many crawlers ask.
+//
+// THE DYNAMIC COMPOSITION IS BEHIND A FLAG, OFF BY DEFAULT (`ZR_COVER_DYNAMIC=1`). Measured on 2 October 2026 on the
+// production runtime: decoding four 1080x1440 webp thumbnails and encoding a JPEG takes ~0.25 s of CPU, and the account's
+// Workers limits kill such an invocation with error 1102 on 10 to 60 % of cold requests, with no way to fall back (a killed
+// Worker cannot answer). On a Workers Paid plan (30 s CPU) the very same code is reliable: set the variable and it is live.
+// Until then the preview is: the mosaic composed by the BROWSER at link creation, else the first real photo of the gallery.
+//
+// FALLBACK CHAIN (never the site icon): [dynamic mosaic, flag only] -> the cover stored by the browser
+// (`.zr-share-cover.json`) -> the first usable photo of the gallery (an Eagle link is followed to its target) -> 404.
+//
+// PUBLIC BUT NOT OPEN: the same signed token as the rest of the share; only direct children of the shared folder are used.
+import { resolveShareToken } from './share-token.js'
+import { loadMediaKey } from './media-key.js'
+import { pickCandidates, composeFromTiles, coverTile, COVER_TILE, COVER_SIDE } from './shareMosaic.js'
+
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const CANDIDATES = 8          // spread candidates; tiles are requested four at a time, replacements only for failures
+const CACHE_SECONDS = 600
+const DYNAMIC = process.env.ZR_COVER_DYNAMIC === '1'
+const REGISTRY_DIR = 'pages/.zr-resources'
+
+export const COVER_FILE = '.zr-share-cover.json'
+
+const headers = (token, extra = {}) => ({ Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress', ...extra })
+
+// raw first (free of REST quota), the Contents API when raw has not seen a recent file yet.
+async function jsonAt(token, path, fetchImpl) {
+  const chemin = path.normalize('NFC')
+  let r = await fetchImpl(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(chemin)}`, { headers: headers(token) })
+  if (!r.ok) r = await fetchImpl(`https://api.github.com/repos/${REPO}/contents/${encodeURI(chemin)}?ref=${BRANCH}`, { headers: headers(token, { Accept: 'application/vnd.github.raw+json' }) })
+  if (!r.ok) return null
+  try { return await r.json() } catch { return null }
+}
+
+export async function listImageNames(token, dir, fetchImpl = fetch) {
+  const r = await fetchImpl(`https://api.github.com/repos/${REPO}/git/trees/${encodeURIComponent(`${BRANCH}:${dir.normalize('NFC')}`)}`, { headers: headers(token, { Accept: 'application/vnd.github+json' }) })
+  if (!r.ok) return []
+  const tree = (await r.json()).tree || []
+  return tree.filter((x) => x.type === 'blob' && x.path.endsWith('.img.json')).map((x) => x.path).sort((a, b) => a.localeCompare(b))
+}
+
+async function decryptThumb(bytes, ivB64, keyB64) {
+  const key = await crypto.subtle.importKey('raw', Uint8Array.from(atob(keyB64), (c) => c.charCodeAt(0)), 'AES-GCM', false, ['decrypt'])
+  const iv = Uint8Array.from(atob(ivB64), (c) => c.charCodeAt(0))
+  return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, bytes)) // WebCrypto expects ciphertext || tag
+}
+
+// The thumbnail bytes (webp) of one gallery entry, following an Eagle link to its target. null when it has none.
+async function thumbBytesOf(token, path, keyB64, fetchImpl) {
+  let m = await jsonAt(token, path, fetchImpl)
+  if (m && m.type === 'zenray-eagle-link/v1' && typeof m.resourceId === 'string' && /^zr_[A-Za-z0-9]+$/.test(m.resourceId)) {
+    const registry = await jsonAt(token, `${REGISTRY_DIR}/${m.resourceId}.json`, fetchImpl)
+    if (!registry || typeof registry.sourcePath !== 'string') return null
+    m = await jsonAt(token, registry.sourcePath, fetchImpl)
+  }
+  if (!m || typeof m.thumb !== 'string' || !/^https:\/\//.test(m.thumb)) return null
+  const r = await fetchImpl(m.thumb)
+  if (!r.ok) return null
+  const bytes = new Uint8Array(await r.arrayBuffer())
+  return m.thumbIv ? decryptThumb(bytes, m.thumbIv, keyB64) : bytes
+}
+
+/**
+ * One tile of the mosaic: fetch the gallery entry's thumbnail (following an Eagle link), decode it, crop-and-shrink it to
+ * `size` x `size` RGBA. This is the CPU-heavy half (libwebp decode of a 1080x1440 image), and it runs in ITS OWN Worker
+ * invocation (route /api/share-cover-tile) so that no single invocation carries four decodes plus an encode: measured on
+ * production, one invocation doing everything was killed (error 1102) on about one cold request in eight.
+ */
+export async function renderTile({ token, path, size, codecs, fetchImpl = fetch, keyB64 = loadMediaKey() }) {
+  const bytes = await thumbBytesOf(token, path, keyB64, fetchImpl)
+  if (!bytes) return null
+  const img = await codecs.decode(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))
+  return coverTile(img, size)
+}
+
+// Default tile source in the Worker: a subrequest to our own tile route, which spends its own CPU budget.
+export const remoteTile = (origin, rawToken, fetchImpl = fetch) => async (path, size) => {
+  const r = await fetchImpl(`${origin}/api/share-cover-tile?d=${encodeURIComponent(rawToken)}&p=${encodeURIComponent(path)}&s=${size}`)
+  if (!r.ok) return null
+  const buf = await r.arrayBuffer()
+  return buf.byteLength === size * size * 4 ? new Uint8ClampedArray(buf) : null
+}
+
+/** Compose the preview of `dir`. Returns Uint8Array (JPEG) or null. `tileFor(path, size)` and the codecs are injectable. */
+export async function buildDynamicCover({ token, dir, codecs, tileFor, fetchImpl = fetch }) {
+  const names = await listImageNames(token, dir, fetchImpl)
+  if (!names.length) return null
+  const picks = pickCandidates(names, CANDIDATES).map((n) => `${dir}/${n}`)
+  const size = names.length >= 4 ? COVER_TILE : COVER_SIDE
+  const tiles = []
+  let next = 0
+  // four candidates first, in parallel; every failure is replaced by the next candidate, one wave at a time
+  while (tiles.length < (size === COVER_TILE ? 4 : 1) && next < picks.length) {
+    const wave = picks.slice(next, next + ((size === COVER_TILE ? 4 : 1) - tiles.length))
+    next += wave.length
+    const results = await Promise.allSettled(wave.map((p) => tileFor(p, size)))
+    for (const r of results) if (r.status === 'fulfilled' && r.value) tiles.push(r.value)
+  }
+  return composeFromTiles(tiles, { encode: codecs.encode })
+}
+
+// The stored cover is a rewritten file, so the Contents API (always fresh) comes FIRST here, raw only as a fallback.
+async function storedCover(token, dir, fetchImpl = fetch) {
+  const chemin = `${dir}/${COVER_FILE}`.normalize('NFC')
+  let r = await fetchImpl(`https://api.github.com/repos/${REPO}/contents/${encodeURI(chemin)}?ref=${BRANCH}`, { headers: headers(token, { Accept: 'application/vnd.github.raw+json' }) })
+  if (!r.ok) r = await fetchImpl(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(chemin)}`, { headers: headers(token) })
+  const j = r.ok ? await r.json().catch(() => null) : null
+  if (!j || typeof j.b64 !== 'string') return null
+  return { bytes: Uint8Array.from(atob(j.b64), (c) => c.charCodeAt(0)), mime: typeof j.mime === 'string' && j.mime.startsWith('image/') ? j.mime : 'image/webp' }
+}
+
+// LAST RESORT BEFORE A 404: the first usable photo of the gallery, straight from its decrypted thumbnail (native AES only,
+// a few milliseconds of CPU). An Eagle link is followed to its target. It replaces the old behaviour where a gallery of
+// links had no preview image at all and WhatsApp showed the site icon.
+export async function firstPhoto(token, dir, fetchImpl = fetch, keyB64 = loadMediaKey()) {
+  const names = await listImageNames(token, dir, fetchImpl)
+  for (const n of pickCandidates(names, 4, 'first')) {
+    const bytes = await thumbBytesOf(token, `${dir}/${n}`, keyB64, fetchImpl).catch(() => null)
+    if (bytes && bytes.length) return { bytes, mime: 'image/webp' }
+  }
+  return null
+}
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  const rawToken = (req.query.d || '').toString()
+  if (!token || !rawToken) return res.status(404).end('')
+  let dir
+  try { dir = (await resolveShareToken(rawToken, { expectedKind: 'folder' })).path } catch { return res.status(404).end('') }
+  if (!dir) return res.status(404).end('')
+
+  const cache = typeof caches !== 'undefined' ? caches.default : null
+  const cacheKey = new Request(`https://share-cover.cache.local/${encodeURIComponent(rawToken)}`)
+  try {
+    const hit = cache && await cache.match(cacheKey)
+    if (hit) {
+      res.setHeader('Content-Type', hit.headers.get('Content-Type') || 'image/jpeg')
+      res.setHeader('Cache-Control', `public, max-age=${CACHE_SECONDS}`)
+      res.setHeader('X-Cover-Source', 'edge-cache')
+      return res.status(200).end(Buffer.from(await hit.arrayBuffer()))
+    }
+  } catch { /* cache is an optimisation */ }
+
+  let image = null
+  let source = 'dynamic'
+  let failure = ''
+  try {
+    const codecs = DYNAMIC ? await import('./mosaicCodecs.workers.js').then((m) => m.codecs()).catch(() => null) : null // null outside the Worker build, or flag off
+    const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0]
+    const origin = `${proto}://${req.headers.host}`
+    const jpeg = codecs ? await buildDynamicCover({ token, dir, codecs, tileFor: remoteTile(origin, rawToken) }) : null
+    if (jpeg) image = { bytes: jpeg, mime: 'image/jpeg' }
+    else if (DYNAMIC) failure = codecs ? 'no-image' : 'no-codecs'
+  } catch (e) { failure = String((e && e.message) || e).slice(0, 120); if (process.env.ZR_TEST_TRACE) console.log('share-cover dynamic failed:', e && e.stack) }
+  if (!image) { source = 'stored'; try { image = await storedCover(token, dir) } catch { image = null } }
+  if (!image) { source = 'first-photo'; try { image = await firstPhoto(token, dir) } catch { image = null } }
+  if (!image) return res.status(404).end('')
+
+  try {
+    if (cache && source === 'dynamic') await cache.put(cacheKey, new Response(image.bytes, { headers: { 'Content-Type': image.mime, 'Cache-Control': `public, max-age=${CACHE_SECONDS}` } }))
+  } catch { /* idem */ }
+  res.setHeader('X-Cover-Source', source)
+  if (failure) res.setHeader('X-Cover-Error', failure.replace(/[^\x20-\x7e]/g, '?'))
+  res.setHeader('Content-Type', image.mime)
+  // NOT immutable any more: the gallery changes, so the preview must be allowed to change (ten minutes at the edge).
+  // a fallback is served for a minute only, so the dynamic cover takes over as soon as it works again
+  res.setHeader('Cache-Control', `public, max-age=${source === 'dynamic' ? CACHE_SECONDS : 60}`)
+  return res.status(200).end(Buffer.from(image.bytes))
+}

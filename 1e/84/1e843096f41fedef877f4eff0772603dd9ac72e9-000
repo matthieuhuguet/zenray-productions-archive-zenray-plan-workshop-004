@@ -1,0 +1,93 @@
+// Sert un fichier média depuis un repo SHARD PRIVÉ via le token serveur.
+// Les repos privés ne sont pas accessibles depuis le navigateur -> tout passe ici.
+// Accepte : zenray-media-NN (legacy img/private), et toute famille PRIVÉE zenray-<kind>-private-NN.
+// Le PUBLIC ne transite JAMAIS par le proxy (servi par jsDelivr) sauf fallback explicite côté client.
+import { parseShard, shardName } from './shard-naming.js'
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+// Repo lisible par le proxy = famille privée (nouveau schéma) OU legacy zenray-media-NN.
+const proxyRepoOk = (repo) => { const p = parseShard(repo); return !!p && p.vis === 'private' }
+// Cache de résolution path -> repo réel (mémoire process, persiste à chaud). Sert au PROXY AUTO-RÉSILIENT :
+// après un déplacement de binaire entre shards, le manifeste peut encore pointer l'ancien repo ; on retrouve
+// le binaire sur un shard frère et on mémorise où il est pour les requêtes suivantes (zéro re-scan).
+const g = globalThis
+g.__zrPathRepo = g.__zrPathRepo || new Map()
+// Cache NÉGATIF borné : un 404 réel (binaire jamais existé, ex. .webp non générée) ne doit PAS relancer
+// un scan complet de ~40 shards à CHAQUE affichage de la même tuile. On mémorise path -> expiration (ms)
+// et on court-circuite le re-scan tant que le TTL court. TTL court pour laisser une 2e chance après génération.
+g.__zrPath404 = g.__zrPath404 || new Map()
+const NEG_TTL = 60000
+const SHARD_BRANCH = 'main'
+// FIX ARCHI QUOTA : on sert les binaires via raw.githubusercontent.com, qui NE COMPTE PAS dans la limite
+// REST de 5000 requêtes/h (vérifié : raw renvoie 200 même quand le core est à 0). L'API contents la consommait
+// -> au bout de ~5000 vignettes vues, tout passait en 403 et le site se figeait. Exception : les playlists HLS
+// .m3u8 peuvent être réécrites (transcode progressif) et le CDN raw a ~5 min de cache -> on les sert encore via
+// l'API contents (frais, faible volume). Tout le reste (images, vignettes .webp, segments) = immuable -> raw CDN.
+const rawFetch = (repo, path, token) => {
+  const ext = path.split('.').pop().toLowerCase()
+  if (ext === 'm3u8') return fetch(`https://api.github.com/repos/${OWNER}/${repo}/contents/${encodeURI(path)}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zenray-progress' } })
+  return fetch(`https://raw.githubusercontent.com/${OWNER}/${repo}/${SHARD_BRANCH}/${encodeURI(path)}`, { headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' } })
+}
+const ctFor = (p) => {
+  const e = p.split('.').pop().toLowerCase()
+  const m = { avif: 'image/avif', webp: 'image/webp', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', svg: 'image/svg+xml', bmp: 'image/bmp', tiff: 'image/tiff', heic: 'image/heic',
+    // Sous-titres : le pipeline mse-av (transcode-worker) pousse les VTT sur le shard privé et le manifest
+    // porte `repo`, donc StreamVideoMSE les sert via /api/shard. Sans ce mapping, le navigateur recevait
+    // application/octet-stream et refusait le <track> -> sous-titres muets. (srt/ass en text/plain par cohérence.)
+    vtt: 'text/vtt', srt: 'text/plain', ass: 'text/plain', ssa: 'text/plain',
+    // Segments HLS (CMAF fMP4) servis depuis le shard privé : sans le bon Content-Type, Safari refuse
+    // un .m4s / init.mp4. m4s = segment média, mp4 = init segment, ts = segment legacy mpegts (au cas où),
+    // m3u8 = playlist (normalement servie par /api/hls, mappée ici par sécurité).
+    m4s: 'video/iso.segment', mp4: 'video/mp4', m4v: 'video/mp4', ts: 'video/mp2t',
+    m3u8: 'application/vnd.apple.mpegurl' }
+  return m[e] || 'application/octet-stream'
+}
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(500).end()
+  const repo = String(req.query.repo || '')
+  const path = String(req.query.path || '')
+  if (!proxyRepoOk(repo)) return res.status(400).end()
+  if (!path || path.includes('..') || path.startsWith('/')) return res.status(400).end()
+  try {
+    // PROXY AUTO-RÉSILIENT : on sert depuis le repo demandé ; si le binaire n'y est plus (déplacé vers un shard
+    // frère), on retrouve le binaire au MÊME chemin haché sur les autres shards de la famille et on mémorise où.
+    const known = g.__zrPathRepo.get(path)
+    const first = (known && proxyRepoOk(known)) ? known : repo
+    let r = await rawFetch(first, path, token)
+    if (!r.ok && r.status === 404) {
+      // Cache négatif : 404 récent déjà constaté pour ce chemin -> on ne re-scanne pas (évite l'orage de fetchs).
+      const neg = g.__zrPath404.get(path)
+      if (neg && neg > Date.now()) return res.status(404).end()
+      // serving-quota-5 : dériver les candidats du DERNIER emplacement connu (first), pas du repo demandé.
+      const p = parseShard(first)
+      const cands = []
+      if (p) {
+        for (let n = 1; n <= 20; n++) cands.push(shardName(p.kind, p.vis, n))
+        if (p.kind === 'img' && p.vis === 'private') for (let n = 1; n <= 20; n++) cands.push(`zenray-media-${String(n).padStart(2, '0')}`)
+      }
+      for (const c of cands) {
+        if (c === first) continue
+        const rr = await rawFetch(c, path, token)
+        if (rr.ok) { g.__zrPathRepo.set(path, c); g.__zrPath404.delete(path); r = rr; break }
+      }
+      // Scan complet bredouille -> mémorise le 404 pour TTL court (évite le re-scan à chaque tuile manquante).
+      if (!r.ok && r.status === 404) g.__zrPath404.set(path, Date.now() + NEG_TTL)
+    }
+    if (!r.ok) return res.status(r.status === 404 ? 404 : 502).end()
+    const buf = Buffer.from(await r.arrayBuffer())
+    res.setHeader('Content-Type', ctFor(path))
+    // Tout binaire adressé par CONTENU (chemin haché, jamais réécrit) est IMMUABLE -> cache navigateur LONG.
+    // Cela couvre les images/vignettes (avif, webp, png…) ET les segments média + sous-titres HLS (m4s, mp4,
+    // m4v, ts, vtt, srt, ass) : eux aussi sont hashés et figés, donc on évite le re-fetch réseau à chaque
+    // seek/replay (l'ancien max-age=0 les re-téléchargeait sans raison). SEULES les playlists HLS (.m3u8)
+    // sont réellement mutables (réécrites sous le même chemin par le transcode progressif) -> cache court.
+    const ext = path.split('.').pop().toLowerCase()
+    // serving-quota-6 : une .m3u8 est RÉÉCRITE par le transcode progressif -> jamais cachable. `no-store`
+    // (cohérent avec server/hls.js). L'ancien `s-maxage=31536000 immutable` pouvait figer une playlist
+    // incomplète côté CDN/proxy intermédiaire. Les segments binaires et images (chemins hashés) restent immuables.
+    const mutablePlaylist = ext === 'm3u8'
+    res.setHeader('Cache-Control', mutablePlaylist ? 'no-store' : 'public, max-age=31536000, immutable')
+    res.setHeader('Content-Length', String(buf.length))
+    return res.status(200).send(buf)
+  } catch (e) { return res.status(500).end() }
+}

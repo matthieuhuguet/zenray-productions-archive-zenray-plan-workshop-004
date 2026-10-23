@@ -1,0 +1,81 @@
+#!/usr/bin/env node
+// ZenRayMedia — couleur EXACTE d'une zone précise d'une capture.
+//
+//   node scripts/zrm-pick.mjs <image> x,y,w,h
+//
+// Complément de zrm-palette.mjs, qui compte des blocs sur l'ensemble des captures et ne peut
+// donc pas rendre la couleur d'un élément désigné. Ici on vise : le rouge d'un titre, le bleu
+// d'un bandeau. On renvoie la couleur DOMINANTE de la zone et sa couleur la plus saturée —
+// pour du texte, c'est la seconde qui est la bonne, le fond occupant toujours plus de place.
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { chromium } from 'playwright'
+
+const [img, rectStr] = process.argv.slice(2)
+if (!img || !rectStr) { console.error('usage : node scripts/zrm-pick.mjs <image> x,y,w,h'); process.exit(1) }
+const rect = rectStr.split(',').map(Number)
+const buf = await readFile(img)
+const ext = path.extname(img).slice(1).toLowerCase().replace('jpg', 'jpeg')
+const url = `data:image/${ext};base64,${buf.toString('base64')}`
+
+const browser = await chromium.launch()
+const page = await browser.newPage()
+await page.setContent('<!doctype html><meta charset="utf-8"><body></body>')
+const out = await page.evaluate(async ([u, r]) => {
+  const i = new Image(); i.src = u; await i.decode()
+  const c = document.createElement('canvas'); c.width = r[2]; c.height = r[3]
+  const g = c.getContext('2d', { willReadFrequently: true })
+  g.drawImage(i, r[0], r[1], r[2], r[3], 0, 0, r[2], r[3])
+  const d = g.getImageData(0, 0, r[2], r[3]).data
+  const counts = new Map()
+  for (let p = 0; p < d.length; p += 4) {
+    const k = `${d[p]},${d[p + 1]},${d[p + 2]}`
+    counts.set(k, (counts.get(k) || 0) + 1)
+  }
+  const list = [...counts.entries()].map(([k, n]) => {
+    const [r0, g0, b0] = k.split(',').map(Number)
+    const mx = Math.max(r0, g0, b0), mn = Math.min(r0, g0, b0)
+    return { r: r0, g: g0, b: b0, n, sat: mx ? (mx - mn) / mx : 0, lum: (r0 * .299 + g0 * .587 + b0 * .114) / 255 }
+  })
+  const hex = (c) => '#' + [c.r, c.g, c.b].map((v) => v.toString(16).padStart(2, '0')).join('')
+  const total = r[2] * r[3]
+  const dom = list.sort((a, b) => b.n - a.n)[0]
+  // Couleur d'encre : la plus fréquente parmi les pixels PURS, c'est-à-dire ni proches du fond
+  // ni intermédiaires. Les pixels de lissage forment une rampe entre encre et papier ; les
+  // ignorer est ce qui distingue la vraie couleur du texte de son gris apparent.
+  // Sur du texte fin compressé en JPEG, AUCUN pixel ne se répète : la sous-échantillonnage de
+  // chrominance étale chaque lettre en un dégradé unique. Compter des couleurs exactes renvoie
+  // alors des fréquences de 0,0 % et une teinte délavée — c'est ce qu'a rendu la première
+  // version sur un titre rouge (#b4716b, un rose, au lieu du rouge du journal).
+  //
+  // La couleur d'un texte se lit donc dans ses pixels les plus SOMBRES : au centre d'un fût,
+  // là où ni le papier ni le lissage n'ont dilué l'encre. On moyenne les 5 % les plus foncés.
+  const px = []
+  for (let p = 0; p < d.length; p += 4) {
+    px.push({ r: d[p], g: d[p + 1], b: d[p + 2], lum: (d[p] * .299 + d[p + 1] * .587 + d[p + 2] * .114) / 255 })
+  }
+  px.sort((a, b) => a.lum - b.lum)
+  const core = px.slice(0, Math.max(1, Math.round(px.length * 0.05)))
+  const ink = {
+    r: Math.round(core.reduce((n, c) => n + c.r, 0) / core.length),
+    g: Math.round(core.reduce((n, c) => n + c.g, 0) / core.length),
+    b: Math.round(core.reduce((n, c) => n + c.b, 0) / core.length),
+    n: core.length,
+  }
+  // Idem pour la teinte : on quantifie à 8 niveaux par canal avant de compter, sinon chaque
+  // pixel forme sa propre classe et le décompte ne veut plus rien dire.
+  const qc = new Map()
+  for (const c of list) {
+    const k = `${c.r >> 3},${c.g >> 3},${c.b >> 3}`
+    const e = qc.get(k)
+    if (e) { e.n += c.n } else { qc.set(k, { ...c }) }
+  }
+  const satu = [...qc.values()].filter((c) => c.sat > 0.3).sort((a, b) => b.n - a.n)[0]
+  return {
+    dominante: dom ? `${hex(dom)}  ${(dom.n / total * 100).toFixed(1)}%` : '—',
+    encre: `${hex(ink)}  (moyenne des 5 % les plus sombres)`,
+    saturee: satu ? `${hex(satu)}  ${(satu.n / total * 100).toFixed(1)}%` : '—',
+  }
+}, [url, rect])
+await browser.close()
+console.log(out)

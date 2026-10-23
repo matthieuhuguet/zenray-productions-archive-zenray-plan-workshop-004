@@ -1,0 +1,116 @@
+// L'ADRESSE UTILISABLE D'UNE VIGNETTE, en un seul endroit (2026-08-04).
+//
+// L'index de recherche décrit une vignette sous TROIS formes, et c'est la source du défaut que
+// Matthieu a vu : « les images importées ne sont pas bonnes, elle ne trouve pas directement dans le
+// Drive Create ».
+//
+//   { u }       image publique EN CLAIR : l'adresse jsDelivr s'utilise telle quelle.
+//   { u, iv }   image publique CHIFFRÉE : `u` pointe sur du CIPHERTEXT. Le poser dans un <img>
+//               affiche une image cassée, ce qui est exactement ce qu'on voyait. Il faut la
+//               chercher, la déchiffrer en AES-GCM avec son vecteur d'initialisation, et n'afficher
+//               que le résultat.
+//   { r, p }    image PRIVÉE ou d'ancien schéma : elle passe par le relais `/api/shard`, qui porte
+//               l'authentification. ZenRayMedia ignorait purement cette forme, si bien qu'aucune
+//               image privée n'apparaissait jamais dans sa palette.
+//
+// ZenRayMedia ne lisait que `.u`, sans regarder `iv` ni `r/p`. Il affichait donc du ciphertext pour
+// les unes et rien du tout pour les autres. La règle existait pourtant déjà, écrite dans `App.jsx`
+// ligne 2521 ; ce module la sort de là pour qu'il n'en existe qu'une seule version, au lieu d'une
+// quatrième écrite de mémoire.
+
+import { decryptBytes } from '../media/crypto.js'
+
+/** L'adresse BRUTE d'une vignette, qui peut être du ciphertext. Miroir de `thumbUrlFor`. */
+export function thumbUrlOf(entry) {
+  if (!entry) return undefined
+  if (typeof entry === 'string') return entry
+  if (entry.u) return entry.u
+  if (entry.r && entry.p) return `/api/shard?repo=${encodeURIComponent(entry.r)}&path=${encodeURIComponent(entry.p)}`
+  return undefined
+}
+
+export function thumbIvOf(entry) {
+  return (entry && typeof entry === 'object' && entry.iv) || undefined
+}
+
+// Un déchiffrement coûte un aller-retour réseau plus du calcul : on ne le refait pas deux fois pour
+// la même vignette. Le cache est volontairement une simple carte, la palette n'en montre que
+// quelques dizaines à la fois.
+const cache = new Map()
+
+/**
+ * L'adresse DIRECTEMENT AFFICHABLE d'une vignette, déchiffrée si besoin.
+ * Rend `null` plutôt que de lever : une vignette manquante ne doit jamais casser une palette.
+ */
+export async function resolveThumbUrl(entry) {
+  const brute = thumbUrlOf(entry)
+  if (!brute) return null
+  const iv = thumbIvOf(entry)
+  if (!iv) return brute                     // en clair : rien à faire
+  if (cache.has(brute)) return cache.get(brute)
+  try {
+    const res = await fetch(brute)
+    if (!res.ok) return null
+    const clair = await decryptBytes(await res.arrayBuffer(), iv)
+    // UNE ADRESSE `data:` ET NON `blob:`, et le choix compte.
+    //
+    // Une adresse d'objet ne vit que dans l'onglet qui l'a créée : elle marche dans l'aperçu, puis
+    // meurt dans le fichier HTML exporté, où l'image redevient cassée. Ce serait le même défaut
+    // déplacé d'un cran, découvert la semaine suivante en ouvrant un export. Une vignette pèse
+    // quelques dizaines de kilo-octets, un tiers de plus une fois en base64 : c'est un prix bien
+    // inférieur à celui d'un export faux.
+    cache.set(brute, dataUrl(clair, 'image/webp'))
+    return cache.get(brute)
+  } catch {
+    return null
+  }
+}
+
+function dataUrl(buffer, mime) {
+  const octets = new Uint8Array(buffer)
+  let binaire = ''
+  // Par tranches : `String.fromCharCode(...tableau)` dépasse la pile d'appels au-delà de quelques
+  // dizaines de milliers d'octets, ce qu'une vignette atteint sans peine.
+  for (let i = 0; i < octets.length; i += 0x8000) {
+    binaire += String.fromCharCode.apply(null, octets.subarray(i, i + 0x8000))
+  }
+  return `data:${mime};base64,${btoa(binaire)}`
+}
+
+// ═══ L'IMAGE PLEINE, ET NON SA VIGNETTE (2026-08-04) ═══════════════════════════════════════════
+//
+// « Les images s'importent mais elles sont hyper pixelisées. » Elles l'étaient à juste titre : ce
+// qu'on posait dans le document était la VIGNETTE, un webp de quelques centaines de pixels fait
+// pour tenir dans une case de la palette, puis étiré sur huit cents pixels de large. Une vignette
+// agrandie ne redevient jamais une image.
+//
+// La chaîne complète existe déjà et a été éprouvée par la galerie : lire le manifeste, puis
+// résoudre l'image pleine, qui sait reconstituer une image découpée en morceaux et la déchiffrer.
+// On ne la réécrit pas, on l'appelle.
+export async function resolveFullImageUrl(path) {
+  if (!path || !path.endsWith('.img.json')) return null
+  try {
+    const { readImgManifestCached, resolveFullUrl } = await import('../components/ImageNodeViewer.jsx')
+    const manifeste = await readImgManifestCached(path)
+    if (!manifeste) return null
+    const url = await resolveFullUrl(manifeste)
+    if (!url) return null
+    // UNE ADRESSE D'OBJET NE SURVIT PAS À L'EXPORT, même raison qu'au-dessus : elle ne vit que dans
+    // l'onglet qui l'a créée. On la fige donc en `data:` pour que le document soit autonome. Le
+    // poids est réel et assumé — le Critique surveille déjà les documents lourds et le dira.
+    return url.startsWith('blob:') ? await blobEnDataUrl(url) : url
+  } catch {
+    return null
+  }
+}
+
+async function blobEnDataUrl(objectUrl) {
+  const res = await fetch(objectUrl)
+  const blob = await res.blob()
+  return new Promise((resoudre) => {
+    const lecteur = new FileReader()
+    lecteur.onload = () => resoudre(String(lecteur.result))
+    lecteur.onerror = () => resoudre(null)
+    lecteur.readAsDataURL(blob)
+  })
+}

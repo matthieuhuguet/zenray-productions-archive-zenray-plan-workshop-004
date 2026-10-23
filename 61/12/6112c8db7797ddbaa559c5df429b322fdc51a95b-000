@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+// AttachSubtitleTracks.mjs (11 October 2026): store the text subtitle tracks of an original video INSIDE its
+// existing .media.json, so VideoPlayer2 + SubtitleLayer show them for HLS/DASH streams without any video re-upload.
+// FR : range les pistes de sous-titres texte de l'original DANS le manifeste deja en ligne, sans re-uploader la video.
+//
+// Usage: node scripts/AttachSubtitleTracks.mjs --source <original.mkv> --manifest <clone>/pages/.../<name>.media.json [--commit] [--dry]
+// Shape written (same contract as scripts/attach-subtitles.mjs and src/lib/subtitleSidecar.js):
+//   manifest.subtitles = [{ id, lang, label, format: 'ass'|'srt'|'vtt', encoding: 'gzip+base64', data }]
+import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import { gzipSync } from 'node:zlib'
+import { SUB_ENCODING } from '../src/lib/subtitleSidecar.js'
+import { withCloneLock } from './lib/clone-lock.mjs'
+import { openVideoGitShard } from './lib/video-git-shard.mjs'
+import { resolveToken } from './lib/public-shard.mjs'
+
+// 11 October 2026: one place for every tunable value.
+const CONFIG = {
+  ffmpeg: fs.existsSync('/opt/homebrew/bin/ffmpeg') ? '/opt/homebrew/bin/ffmpeg' : 'ffmpeg',
+  ffprobe: fs.existsSync('/opt/homebrew/bin/ffprobe') ? '/opt/homebrew/bin/ffprobe' : 'ffprobe',
+  // 11 October 2026: ALL text tracks are kept; this order only decides which ones come first in the player menu.
+  languagePriority: ['fre', 'fra', 'fr', 'jpn', 'ja', 'eng', 'en'],
+  // The manifest is read as ONE file: past ~1 MiB the GitHub contents API returns it empty. Tracks beyond this budget
+  // (lowest priority first) are listed in manifest.subtitlesDropped instead of silently lost.
+  maxManifestBytes: 900 * 1024,
+  // 11 October 2026: a track is valid when it carries at least one cue, not when it passes a size threshold.
+  cuePattern: /-->|^Dialogue:/m,
+  labels: { fre: 'Français', fra: 'Français', fr: 'Français', jpn: '日本語', ja: '日本語', eng: 'English', en: 'English',
+    spa: 'Español', ger: 'Deutsch', deu: 'Deutsch', ita: 'Italiano', por: 'Português', kor: '한국어', chi: '中文', zho: '中文',
+    ara: 'العربية', rus: 'Русский', tha: 'ไทย', vie: 'Tiếng Việt', ind: 'Indonesia', may: 'Melayu', msa: 'Melayu' },
+  // ffmpeg muxer and player format for each text codec; image codecs (PGS, DVD, DVB) are skipped.
+  textCodecs: {
+    ass: { muxer: 'ass', format: 'ass' },
+    ssa: { muxer: 'ass', format: 'ass' },
+    subrip: { muxer: 'srt', format: 'srt' },
+    srt: { muxer: 'srt', format: 'srt' },
+    mov_text: { muxer: 'srt', format: 'srt' },
+    webvtt: { muxer: 'webvtt', format: 'vtt' },
+  },
+}
+
+function parseArgs(argv) {
+  const out = { commit: false, dry: false }
+  for (let i = 2; i < argv.length; i += 1) {
+    const a = argv[i]
+    if (a === '--commit') out.commit = true
+    else if (a === '--dry') out.dry = true
+    else if (a.startsWith('--')) { out[a.slice(2)] = argv[i + 1]; i += 1 }
+  }
+  return out
+}
+
+function probeSubtitleStreams(source) {
+  const raw = execFileSync(CONFIG.ffprobe, ['-v', 'error', '-select_streams', 's', '-show_entries',
+    'stream=index,codec_name:stream_tags=language,title', '-of', 'json', source], { encoding: 'utf8' })
+  return (JSON.parse(raw).streams || []).map((s, order) => ({
+    order, index: s.index, codec: String(s.codec_name || '').toLowerCase(),
+    lang: String(s.tags?.language || 'und').toLowerCase(), title: s.tags?.title || '',
+  }))
+}
+
+// Every text track, French / Japanese / English first, the others in file order. Image tracks (PGS, DVD) are skipped.
+export function selectTracks(streams) {
+  const text = streams.filter((s) => CONFIG.textCodecs[s.codec])
+  const rank = (s) => { const r = CONFIG.languagePriority.indexOf(s.lang); return r === -1 ? CONFIG.languagePriority.length : r }
+  return text.map((s, i) => ({ s, i })).sort((a, b) => rank(a.s) - rank(b.s) || a.i - b.i).map((x) => x.s)
+}
+
+function extractTrack(source, stream) {
+  const { muxer } = CONFIG.textCodecs[stream.codec]
+  return execFileSync(CONFIG.ffmpeg, ['-v', 'error', '-i', source, '-map', `0:${stream.index}`, '-f', muxer, '-'],
+    { maxBuffer: 1 << 28 })
+}
+
+function commitManifest(manifestPath, message) {
+  const root = execFileSync('git', ['-C', path.dirname(manifestPath), 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim()
+  const rel = path.relative(root, manifestPath)
+  const git = (args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  git(['add', '--', rel])
+  git(['commit', '-q', '-m', message])
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try { git(['push', '-q']); return }
+    catch (error) {
+      if (attempt === 5) throw error
+      git(['pull', '--rebase', '-q'])
+    }
+  }
+}
+
+const args = parseArgs(process.argv)
+if (!args.source || !args.manifest) {
+  console.error('usage: AttachSubtitleTracks.mjs --source <video> --manifest <file.media.json> [--commit] [--dry]')
+  process.exit(2)
+}
+if (!fs.existsSync(args.source)) throw new Error(`source not found: ${args.source}`)
+if (!fs.existsSync(args.manifest)) throw new Error(`manifest not found: ${args.manifest}`)
+
+// 11 October 2026: subtitle files stored next to the video (same folder, subs/ or SRT/) whose name starts with
+// the video base name, e.g. "Show S01E09.srt" or "Film.fr.srt"; the language comes from the last suffix.
+// FR : fichiers de sous-titres poses a cote de la video, langue lue dans le suffixe.
+function findSidecars(source) {
+  const dir = path.dirname(source)
+  const base = path.basename(source, path.extname(source)).toLowerCase()
+  const out = []
+  for (const folder of [dir, path.join(dir, 'subs'), path.join(dir, 'SRT'), path.join(dir, 'Subs')]) {
+    if (!fs.existsSync(folder)) continue
+    for (const file of fs.readdirSync(folder)) {
+      const ext = path.extname(file).slice(1).toLowerCase()
+      const codec = { srt: 'subrip', ass: 'ass', ssa: 'ssa', vtt: 'webvtt' }[ext]
+      if (!codec || !file.toLowerCase().startsWith(base)) continue
+      const suffix = path.basename(file, path.extname(file)).slice(base.length).split('.').filter(Boolean).pop() || 'und'
+      out.push({ order: -1, index: `file:${file}`, codec, lang: suffix.toLowerCase(), title: file, file: path.join(folder, file) })
+    }
+  }
+  return out
+}
+
+const streams = [...findSidecars(args.source), ...probeSubtitleStreams(args.source)]
+const chosen = selectTracks(streams)
+const tracks = []
+const dropped = []
+const external = [] // 14 October 2026: tracks over the manifest budget, stored as files next to the segments. FR : pistes trop grosses, rangees en fichiers.
+const usedLabels = new Map()
+let budget = 0
+for (const stream of chosen) {
+  const bytes = stream.file ? fs.readFileSync(stream.file) : extractTrack(args.source, stream)
+  if (!CONFIG.cuePattern.test(bytes.toString('utf8'))) {
+    dropped.push({ lang: stream.lang, reason: 'no-cue' })
+    continue
+  }
+  const { format } = CONFIG.textCodecs[stream.codec]
+  const data = gzipSync(bytes, { level: 9 }).toString('base64')
+  const overBudget = budget + data.length > CONFIG.maxManifestBytes
+  if (!overBudget) budget += data.length
+  // Several tracks can share a language (full / forced / commentary): keep the labels distinct.
+  const base = CONFIG.labels[stream.lang] || stream.title || stream.lang.toUpperCase()
+  const seen = (usedLabels.get(base) || 0) + 1
+  usedLabels.set(base, seen)
+  const label = seen === 1 ? base : `${base} ${seen}${stream.title && !stream.file ? ` (${stream.title})` : ''}`
+  const id = `sub-${String(stream.index).replace(/[^a-zA-Z0-9]+/g, '-')}`
+  if (overBudget) { external.push({ id, lang: stream.lang, label, format, bytes, kb: Math.round(data.length / 1024) }); continue }
+  tracks.push({ id, lang: stream.lang, label, format, encoding: SUB_ENCODING, data })
+}
+
+// 14 October 2026 (decision of Matthieu: every audio and every subtitle in the cloud, no question asked): a track that does not fit the
+// manifest is pushed as a plain text file into the SAME public shard as the segments, and the manifest points to it (`src`, which the
+// player already reads). FR : une piste trop grosse part en fichier dans le meme depot que les segments ; le manifeste la reference.
+if (external.length && !args.dry) {
+  const current = JSON.parse(fs.readFileSync(args.manifest, 'utf8'))
+  const vid = /\.streams\/([^/]+)\//.exec(String(current.master || ''))
+  if (!current.publicRepo || !vid) {
+    for (const t of external) dropped.push({ lang: t.lang, reason: 'manifest-size-budget', kb: t.kb })
+  } else {
+    const token = resolveToken()
+    const shard = await openVideoGitShard({ owner: 'matthieuhuguet', repo: current.publicRepo, token, workDir: '/Users/zenray/.claude/tmp/tmp-movies-series-upload/GitShards' })
+    let commit
+    const temp = fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'zr-subs-'))
+    try {
+      const files = external.map((t) => {
+        const file = path.join(temp, `${t.id}.${t.format}`)
+        fs.writeFileSync(file, t.bytes)
+        return { path: `${vid[1]}/${t.id}.${t.format}`, sourcePath: file, size: t.bytes.length }
+      })
+      commit = (await shard.pushFiles(files, { message: `subtitles(${vid[1]}): ${files.length} files` })).commit
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true })
+      fs.rmSync(shard.directory, { recursive: true, force: true })
+    }
+    for (const t of external) {
+      const src = `https://raw.githubusercontent.com/matthieuhuguet/${current.publicRepo}/${commit}/${vid[1]}/${t.id}.${t.format}`
+      let ok = false
+      for (let attempt = 0; attempt < 6 && !ok; attempt += 1) {
+        try { ok = (await fetch(src, { method: 'HEAD' })).ok } catch { /* retry */ }
+        if (!ok) await new Promise((r) => setTimeout(r, 2000))
+      }
+      if (!ok) { dropped.push({ lang: t.lang, reason: 'sidecar-not-reachable', kb: t.kb }); continue }
+      tracks.push({ id: t.id, lang: t.lang, label: t.label, format: t.format, src })
+    }
+  }
+}
+
+const summary = {
+  source: path.basename(args.source),
+  subtitleStreams: streams.length,
+  imageOnlySkipped: streams.filter((s) => !CONFIG.textCodecs[s.codec]).length,
+  attached: tracks.map((t) => ({ lang: t.lang, format: t.format, kb: t.data ? Math.round(t.data.length / 1024) : 0, external: Boolean(t.src) })),
+  dropped,
+}
+if (!tracks.length) { console.log(JSON.stringify({ ...summary, status: 'no-text-subtitles' })); process.exit(0) }
+if (args.dry) { console.log(JSON.stringify({ ...summary, status: 'dry-run' })); process.exit(0) }
+
+// 12 October 2026: the write AND the commit happen inside one lock acquisition: the archive upload of the next film commits to
+// the same clone at the same time, and a manifest modified outside the lock would make its `pull --rebase` refuse to run.
+// FR : l'ecriture ET le commit tiennent dans une seule prise du verrou du clone.
+const writeAndCommit = () => {
+  const manifest = JSON.parse(fs.readFileSync(args.manifest, 'utf8'))
+  manifest.subtitles = tracks
+  if (dropped.length) manifest.subtitlesDropped = dropped
+  manifest.subtitlesAttachedAt = new Date().toISOString()
+  fs.writeFileSync(args.manifest, JSON.stringify(manifest))
+  if (args.commit) commitManifest(args.manifest, `subtitles: ${tracks.length} track(s) for ${path.basename(args.manifest)}`)
+}
+if (args.commit) {
+  const cloneRoot = execFileSync('git', ['-C', path.dirname(args.manifest), 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim()
+  await withCloneLock(cloneRoot, `subtitles ${path.basename(args.manifest)}`, async () => writeAndCommit())
+} else writeAndCommit()
+console.log(JSON.stringify({ ...summary, status: args.commit ? 'committed' : 'written' }))

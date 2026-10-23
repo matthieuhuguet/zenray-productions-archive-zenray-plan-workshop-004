@@ -1,0 +1,175 @@
+// 4 October 2026: each adapter reads its board's real markup, and a failing source never hides the others.
+import { describe, expect, it } from 'vitest'
+import config from './FreelanceConfig.json'
+import { offerId } from './lib/Offer.mjs'
+import { clean, decodeEntities, jobPosting, readable } from './lib/Text.mjs'
+import { mapLimited, createHttp } from './lib/Http.mjs'
+import * as afjv from './sources/Afjv.mjs'
+import * as keywords from './sources/Keywords.mjs'
+import * as gamesindustry from './sources/GamesIndustry.mjs'
+import { ashby, breezy, greenhouse, lever, recruitee, smartrecruiters, teamtailor } from './sources/Ats.mjs'
+import { collectAll } from './sources/Index.mjs'
+
+const AFJV_ROW = '<section class="1FR3403" style="display:none" data-cv="14" data-ref="SCOM801-29118" ><span class="emp_log"></span><a class="emp_lnk" href="/emploi-jeux-video/SCOM801-29118" ></a><span class="emp_cat">CDI </span><a class="emp_pos" href="/emploi-jeux-video/SCOM801-29118" title="Technical Artist">Technical Artist</a><a class="empt_soc" href="/annonces-societes/701" title="Plug In Digital">Plug In Digital</a><a class="emp_met" href="/metier/graphisme" title="Graphisme">Graphisme</a><a class="emp_vil" href="/annonces-departement/34" title="34">Montpellier (34)</a><span data-ts="1790934600" class="emp_dat">2 oct. 2026</span><span class="emp_msk"></span></section>'
+const AFJV_OTHER = AFJV_ROW.replaceAll('SCOM801-29118', 'SCOM801-1').replaceAll('Technical Artist', 'Comptable').replace('Graphisme', 'Gestion')
+const AFJV_DETAIL = '<html><script type="application/ld+json">{"@type":"JobPosting","datePosted":"2026-10-02","hiringOrganization":{"@type":"Organization","name":"Plug In Digital","sameAs":"https://www.pluginDigital.com"},"jobLocation":{"address":{"addressCountry":"FR"}}}</script><h1>Technical Artist</h1><p>Houdini et Unreal Engine.</p><div id="nws_shr"></div></html>'
+
+const fakeHttp = (routes) => ({
+  text: async (url) => { if (!(url in routes)) throw new Error(`HTTP 404 ${url}`); return routes[url] },
+  json: async (url) => { if (!(url in routes)) throw new Error(`HTTP 404 ${url}`); return routes[url] },
+})
+
+describe('text helpers', () => {
+  it('decodes entities, flattens and keeps readable paragraphs', () => {
+    expect(decodeEntities('Caf&eacute; &amp; l&rsquo;&#233;quipe &#x41;')).toBe('Café & l’équipe A')
+    expect(clean('<p>One</p><script>x()</script> <b>two&nbsp;three</b>')).toBe('One two three')
+    expect(readable('<p>Missions</p><ul><li>One</li><li>Two</li></ul>')).toBe('Missions\n\n• One\n• Two')
+    expect(jobPosting('<script type="application/ld+json">{"@graph":[{"@type":"WebSite"},{"@type":"JobPosting","title":"T"}]}</script>').title).toBe('T')
+    expect(jobPosting('<p>nothing</p>')).toBeNull()
+  })
+})
+
+describe('AFJV', () => {
+  it('reads the listing, keeps trade and title matches, and reads the detail with its employer link', async () => {
+    const rows = afjv.parseListing(`<div>${AFJV_ROW}${AFJV_OTHER}</div>`, 'https://emploi.afjv.com')
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toMatchObject({ company: 'Plug In Digital', title: 'Technical Artist', contract: 'CDI', location: 'Montpellier (34)', url: 'https://emploi.afjv.com/emploi-jeux-video/SCOM801-29118' })
+    expect(rows.filter(afjv.isRelevant)).toHaveLength(1)
+    const listing = afjv.parseDetail(rows[0], AFJV_DETAIL, 'https://emploi.afjv.com')
+    expect(listing).toMatchObject({ country: 'FR', applyUrl: 'https://emploi.afjv.com/postuler/SCOM801-29118', employerUrl: 'https://www.pluginDigital.com', careersUrl: 'https://emploi.afjv.com/annonces-societes/701', sourceId: rows[0].url })
+  })
+  it('refuses a listing page with no row instead of reading it as "no vacancy"', async () => {
+    await expect(afjv.collect({ http: fakeHttp({ [config.sources.afjv.listUrl]: '<html>maintenance</html>' }), config })).rejects.toThrow(/no vacancy row/)
+  })
+  it('skips an expired advertisement and records a failed detail without losing its id', async () => {
+    const http = fakeHttp({ [config.sources.afjv.listUrl]: `<div>${AFJV_ROW}</div>`, 'https://emploi.afjv.com/emploi-jeux-video/SCOM801-29118': '<h1>x</h1> Cette offre n’est plus disponible' })
+    const [board] = await afjv.collect({ http, config })
+    expect(board.listings).toHaveLength(0)
+    expect(board.seenIds).toEqual([offerId('https://emploi.afjv.com/emploi-jeux-video/SCOM801-29118')])
+    expect(board.complete).toBe(true)
+  })
+})
+
+describe('Keywords Studios and GamesIndustry', () => {
+  it('finds the stream endpoint and total, and refuses a changed layout', () => {
+    expect(keywords.parseBoard("data_url: 'https://k.example/filter_stream/abc'; var _filter_total = 379;")).toEqual({ endpoint: 'https://k.example/filter_stream/abc', total: 379 })
+    expect(() => keywords.parseBoard('<html></html>')).toThrow(/layout changed/)
+  })
+  it('reads a pool as a pool and names the studio inside Keywords', () => {
+    const body = '<script type="application/ld+json">{"@type":"JobPosting","datePosted":"2026-07-11","jobLocation":{"address":{"addressCountry":"MX"}},"hiringOrganization":{"name":"Keywords Studios"}}</script><h1>Role</h1><p>Join d3t, fully remote.</p><form></form>'
+    const listing = keywords.parseDetail({ id: '9', title: 'Environment Artist Talent Pipeline', url: 'https://k.example/9', location_text: 'Mexico' }, body)
+    expect(listing).toMatchObject({ name: 'd3t (Keywords Studios)', title: 'Vivier de candidatures : Environment Artist Talent Pipeline', workplace: 'Remote', sourceId: 'keywords:9' })
+    expect(listing.extra).toMatch(/Vivier/)
+  })
+  it('reads a GamesIndustry card and never lets a search window close a vacancy', async () => {
+    const card = '<article id="node-44197" about="/job/x-44197"><h2 class="node__title"><a href="https://jobs.gamesindustry.biz/job/technical-artist-44197" class="recruiter-job-link" title="Technical Artist (Profiling)">T</a></h2><span class="recruiter-company-profile-job-organization"><a href="/company/a">Avalanche Studios</a></span><div class="location"><span>Stockholm, SE</span></div><div class="terms">Art</div></article>'
+    expect(gamesindustry.parseSearch(card, 'https://jobs.gamesindustry.biz')[0]).toMatchObject({ id: '44197', title: 'Technical Artist (Profiling)', company: 'Avalanche Studios', location: 'Stockholm, SE' })
+    const detail = '<script type="application/ld+json">{"@type":"JobPosting","datePosted":"2026-09-24","validThrough":"2026-10-14","hiringOrganization":{"name":"Avalanche Studios"},"jobLocation":[{"address":{"addressCountry":"SE","addressLocality":"Stockholm"}}],"description":"<p>Houdini wanted</p>"}</script>'
+    const http = { text: async (url) => (url.includes('/jobs?') ? card : detail) }
+    const [board] = await gamesindustry.collect({ http, config: { ...config, sources: { ...config.sources, gamesindustry: { ...config.sources.gamesindustry, queries: ['technical artist'] } } } })
+    expect(board.complete).toBe(false)
+    expect(board.listings[0]).toMatchObject({ validThrough: '2026-10-14', applyUrl: 'https://jobs.gamesindustry.biz/node/44197/apply-external', country: 'SE', careersUrl: 'https://jobs.gamesindustry.biz/company/a' })
+  })
+})
+
+describe('official boards', () => {
+  it('groups Greenhouse variants under one record and sees every variant id', async () => {
+    const jobs = [{ id: 1, internal_job_id: 77, title: 'Technical Artist', location: { name: 'BLANK,BLANK,Paris' }, absolute_url: 'https://g.example/1', content: '&lt;p&gt;Houdini&lt;/p&gt;' }, { id: 2, internal_job_id: 77, title: 'Technical Artist', location: { name: 'London' }, absolute_url: 'https://g.example/2', content: '&lt;p&gt;Houdini&lt;/p&gt;' }, { id: 3, internal_job_id: 80, title: 'Accountant', location: { name: 'Paris' }, absolute_url: 'https://g.example/3', content: '' }]
+    const [board] = await greenhouse({ http: fakeHttp({ 'https://boards-api.greenhouse.io/v1/boards/acme/jobs?content=true': { jobs } }), config: { ...config, sources: { ...config.sources, greenhouse: { boards: { acme: 'Acme' } } } } })
+    expect(board.listings).toHaveLength(1)
+    expect(board.listings[0]).toMatchObject({ sourceId: 'acme:2', location: 'London' })
+    expect(board.listings[0].variantIds).toEqual([offerId('acme:1'), offerId('acme:2')])
+    expect(board.seenIds).toEqual([offerId('acme:1'), offerId('acme:2')])
+  })
+  it('marks a board that answers 404 as incomplete instead of empty', async () => {
+    const [board] = await lever({ http: fakeHttp({}), config: { ...config, sources: { ...config.sources, lever: { boards: { gone: 'Gone' } } } } })
+    expect(board).toMatchObject({ complete: false, listings: [] })
+    expect(board.errors[0].error).toMatch(/404/)
+  })
+  it('reads SmartRecruiters in pages and keeps one record per ref and place', async () => {
+    const list = (offset) => ({ totalFound: 2, content: [{ id: String(offset + 1), refNumber: 'R1', name: 'Technical Artist', location: { fullLocation: 'Paris' } }] })
+    const base = 'https://api.smartrecruiters.com/v1/companies/acme/postings'
+    const http = fakeHttp({ [`${base}?limit=100&offset=0`]: list(0), [`${base}/1`]: { name: 'Technical Artist', location: { fullLocation: 'Paris', country: 'fr' }, jobAd: { sections: { jobDescription: { text: '<p>Unreal</p>' } } }, typeOfEmployment: { label: 'Full-time' }, releasedDate: '2026-10-01' } })
+    const [board] = await smartrecruiters({ http, config: { ...config, sources: { ...config.sources, smartrecruiters: { boards: { acme: 'Acme' } } } } })
+    expect(board.listings[0]).toMatchObject({ sourceId: 'acme:1', contract: 'Full-time', url: 'https://jobs.smartrecruiters.com/acme/1', careersUrl: 'https://jobs.smartrecruiters.com/acme' })
+  })
+})
+
+describe('SmartRecruiters duplicates', () => {
+  it('recognises a record written from either posting of the same reference, and sees both as present', async () => {
+    const base = 'https://api.smartrecruiters.com/v1/companies/acme/postings'
+    const list = { totalFound: 2, content: [{ id: '10', refNumber: 'R1', name: 'Technical Artist', location: { fullLocation: 'Paris' } }, { id: '11', refNumber: 'R1', name: 'Technical Artist', location: { fullLocation: 'Paris' } }] }
+    const detail = { name: 'Technical Artist', location: { fullLocation: 'Paris', country: 'fr' }, jobAd: { sections: { a: { text: 'Unreal' } } }, typeOfEmployment: { label: 'Full-time' } }
+    const http = fakeHttp({ [`${base}?limit=100&offset=0`]: list, [`${base}/10`]: detail })
+    const [board] = await smartrecruiters({ http, config: { ...config, sources: { ...config.sources, smartrecruiters: { boards: { acme: 'Acme' } } } } })
+    expect(board.listings).toHaveLength(1)
+    expect(board.listings[0].variantIds).toEqual([offerId('acme:10'), offerId('acme:11')])
+    expect(board.seenIds).toEqual([offerId('acme:10'), offerId('acme:11')])
+  })
+})
+
+describe('Ashby and Recruitee', () => {
+  it('reads an Ashby board with its listing flag, remote flag and published salary', async () => {
+    const jobs = [{ id: 'a1', title: 'Senior Lighting Artist', isListed: true, isRemote: true, location: 'United States - Remote', address: { postalAddress: { addressCountry: 'United States' } }, jobUrl: 'https://jobs.ashbyhq.com/acme/a1', applyUrl: 'https://jobs.ashbyhq.com/acme/a1/application', employmentType: 'FullTime', publishedAt: '2026-08-24', descriptionHtml: '<p>Houdini</p>', compensation: { compensationTierSummary: '$130K' } }, { id: 'a2', title: 'Hidden Technical Artist', isListed: false }, { id: 'a3', title: 'Accountant', isListed: true }]
+    const [board] = await ashby({ http: fakeHttp({ 'https://api.ashbyhq.com/posting-api/job-board/acme?includeCompensation=true': { jobs } }), config: { ...config, sources: { ...config.sources, ashby: { boards: { acme: 'Acme' } } } } })
+    expect(board.listed).toBe(2)
+    expect(board.listings).toHaveLength(1)
+    expect(board.listings[0]).toMatchObject({ sourceId: 'acme:a1', workplace: 'Remote', extra: 'Rémunération publiée : $130K', applyUrl: 'https://jobs.ashbyhq.com/acme/a1/application' })
+  })
+  it('reads a Recruitee board and ignores unpublished offers', async () => {
+    const offers = [{ id: 1, status: 'published', title: 'Technical Artist', careers_url: 'https://acme.recruitee.com/o/ta', careers_apply_url: 'https://acme.recruitee.com/o/ta/c/new', location: 'Warszawa', country_code: 'PL', employment_type_code: 'fulltime_permanent', hybrid: true, description: '<p>Unreal</p>', requirements: '<p>Python</p>', published_at: '2026-09-30' }, { id: 2, status: 'draft', title: 'Technical Artist draft' }]
+    const [board] = await recruitee({ http: fakeHttp({ 'https://acme.recruitee.com/api/offers/': { offers } }), config: { ...config, sources: { ...config.sources, recruitee: { boards: { acme: 'Acme' } } } } })
+    expect(board.listings).toHaveLength(1)
+    expect(board.listings[0]).toMatchObject({ sourceId: 'acme:1', contract: 'fulltime permanent', workplace: 'Hybride', country: 'PL' })
+    expect(board.listings[0].text).toContain('Python')
+  })
+})
+
+describe('Breezy and Teamtailor', () => {
+  it('reads a Breezy board and refuses a page whose layout lost its description', async () => {
+    const positions = [{ id: 'p1', name: '3D Environment Artist', url: 'https://acme.breezy.hr/p/p1-env', published_date: '2026-04-09T13:37:28Z', type: { name: 'Full-Time' }, location: { city: 'Copenhagen', country: { id: 'DK', name: 'Denmark' }, is_remote: false } }, { id: 'p2', name: 'Accountant', url: 'https://acme.breezy.hr/p/p2' }]
+    const page = `<div class="description"><p>${'Unreal Engine and Houdini work in an open world. '.repeat(4)}</p></div></div>`
+    const cfg = { ...config, sources: { ...config.sources, breezy: { boards: { acme: 'Acme' } } } }
+    const [board] = await breezy({ http: fakeHttp({ 'https://acme.breezy.hr/json': positions, 'https://acme.breezy.hr/p/p1-env': page }), config: cfg })
+    expect(board.listed).toBe(2)
+    expect(board.listings[0]).toMatchObject({ sourceId: 'acme:p1', country: 'DK', location: 'Copenhagen, Denmark', careersUrl: 'https://acme.breezy.hr' })
+    const [broken] = await breezy({ http: fakeHttp({ 'https://acme.breezy.hr/json': positions, 'https://acme.breezy.hr/p/p1-env': '<html>new layout</html>' }), config: cfg })
+    expect(broken.listings).toHaveLength(0)
+    expect(broken.errors[0].error).toMatch(/layout changed/)
+    expect(broken.seenIds).toHaveLength(1)
+  })
+  it('reads a Teamtailor feed, its escaped description and its location', async () => {
+    const feed = `<?xml version="1.0"?><rss version="2.0" xmlns:tt="https://teamtailor.com/locations"><channel><item><title>Freelance FX Artist</title><description>&lt;p&gt;Houdini FX&lt;/p&gt;</description><pubDate>Mon, 22 Jun 2026 12:50:54 +0100</pubDate><link>https://jobs.example/jobs/1-fx</link><remoteStatus>hybrid</remoteStatus><guid>abc-1</guid><tt:locations><tt:location><tt:city>London</tt:city><tt:country>United Kingdom</tt:country></tt:location></tt:locations></item><item><title>Office Manager</title><guid>abc-2</guid><link>https://jobs.example/jobs/2</link></item></channel></rss>`
+    const [board] = await teamtailor({ http: fakeHttp({ 'https://jobs.example/jobs.rss': feed }), config: { ...config, sources: { ...config.sources, teamtailor: { boards: { 'jobs.example': 'Example' } } } } })
+    expect(board.listed).toBe(2)
+    expect(board.listings).toHaveLength(1)
+    expect(board.listings[0]).toMatchObject({ sourceId: 'jobs.example:abc-1', title: 'Freelance FX Artist', contract: 'Freelance', workplace: 'hybrid', location: 'London, United Kingdom', published: '2026-06-22T11:50:54.000Z', careersUrl: 'https://jobs.example/jobs' })
+    expect(board.listings[0].text).toContain('Houdini FX')
+    const [none] = await teamtailor({ http: fakeHttp({ 'https://jobs.example/jobs.rss': '<html>not a feed</html>' }), config: { ...config, sources: { ...config.sources, teamtailor: { boards: { 'jobs.example': 'Example' } } } } })
+    expect(none.complete).toBe(false)
+  })
+})
+
+describe('collectAll and the http layer', () => {
+  it('turns a thrown source into an incomplete board and keeps the others', async () => {
+    const registry = { afjv: async () => { throw new Error('boom') }, lever: async () => [{ key: 'lever:a', label: 'A', listings: [], seenIds: [], listed: 0, matched: 0, errors: [], complete: true }] }
+    const cfg = { ...config, sources: { ...config.sources, afjv: { ...config.sources.afjv, enabled: true }, lever: { ...config.sources.lever, enabled: true } } }
+    const boards = await collectAll({ http: {}, config: cfg, registry })
+    expect(boards.find((b) => b.key === 'afjv')).toMatchObject({ complete: false, errors: [{ error: 'boom' }] })
+    expect(boards.find((b) => b.key === 'lever:a').complete).toBe(true)
+  })
+  it('retries a server error, never a 404, and bounds concurrency', async () => {
+    let calls = 0
+    const http = createHttp(config, { fetchImpl: async () => { calls += 1; return calls < 3 ? { ok: false, status: 503 } : { ok: true, status: 200, text: async () => '{"a":1}' } }, sleep: async () => {} })
+    expect(await http.json('https://x')).toEqual({ a: 1 })
+    expect(calls).toBe(3)
+    let notFound = 0
+    const gone = createHttp(config, { fetchImpl: async () => { notFound += 1; return { ok: false, status: 404 } }, sleep: async () => {} })
+    await expect(gone.text('https://x')).rejects.toThrow(/404/)
+    expect(notFound).toBe(1)
+    let active = 0, peak = 0
+    const results = await mapLimited([1, 2, 3, 4, 5, 6], 2, async (n) => { active += 1; peak = Math.max(peak, active); await new Promise((r) => setTimeout(r, 5)); active -= 1; if (n === 3) throw new Error('x'); return n })
+    expect(peak).toBeLessThanOrEqual(2)
+    expect(results.filter((r) => r.ok)).toHaveLength(5)
+  })
+})

@@ -1,0 +1,181 @@
+// >>> MÉTHODE CANONIQUE images = docs/image-backup-canonical.md + Scripts/lib/img-pipeline.mjs (public+chiffré+jsDelivr+index). Ne pas réinventer.
+// BACKUP IMAGE par GIT PUSH (contourne le secondary rate limit GitHub des POST blob-par-blob).
+// - Convertit les rasters (png/jpg/webp/gif/bmp/tif/heic/jfif) -> AVIF CRF25 en PARALLÈLE (16 coeurs).
+// - Stocke l'ORIGINAL tel quel pour svg/psd/ico (non convertibles proprement -> zéro perte).
+// - Pousse les binaires par GIT PUSH dans des shards frais zenray-img-private-NN (cap DUR 4,5 Go < 5 Go).
+// - Pousse les manifestes .img.json par UN arbre Git inline (peu d'appels API, pas de rate limit).
+// - VÉRIF-APRÈS-PUSH (blob résout 200) -> stage la source en corbeille réversible. Rien supprimé.
+// - Idempotent : réutilise pngjpg-backup.json (done) pour sauter ce qui est déjà sauvegardé.
+import { readFile, readdir, rename, writeFile, appendFile, mkdir, rm, stat, copyFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
+import { promisify } from 'node:util'
+import path from 'node:path'; import { createHash } from 'node:crypto'
+const exec = promisify(execFile)
+
+process.on('unhandledRejection', e => console.error('unhandledRejection:', e && e.message))
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN requis'); process.exit(1) }
+const OWNER = 'matthieuhuguet', DATA = `${OWNER}/zenray-data`, BRANCH = 'main'
+const LIB = '/Users/zenray/Create/Media/References/References.library'
+const TRASH = '/Users/zenray/.zr-eagle-trash/pngjpg'
+const PROG = '/Users/zenray/.zr-eagle-trash/pngjpg-backup.json'
+const RESTORE = '/Users/zenray/.zr-eagle-trash/restore-pngjpg.tsv'
+const GPROG = '/Users/zenray/.zr-eagle-trash/img-gitpush.json'
+const TMP = '/tmp/eagle-avif2'
+const WORK = '/tmp/zr-img-gitpush'
+const SHARD_CAP = 4.5 * 1024 ** 3
+const MAX_BLOB = 95 * 1024 * 1024
+const CONVERT_EXT = ['png','jpg','jpeg','jfif','bmp','gif','tif','tiff','heic','webp'] // -> avif
+const COPY_EXT = ['svg','psd','ico']                                                  // original tel quel
+const ALL_EXT = [...CONVERT_EXT, ...COPY_EXT]
+const AVIFENC = '/opt/homebrew/bin/avifenc', FFMPEG = '/opt/homebrew/bin/ffmpeg'
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const hash = s => createHash('sha1').update(s).digest('hex')
+const sanitize = s => String(s||'').replace(/[^\p{L}\p{N} ._-]/gu,'').replace(/\s+/g,' ').trim().slice(0,80)||'_'
+await mkdir(TMP,{recursive:true}); await mkdir(WORK,{recursive:true}); await mkdir(TRASH,{recursive:true})
+
+// --- API helpers (manifestes uniquement) ---
+const DEAD = { ok:false, status:0, json:async()=>({}), text:async()=>'' }
+async function ghFetch(url,init={},tries=5){ for(let i=0;i<tries;i++){ try{ return await fetch(url,{...init,headers:{Authorization:`Bearer ${TOKEN}`,Accept:'application/vnd.github+json','User-Agent':'zr-imgpush',...(init.headers||{})}}) }catch{ await sleep(1500*(i+1)) } } return DEAD }
+const gh = (p,init={}) => ghFetch(`https://api.github.com/repos/${p}`,init)
+const ghAbs = (p,init={}) => ghFetch(`https://api.github.com/${p}`,init)
+async function ensureRepo(name){ const r=await gh(name); if(r.status===200)return; await ghAbs('user/repos',{method:'POST',body:JSON.stringify({name,private:true,auto_init:true,description:'ZenRay drive — shard image privé'})}); await sleep(2000) }
+// commit d'un lot de fichiers TEXTE via arbre inline (1 tree + 1 commit + 1 ref, pas de POST blob individuel)
+async function commitInline(repo,files,msg){
+  for(let attempt=0; attempt<8; attempt++){
+    const ref=await gh(`${repo}/git/ref/heads/${BRANCH}`).then(r=>r.json()); const head=ref.object?.sha; if(!head){await sleep(1500);continue}
+    const baseTree=(await gh(`${repo}/git/commits/${head}`).then(r=>r.json())).tree?.sha; if(!baseTree){await sleep(1500);continue}
+    const tree=files.map(f=>({path:f.path,mode:'100644',type:'blob',content:f.content}))
+    const nt=await gh(`${repo}/git/trees`,{method:'POST',body:JSON.stringify({base_tree:baseTree,tree})}).then(r=>r.json()); if(!nt.sha){await sleep(2000);continue}
+    const nc=await gh(`${repo}/git/commits`,{method:'POST',body:JSON.stringify({message:msg,tree:nt.sha,parents:[head]})}).then(r=>r.json()); if(!nc.sha){await sleep(2000);continue}
+    const up=await gh(`${repo}/git/refs/heads/${BRANCH}`,{method:'PATCH',body:JSON.stringify({sha:nc.sha,force:false})})
+    if(up.ok)return true
+    if(up.status===422){ await sleep(1200+Math.random()*1500); continue }
+    await sleep(1500)
+  }
+  return false
+}
+
+// --- arbo dossiers Eagle -> chemins ---
+const meta = JSON.parse(await readFile(path.join(LIB,'metadata.json'),'utf8'))
+const fmap = new Map(); (function walk(arr,prefix){ for(const f of arr||[]){ const p=prefix?`${prefix}/${sanitize(f.name)}`:sanitize(f.name); fmap.set(f.id,p); if(f.children)walk(f.children,p) } })(meta.folders,'')
+
+// --- progress unifié (skip ce qui est déjà sauvegardé par le runner API) ---
+let prog={ done:[],failed:[],skippedBig:[],savedBytes:0 }
+try{ prog={...prog,...JSON.parse(await readFile(PROG,'utf8'))} }catch{}
+const doneIds=new Set(prog.done.map(d=>d.id))
+let g={ startedAt:Date.now(),updatedAt:Date.now(),running:true,converted:0,pushed:0,staged:0,failed:0,shards:[],savedBytes:0,total:0 }
+const gsave=async()=>{ g.updatedAt=Date.now(); await writeFile(GPROG,JSON.stringify(g,null,2)) }
+
+// --- inventaire des images restantes ---
+const dirs=(await readdir(path.join(LIB,'images'),{withFileTypes:true})).filter(d=>d.isDirectory()&&d.name.endsWith('.info')).map(d=>d.name)
+const items=[]
+for(const d of dirs){ let m; try{ m=JSON.parse(await readFile(path.join(LIB,'images',d,'metadata.json'),'utf8')) }catch{continue}
+  const ext=(m.ext||'').toLowerCase(); if(!ALL_EXT.includes(ext)||doneIds.has(m.id))continue
+  items.push({dir:d,id:m.id,name:m.name||m.id,ext,size:m.size||0,w:m.width,h:m.height,tags:m.tags||[],folders:m.folders||[],btime:m.btime||0}) }
+g.total=items.length; await gsave()
+console.log(`${items.length} images à sauvegarder par git push (${(items.reduce((s,x)=>s+x.size,0)/1073741824).toFixed(1)} Go sources)`)
+if(!items.length){ g.running=false; await gsave(); console.log('rien à faire — tout est déjà sauvegardé'); process.exit(0) }
+
+// ============ PHASE A : conversion PARALLÈLE (16 coeurs) ============
+// chaque item -> blob local prêt à pousser : avif (raster) ou copie de l'original (svg/psd/ico).
+async function findSrc(dirAbs){ try{ for(const f of await readdir(dirAbs)){ const e=f.split('.').pop().toLowerCase(); if(ALL_EXT.includes(e)&&!f.includes('_thumbnail'))return path.join(dirAbs,f) } }catch{} return null }
+async function convertOne(it){
+  const dirAbs=path.join(LIB,'images',it.dir)
+  const src=await findSrc(dirAbs); if(!src){ return {it,err:'no-src'} }
+  const h=hash(it.id)
+  if(COPY_EXT.includes(it.ext)){ // original tel quel
+    let sz; try{ sz=(await stat(src)).size }catch{ return {it,err:'stat'} }
+    if(sz>MAX_BLOB) return {it,err:'big',mb:Math.round(sz/1048576)}
+    const out=path.join(TMP,`${h}.${it.ext}`); try{ await copyFile(src,out) }catch{ return {it,err:'copy'} }
+    return {it,blob:out,ext:it.ext,shardPath:`${h.slice(0,2)}/${h.slice(2,4)}/${h}.${it.ext}`,size:sz}
+  }
+  // raster -> avif (avifenc lit png/jpg ; les autres via ffmpeg -> png temp)
+  const avif=path.join(TMP,`${h}.avif`); let avifIn=src, tmpPng=null
+  if(!['png','jpg','jpeg'].includes(it.ext)){ tmpPng=path.join(TMP,`${h}.png`); try{ await exec(FFMPEG,['-y','-i',src,'-frames:v','1',tmpPng]) }catch{ return {it,err:'ffmpeg'} } avifIn=tmpPng }
+  try{ await exec(AVIFENC,['--min','25','--max','25','--speed','8','--jobs','2',avifIn,avif]) }catch{ if(tmpPng)await rm(tmpPng,{force:true}).catch(()=>{}); return {it,err:'avifenc'} }
+  if(tmpPng)await rm(tmpPng,{force:true}).catch(()=>{})
+  let sz; try{ sz=(await stat(avif)).size }catch{ return {it,err:'read'} }
+  if(sz>MAX_BLOB){ await rm(avif,{force:true}).catch(()=>{}); return {it,err:'big',mb:Math.round(sz/1048576)} }
+  return {it,blob:avif,ext:'avif',shardPath:`${h.slice(0,2)}/${h.slice(2,4)}/${h}.avif`,size:sz}
+}
+const CONC=16; let ci=0; const ready=[]
+async function worker(){ while(ci<items.length){ const it=items[ci++]; const r=await convertOne(it)
+  if(r.err){ g.failed++; prog.failed.push({id:it.id,name:it.name,reason:r.err}); if(r.err==='big')prog.skippedBig.push({id:it.id,name:it.name,mb:r.mb}) }
+  else { ready.push(r); g.converted++ }
+  if(g.converted%200===0||ci===items.length){ console.log(`  converti ${g.converted}/${items.length} (échecs ${g.failed})`); await gsave() } } }
+console.log('PHASE A — conversion parallèle…')
+await Promise.all(Array.from({length:CONC},worker))
+console.log(`PHASE A finie : ${ready.length} blobs prêts, ${g.failed} échecs`)
+await gsave()
+
+// ============ PHASE B : distribution en shards + GIT PUSH + manifestes + stage ============
+let shardNum=9 // shards FRAIS à partir de 09 (08 et avant = déjà remplis par le runner API)
+let shardDir=null, shardName=null, shardBytes=0, shardItems=[], pendingSincePush=0
+// git non-interactif (jamais de prompt d'auth = jamais de hang) + timeout dur sur push
+const GENV={...process.env, GIT_TERMINAL_PROMPT:'0', GIT_ASKPASS:'/usr/bin/true', GCM_INTERACTIVE:'never'}
+function gitC(dir,args,timeout=0){ return spawnSync('git',['-C',dir,...args],{encoding:'utf8',env:GENV,timeout:timeout||undefined,killSignal:'SIGKILL'}) }
+async function openShard(){
+  shardName=`zenray-img-private-${String(shardNum).padStart(2,'0')}`
+  await ensureRepo(shardName)
+  shardDir=path.join(WORK,shardName)
+  await rm(shardDir,{recursive:true,force:true}).catch(()=>{})
+  const remote=`https://x-access-token:${TOKEN}@github.com/${OWNER}/${shardName}.git`
+  const cl=spawnSync('git',['clone','--depth','1',remote,shardDir],{encoding:'utf8',env:GENV,timeout:120000,killSignal:'SIGKILL'})
+  if(cl.status!==0){ console.error('clone échec',shardName,cl.stderr?.slice(0,200)); throw new Error('clone') }
+  gitC(shardDir,['config','user.email','bot@zenray']); gitC(shardDir,['config','user.name','zenray-bot'])
+  shardBytes=0; shardItems=[]; pendingSincePush=0
+  if(!g.shards.includes(shardName))g.shards.push(shardName)
+  console.log(`  >>> shard ${shardName} ouvert (git push incrémental)`)
+}
+// PUSH INCRÉMENTAL : commit + push ce qui est dans le working tree (sous-lot ~600 fichiers / <1 Go).
+// Petit pack = push fiable, jamais de hang. Timeout 240 s + 4 retries.
+async function pushIncrement(){
+  if(pendingSincePush===0)return true
+  gitC(shardDir,['add','-A'])
+  const cm=gitC(shardDir,['commit','-m',`+${pendingSincePush} images`])
+  if(cm.status!==0 && !/nothing to commit/.test((cm.stdout||'')+(cm.stderr||''))){ console.error('commit échec',(cm.stderr||'').slice(0,150)) }
+  for(let a=0;a<4;a++){ const ps=gitC(shardDir,['push','origin',BRANCH],240000); if(ps.status===0){ pendingSincePush=0; return true } console.error(`push retry ${a+1}/4 (${ps.signal||ps.status})`,(ps.stderr||'').slice(0,150)); await sleep(2000*(a+1)) }
+  return false
+}
+async function flushShard(){
+  if(!shardItems.length)return
+  // 1) pousser le dernier incrément en attente
+  if(!await pushIncrement()){ console.error('PUSH ÉCHEC — sources CONSERVÉES pour',shardName); g.failed+=shardItems.length; shardItems=[]; return }
+  // 2) manifestes -> zenray-data par arbre inline (chunks de 1500)
+  const manifests=shardItems.map(s=>({path:`pages/References/${s.folderPath}/${sanitize(s.it.name)}.${s.it.id}.img.json`,
+    content:JSON.stringify({type:'image',v:1,repo:shardName,path:s.shardPath,name:s.it.name,ext:s.ext,w:s.it.w,h:s.it.h,size:s.size,tags:s.it.tags,addedAt:s.it.btime,eagleId:s.it.id})}))
+  let mok=true
+  for(let i=0;i<manifests.length;i+=1500){ if(!await commitInline(DATA,manifests.slice(i,i+1500),`index ${Math.min(1500,manifests.length-i)} images`)){ mok=false; break } }
+  if(!mok){ console.error('MANIFESTES ÉCHEC — sources CONSERVÉES'); shardItems=[]; return }
+  // 3) VÉRIF un blob résout 200 -> stage TOUTES les sources du shard en corbeille
+  const probe=shardItems[0]
+  const code=await fetch(`https://raw.githubusercontent.com/${OWNER}/${shardName}/${BRANCH}/${probe.shardPath}`,{headers:{Authorization:`Bearer ${TOKEN}`},method:'HEAD'}).then(r=>r.status).catch(()=>0)
+  if(code!==200){ console.error(`vérif blob KO (${code}) — sources CONSERVÉES`); shardItems=[]; return }
+  for(const s of shardItems){ try{ await rename(path.join(LIB,'images',s.it.dir),path.join(TRASH,s.it.dir)); await appendFile(RESTORE,`${s.it.dir}\t${s.it.id}\t${(s.it.name||'').replace(/\t/g,' ')}\t${s.it.size}\n`); prog.done.push({id:s.it.id,name:s.it.name,size:s.it.size}); prog.savedBytes+=s.it.size; g.staged++; g.savedBytes+=s.it.size }catch{ g.failed++ } }
+  g.pushed+=shardItems.length
+  await writeFile(PROG,JSON.stringify(prog,null,2)); await gsave()
+  console.log(`  ✓ shard ${shardName} poussé+indexé+stagé : ${g.staged}/${ready.length} (${(g.savedBytes/1073741824).toFixed(1)} Go libérés)`)
+  shardItems=[]
+}
+console.log('PHASE B — git push + index + stage…')
+const PUSH_EVERY=600   // pousser un incrément tous les 600 fichiers
+let pendBytes=0
+await openShard()
+for(const r of ready){
+  if(shardBytes+r.size>SHARD_CAP){ await flushShard(); shardNum++; await openShard(); pendBytes=0 }
+  const dst=path.join(shardDir,r.shardPath)
+  await mkdir(path.dirname(dst),{recursive:true})
+  await rename(r.blob,dst).catch(async()=>{ await copyFile(r.blob,dst); await rm(r.blob,{force:true}).catch(()=>{}) })
+  const folderPath=r.it.folders.length?(fmap.get(r.it.folders[0])||'_Unsorted'):'_Unsorted'
+  shardItems.push({...r,folderPath})
+  shardBytes+=r.size; pendingSincePush++; pendBytes+=r.size
+  if(pendingSincePush>=PUSH_EVERY || pendBytes>=1024**3){ // push incrémental (fiable, jamais de hang)
+    if(!await pushIncrement()){ console.error('PUSH incrément ÉCHEC — on stoppe ce shard'); break }
+    g.pushed+=PUSH_EVERY; pendBytes=0; await gsave(); console.log(`  ↑ poussé incrément, total poussé ~${g.pushed}`)
+  }
+}
+await flushShard()
+g.running=false; await gsave()
+console.log(`\n=== IMAGES TERMINÉ (git push) — ${g.staged} sauvées+indexées+stagées (${(g.savedBytes/1073741824).toFixed(1)} Go), ${g.failed} échecs, ${prog.skippedBig.length} >95Mo ===`)

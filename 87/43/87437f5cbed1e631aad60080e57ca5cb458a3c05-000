@@ -1,0 +1,88 @@
+// Singleton ffmpeg.wasm SINGLE-THREAD (core-st) : pas de SharedArrayBuffer -> PAS de COOP/COEP,
+// l'existant <video src=/api/stream> reste intact. Core SELF-HOSTÉ dans /public/ffmpeg/esm.
+//
+// ── POURQUOI CETTE VERSION (cause racine du bug dev) ──────────────────────────────────────────
+// @ffmpeg/ffmpeg@0.12.15 crée TOUJOURS son worker en `new Worker(url, { type: "module" })`
+// (cf. node_modules/@ffmpeg/ffmpeg/dist/esm/classes.js L102-112), même quand on passe classWorkerURL.
+// Dans un worker `type:"module"`, importScripts() est INTERDIT. Or le worker UMD bundlé (814.ffmpeg.js)
+// repose sur importScripts(coreURL). Résultat : il throw, tombe sur son fallback require(454) et
+// renvoie l'erreur observée « Cannot find module 'http://localhost:3100/ffmpeg/ffmpeg-core.js' ».
+//
+// LA VOIE QUI MARCHE en dev Vite ET en prod : NE PAS fournir classWorkerURL. On laisse classes.js
+// charger SON worker ESM interne (./worker.js, voisin de classes.js, que Vite sert/transforme en
+// module). Ce worker ESM (dist/esm/worker.js L7-24) fait : importScripts(coreURL) -> échoue car
+// worker module -> catch -> `self.createFFmpegCore = (await import(coreURL)).default`.
+// Donc le coreURL DOIT être le core ESM (export default createFFmpegCore) : public/ffmpeg/esm/ffmpeg-core.js.
+// Le core UMD n'a pas d'export default -> .default = undefined -> ERROR_IMPORT_FAILURE. C'était le piège.
+//
+// Le worker déduit wasmURL = coreURL.replace('.js','.wasm') : le .wasm doit être à côté (esm/). Fait.
+// vite.config.js garde optimizeDeps.exclude:['@ffmpeg/ffmpeg',...] pour que import.meta.url de classes.js
+// pointe vers le fichier réel servi par Vite et que `new URL('./worker.js', import.meta.url)` se résolve.
+// Doit rester ÉGALE à la version de `@ffmpeg/core` dans package.json. Le test
+// `ffmpegCore.test.js` échoue si les deux divergent, parce qu'un core d'une autre version que le
+// worker installé échoue au chargement sans jamais dire que la version est en cause.
+export const FFMPEG_CORE_VERSION = '0.12.10'
+
+let _ff = null
+let _loading = null
+let _users = 0
+
+export async function getFFmpeg() {
+  _users++
+  if (_ff) return _ff
+  if (_loading) return _loading
+  _loading = (async () => {
+    const { FFmpeg } = await import('@ffmpeg/ffmpeg')
+    const ff = new FFmpeg()
+    // LE CORE VIENT DU CDN npm, PLUS DU DÉPLOIEMENT (2026-07-30).
+    //
+    // `ffmpeg-core.wasm` pèse 32,2 Mo. Auto-hébergé, il partait dans CHAQUE déploiement et comptait
+    // dans le transfert de l'hébergeur ; il dépassait en outre le plafond de 25 Mo par fichier de
+    // Cloudflare Pages, ce qui interdisait toute migration.
+    //
+    // Nuance qui a manqué de faire écarter cette solution : jsDelivr plafonne bien à ~20 Mo, mais
+    // sur le chemin `/gh/` (fichiers servis depuis GitHub, celui de nos médias). Le chemin `/npm/`
+    // n'a pas cette limite, et sert les 32,2 Mo en HTTP 200 — vérifié le 2026-07-30. jsDelivr est
+    // préféré à unpkg parce que la politique de sécurité du contenu l'autorise DÉJÀ dans
+    // `connect-src` : aucun élargissement de la surface de sécurité.
+    //
+    // La version est FIGÉE ici et vérifiée par un test contre `package.json` : un CDN pinné sur une
+    // version qui ne correspond plus au paquet installé sert un core incompatible avec le worker,
+    // et l'erreur ne dit jamais que c'est un problème de version.
+    const base = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`
+    // PAS de classWorkerURL : on utilise le worker ESM interne (cf. en-tête). coreURL/wasmURL ESM only.
+    try {
+      await Promise.race([
+        ff.load({ coreURL: `${base}/ffmpeg-core.js`, wasmURL: `${base}/ffmpeg-core.wasm` }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('ffmpeg-core-load-timeout')), 20000)),
+      ])
+    } catch (e) {
+      // Signal STRUCTURÉ (code), pas un motif de texte libre : VideoPlayer.jsx doit savoir que ffmpeg.wasm
+      // lui-même n'a pas pu charger (inutile de retenter en transcode, même moteur) sans dépendre du
+      // libellé exact de l'erreur — celui de @ffmpeg/ffmpeg (tiers) peut changer d'une version à l'autre
+      // sans prévenir, contrairement au timeout ci-dessus qui est notre propre message.
+      const err = new Error('ffmpeg-load-failed: ' + ((e && e.message) || e))
+      err.code = 'ffmpeg-load-failed'
+      err.cause = e
+      throw err
+    }
+    _ff = ff
+    return ff
+  })()
+  try { return await _loading } finally { _loading = null }
+}
+
+// Exécute fn(ff) en capturant les lignes de log uniquement pour cette opération (pas de listener qui traîne).
+export async function withLogs(ff, fn) {
+  const lines = []
+  const onLog = ({ message }) => lines.push(message)
+  ff.on('log', onLog)
+  try { await fn() } finally { ff.off('log', onLog) }
+  return lines
+}
+
+// Relâche une référence. Ne détruit réellement l'instance que quand plus personne ne l'utilise.
+export function releaseFFmpeg() {
+  _users = Math.max(0, _users - 1)
+  if (_users === 0 && _ff) { try { _ff.terminate() } catch {} _ff = null }
+}

@@ -1,0 +1,84 @@
+<!doctype html>
+<!--
+  TEST DE VALIDATION ffmpeg.wasm — à servir par Vite dev.
+  Lancer : npm run dev  puis ouvrir  http://localhost:3100/src/media/ffmpegCore.test.html  (ou le port Vite).
+  Valide 3 choses dans l'ordre :
+    1. getFFmpeg() charge VRAIMENT le core ESM via le worker ESM interne (le bug d'origine).
+    2. ffmpeg -c copy fait un remux HEVC->fMP4 fragmenté sur un petit échantillon.
+    3. MediaSource accepte hvc1 et joue le fragment (chemin de prod : pas de transcode).
+  Vert = OK. Rouge = la ligne de log précédente donne la cause exacte.
+-->
+<html lang="fr"><head><meta charset="utf-8"><title>ffmpeg core test</title>
+<style>body{font:14px ui-monospace,monospace;background:#1c1c1e;color:#e5e5e7;padding:24px;max-width:780px;margin:auto}
+h1{font-size:16px}.ok{color:#30d158}.ko{color:#ff453a}.dim{color:#8e8e93}
+pre{background:#000;padding:12px;border-radius:10px;white-space:pre-wrap;max-height:280px;overflow:auto}
+video{width:100%;border-radius:10px;margin-top:12px;background:#000}</style></head>
+<body>
+<h1>ffmpeg.wasm — validation core ESM + remux HEVC -> fMP4 -> MSE</h1>
+<p class="dim">Renseigne un chemin /api/stream HEVC mkv (optionnel). Vide = on génère un petit clip HEVC de test.</p>
+<input id="path" placeholder="ex: pages/Initial D S01E01.mkv" style="width:100%;padding:8px;border-radius:8px;border:0">
+<button id="run" style="margin-top:10px;padding:8px 16px;border-radius:8px;border:0;background:#F38A5C;color:#fff;font-weight:600">Lancer le test</button>
+<pre id="log"></pre>
+<video id="v" controls></video>
+<script type="module">
+import { getFFmpeg, withLogs, releaseFFmpeg } from './ffmpegCore.js'
+const logEl = document.getElementById('log')
+const log = (m, cls = '') => { logEl.innerHTML += `<span class="${cls}">${m}</span>\n`; logEl.scrollTop = logEl.scrollHeight }
+
+document.getElementById('run').onclick = async () => {
+  logEl.innerHTML = ''
+  try {
+    // ── 1. CHARGEMENT (le bug historique) ───────────────────────────────
+    log('1/3 getFFmpeg() … (worker ESM interne + core ESM)')
+    const t0 = performance.now()
+    const ff = await getFFmpeg()
+    log(`   OK core chargé en ${Math.round(performance.now() - t0)} ms`, 'ok')
+
+    // ── 2. INPUT : vrai mkv via /api/stream, sinon clip HEVC généré ─────
+    let input
+    const path = document.getElementById('path').value.trim()
+    if (path) {
+      log('2/3 fetch /api/stream … ' + path)
+      const r = await fetch('/api/stream?path=' + encodeURIComponent(path), { headers: { Range: 'bytes=0-' } })
+      input = new Uint8Array(await r.arrayBuffer())
+      log(`   reçu ${(input.byteLength / 1e6).toFixed(1)} Mo`, 'ok')
+    } else {
+      log('2/3 génération d\'un clip HEVC de test (testsrc, 2s) …')
+      await ff.exec(['-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=15:duration=2',
+        '-c:v', 'libx265', '-tag:v', 'hvc1', '-pix_fmt', 'yuv420p', '-an', 'src.mp4'])
+      input = await ff.readFile('src.mp4')
+      log(`   clip HEVC: ${input.byteLength} octets`, 'ok')
+    }
+
+    // ── 3. REMUX -c copy -> fMP4, puis MSE hvc1 ─────────────────────────
+    log('3/3 remux -c copy HEVC -> fMP4 fragmenté …')
+    await ff.writeFile('in', input)
+    const logs = await withLogs(ff, async () => {
+      await ff.exec(['-i', 'in', '-map', '0:v:0', '-c:v', 'copy',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'out.mp4'])
+    })
+    const out = await ff.readFile('out.mp4')
+    log(`   remux OK: ${out.byteLength} octets`, out.byteLength > 0 ? 'ok' : 'ko')
+
+    const cs = 'video/mp4; codecs="hvc1.1.6.L93.B0"'
+    log('   MediaSource.isTypeSupported(hvc1) = ' + MediaSource.isTypeSupported(cs),
+      MediaSource.isTypeSupported(cs) ? 'ok' : 'ko')
+
+    const ms = new MediaSource()
+    const v = document.getElementById('v')
+    v.src = URL.createObjectURL(ms)
+    await new Promise(res => ms.addEventListener('sourceopen', res, { once: true }))
+    const sb = ms.addSourceBuffer(MediaSource.isTypeSupported(cs) ? cs : 'video/mp4; codecs="avc1.42E01E"')
+    await new Promise((res, rej) => { sb.addEventListener('updateend', res, { once: true }); sb.addEventListener('error', rej, { once: true }); sb.appendBuffer(out) })
+    try { ms.endOfStream() } catch {}
+    log('   fragment ajouté au SourceBuffer. La vidéo doit être lisible ci-dessous.', 'ok')
+    log('TOUS LES VOYANTS VERTS — la voie ESM marche.', 'ok')
+  } catch (e) {
+    log('ÉCHEC: ' + (e && e.message || e), 'ko')
+    log('(la ligne précédente indique l\'étape qui a cassé)', 'dim')
+  } finally {
+    releaseFFmpeg()
+  }
+}
+</script>
+</body></html>

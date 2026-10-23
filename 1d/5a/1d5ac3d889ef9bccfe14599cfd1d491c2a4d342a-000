@@ -1,0 +1,213 @@
+# StreamBatchBanner.py (17 October 2026): feeds the Create banner during a streaming batch (run_stream_batch).
+# Before this, a batch wrote only StreamBatchStatus.json, so the banner kept showing the last LiveTransferStatus.json of an older run
+# (Bleach, 14 October 2026). Two files feed the banner: UploadQueueStatus.json (per file) and LiveTransferStatus.json (current item).
+# FR : alimente la banniere de Create pendant un lot streaming ; avant, elle gardait le dernier statut d'un ancien lot (Bleach).
+# CLI : python3 StreamBatchBanner.py --follow --pid <worker pid> --names "A.mkv,B.mkv"  (sidecar for a worker started before this fix)
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from QueueStatus import UploadQueue, watch_progress  # noqa: E402
+
+# Every tunable value in one place (HDA rule). / FR : toutes les valeurs reglables au meme endroit.
+BANNER = {
+    'base': '/Users/zenray/.claude/tmp/tmp-movies-series-upload',
+    'statusFile': 'StreamBatchStatus.json',
+    'liveFile': 'LiveTransferStatus.json',
+    'pollSeconds': 5,
+    'notifyEverySeconds': 60,   # 17 October 2026 (Matthieu): a notification every minute, cheap in CPU. FR : une notification par minute.
+    'rateWindowSeconds': 30,
+    'stagedDir': 'CmafStaged',
+    'pushStateFile': 'StreamBatchPush.json',  # baseline of the running push, so a restart of the follower keeps the percentage. FR : la reprise garde le pourcentage.
+    'publisherPattern': 'PublishStagedBatch.mjs',
+    'stageOf': {'staging': 'cmaf', 'staged': 'push', 'published': 'proof', 'proved-source-kept': 'done', 'unloaded': 'done',
+                'stage-failed': 'failed', 'publish-failed': 'failed', 'proof-red': 'failed', 'finish-failed': 'failed'},
+    # plain French sentences, one per status (17 October 2026, Matthieu: "des vrais statuts d'explication"). FR : phrases claires.
+    'stepOf': {'staging': 'Preparation du streaming : decoupage de la video en petits segments',
+               'staged': "Pret : en attente de l'envoi vers GitHub",
+               'published': 'Envoye sur GitHub : ajout des sous-titres, puis verification dans le cloud',
+               'proved-source-kept': 'Verifie dans le cloud : copie locale conservee',
+               'unloaded': 'Termine : verifie dans le cloud, copie locale supprimee',
+               'stage-failed': "Echec de la preparation du streaming", 'publish-failed': "Echec de l'envoi vers GitHub",
+               'proof-red': 'Verification cloud rouge : la copie locale est conservee', 'finish-failed': 'Echec des sous-titres ou de la suppression locale'},
+}
+
+
+def stage_of(status):
+    return BANNER['stageOf'].get(status, 'waiting')
+
+
+def step_of(status):
+    return BANNER['stepOf'].get(status, status)
+
+
+def patch_live(path, status, item, step, now=None):
+    """Patches currentItem/currentStep/status of the live file and keeps the library totals already there. / FR : ne change que l'element courant."""
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        data = {}
+    data.update({'status': status, 'currentItem': item, 'currentStep': step, 'updatedAt': now or time.strftime('%Y-%m-%dT%H:%M:%S%z')})
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    os.replace(tmp, path)
+    return data
+
+
+def apply_films(queue, live_path, films, pushing=False):
+    """films = the 'films' dict of StreamBatchStatus.json. One call updates the queue stages and the live line.
+    pushing = a GitHub push is running: the staged films then get their real numbers from follow(), not a static sentence.
+    FR : un appel met tout a jour ; pendant un push, follow() fournit les vrais chiffres."""
+    for name, entry in films.items():
+        status = entry.get('status')
+        queue.set_stage(name, stage_of(status))
+        if status == 'staging' or (pushing and status == 'staged'):
+            continue  # percentage and numbers come from progress.json or from the network measure. FR : chiffres reels ailleurs.
+        queue.set_detail(name, step_of(status))
+    if pushing:
+        return
+    active = [(n, e) for n, e in films.items() if stage_of(e.get('status')) not in ('done', 'failed')]
+    name, entry = active[0] if active else (next(iter(films), ''), next(iter(films.values()), {}))
+    status = entry.get('status', '')
+    patch_live(live_path, 'running' if active else 'idle', name, step_of(status))
+
+
+def default_interface():
+    import subprocess
+    out = subprocess.run(['route', '-n', 'get', 'default'], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if 'interface:' in line:
+            return line.split()[-1]
+    return 'en0'
+
+
+def tx_bytes(interface):
+    """Bytes sent on the interface since boot (Link row of netstat -ib). / FR : octets envoyes depuis le demarrage."""
+    import subprocess
+    for line in subprocess.run(['netstat', '-ib', '-I', interface], capture_output=True, text=True).stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 10 and parts[2].startswith('<Link'):
+            return int(parts[-2])
+    return 0
+
+
+def dir_bytes(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def publisher_pid():
+    """PID of the running PublishStagedBatch.mjs, or 0. / FR : PID du publieur en cours, sinon 0."""
+    import subprocess
+    out = subprocess.run(['pgrep', '-f', BANNER['publisherPattern']], capture_output=True, text=True).stdout.split()
+    return int(out[0]) if out else 0
+
+
+def publisher_running():
+    return publisher_pid() != 0
+
+
+def notify(title, message):
+    import subprocess
+    safe = lambda t: str(t).replace('\\', ' ').replace('"', "'")
+    subprocess.run(['osascript', '-e', f'display notification "{safe(message)}" with title "{safe(title)}"'], capture_output=True)
+
+
+def fmt_eta(seconds):
+    minutes = int(seconds // 60)
+    return f'{minutes // 60} h {minutes % 60:02d}' if minutes >= 60 else f'{max(minutes, 1)} min'
+
+
+def follow(pid, names, base=BANNER['base'], work_hash=None, queue=None, notifier=notify):
+    """Heartbeat loop: every poll the banner is refreshed; every notifyEverySeconds one notification says where the batch is.
+    During the GitHub push the numbers are real: bytes sent on the network since the push began over the bytes staged.
+    FR : battement ; la banniere est rafraichie et une notification par minute dit ou en est le lot ; chiffres reels pendant le push."""
+    import threading
+    base = Path(base)
+    queue = queue or UploadQueue(base, names)
+    stop = threading.Event()
+    for name in names:
+        h = (work_hash or {}).get(name)
+        if h:
+            threading.Thread(target=watch_progress, args=(queue, name, base / 'HlsDashWork' / h / 'progress.json', stop), daemon=True).start()
+    interface = default_interface()
+    samples, baseline, total, last_note = [], None, 0, 0.0
+    while True:
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+        films = {}
+        try:
+            films = json.loads((base / BANNER['statusFile']).read_text(encoding='utf-8')).get('films', {})
+        except (OSError, ValueError):
+            pass
+        now = time.time()
+        pushing = publisher_running() and any(e.get('status') == 'staged' for e in films.values())
+        try:
+            apply_films(queue, base / BANNER['liveFile'], films, pushing=pushing)
+        except OSError:
+            pass
+        text = ''
+        if pushing:
+            sent_now = tx_bytes(interface)
+            if baseline is None:
+                state_path, pid_now = base / BANNER['pushStateFile'], publisher_pid()
+                try:
+                    state = json.loads(state_path.read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    state = {}
+                if state.get('publisherPid') == pid_now and state.get('txBoot', 0) <= sent_now:
+                    baseline, total = state['baseline'], state['total']
+                else:
+                    baseline, total = sent_now, dir_bytes(base / BANNER['stagedDir'])
+                    state_path.write_text(json.dumps({'publisherPid': pid_now, 'baseline': baseline, 'total': total, 'txBoot': baseline}))
+            samples = [(t, b) for t, b in samples if now - t <= BANNER['rateWindowSeconds']] + [(now, sent_now)]
+            rate = (samples[-1][1] - samples[0][1]) / max(samples[-1][0] - samples[0][0], 1)
+            sent = max(0, sent_now - baseline)
+            percent = min(99, int(100 * sent / total)) if total else 0
+            eta = f", reste environ {fmt_eta((total - sent) / rate)}" if rate > 1e5 and total > sent else ''
+            detail = f"{sent / 1024 ** 3:.1f} Go envoyes sur {total / 1024 ** 3:.1f} Go, a {rate / 1e6:.1f} Mo/s{eta}"
+            text = f"Envoi vers GitHub {percent} % : {detail}"
+            for name, entry in films.items():
+                if entry.get('status') == 'staged':
+                    queue.set_progress(name, percent, detail)
+            patch_live(base / BANNER['liveFile'], 'running', ' + '.join(names), text)
+        else:
+            baseline = None
+            active = [f"{n.rsplit('.', 1)[0]} : {step_of(e.get('status'))}" for n, e in films.items() if stage_of(e.get('status')) not in ('done', 'failed')]
+            text = ' | '.join(active) or ('Termine' if films else '')
+        if text and now - last_note >= BANNER['notifyEverySeconds']:
+            notifier('ZenRay Upload', text)
+            last_note = now
+        if not alive:
+            stop.set()
+            queue.close()
+            notifier('ZenRay Upload', 'Lot termine : ' + ', '.join(f"{n.rsplit('.', 1)[0]} {e.get('status')}" for n, e in films.items()))
+            return
+        time.sleep(BANNER['pollSeconds'])
+
+
+if __name__ == '__main__':
+    import hashlib
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--follow', action='store_true')
+    parser.add_argument('--pid', type=int, required=True)
+    parser.add_argument('--names', required=True)
+    args = parser.parse_args()
+    names = [n for n in args.names.split(',') if n]
+    # the worker packages each film in HlsDashWork/stage-<sha1(name)[:12]>. / FR : dossier de travail de chaque film.
+    hashes = {n: 'stage-' + hashlib.sha1(n.encode()).hexdigest()[:12] for n in names}
+    follow(args.pid, names, work_hash=hashes)

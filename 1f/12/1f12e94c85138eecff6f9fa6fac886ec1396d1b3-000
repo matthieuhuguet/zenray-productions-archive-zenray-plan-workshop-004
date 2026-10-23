@@ -1,0 +1,61 @@
+// /api/media-key — sert la CLÉ MAÎTRE de chiffrement média (AES-GCM 256). Modèle "public + chiffré + jsDelivr" :
+// les binaires sont poussés CHIFFRÉS sur des repos PUBLICS (servis par jsDelivr) ; cette clé, gardée HORS des
+// repos publics, permet au client de déchiffrer pour afficher/télécharger. La clé n'est JAMAIS committée ni
+// poussée sur un repo public.
+//
+// SOURCE de la clé (ordre) :
+//   1. env ZENRAY_MEDIA_KEY (base64 de 32 octets) — recommandé en prod.
+//   2. fichier LOCAL <repo>/.zenray-media-key (gitignored) — généré au premier appel s'il n'existe pas.
+// Renvoie { key: base64 }. (Gating : en local, accès direct ; en prod le routeur est derrière le login Vercel.)
+import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// LE CHEMIN EST CALCULÉ À L'APPEL, JAMAIS AU CHARGEMENT DU MODULE.
+//
+// Écrit d'abord au niveau module, ce calcul a fait échouer le tout premier déploiement Cloudflare
+// (2026-07-31) : `import.meta.url` vaut `undefined` dans le Worker assemblé, `fileURLToPath` jette
+// aussitôt, et comme la ligne s'exécute à l'initialisation, elle emportait le Worker ENTIER — donc
+// les quarante-quatre handlers, pas seulement celui-ci. Une erreur de repli disque tuait toute
+// l'application.
+//
+// Le repli sur fichier n'a de sens qu'en développement, où il évite de régénérer une clé à chaque
+// démarrage. En production la clé vient de `ZENRAY_MEDIA_KEY`, et sur Workers il n'existe de toute
+// façon aucun disque persistant : l'échec de ce calcul est donc normal, et doit rester silencieux.
+function fichierCle() {
+  try {
+    const racine = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+    return path.join(racine, '.zenray-media-key')
+  } catch { return null }
+}
+
+function loadOrCreateKey() {
+  const env = process.env.ZENRAY_MEDIA_KEY
+  if (env && /^[A-Za-z0-9+/=]{40,}$/.test(env)) return env.trim()
+  try {
+    const f = fichierCle()
+    if (f && existsSync(f)) { const v = readFileSync(f, 'utf8').trim(); if (v) return v }
+  } catch {}
+  // Génère une clé 256 bits stable et la persiste localement (best-effort).
+  const key = randomBytes(32).toString('base64')
+  try { const f = fichierCle(); if (f) writeFileSync(f, key, { mode: 0o600 }) } catch {}
+  return key
+}
+
+let _cached = null
+
+// Loader réutilisable côté serveur (ex. /api/stream qui déchiffre les chunks publics). Même source que l'endpoint.
+export function loadMediaKey() { if (!_cached) _cached = loadOrCreateKey(); return _cached }
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return res.status(405).end() }
+  try {
+    if (!_cached) _cached = loadOrCreateKey()
+    // Pas de cache HTTP de la clé (sensible) : revalidation systématique.
+    res.setHeader('Cache-Control', 'no-store')
+    return res.status(200).json({ key: _cached, alg: 'AES-GCM' })
+  } catch (e) {
+    return res.status(200).json({ error: 'media-key', detail: String((e && e.message) || e).slice(0, 120) })
+  }
+}

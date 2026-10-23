@@ -1,0 +1,110 @@
+// VIGNETTES D'ARCHIVE — génère un aperçu webp léger par fichier, À PARTIR DES FICHIERS LOCAUX (zéro
+// re-téléchargement GitHub), pousse les vignettes sur un repo PUBLIC dédié, et ajoute le champ `thumb`
+// (image) / `poster` (vidéo) à chaque manifeste .file.json (zenray-data). La vue Archives affiche alors
+// la vignette directement, sans réassembler l'original.
+//
+// Usage : GITHUB_TOKEN=$(gh auth token) node scripts/archive-thumbs.mjs <dossierMacSource> <siteArchiveDir> --apply [--images-only]
+//   ex : ... "/Users/zenray/Downloads/DJI/16 Juin 2026" "pages/Build/DJI/16 Juin 2026" --apply
+//   --images-only : ne génère QUE les vignettes d'images (pas de poster vidéo).
+import { readdir, stat, mkdir, rm, readFile, writeFile } from 'node:fs/promises'
+import { execFile, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
+const APPLY = process.argv.includes('--apply')
+if (!APPLY) {
+  console.log('Aucune vignette générée : --apply est requis pour autoriser le rendu et les pushes forcés.')
+  process.exit(0)
+}
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN requis'); process.exit(1) }
+const OWNER = 'matthieuhuguet', DATA = 'zenray-data', BRANCH = 'main'
+const THUMBS_REPO = 'zenrayshards-img-a28bd2d2ac54' // ex zenray-archive-thumbs-public, renommé 2026-07-05 (rename v2)
+const SRC = process.argv[2] && path.resolve(process.argv[2])
+const DEST = (process.argv[3] || '').replace(/\/+$/, '')
+const IMAGES_ONLY = process.argv.includes('--images-only')
+if (!SRC || !DEST) { console.error('usage: node scripts/archive-thumbs.mjs <dossierMac> <siteArchiveDir> --apply [--images-only]'); process.exit(1) }
+const WORK = `${process.env.HOME}/.zr-archive-thumbs`
+const IMG_EXT = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'bmp', 'tiff', 'heic'])
+const VID_EXT = new Set(['mp4', 'mov', 'mkv', 'webm', 'm4v', 'avi', 'wmv', 'flv', 'ts'])
+const sha = (s) => createHash('sha256').update(s).digest('hex')
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const run = (cmd, args, opts = {}) => new Promise((res) => execFile(cmd, args, { timeout: 60000, ...opts }, (e) => res(!e)))
+const git = (dir, a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } })
+
+// 1) Inventaire local : images + vidéos (rel = chemin relatif à SRC = chemin relatif du manifeste).
+const files = []
+async function walk(abs, rel) {
+  for (const e of await readdir(abs, { withFileTypes: true })) {
+    if (e.name === '.DS_Store') continue
+    const a = path.join(abs, e.name), r = rel ? `${rel}/${e.name}` : e.name
+    if (e.isDirectory()) await walk(a, r)
+    else if (e.isFile()) {
+      const ext = e.name.split('.').pop().toLowerCase()
+      const kind = IMG_EXT.has(ext) ? 'img' : VID_EXT.has(ext) ? 'vid' : null
+      if (kind && !(IMAGES_ONLY && kind === 'vid')) files.push({ abs: a, rel: r, kind })
+    }
+  }
+}
+await walk(SRC, '')
+console.log(`${files.length} média(s) local(aux) -> vignettes (images${IMAGES_ONLY ? ' seulement' : ' + posters vidéo'})`)
+if (!files.length) process.exit(0)
+
+// 2) Génère les webp en local (ffmpeg), en parallèle x16 (CPU local gratuit). Chemin haché aa/bb/<hash>.webp.
+await rm(WORK, { recursive: true, force: true })
+const repoDir = path.join(WORK, 'repo')
+await mkdir(repoDir, { recursive: true })
+// Sortie JPEG (mjpeg) : cet ffmpeg n'a pas d'encodeur webp. JPEG 420/480px ~20-40 Ko = parfait pour un aperçu.
+const thumbPathFor = (rel) => { const h = sha(rel); return `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.jpg` }
+let done = 0, fail = 0
+const genOne = async (f) => {
+  const tp = thumbPathFor(f.rel)
+  const out = path.join(repoDir, tp)
+  await mkdir(path.dirname(out), { recursive: true })
+  const ok = f.kind === 'img'
+    ? await run('ffmpeg', ['-y', '-i', f.abs, '-vf', 'scale=420:-2', '-frames:v', '1', '-q:v', '3', out])
+    : await run('ffmpeg', ['-y', '-ss', '1', '-i', f.abs, '-frames:v', '1', '-vf', 'scale=480:-2', '-q:v', '3', out])
+  if (ok) { f.thumb = tp; done++ } else { fail++; console.error(`  ⚠ ffmpeg échec ${f.rel}`) }
+  if ((done + fail) % 25 === 0) console.log(`  ${done} ok / ${fail} échec / ${files.length}`)
+}
+const POOL = 16; let qi = 0
+await Promise.all(Array.from({ length: POOL }, async () => { while (qi < files.length) { const i = qi++; await genOne(files[i]) } }))
+console.log(`vignettes générées: ${done} (échecs ${fail})`)
+const withThumb = files.filter((f) => f.thumb)
+if (!withThumb.length) { console.error('aucune vignette — stop'); process.exit(1) }
+
+// 3) Pousse le repo de vignettes PUBLIC (créé si besoin). Repo de dérivés -> push -f assumé (pas d'historique à garder).
+const ghCreate = spawnSync('gh', ['repo', 'create', `${OWNER}/${THUMBS_REPO}`, '--public', '-d', 'ZenRay — vignettes d\'archives (aperçus webp légers)'], { encoding: 'utf8' })
+if (ghCreate.status !== 0 && !/already exists|Name already/i.test((ghCreate.stderr || '') + (ghCreate.stdout || ''))) console.error('repo create:', ghCreate.stderr)
+const url = `https://x-access-token:${TOKEN}@github.com/${OWNER}/${THUMBS_REPO}.git`
+git(repoDir, ['init', '-q']); git(repoDir, ['branch', '-M', 'main'])
+git(repoDir, ['config', 'user.email', 'bot@zenray']); git(repoDir, ['config', 'user.name', 'zenray-bot'])
+await writeFile(path.join(repoDir, 'README.md'), `# ${THUMBS_REPO}\n\nVignettes d'aperçu (webp) des archives ZenRay. Dérivées, régénérables.\n`)
+git(repoDir, ['add', '-A']); git(repoDir, ['commit', '-q', '-m', `thumbs ${new Date().toISOString().slice(0, 10)} (${withThumb.length})`])
+git(repoDir, ['remote', 'add', 'origin', url])
+let pushed = false
+for (let a = 0; a < 4 && !pushed; a++) { const ps = git(repoDir, ['push', '-q', '-f', 'origin', 'HEAD:main']); if (ps.status === 0) pushed = true; else { console.error(`  push retry ${a + 1}/4`, (ps.stderr || '').slice(-120)); await sleep(2000 * (a + 1)) } }
+if (!pushed) { console.error('push vignettes échoué'); process.exit(1) }
+const commit = git(repoDir, ['rev-parse', 'HEAD']).stdout.trim()
+const jsdelivr = (p) => `https://cdn.jsdelivr.net/gh/${OWNER}/${THUMBS_REPO}@${commit}/${p}`
+console.log(`vignettes poussées sur ${THUMBS_REPO}@${commit.slice(0, 7)}`)
+
+// 4) Met à jour chaque manifeste .file.json (zenray-data) : ajoute thumb (image) / poster (vidéo). Clone sparse,
+//    édite, 1 commit, push.
+const dataDir = path.join(WORK, 'data')
+const cl = spawnSync('git', ['clone', '--quiet', '--filter=blob:none', '--no-checkout', url.replace(THUMBS_REPO, DATA), dataDir], { encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, timeout: 120000 })
+if (cl.status !== 0) { console.error('clone zenray-data:', (cl.stderr || '').slice(-200)); process.exit(1) }
+git(dataDir, ['sparse-checkout', 'set', DEST]); git(dataDir, ['checkout', BRANCH])
+git(dataDir, ['config', 'user.email', 'bot@zenray']); git(dataDir, ['config', 'user.name', 'zenray-bot'])
+let upd = 0, miss = 0
+for (const f of withThumb) {
+  const mp = path.join(dataDir, `${DEST}/${f.rel}.file.json`)
+  let m; try { m = JSON.parse(await readFile(mp, 'utf8')) } catch { miss++; continue }
+  if (f.kind === 'img') m.thumb = jsdelivr(f.thumb); else m.poster = jsdelivr(f.thumb)
+  await writeFile(mp, JSON.stringify(m)); upd++
+}
+git(dataDir, ['add', '-A'])
+const ci = git(dataDir, ['commit', '-q', '-m', `vignettes archive: ${DEST} (${upd} manifestes)`])
+if (ci.status === 0) { const ps = git(dataDir, ['push', '-q', 'origin', `HEAD:${BRANCH}`]); if (ps.status !== 0) { console.error('push manifestes:', (ps.stderr || '').slice(-200)); process.exit(1) } }
+await rm(WORK, { recursive: true, force: true }).catch(() => {})
+console.log(`\n=== ${upd} manifestes mis à jour (thumb/poster) · ${miss} sans manifeste · vignettes publiques sur ${THUMBS_REPO} ===`)

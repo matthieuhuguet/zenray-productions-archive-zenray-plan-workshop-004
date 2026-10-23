@@ -1,0 +1,205 @@
+// 6 October 2026, 21:20 CEST: link EVERY conversation to the projects it really worked on, by evidence and not by intuition.
+// EN: a project owns exact local paths (its workshop, its production folder, its memory folder, its cloud folder). A conversation that prompts, edits or runs commands on those paths is evidence for that project. The scan is incremental (JSONL transcripts are append only), works on bytes (no JSON parse of multi megabyte lines) and keeps the one-session-one-project binding untouched: evidence is a many-to-many index next to it, never a silent rebinding.
+// FR : un projet possede des chemins exacts ; une conversation qui les cite dans un prompt, un outil ou une commande est une preuve. Index plusieurs-a-plusieurs a cote de la liaison principale, jamais un rattachement silencieux.
+import { open, stat, readFile, writeFile, rename, mkdir } from 'node:fs/promises'
+import path from 'node:path'
+import { createHash } from 'node:crypto'
+
+export const LINK_SETTINGS = { chunkBytes: 8 * 1024 * 1024, minimumMarkerLength: 24, strongWorkLines: 3, strongPromptLines: 2 }
+const text = value => Buffer.from(value, 'utf8')
+
+// markers: exact local paths of every registered source, plus the cloud folder of the project. A marker shared by several projects credits all of them.
+export function projectMarkers(index) {
+  const markers = new Map()
+  const add = (marker, projectId) => {
+    if (typeof marker !== 'string' || marker.length < LINK_SETTINGS.minimumMarkerLength) return
+    if (!markers.has(marker)) markers.set(marker, new Set())
+    markers.get(marker).add(projectId)
+  }
+  for (const [projectId, project] of Object.entries(index?.projects || {})) {
+    for (const sources of Object.values(project.locations || {})) for (const source of sources || []) add(source.localPath, projectId)
+    add(`pages/ZenRayAssets/${projectId}/`, projectId)
+  }
+  return [...markers.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([marker, projects]) => ({ marker, buffer: text(marker), projects: [...projects] }))
+}
+// the scan version is part of the cache key: changing what a hit means (6 October 2026: Gemini hits come from decoded messages) invalidates every cached result
+export const SCAN_VERSION = 3
+export const markersKey = markers => createHash('sha256').update(`v${SCAN_VERSION}\n` + markers.map(item => `${item.marker}=>${item.projects.join(',')}`).join('\n')).digest('hex').slice(0, 16)
+
+function classify(provider, line) {
+  const head = line.subarray(0, 2000)
+  if (provider === 'claude') {
+    const user = head.indexOf('"type":"user"') !== -1
+    const result = user && line.indexOf('"tool_result"') !== -1
+    return { prompt: user && !result && head.indexOf('"isMeta":true') === -1, work: head.indexOf('"type":"assistant"') !== -1 }
+  }
+  if (provider === 'codex') {
+    return { prompt: head.indexOf('"role":"user"') !== -1, work: head.indexOf('"function_call') !== -1 || head.indexOf('"custom_tool_call') !== -1 || head.indexOf('exec_command') !== -1 }
+  }
+  return { prompt: false, work: false }
+}
+function timestampOf(line) {
+  const at = line.lastIndexOf('"timestamp":"')
+  if (at === -1) return null
+  const value = line.subarray(at + 13, at + 13 + 30).toString('utf8').split('"')[0]
+  return Number.isFinite(Date.parse(value)) ? value : null
+}
+function addHit(hits, projectId, flags, timestamp) {
+  const hit = hits[projectId] || (hits[projectId] = { lines: 0, work: 0, prompts: 0, first: null, last: null })
+  hit.lines += 1
+  if (flags.work) hit.work += 1
+  if (flags.prompt) hit.prompts += 1
+  if (timestamp) { if (!hit.first || timestamp < hit.first) hit.first = timestamp; if (!hit.last || timestamp > hit.last) hit.last = timestamp }
+}
+function scanLine(line, markers, provider, hits) {
+  let found = null
+  for (const item of markers) {
+    if (line.indexOf(item.buffer) === -1) continue
+    found = found || new Set()
+    for (const projectId of item.projects) found.add(projectId)
+  }
+  if (!found) return
+  const flags = classify(provider, line), timestamp = timestampOf(line)
+  for (const projectId of found) addHit(hits, projectId, flags, timestamp)
+}
+
+// JSONL: stream by 8 MiB chunks, cut on newlines, resume from the saved offset when the file only grew.
+export async function scanJsonl(filename, provider, markers, cached) {
+  const info = await stat(filename), key = markersKey(markers)
+  let offset = 0, hits = {}
+  if (cached && cached.key === key && cached.provider === provider && info.size >= cached.offset) { offset = cached.offset; hits = JSON.parse(JSON.stringify(cached.hits)) }
+  const descriptor = await open(filename, 'r')
+  try {
+    let carry = Buffer.alloc(0), position = offset
+    while (position < info.size) {
+      const length = Math.min(LINK_SETTINGS.chunkBytes, info.size - position)
+      const chunk = Buffer.alloc(length), { bytesRead } = await descriptor.read(chunk, 0, length, position)
+      position += bytesRead
+      let buffer = carry.length ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : chunk.subarray(0, bytesRead), start = 0
+      for (let newline = buffer.indexOf(10, start); newline !== -1; newline = buffer.indexOf(10, start)) {
+        if (newline > start) scanLine(buffer.subarray(start, newline), markers, provider, hits)
+        start = newline + 1
+      }
+      carry = Buffer.from(buffer.subarray(start))
+    }
+    // a final line without newline is not consumed: the next scan reads it again once it is complete
+    return { provider, key, size: info.size, mtimeMs: info.mtimeMs, offset: position - carry.length, hits }
+  } finally { await descriptor.close() }
+}
+
+// Gemini (Antigravity SQLite): a raw byte scan is only a PREFILTER (the blobs also hold hidden injected context, so raw hits prove nothing); a conversation with a raw hit is decoded through the verified native reader and only its VISIBLE prompts and answers count.
+export async function scanBinary(filename, markers) {
+  let found = false, size = 0, mtimeMs = 0
+  for (const file of [filename, `${filename}-wal`]) {
+    let info
+    try { info = await stat(file) } catch (error) { if (error.code === 'ENOENT') continue; throw error }
+    size += info.size; mtimeMs = Math.max(mtimeMs, info.mtimeMs)
+    if (found) continue
+    const bytes = await readFile(file)
+    found = markers.some(item => bytes.indexOf(item.buffer) !== -1)
+  }
+  return { provider: 'gemini', key: markersKey(markers), size, mtimeMs, offset: size, rawHit: found, hits: {} }
+}
+export async function scanDecoded(conversationId, markers, readConversation) {
+  const hits = {}
+  let before, pages = 0
+  for (;;) {
+    const page = await readConversation(conversationId, before); pages += 1
+    for (const message of page.messages || []) {
+      const body = String(message.text || '')
+      const found = new Set()
+      for (const item of markers) if (body.includes(item.marker)) for (const projectId of item.projects) found.add(projectId)
+      for (const projectId of found) addHit(hits, projectId, { prompt: message.kind === 'prompt', work: message.kind !== 'prompt' }, message.timestamp ? new Date(message.timestamp).toISOString() : null)
+    }
+    before = page.nextBefore
+    if (!before || pages > 200) break
+  }
+  return hits
+}
+
+// strong = the assistant worked on the project paths several times, or the user pointed to them in two prompts, or the user pointed to them once and the assistant then worked on them (a short Gemini session that builds a video from project files has exactly one such prompt)
+const strength = hit => hit.work >= LINK_SETTINGS.strongWorkLines || hit.prompts >= LINK_SETTINGS.strongPromptLines || (hit.prompts >= 1 && hit.work >= 1) ? 'strong' : 'weak'
+
+export async function readLinkState(stateDir) {
+  try { return JSON.parse(await readFile(path.join(stateDir, 'ConversationLinks.json'), 'utf8')) } catch (error) { if (error.code === 'ENOENT') return { files: {} }; throw error }
+}
+export async function writeJsonAtomic(file, value) {
+  await mkdir(path.dirname(file), { recursive: true })
+  const temporary = `${file}.${process.pid}.tmp`
+  await writeFile(temporary, JSON.stringify(value, null, 1), { mode: 0o600 }); await rename(temporary, file)
+}
+
+// The whole link table: one row per readable conversation with its evidence per project.
+export async function linkConversations({ conversations, index, stateDir, bindings = {}, readConversation, onProgress }) {
+  const markers = projectMarkers(index), state = await readLinkState(stateDir), files = {}
+  const rows = []
+  for (const conversation of conversations) {
+    if (!conversation.readable) continue
+    const paths = conversation.provider === 'gemini' ? [conversation.localPath] : conversation.transcriptPaths || [conversation.localPath]
+    const merged = {}
+    for (const filename of paths) {
+      let result
+      try {
+        const cached = state.files?.[filename]
+        const info = await stat(filename)
+        const unchanged = cached && cached.key === markersKey(markers) && cached.size === info.size && cached.mtimeMs === info.mtimeMs && cached.provider === conversation.provider
+        if (unchanged) result = cached
+        else if (conversation.provider === 'gemini') {
+          result = await scanBinary(filename, markers)
+          if (result.rawHit && readConversation) result.hits = await scanDecoded(conversation.id, markers, readConversation)
+        } else result = await scanJsonl(filename, conversation.provider, markers, cached)
+      } catch (error) { if (error.code === 'ENOENT') continue; throw error }
+      files[filename] = result
+      for (const [projectId, hit] of Object.entries(result.hits)) {
+        const total = merged[projectId] || (merged[projectId] = { lines: 0, work: 0, prompts: 0, first: null, last: null })
+        total.lines += hit.lines; total.work += hit.work; total.prompts += hit.prompts
+        if (hit.first && (!total.first || hit.first < total.first)) total.first = hit.first
+        if (hit.last && (!total.last || hit.last > total.last)) total.last = hit.last
+      }
+    }
+    onProgress?.(conversation)
+    const evidence = Object.entries(merged).map(([projectId, hit]) => ({ projectId, ...hit, strength: strength(hit) })).sort((left, right) => right.work - left.work || right.lines - left.lines)
+    if (evidence.length) rows.push({ id: conversation.id, provider: conversation.provider, sessionId: conversation.sessionId, title: conversation.title, updatedAt: conversation.updatedAt, bytes: conversation.bytes, boundProject: bindings[conversation.sessionId] || null, evidence })
+  }
+  const scannedAt = new Date().toISOString()
+  await writeJsonAtomic(path.join(stateDir, 'ConversationLinks.json'), { schemaVersion: 1, scannedAt, markersKey: markersKey(markers), files })
+  const byProject = {}
+  for (const row of rows) for (const item of row.evidence) (byProject[item.projectId] || (byProject[item.projectId] = [])).push({ ...item, conversationId: row.id, provider: row.provider, sessionId: row.sessionId, title: row.title, updatedAt: row.updatedAt, bytes: row.bytes, boundProject: row.boundProject })
+  for (const list of Object.values(byProject)) list.sort((left, right) => (left.strength === 'strong' ? 0 : 1) - (right.strength === 'strong' ? 0 : 1) || right.work - left.work || right.lines - left.lines)
+  return { scannedAt, rows, byProject }
+}
+
+// Suggestions only: unbound conversations with strong evidence for exactly one project. Evidence is not meaning (a UI session that used a project as its test case also leaves strong evidence), so nothing is bound without an explicit --bind.
+export function suggestions(rows) {
+  return rows.filter(row => !row.boundProject && row.evidence.filter(item => item.strength === 'strong').length === 1 && row.evidence[0].strength === 'strong')
+    .map(row => ({ conversationId: row.id, provider: row.provider, sessionId: row.sessionId, projectId: row.evidence[0].projectId, title: row.title, work: row.evidence[0].work, prompts: row.evidence[0].prompts }))
+}
+
+// The readable index stored in the project memory (archived with it): who worked on this project, where to read it, how strong the evidence is.
+export function renderConversationIndex(projectId, links, date) {
+  const list = links.byProject[projectId] || [], lines = [`# Conversations that worked on ${projectId} (${date})`, '']
+  lines.push(`Generated by \`node scripts/Assets/LinkConversations.mjs --project ${projectId} --write-memory\` from exact path evidence in the ORIGINAL transcripts (${links.scannedAt}). Do not edit by hand: regenerate. The one-session-one-project binding stays in SessionBindings.json; this index also lists conversations that only touched the project. (${date})`, '')
+  lines.push('| Provider | Conversation | Strength | Work lines | Prompt lines | First | Last | Bound to | Reader id |', '|---|---|---|---|---|---|---|---|---|')
+  for (const item of list) lines.push(`| ${item.provider} | ${String(item.title || '').replace(/\|/g, '/').replace(/\s+/g, ' ').slice(0, 70)} | ${item.strength} | ${item.work} | ${item.prompts} | ${item.first || ''} | ${item.last || ''} | ${item.boundProject || 'none'} | \`${item.conversationId}\` |`)
+  lines.push('', `To read a conversation as text: \`node scripts/Assets/ConversationDigest.mjs <reader id> --since <date> --out <file.md>\`. A conversation that is a resumed session also contains its ancestor's history; keep only the dates of the project. (${date})`)
+  return lines.join('\n') + '\n'
+}
+
+// 6 October 2026, 22:05 CEST: the PRIVACY filter of the digests, pure so that it can be tested in both directions.
+// EN: a conversation linked by path evidence is not always ABOUT the project; keep only the messages that cite one of the project's own paths.
+// FR : filtre de confidentialite des digests : seuls les messages qui citent les chemins du projet restent.
+export function citingProject(messages, index, projectId) {
+  const markers = projectMarkers(index).filter(item => item.projects.includes(projectId)).map(item => item.marker)
+  if (!markers.length) throw new Error(`No registered path for project ${projectId}`)
+  return messages.filter(message => markers.some(marker => String(message.text || '').includes(marker)))
+}
+// The markdown of a digest: every message in time order with its timestamp, long bodies clipped with an honest count of what was cut.
+export function renderDigest({ id, conversation, messages, pages = 1, since, until, project, maxChars = 4000 }) {
+  const ordered = [...messages].sort((left, right) => Date.parse(left.timestamp || 0) - Date.parse(right.timestamp || 0))
+  const lines = [`# Conversation digest: ${conversation?.title || id}`, '', `Reader id \`${id}\`, provider ${conversation?.provider}, ${ordered.length} messages${project ? ` that cite the paths of ${project} (every other message of this conversation is deliberately left out)` : ''} from ${since || 'the beginning'} to ${until || 'the end'}, built from the original transcript (${pages} windows read).`, '']
+  for (const message of ordered) {
+    const body = String(message.text || '').trim(), clipped = body.length > maxChars ? `${body.slice(0, maxChars)}\n[... ${body.length - maxChars} more characters in the original]` : body
+    lines.push(`### ${message.timestamp || 'no date'} \u00b7 ${message.kind}`, '', clipped, '')
+  }
+  return lines.join('\n')
+}

@@ -1,0 +1,129 @@
+// 8 October 2026, 21:09 CEST: scan pending GitHub-token-shaped text without printing any matched value.
+import { createReadStream } from 'node:fs'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { PROJECT_PREVIEW_CONFIG } from '../../src/lib/projectPreview.js'
+import { config, requestAssets } from './BridgeClient.mjs'
+
+const TOKEN_SHAPE = /(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,})/g
+const TEXT_EXTENSIONS = new Set([...PROJECT_PREVIEW_CONFIG.textExtensions, 'xml', 'sh', 'swift'])
+
+export function isPendingWorkspaceFile(file, backup) {
+  return !backup || backup.changeToken !== file.changeToken
+}
+
+export function isScannableTextFile(file) {
+  const extension = path.extname(file.relativePath || '').slice(1).toLowerCase()
+  return TEXT_EXTENSIONS.has(extension)
+}
+
+export async function scanTextStream(stream) {
+  let carry = Buffer.alloc(0)
+  let bytesRead = 0
+  let matches = 0
+  const prefixTypes = new Set()
+
+  for await (const chunk of stream) {
+    const block = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    bytesRead += block.length
+    const combined = Buffer.concat([carry, block])
+    const text = combined.toString('latin1')
+
+    for (const match of text.matchAll(TOKEN_SHAPE)) {
+      if (match.index + match[0].length <= carry.length) continue
+      matches += 1
+      prefixTypes.add(match[0].slice(0, match[0].indexOf('_')))
+    }
+
+    carry = combined.subarray(Math.max(0, combined.length - 512))
+  }
+
+  return { bytesRead, matches, prefixTypes: [...prefixTypes].sort() }
+}
+
+export async function scanPendingTextFiles(state, { openStream = createReadStream } = {}) {
+  const backups = state.backups || {}
+  const pendingTextFiles = (state.inventory?.localFiles || [])
+    .filter((file) => isPendingWorkspaceFile(file, backups[file.id]) && isScannableTextFile(file))
+    .sort((left, right) => left.relativePath.localeCompare(right.relativePath))
+  const findings = []
+  let bytesRead = 0
+
+  for (const file of pendingTextFiles) {
+    const result = await scanTextStream(openStream(file.localPath))
+    bytesRead += result.bytesRead
+    if (result.matches) findings.push({
+      fileId: file.id,
+      sourceId: file.sourceId,
+      relativePath: file.relativePath,
+      size: file.size,
+      matches: result.matches,
+      prefixTypes: result.prefixTypes,
+    })
+  }
+
+  return { scannedFiles: pendingTextFiles.length, bytesRead, candidateFiles: findings.length, findings }
+}
+
+export async function addFindingsToLocalExclusions(projectId, findings, {
+  stateDir = config.storage.stateDir,
+  request = requestAssets,
+} = {}) {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(projectId)) throw new Error('Invalid project id')
+  const registryPath = path.join(stateDir, 'Projects.json')
+  const registry = JSON.parse(await readFile(registryPath, 'utf8'))
+  const project = registry.projects.find((entry) => entry.id === projectId)
+  if (!project) throw new Error('Project is not registered')
+
+  let added = 0
+  for (const sourceId of new Set(findings.map((finding) => finding.sourceId))) {
+    const source = project.sources.find((entry) => entry.id === sourceId)
+    if (!source) throw new Error('Source is not registered: ' + sourceId)
+    const excludes = new Set(source.exclude || [])
+    for (const finding of findings.filter((entry) => entry.sourceId === sourceId)) {
+      if (!excludes.has(finding.relativePath)) added += 1
+      excludes.add(finding.relativePath)
+    }
+    source.exclude = [...excludes].sort()
+  }
+
+  if (added) {
+    const status = await request({ action: 'status', projectId })
+    if (status.project.sync.watched || (status.project.jobs || []).some((job) => ['queued', 'running'].includes(job.state))) {
+      throw new Error('Stop the source watcher and finish active archive jobs before applying exclusions')
+    }
+    await request({ action: 'register', project })
+  }
+  return { added, exclusions: findings.length }
+}
+
+async function run() {
+  const [projectId, ...options] = process.argv.slice(2)
+  if (!projectId) throw new Error('Usage: node scripts/Assets/ScanGithubTokenShapes.mjs <project-id> [--apply]')
+  const apply = options.includes('--apply')
+  const statePath = path.join(config.storage.stateDir, 'Project-' + projectId + '.json')
+  const state = JSON.parse(await readFile(statePath, 'utf8'))
+  const scan = await scanPendingTextFiles(state)
+  let exclusions = null
+
+  if (apply && scan.findings.length) exclusions = await addFindingsToLocalExclusions(projectId, scan.findings)
+
+  const generatedAt = new Intl.DateTimeFormat('en-GB', {
+    dateStyle: 'long', timeStyle: 'medium', timeZone: 'Europe/Paris',
+  }).format(new Date())
+  const report = { projectId, generatedAt, scope: 'GitHub token-shaped strings in pending text files only', ...scan, exclusions }
+  const reportDirectory = path.join(config.storage.stateDir, 'security-scans')
+  await mkdir(reportDirectory, { recursive: true })
+  const safeTimestamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const reportPath = path.join(reportDirectory, 'github-token-shapes-' + projectId + '-' + safeTimestamp + '.json')
+  await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 })
+  console.log(JSON.stringify({ ...report, reportPath }, null, 2))
+}
+
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  run().catch((error) => {
+    console.error(error.message)
+    process.exitCode = 1
+  })
+}

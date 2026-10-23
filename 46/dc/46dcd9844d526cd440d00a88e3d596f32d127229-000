@@ -1,0 +1,200 @@
+#!/usr/bin/env node
+// ZenRayMedia — RELEVÉ AUTOMATIQUE DE PALETTE depuis les captures d'un thème.
+//
+//   node scripts/zrm-palette.mjs docs/zenraymedia/references-jpeg/<thème>
+//
+// POURQUOI
+// --------
+// Les couleurs d'un thème sont la deuxième chose qu'on hérite sans s'en apercevoir, après la
+// police. Un thème échafaudé sur un autre garde son rouge, son gris de filet, son fond — et
+// personne ne le voit avant de comparer les deux côte à côte.
+//
+// Une couleur se RELÈVE, elle ne se choisit pas : elle est dans l'image, il suffit de compter.
+//
+// CE QUE ÇA MESURE, ET POURQUOI PAS UNE SIMPLE « COULEUR DOMINANTE »
+// -----------------------------------------------------------------
+// La couleur dominante d'une page de journal est le blanc du papier : la donner comme palette
+// n'apprend rien. Ce qui compte, ce sont les rôles :
+//
+//   papier   la couleur de fond majoritaire (souvent presque blanche, mais rarement #fff pile) ;
+//   encre    la couleur des grandes surfaces sombres, c'est-à-dire le texte ;
+//   accent   la couleur SATURÉE la plus fréquente — le rouge d'un surtitre, le bleu d'un
+//            bandeau-titre. On l'isole en écartant tout ce qui est gris, sinon elle se noie ;
+//   filet    les gris intermédiaires, qui donnent les traits de séparation ;
+//   lavis    les fonds légèrement teintés des blocs et encadrés.
+//
+// Les photographies fausseraient tout : une image de forêt en flammes remplirait la palette
+// d'orange. On écarte donc les zones de forte variance locale — le texte et les aplats sont
+// plats, les photographies ne le sont pas.
+
+import { readFile, readdir, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { chromium } from 'playwright'
+
+const PAGE_CODE = `
+window.ZRP = (() => {
+  // Un bloc est « plat » si ses pixels varient peu : c'est du texte, un filet ou un aplat.
+  // Une photographie varie beaucoup. Ce seul critère élimine l'essentiel du bruit
+  // photographique sans avoir à détecter les images.
+  const BLOCK = 8
+  const FLAT_VARIANCE = 90
+
+  function sample(img) {
+    const { width: W, height: H, data } = img
+    const counts = new Map()
+    for (let by = 0; by + BLOCK <= H; by += BLOCK) {
+      for (let bx = 0; bx + BLOCK <= W; bx += BLOCK) {
+        let sr = 0, sg = 0, sb = 0, n = 0, s2 = 0
+        for (let y = by; y < by + BLOCK; y++) {
+          for (let x = bx; x < bx + BLOCK; x++) {
+            const p = (y * W + x) * 4
+            const r = data[p], g = data[p + 1], b = data[p + 2]
+            sr += r; sg += g; sb += b; n++
+            const l = r * 0.299 + g * 0.587 + b * 0.114
+            s2 += l * l
+          }
+        }
+        const mr = sr / n, mg = sg / n, mb = sb / n
+        const ml = mr * 0.299 + mg * 0.587 + mb * 0.114
+        if (s2 / n - ml * ml > FLAT_VARIANCE) continue
+        // Quantification à 8 niveaux par canal : deux blancs à un point d'écart sont le même
+        // blanc pour l'oeil, et les compter séparément éparpillerait le décompte.
+        const key = ((mr >> 3) << 16) | ((mg >> 3) << 8) | (mb >> 3)
+        const e = counts.get(key)
+        if (e) { e.n++; e.r += mr; e.g += mg; e.b += mb }
+        else counts.set(key, { n: 1, r: mr, g: mg, b: mb })
+      }
+    }
+    return [...counts.values()].map((e) => ({
+      n: e.n,
+      r: Math.round(e.r / e.n), g: Math.round(e.g / e.n), b: Math.round(e.b / e.n),
+    }))
+  }
+
+  async function fromImage(url) {
+    const img = new Image()
+    img.src = url
+    await img.decode()
+    // On travaille sur une réduction : la palette d'une page ne change pas avec la définition,
+    // et une capture de 3200 px comptée pixel à pixel coûte pour rien.
+    const scale = Math.min(1, 1400 / img.naturalWidth)
+    const w = Math.round(img.naturalWidth * scale), h = Math.round(img.naturalHeight * scale)
+    const c = document.createElement('canvas')
+    c.width = w; c.height = h
+    const ctx = c.getContext('2d', { willReadFrequently: true })
+    ctx.drawImage(img, 0, 0, w, h)
+    return sample(ctx.getImageData(0, 0, w, h))
+  }
+
+  return { fromImage }
+})()
+`
+
+const hex = (c) => '#' + [c.r, c.g, c.b].map((v) => v.toString(16).padStart(2, '0')).join('')
+const lum = (c) => (c.r * 0.299 + c.g * 0.587 + c.b * 0.114) / 255
+const sat = (c) => {
+  const mx = Math.max(c.r, c.g, c.b), mn = Math.min(c.r, c.g, c.b)
+  return mx ? (mx - mn) / mx : 0
+}
+
+function rolesFrom(bins) {
+  const total = bins.reduce((n, b) => n + b.n, 0)
+  const by = (f) => bins.filter(f).sort((a, b) => b.n - a.n)
+  const share = (c) => c && (c.n / total)
+
+  // Papier : le plus fréquent parmi les clairs et désaturés.
+  const paper = by((c) => lum(c) > 0.85 && sat(c) < 0.08)[0]
+  // Encre : le plus SOMBRE parmi les sombres fréquents, pas le plus fréquent.
+  //
+  // Correction d'une première version qui rendait #414141 sur un journal dont le texte est
+  // presque noir. La cause : un bloc de 8x8 px posé sur du texte contient surtout du papier
+  // entre les lettres, donc sa moyenne est un gris moyen. Prendre le plus fréquent des blocs
+  // sombres revient à mesurer le gris apparent d'un paragraphe, pas la couleur de l'encre.
+  //
+  // On garde le seuil de fréquence (0.1 % des blocs plats) pour ne pas attraper une ombre
+  // isolée, mais parmi les candidats retenus on prend le plus foncé : c'est le bloc le plus
+  // saturé en lettres, donc le plus proche de l'encre pure.
+  const inkTotal = bins.reduce((n, b) => n + b.n, 0)
+  const inkCandidates = bins.filter((c) => lum(c) < 0.35 && c.n / inkTotal > 0.001)
+  const ink = inkCandidates.sort((a, b) => lum(a) - lum(b))[0] || by((c) => lum(c) < 0.35)[0]
+  // ACCENTS : une LISTE, pas une réponse unique.
+  //
+  // Contrôle sur Libération : le plus fréquent des saturés ressortait à #a62f27 alors que le
+  // rouge relevé à la main sur les titres est #e5241d. Les deux rouges existent bien dans les
+  // captures — l'un vient des aplats et des photographies, l'autre du texte — et rien dans un
+  // décompte de fréquence ne dit lequel est LA couleur de marque.
+  //
+  // Prétendre trancher serait inventer. On propose donc les teintes distinctes les plus
+  // présentes, à départager à l'oeil sur les captures. C'est une aide au relevé, pas un relevé.
+  const saturated = by((c) => sat(c) > 0.35 && lum(c) > 0.12 && lum(c) < 0.92)
+  const accents = []
+  for (const c of saturated) {
+    // On ne garde qu'une teinte par famille : deux nuances voisines du même rouge n'apportent
+    // pas deux choix, elles occupent deux places pour rien.
+    const near = accents.some((a) => Math.abs(a.r - c.r) + Math.abs(a.g - c.g) + Math.abs(a.b - c.b) < 140)
+    if (!near) accents.push(c)
+    if (accents.length === 4) break
+  }
+  const accent = accents[0] || null
+  const accent2 = accents[1] || null
+  const wash = by((c) => lum(c) > 0.9 && lum(c) < 0.985 && sat(c) < 0.06)[1]
+  const rule = by((c) => lum(c) > 0.7 && lum(c) < 0.88 && sat(c) < 0.1)[0]
+  const meta = by((c) => lum(c) > 0.35 && lum(c) < 0.6 && sat(c) < 0.15)[0]
+
+  return { paper, ink, accent, accent2, accents, wash, rule, meta, share }
+}
+
+async function main() {
+  const dir = process.argv[2]
+  if (!dir) throw new Error('usage : node scripts/zrm-palette.mjs <dossier de captures>')
+  const rawDir = path.join(dir, 'raw')
+  const files = (await readdir(rawDir)).filter((f) => /\.(jpe?g|png)$/i.test(f)).sort()
+
+  const browser = await chromium.launch()
+  const page = await browser.newPage()
+  await page.setContent('<!doctype html><meta charset="utf-8"><body></body>')
+  await page.addScriptTag({ content: PAGE_CODE })
+
+  // On agrège TOUTES les captures : une couleur qui n'apparaît que sur une page est un accident
+  // de cette page, pas une couleur du média. L'agrégation fait ce tri toute seule.
+  const merged = new Map()
+  for (const f of files) {
+    const buf = await readFile(path.join(rawDir, f))
+    const url = `data:image/${path.extname(f).slice(1).replace('jpg', 'jpeg')};base64,${buf.toString('base64')}`
+    const bins = await page.evaluate((u) => window.ZRP.fromImage(u), url)
+    for (const b of bins) {
+      const key = `${b.r >> 3},${b.g >> 3},${b.b >> 3}`
+      const e = merged.get(key)
+      if (e) e.n += b.n
+      else merged.set(key, { ...b })
+    }
+    process.stdout.write(`  lu ${f}\n`)
+  }
+  await browser.close()
+
+  const bins = [...merged.values()]
+  const r = rolesFrom(bins)
+  const rows = [
+    ['papier', r.paper], ['encre', r.ink], ['accent', r.accent], ['accent 2', r.accent2],
+    ['lavis', r.wash], ['filet', r.rule], ['gris de méta', r.meta],
+  ]
+  console.log('\nPalette relevée sur ' + files.length + ' captures :\n')
+  for (const [label, c] of rows) {
+    if (!c) { console.log(`  ${label.padEnd(14)} — non trouvé`); continue }
+    console.log(`  ${label.padEnd(14)} ${hex(c)}   ${(r.share(c) * 100).toFixed(1)} % des blocs plats`)
+  }
+  if (r.accents.length > 1) {
+    console.log(`\n  Accents candidats (à départager à l'oeil, la fréquence ne dit pas laquelle est`)
+    console.log(`  la couleur de marque) : ${r.accents.map((c) => `${hex(c)} ${(r.share(c) * 100).toFixed(1)}%`).join('   ')}`)
+  }
+  console.log(`\n  Rappel : « encre » et « accent » sont mesurés sur des blocs de 8 px qui mélangent`)
+  console.log(`  toujours un peu de papier. Les vérifier sur un aplat large avant de les figer.`)
+
+  const out = path.join(dir, 'palette.json')
+  const json = Object.fromEntries(rows.map(([k, c]) => [k, c ? { hex: hex(c), share: r.share(c) } : null]))
+  json['accents candidats'] = r.accents.map((c) => ({ hex: hex(c), share: r.share(c) }))
+  await writeFile(out, JSON.stringify(json, null, 2) + '\n')
+  console.log(`\n→ ${out}`)
+}
+
+main().catch((e) => { console.error(e.message || e); process.exit(1) })

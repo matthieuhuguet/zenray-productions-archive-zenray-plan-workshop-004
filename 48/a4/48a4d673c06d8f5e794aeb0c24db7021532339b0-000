@@ -1,0 +1,103 @@
+// @vitest-environment node
+// 12 October 2026: identity proof of archived (plain chunked) files, green on a good archive and RED on each corruption.
+// FR : preuve par identite des fichiers archives (chunks en clair), verte sur le bon, rouge sur chaque corruption.
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { createHash, randomBytes } from 'node:crypto'
+import { afterEach, describe, expect, it } from 'vitest'
+import { planArchiveObjects, proveArchiveIdentity } from './archive-identity-proof.mjs'
+import { gitBlobId, resolveIdentityProofConfig } from './video-identity-proof.mjs'
+
+const cleanups = []
+afterEach(() => { while (cleanups.length) cleanups.pop()() })
+const config = (overrides = {}) => resolveIdentityProofConfig(overrides, {})
+const REPO = 'zenray-productions-archive-demo'
+const COMMIT = '1'.repeat(40)
+
+function makeArchive({ size = 23, chunkSize = 10 } = {}) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'archive-identity-'))
+  cleanups.push(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const content = randomBytes(size)
+  const localPath = path.join(directory, 'file.bin')
+  fs.writeFileSync(localPath, content)
+  const chunks = []
+  const tree = new Map(), blobs = new Map()
+  for (let offset = 0, index = 0; offset < size; offset += chunkSize, index++) {
+    const name = `aa/bb/fid-${String(index).padStart(3, '0')}`
+    const bytes = content.subarray(offset, offset + chunkSize)
+    chunks.push(name); blobs.set(name, Buffer.from(bytes)); tree.set(name, gitBlobId(bytes))
+  }
+  const sha256 = createHash('sha256').update(content).digest('hex')
+  const manifest = { mode: 'chunked', size, sha256, chunkSize, repo: REPO, commit: COMMIT, chunks, parts: [{ repo: REPO, commit: COMMIT, chunks }] }
+  const remote = { async treeIds() { return tree }, async readBlob(_r, _c, p) { return Buffer.from(blobs.get(p)) } }
+  return { content, localPath, manifest, sha256, size, remote, tree, blobs, chunks }
+}
+const prove = (a, overrides = {}) => proveArchiveIdentity({ manifest: a.manifest, sha256: a.sha256, size: a.size, localPath: a.localPath, remote: a.remote, config: config(), ...overrides })
+
+describe('archive identity proof', () => {
+  it('plans the chunks as contiguous slices of the source, the last one shorter', () => {
+    const a = makeArchive()
+    expect(planArchiveObjects(a.manifest).map((o) => [o.start, o.end, o.size])).toEqual([[0, 9, 10], [10, 19, 10], [20, 22, 3]])
+  })
+
+  it('is green on a good archive and downloads only the tail chunk', async () => {
+    const a = makeArchive()
+    let reads = 0
+    const remote = { ...a.remote, readBlob: async (...args) => { reads += 1; return a.remote.readBlob(...args) } }
+    const result = await prove(a, { remote })
+    expect(result).toMatchObject({ supported: true, ok: true, sha256: a.sha256 })
+    expect(result.counters).toMatchObject({ parts: 3, remoteIdOk: 3, realPartsRead: 1, realPartIndexes: [2] })
+    expect(reads).toBe(1)
+  })
+
+  it('is RED when a chunk on GitHub differs from the local slice', async () => {
+    const a = makeArchive()
+    const name = a.chunks[1]; const bad = Buffer.from(a.blobs.get(name)); bad[2] ^= 1
+    a.blobs.set(name, bad); a.tree.set(name, gitBlobId(bad))
+    expect(await prove(a)).toMatchObject({ ok: false, failure: { class: 'remote', code: 'remote-id-mismatch', partIndex: 1 } })
+  })
+
+  it('is RED when a chunk is absent from the tree', async () => {
+    const a = makeArchive()
+    a.tree.delete(a.chunks[0])
+    expect(await prove(a)).toMatchObject({ ok: false, failure: { class: 'remote', code: 'remote-part-missing' } })
+  })
+
+  it('is RED when the loaded copy is not the archived bytes (SHA-256 recorded for the version)', async () => {
+    const a = makeArchive()
+    const other = Buffer.from(a.content); other[0] ^= 1
+    fs.writeFileSync(a.localPath, other)
+    const result = await prove(a)
+    expect(result.ok).toBe(false)
+    expect(['remote', 'local']).toContain(result.failure.class)
+  })
+
+  it('is RED when the size differs from the version', async () => {
+    const a = makeArchive()
+    expect(await prove(a, { size: a.size + 1 })).toMatchObject({ ok: false, failure: { code: 'source-size-mismatch' } })
+  })
+
+  it('is RED when the manifest online has no version with that SHA-256', async () => {
+    const a = makeArchive()
+    expect(await prove(a, { sha256: 'f'.repeat(64) })).toMatchObject({ ok: false, failure: { class: 'manifest', code: 'version-missing' } })
+  })
+
+  it('selects the requested older version inside versions[]', async () => {
+    const a = makeArchive()
+    const older = { ...a.manifest }
+    const manifest = { ...a.manifest, sha256: 'd'.repeat(64), versions: [older, { ...a.manifest, sha256: 'd'.repeat(64) }] }
+    expect(await prove(a, { manifest })).toMatchObject({ ok: true })
+  })
+
+  it('is RED when the chunk count does not match the size and chunk size', async () => {
+    const a = makeArchive()
+    a.manifest.chunks.pop(); a.manifest.parts[0].chunks.pop()
+    expect(await prove(a)).toMatchObject({ ok: false, failure: { code: 'manifest-unsupported' } })
+  })
+
+  it('declares an unsupported format instead of guessing', async () => {
+    const a = makeArchive()
+    expect(await prove(a, { manifest: { ...a.manifest, type: 'chunked-media' } })).toEqual({ supported: false, reason: 'format' })
+  })
+})

@@ -1,0 +1,245 @@
+// 2 October 2026, 13:12 CEST: human prompts and final iterations append once to their bound project feedback.
+import { createReadStream } from 'node:fs'
+import { mkdtemp, readdir, readFile, rm, stat, open } from 'node:fs/promises'
+import { createInterface } from 'node:readline'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+import { execFile, spawn } from 'node:child_process'
+import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
+import { cleanConversationPrompt } from '../src/lib/assetsConversations.js'
+
+const run = promisify(execFile)
+const geminiReader = fileURLToPath(new URL('./Assets/ReadGeminiConversation.py', import.meta.url))
+
+async function readGeminiPage(filename, before, sessionId) {
+  const args = [filename, ...(before === undefined ? [] : [String(before)]), '--session-id', sessionId]
+  const result = await run('python3', [geminiReader, ...args], { timeout: 45000, maxBuffer: 8388608 })
+  return JSON.parse(result.stdout)
+}
+
+export function transcriptEntry(record) {
+  if (record.type === 'event_msg' && record.payload?.type === 'task_complete' && !record.payload.error && record.payload.last_agent_message?.trim()) return { text: record.payload.last_agent_message.trim(), kind: 'iteration', timestamp: record.timestamp }
+  const payload = record.type === 'response_item' ? record.payload : record.message
+  if (!payload || !['user', 'assistant'].includes(payload.role)) return null
+  if (payload.role === 'assistant' && payload.phase !== 'final_answer' && payload.channel !== 'final' && record.type !== 'assistant') return null
+  const parts = typeof payload.content === 'string' ? [payload.content] : (payload.content || []).filter((part) => ['input_text', 'output_text', 'text'].includes(part.type)).map((part) => part.text)
+  // 9 October 2026, 11:35 CEST: Apply the same host-context cleanup in capture and display.
+  const text = cleanConversationPrompt(parts.filter(Boolean).join('\n'))
+  if (!text || /^# AGENTS\.md instructions|^<environment_context>|^<system-reminder>|^<subagent_notification>|^<turn_aborted>|^<skill>/i.test(text)) return null
+  return { text, kind: payload.role === 'user' ? 'prompt' : 'iteration', timestamp: record.timestamp }
+}
+
+// 9 October 2026, 14:08 CEST: Codex represents one final answer in both the message and task-complete records.
+export function transcriptIdentity(record, entry, fallback) {
+  const turnId = entry.kind === 'iteration'
+    ? record?.payload?.turn_id || record?.metadata?.retained_source?.id?.turn_id || record?.metadata?.turn_id || record?.payload?.id?.turn_id
+    : null
+  const identity = typeof turnId === 'string' && turnId ? `turn:${turnId}` : fallback
+  return `${identity}:${entry.kind}:${entry.text}`
+}
+
+export function matchFeedbackProject(cwd, projects) {
+  if (!cwd) return null
+  const matches = projects.flatMap((project) => project.sources.filter((source) => {
+    const root = path.resolve(source.localPath)
+    const target = path.resolve(cwd)
+    if (target !== root && !target.startsWith(`${root}/`)) return false
+    if (!source.include) return true
+    return source.include.some((entry) => target === path.join(root, entry) || target.startsWith(path.join(root, entry) + '/'))
+  }).map((source) => ({ id: project.id, depth: source.localPath.length })))
+  if (!matches.length) return null
+  const depth = Math.max(...matches.map((match) => match.depth))
+  const ids = [...new Set(matches.filter((match) => match.depth === depth).map((match) => match.id))]
+  return ids.length === 1 ? ids[0] : null
+}
+
+export async function createFeedbackCapture({ config, projects, atomicJson, home = process.env.HOME, onError = () => {}, onStatus = () => {}, readGeminiPage: readPage = readGeminiPage }) {
+  const stateFile = path.join(config.storage.stateDir, 'TranscriptCursors.json')
+  let cursors = {}
+  try { cursors = JSON.parse(await readFile(stateFile, 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+  let busy = false, closed = false, timer
+  const pendingReplaySessions = new Set()
+  const writer = config.storage.feedbackWriter
+  const roots = [path.join(home, '.codex/sessions'), path.join(home, '.claude/projects')]
+  const files = async (directory, found = []) => {
+    let entries
+    try { entries = await readdir(directory, { withFileTypes: true }) } catch (error) { if (error.code === 'ENOENT') return found; throw error }
+    for (const entry of entries) {
+      const filename = path.join(directory, entry.name)
+      if (entry.isDirectory()) await files(filename, found)
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        const info = await stat(filename)
+        if (info.mtimeMs >= Date.now() - 86400000 || cursors[filename]) found.push({ filename, info })
+      }
+    }
+    return found
+  }
+  const geminiFiles = async (directory, eligibleSessions, found = []) => {
+    let entries
+    try { entries = await readdir(directory, { withFileTypes: true }) } catch (error) { if (error.code === 'ENOENT') return found; throw error }
+    for (const entry of entries) {
+      const filename = path.join(directory, entry.name)
+      if (entry.isDirectory()) await geminiFiles(filename, eligibleSessions, found)
+      else if (entry.isFile() && /^[a-f0-9-]{36}\.db$/.test(entry.name)) {
+        const sessionId = path.basename(entry.name, '.db')
+        if (!eligibleSessions.has(sessionId)) continue
+        const info = await stat(filename)
+        const signatures = [JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs])]
+        try {
+          const wal = await stat(`${filename}-wal`)
+          signatures.push(JSON.stringify([wal.dev, wal.ino, wal.size, wal.mtimeMs, wal.ctimeMs]))
+        } catch (error) { if (error.code !== 'ENOENT') throw error }
+        found.push({ filename, sessionId, sourceToken: createHash('sha256').update(signatures.join('\n')).digest('hex') })
+      }
+    }
+    return found
+  }
+  const append = (project, entry, eventId, source) => new Promise((resolve, reject) => {
+    const child = spawn('python3', [writer, 'add', project.id, entry.text, '--file', project.feedbackPath,
+      '--kind', entry.kind, '--event-id', eventId, ...(entry.timestamp ? ['--timestamp', entry.timestamp] : []), '--source', source, '--json'], { stdio: ['ignore', 'ignore', 'pipe'] })
+    let failure = ''; child.stderr.on('data', (data) => { failure += String(data) })
+    child.on('error', reject); child.on('close', (code) => code === 0 ? resolve() : reject(new Error(failure.slice(0, 200))))
+  })
+  const drain = async () => {
+    if (closed || busy) return
+    busy = true
+    const replaySessions = new Set(pendingReplaySessions)
+    pendingReplaySessions.clear()
+    for (const cursor of Object.values(cursors)) if (replaySessions.has(cursor.sessionId)) {
+      if (cursor.provider === 'antigravity') { cursor.lastStepIndex = null; cursor.sourceToken = null }
+      else cursor.offset = 0
+    }
+    const failures = []
+    const reportError = (error) => { failures.push(error.message); onError(error) }
+    try {
+      let bindings = {}
+      try { bindings = JSON.parse(await readFile(path.join(config.storage.stateDir, 'SessionBindings.json'), 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+      const candidates = (await Promise.all(roots.map((root) => files(root)))).flat()
+      const geminiCandidates = await geminiFiles(path.join(home, '.gemini/antigravity/conversations'), new Set([...Object.keys(bindings), ...replaySessions]))
+      candidates.sort((left, right) => Number(!left.filename.includes(Object.keys(bindings)[0] || '\0')) - Number(!right.filename.includes(Object.keys(bindings)[0] || '\0')))
+      for (const { filename, info } of candidates) {
+        try {
+          let cursor = cursors[filename] || { offset: 0, cwd: null, sessionId: null }
+          if (info.size < cursor.offset) throw new Error('Transcript shrank; original capture cursor retained')
+          if (info.size === cursor.offset) continue
+          if (!cursor.cwd || !cursor.sessionId) {
+            const descriptor = await open(filename, 'r'), prefix = Buffer.alloc(Math.min(info.size, 65536))
+            try { await descriptor.read(prefix, 0, prefix.length, 0) } finally { await descriptor.close() }
+            const beginning = prefix.toString('utf8')
+            cursor.cwd ||= beginning.match(/"cwd"\s*:\s*"([^"\n]+)"/)?.[1]
+            cursor.sessionId ||= beginning.match(/"sessionId"\s*:\s*"([^"\n]+)"/)?.[1] || beginning.match(/"id"\s*:\s*"([^"\n]+)"/)?.[1]
+          }
+          if (!bindings[cursor.sessionId] && !matchFeedbackProject(cursor.cwd, projects())) {
+            // 3 October 2026, 22:23 CEST: an unbound session keeps unread history available when its real identity is linked later.
+            cursors[filename] = cursor; continue
+          }
+          const stream = createReadStream(filename, { start: cursor.offset, end: info.size - 1 })
+          const lines = createInterface({ input: stream, crlfDelay: Infinity })
+          let consumed = cursor.offset
+          try {
+            for await (const line of lines) {
+              const bytes = Buffer.byteLength(line, 'utf8') + 1
+              if (consumed + bytes > info.size) break
+              consumed += bytes
+              if (!line || !/"(?:type|role)"\s*:\s*"(?:session_meta|message|user|assistant|task_complete)"/.test(line.slice(0, 4096))) continue
+              const record = JSON.parse(line)
+              if (record.type === 'session_meta') { cursor.cwd = record.payload.cwd; cursor.sessionId = record.payload.id }
+              cursor.cwd ||= record.cwd
+              cursor.sessionId ||= record.sessionId
+              const entry = transcriptEntry(record)
+              if (!entry) continue
+              // 3 October 2026, 22:23 CEST: delegated instructions retain agent provenance instead of pretending to be human prompts.
+              const subagentId = record.isSidechain && record.agentId ? record.agentId : null
+              if (subagentId && entry.kind === 'prompt') entry.kind = 'order'
+              const projectId = bindings[cursor.sessionId] || matchFeedbackProject(cursor.cwd, projects())
+              const project = projects().find((item) => item.id === projectId)
+              if (!project?.feedbackPath) continue
+              const eventKey = transcriptIdentity(record, entry, record.timestamp)
+              const eventId = 'transcript:' + createHash('sha256').update(`${cursor.sessionId}:${subagentId ? `${subagentId}:` : ''}${eventKey}`).digest('hex')
+              await append(project, entry, eventId, filename)
+            }
+          } finally { lines.close(); stream.destroy() }
+          cursors[filename] = { ...cursor, offset: consumed }
+          await atomicJson(stateFile, cursors)
+        } catch (error) {
+          // 3 October 2026, 03:47 CEST: retain the failing cursor and continue collecting independent project sessions.
+          reportError(new Error(`Transcript capture failed for ${filename}: ${error.message}`, { cause: error }))
+        }
+      }
+      // 9 October 2026, 06:46 CEST: capture bound Antigravity SQLite messages through the canonical feedback writer.
+      for (const { filename, sessionId, sourceToken } of geminiCandidates) {
+        try {
+          const projectId = bindings[sessionId]
+          const project = projects().find((item) => item.id === projectId)
+          if (!project?.feedbackPath) continue
+          const cursor = cursors[filename] || { provider: 'antigravity', sessionId, lastStepIndex: null, sourceToken: null }
+          if (cursor.sourceToken === sourceToken && !replaySessions.has(sessionId)) continue
+          const lastStepIndex = Number.isSafeInteger(cursor.lastStepIndex) ? cursor.lastStepIndex : -1
+          const spoolDirectory = await mkdtemp(path.join(config.storage.stateDir, 'antigravity-feedback-'))
+          let spool
+          try {
+            spool = await open(path.join(spoolDirectory, 'messages.jsonl'), 'wx+', 0o600)
+            const pages = []
+            let spoolOffset = 0, highestStepIndex = lastStepIndex, before
+            while (true) {
+              const page = await readPage(filename, before, sessionId)
+              if (!Array.isArray(page.messages)) throw new Error('Antigravity reader returned no message list')
+              const pageMessages = [...new Map(page.messages
+                .filter((message) => Number.isSafeInteger(message.stepIndex) && message.stepIndex > lastStepIndex && ['prompt', 'iteration'].includes(message.kind) && typeof message.text === 'string' && message.text.trim())
+                .map((message) => [message.stepIndex, message])).values()]
+                .sort((left, right) => left.stepIndex - right.stepIndex)
+              if (pageMessages.length) {
+                highestStepIndex = pageMessages.reduce((highest, message) => Math.max(highest, message.stepIndex), highestStepIndex)
+                const data = Buffer.from(JSON.stringify(pageMessages) + '\n')
+                const result = await spool.write(data, 0, data.length, spoolOffset)
+                if (result.bytesWritten !== data.length) throw new Error('Antigravity feedback spool write was incomplete')
+                pages.push({ offset: spoolOffset, length: data.length })
+                spoolOffset += data.length
+              }
+              const overlapsCursor = lastStepIndex >= 0 && page.messages.some((message) => Number.isSafeInteger(message.stepIndex) && message.stepIndex <= lastStepIndex)
+              if (overlapsCursor || page.nextBefore === null || page.nextBefore === undefined) break
+              if (!Number.isSafeInteger(page.nextBefore) || page.nextBefore < 0 || (before !== undefined && page.nextBefore >= before)) throw new Error('Antigravity reader cursor did not move backward')
+              before = page.nextBefore
+            }
+            // 9 October 2026, 06:50 CEST: reverse the page spool so old messages reach FEEDBACK before newer ones without holding the transcript in memory.
+            for (const page of pages.reverse()) {
+              const data = Buffer.alloc(page.length)
+              let bytesRead = 0
+              while (bytesRead < page.length) {
+                const result = await spool.read(data, bytesRead, page.length - bytesRead, page.offset + bytesRead)
+                if (!result.bytesRead) throw new Error('Antigravity feedback spool read was incomplete')
+                bytesRead += result.bytesRead
+              }
+              for (const message of JSON.parse(data.toString('utf8'))) {
+                const entry = { text: message.text.trim(), kind: message.kind, timestamp: message.timestamp }
+                const eventId = 'transcript:' + createHash('sha256').update(`${sessionId}:${message.id}:${message.stepIndex}:${entry.kind}:${entry.timestamp || ''}:${entry.text}`).digest('hex')
+                await append(project, entry, eventId, filename)
+              }
+            }
+            cursors[filename] = { provider: 'antigravity', sessionId, lastStepIndex: highestStepIndex, sourceToken }
+            await atomicJson(stateFile, cursors)
+          } finally {
+            await spool?.close()
+            await rm(spoolDirectory, { recursive: true, force: true })
+          }
+        } catch (error) {
+          reportError(new Error(`Antigravity feedback capture failed for ${filename}: ${error.message}`, { cause: error }))
+        }
+      }
+      await atomicJson(stateFile, cursors)
+    // 3 October 2026, 03:50 CEST: publish current collection health after each scan, including recovery.
+    } catch (error) { reportError(error) } finally {
+      busy = false
+      if (pendingReplaySessions.size && !closed) queueMicrotask(() => { void drain() })
+      onStatus({ error: failures.join('; ') || null, checkedAt: new Date().toISOString() })
+    }
+  }
+  timer = setInterval(drain, 5000); timer.unref?.()
+  return { drain, replay: async (sessionId) => {
+    // 8 October 2026, 22:39 CEST: queue replay behind the active scan so transcript capture never blocks project startup.
+    pendingReplaySessions.add(sessionId)
+    if (!busy) queueMicrotask(() => { void drain() })
+    return { queued: true }
+  }, close: () => { closed = true; clearInterval(timer) } }
+}

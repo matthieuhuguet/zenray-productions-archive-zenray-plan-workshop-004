@@ -1,0 +1,752 @@
+import React, { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { PALETTE, RADII, QUICKLOOK_ANIM_MS } from '../theme.js'
+import Icon from './Icon.jsx'
+import SpinnerApple from './SpinnerApple.jsx'
+import { notifyProgress } from './Notifications.jsx'
+import { readImgManifestCached, shardImgUrl, isEncrypted, resolveFullUrl, resolveThumbUrl, prefetchThumbImages, downloadMedia, useResolvedDirectThumb } from './ImageNodeViewer.jsx'
+import { getNodeThumb } from '../search/searchIndexClient.js'
+import { resolveDisplayUrl } from '../media/imageCacheIDB.js'
+import { downloadUrls } from '../lib/archiveChunks.js'
+import { assembleBlobUrl } from '../lib/fetchAsset.js'
+import { mimeForName, isNativePreview, kindForName } from '../lib/fileKinds.js'
+import { lazyRetry } from '../lib/lazyRetry.js'
+import { readPageCached } from '../lib/manifestReadCache.js'
+import { resolveEaglePath, eaglePathConnu } from '../lib/eagleLink.js'
+import { mediaSourceSegments } from '../lib/mediaProvenance.js'
+import { estTriable } from '../lib/dossiersDeTri.js'
+import { isUnifiedVideoManifest } from '../media/mediaViewerRoute.js'
+import { registerRawMedia } from '../lib/vidStream.js'
+import { loadChunked } from '../media/chunked.js'
+import QuickLookAudioPlayer from './QuickLookAudioPlayer.jsx'
+import {
+  getCachedAudioManifest,
+  getCachedAudioUrl,
+  readAudioManifestCached,
+  resolveAudioUrlFast,
+  isAudioEntry,
+  prefetchAudioNeighbors,
+} from '../audio/audioQuickCache.js'
+const LazyLibPreview = lazyRetry(() => import('./LibFilePreview.jsx'))
+const LazyVideoPlayer2 = lazyRetry(() => import('./VideoPlayer2.jsx'))
+const LazyGmapsViewer = lazyRetry(() => import('./GmapsViewer.jsx')) // liens Google Maps intégrés (2026-07-04)
+
+// C211a — Quick Look plein écran façon macOS (geste signature Eagle). ESPACE ouvre, ←/→ navigue, Échap/Espace ferme, Enter ouvre en grand.
+// item = { name, contentPath, type }. onPrev/onNext naviguent dans la grille. onOpen ouvre réellement le nœud.
+const enc = encodeURIComponent
+const streamUrl = (p) => `/api/stream?path=${enc(p)}`
+const rd = (p) => readPageCached(`/api/page?action=read&path=${enc(p)}`)
+const firstImg = (md) => { const m = /!\[[^\]]*\]\(([^)]+)\)/.exec(md || ''); return m ? m[1] : null }
+
+// ARCHIVE (.file.json) : reconstitution à la volée des chunks 19 Mo -> aperçu, comme la vue Downloads.
+// Résolution des URLs via archiveChunks.js (source unique) -> CORRIGE au passage un bug latent : l'ancien
+// code ici ne lisait que m.chunks et IGNORAIT parts[], donc un gros fichier v4 multi-shards ne s'aperçevait
+// pas. downloadUrls gère v2/v3/v4. Assemblage Blob borné (cap mémoire) via fetchAsset.
+const FILE_PREVIEW_MAX = 500 * 1e6
+// MIME + catégorie déduits de l'EXTENSION via la SOURCE UNIQUE fileKinds.js (partagée avec l'upload). Les manifestes
+// blob-raw (ZenRayShards) portent parfois un mime générique (octet-stream/video/mp4) -> on fait toujours confiance
+// à l'extension pour l'aperçu. Garantit zéro divergence avec les futurs uploads.
+const mimeFromName = (name) => { const m = mimeForName(name); return m === 'application/octet-stream' ? '' : m }
+const effectiveMime = (m, name) => mimeFromName(name || m.name) || (m.mime && m.mime !== 'application/octet-stream' && m.mime !== 'video/mp4' ? m.mime : '')
+// Catégories à viewer LIB (décodeur dynamique lazy) — voir LibFilePreview.
+const LIB_KINDS = new Set(['image-lib', 'doc-lib', 'sheet-lib', 'epub-lib', '3d-lib'])
+// Aperçu possible : natif (audio/vidéo/image/pdf/texte-code, zéro dépendance) OU lib (docx/xlsx/heic/epub/3D, lazy).
+// Exclus -> download seul : slides-lib (pptx, pas de lib fiable), archive (zip…), binary.
+const filePreviewable = (name, mime, size) => (size == null || size <= FILE_PREVIEW_MAX) && (isNativePreview(name || '') || LIB_KINDS.has(kindForName(name || '')) || (!!mime && (/^(image|video|audio|text)\//.test(mime) || mime === 'application/pdf')))
+// PROVENANCE RÉELLE de l'image affichée (2026-07-11, fix pastilles obsolètes) — pas un texte figé : dérivée
+//   du manifeste, donc toujours exacte, y compris pour les vieilles images jamais migrées.
+//   - non chiffrée (public, pas d'iv) : jsDelivr en clair, une seule source.
+//   - chiffrée + cdnChunks[] (schéma 2026-07-07+, TOUT nouvel upload) : jsDelivr chiffré pour la vignette
+//     ET l'original (découpé en morceaux ≤19 Mo) -> plus JAMAIS de raw.github, une seule pastille suffit.
+//   - chiffrée + cdnPath seul (ancien schéma, jamais migré, décision Matthieu) : la vignette reste jsDelivr,
+//     mais l'ORIGINAL passe par raw.github en premier (repli jsDelivr) -> deux sources réellement distinctes,
+//     deux pastilles.
+//   - privée/legacy (pas de vis, ou vis:'private') : proxy /api/shard (token serveur), jamais de CDN public.
+// Image en fondu simple (2026-07-13) : invisible tant qu'elle n'est pas décodée, puis fade-in 180 ms.
+// Remplace l'ancien duo flou + spinner (qui créait une saccade au passage vignette -> plein format).
+// `overlay` = se superpose à la vignette déjà affichée (le plein format arrive par-dessus, en douceur).
+function FadeImg({ src, alt, overlay = false }) {
+  const [ready, setReady] = useState(false)
+  // Image déjà décodée (cache navigateur / objectURL local) : `complete` est vrai dès le montage et
+  // onLoad peut ne jamais tirer -> sans cette garde l'image resterait invisible (opacity 0) à jamais.
+  const check = (el) => { if (el && el.complete && el.naturalWidth > 0) setReady(true) }
+  return (
+    <img ref={check} src={src} alt={alt} onLoad={() => setReady(true)}
+      style={{
+        width: '100%', height: '100%', display: 'block', objectFit: 'contain',
+        borderRadius: RADII.md, boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+        opacity: ready ? 1 : 0, transition: 'opacity 180ms ease',
+        ...(overlay ? { position: 'absolute', inset: 0 } : null),
+      }} />
+  )
+}
+
+// (2026-07-20) imageSourceSegments a été GÉNÉRALISÉE à tous les types de médias et déplacée dans
+// src/lib/mediaProvenance.js (mediaSourceSegments) -- couleurs canoniques vert jsDelivr / bleu
+// raw.github / jaune Vercel, spec Matthieu. L'ancienne implémentation locale (image seulement,
+// jsDelivr en bleu, legacy en violet) est remplacée, pas dupliquée.
+
+async function assembleFileUrl(m, mime, onProg) {
+  // ZenRayShards blob-raw : parts[] = [{url,...}] (un blob direct par part) -> URLs directes, dans l'ordre.
+  // Archive v2/v3/v4 : downloadUrls(m) (chunks 19 Mo). Le mime passé prime (déduit de l'extension).
+  const urls = (m.type === 'blob-raw' && Array.isArray(m.parts) && m.parts.length && m.parts[0] && m.parts[0].url)
+    ? m.parts.map((p) => p.url)
+    : downloadUrls(m)
+  return assembleBlobUrl({ urls, mime: mime || m.mime || 'application/octet-stream', onProgress: onProg })
+}
+
+// ═══ LA VIGNETTE DE L'INDEX S'AFFICHE AVANT LE MOINDRE APPEL ════════════════════════════════════
+//
+// CE QUE ÇA CORRIGE, mesuré le 2026-08-31 : ouvrir une image JAMAIS VUE prenait 215 ms — deux cents
+// de latence réseau pour lire son manifeste, quinze de travail. La cible est cent.
+//
+// Or l'index de recherche, déjà chargé en mémoire, porte pour chaque image l'adresse de sa vignette.
+// Elle est donc disponible en ZÉRO appel, avant même que la lecture du manifeste ne parte. Le Quick
+// Look ne la consultait pas : il attendait le manifeste pour savoir quoi afficher, alors que la
+// réponse était à côté de lui.
+//
+// Ce qui suit rend cette adresse, prête pour `useResolvedDirectThumb` — la même fonction que les
+// tuiles de la grille utilisent, y compris pour déchiffrer une vignette chiffrée.
+function vignetteDeIndex(chemin) {
+  try {
+    const v = getNodeThumb(chemin)
+    if (!v) return { url: null, iv: null }
+    const url = v.u || (v.r && v.p ? `/api/shard?repo=${encodeURIComponent(v.r)}&path=${encodeURIComponent(v.p)}` : null)
+    return { url, iv: v.iv || null }
+  } catch { return { url: null, iv: null } }
+}
+
+function QuickLookBody({ t, item, prefetchImagePaths = [], neighborEntries = [], prettyName, onPrev, onNext, onClose, onOpen, tri, extraDetails }) {
+  // Close = shrink for QUICKLOOK_ANIM_MS, then unmount. Every close path (Esc, Space, backdrop) goes through
+  // requestClose so the animation always plays; refs keep the latest callbacks without re-subscribing.
+  const [closing, setClosing] = useState(false)
+  const closingRef = React.useRef(false)
+  const onCloseRef = React.useRef(onClose)
+  onCloseRef.current = onClose
+  const requestClose = React.useCallback(() => {
+    if (closingRef.current) return
+    closingRef.current = true; setClosing(true)
+    setTimeout(() => onCloseRef.current && onCloseRef.current(), QUICKLOOK_ANIM_MS)
+  }, [])
+  const [page, setPage] = useState(null) // { img, md } pour un .md
+  const [file, setFile] = useState(null) // archive .file.json : { mime, url?, prog?, err?, unsupported?, tooBig?, text?, playErr? }
+  const [mediaMime, setMediaMime] = useState(null) // mime réel d'un .media.json (le nom du nœud n'a pas l'extension)
+  const [mediaErr, setMediaErr] = useState(null) // manifest read failure: shown instead of a false « no preview » message
+  const [mediaManifest, setMediaManifest] = useState(() => (item?.contentPath ? getCachedAudioManifest(item.contentPath) : null)) // manifeste complet
+  const [audioUrl, setAudioUrl] = useState(() => (item?.contentPath ? getCachedAudioUrl(item.contentPath) : null))
+  // 9 October 2026, 01:37 CEST: Derive audio mode after React has initialized the media state.
+  const isAudio = isAudioEntry(item) || (mediaMime && mediaMime.startsWith('audio/')) || (mediaManifest && (mediaManifest.mediaKind === 'audio' || (mediaManifest.mime && mediaManifest.mime.startsWith('audio/'))))
+  const [showSrc, setShowSrc] = useState(false) // badge de provenance (jsDelivr/…) : masqué par défaut (design minimaliste, 2026-07-12), dépliable au clic sur la pastille
+
+  // Prechauffage immediat des pistes audio voisines (06 October 2026)
+  useEffect(() => {
+    if (isAudio && Array.isArray(neighborEntries) && neighborEntries.length) {
+      const idx = neighborEntries.findIndex((x) => x?.contentPath === item?.contentPath)
+      if (idx >= 0) prefetchAudioNeighbors(neighborEntries, idx, 6)
+    }
+  }, [isAudio, neighborEntries, item?.contentPath])
+
+  // Hors-Vercel (2026-07-20) : un .media.json PUBLIC chiffré est enregistré auprès du SW range-shim
+  // (même pont que le lecteur vidéo/audio) -> l'aperçu QuickLook lit ses octets DIRECTEMENT depuis
+  // jsDelivr, déchiffrés côté client. mediaSwUrl=null tant que non résolu (ou manifeste privé/échec
+  // SW) -> repli /api/stream, l'aperçu n'est jamais cassé.
+  const [mediaSwUrl, setMediaSwUrl] = useState(null)
+  // PDF/HTML/texte (2026-07-21) : blob déchiffré CLIENT (loadChunked -> jsDelivr + AES-GCM), état
+  // générique { kind, url?, text?, err?, prog }. Deux bugs réels fermés ici : (1) l'ancien
+  // /api/stream échouait sur tout fichier > ~4 Mo (réponse Vercel plafonnée ~4,5 Mo) ; (2) le catch
+  // SILENCIEUX affichait "Déchiffrement du PDF…" à l'infini au lieu de l'erreur -- toute erreur est
+  // désormais montrée. Les .html (296 Ko de Matthieu) et textes ont enfin un aperçu ; les binaires
+  // sans viewer (fbx/hda/zip) affichent un message honnête au lieu d'un <video> cassé.
+  const [docPreview, setDocPreview] = useState(null)
+  useEffect(() => {
+    setMediaSwUrl(null)
+    const m = mediaManifest
+    if (!m || m.vis !== 'public' || !m.cdnRepo || !Array.isArray(m.parts) || !m.parts.length) return undefined
+    let live = true
+    registerRawMedia(m, item?.contentPath || '').then((u) => { if (live) setMediaSwUrl(u) }).catch(() => {})
+    return () => { live = false }
+  }, [mediaManifest]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    setDocPreview(null)
+    const m = mediaManifest
+    if (!m || !item?.contentPath) return undefined
+    const nm = m.name || ''
+    const mm = m.mime || ''
+    const kind = (mm === 'application/pdf' || /\.pdf$/i.test(nm)) ? 'pdf'
+      : (mm === 'text/html' || /\.html?$/i.test(nm)) ? 'html'
+      : (mm.startsWith('text/') || /\.(md|txt|json|csv|js|jsx|ts|css|py|sh|xml|yml|yaml)$/i.test(nm)) ? 'text'
+      : null
+    if (!kind) return undefined
+    let live = true
+    let objUrl = null
+    setDocPreview({ kind, prog: 0 })
+    loadChunked(item.contentPath, (r) => { if (live) setDocPreview((prev) => prev && !prev.url && !prev.err ? { ...prev, prog: r } : prev) })
+      .then(async ({ url, blob }) => {
+        if (!live) { URL.revokeObjectURL(url); return }
+        objUrl = url
+        if (kind === 'text') {
+          const text = await blob.text()
+          if (live) setDocPreview({ kind, text: text.slice(0, 400000) })
+        } else {
+          setDocPreview({ kind, url })
+        }
+      })
+      .catch((e) => { if (live) setDocPreview({ kind, err: String(e?.message || e) }) })
+    return () => { live = false; if (objUrl) URL.revokeObjectURL(objUrl) }
+  }, [mediaManifest]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fenêtre glissante indépendante du scroll : 96 images avant + 96 après sont téléchargées et
+  // décodées en 1080p. À chaque flèche les URLs communes restent en cache ; seule la nouvelle
+  // bordure travaille. Le plein format reste réservé à l'image active.
+  // Lue au MONTAGE, sans attendre : c'est ce qui donne un premier pixel a froid.
+  // On teste `item.type` et non la variable `type`, qui n'est declaree que bien plus bas : s'y
+  // appuyer ici jetait une erreur de zone morte a CHAQUE rendu, et l'apercu ne montait jamais.
+  const deIndex = React.useMemo(
+    () => (item?.type === 'image' && item?.contentPath) ? vignetteDeIndex(item.contentPath) : { url: null, iv: null },
+    [item?.type, item?.contentPath],
+  )
+  const vignetteIndex = useResolvedDirectThumb(deIndex.url, deIndex.iv, !!deIndex.url)
+  // Sans chiffrement, l'adresse est directement affichable ; avec, on attend son dechiffrement, qui
+  // coute un dixieme de milliseconde (mesure du 2026-08-31) et non un aller-retour.
+  const vignettePrete = deIndex.iv ? vignetteIndex : deIndex.url
+
+  const prefetchKey = prefetchImagePaths.join('|')
+  useEffect(() => {
+    if (!prefetchImagePaths.length) return
+    const ctrl = new AbortController()
+    // Laisser l'effet de l'image active démarrer son plein format avant les quatre workers voisins.
+    // On prechauffe AUSSI le manifeste des voisins : sans lui, chaque fleche vers une image jamais
+    // vue repaie un aller-retour de deux cents millisecondes. Borne a quatre — deux de chaque cote
+    // suffisent au parcours, et lire tout un dossier serait l'erreur qui a vide le quota.
+    const idM = setTimeout(() => { for (const p of prefetchImagePaths.slice(0, 4)) readImgManifestCached(p).catch(() => {}) }, 40)
+    const id = setTimeout(() => prefetchThumbImages(prefetchImagePaths, ctrl.signal, 192).catch(() => {}), 60)
+    return () => { clearTimeout(id); ctrl.abort() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefetchKey])
+
+  useEffect(() => {
+    let live = true
+    let revoke = null
+    setPage(null); setFile(null); setMediaMime(null); setMediaManifest(null); setMediaErr(null); setShowSrc(false)
+    if (item && item.type === 'media' && item.contentPath) {
+      const audioCached = getCachedAudioManifest(item.contentPath)
+      if (audioCached) {
+        setMediaMime(audioCached.mime || '')
+        setMediaManifest(audioCached)
+      }
+      const audioUrlCached = getCachedAudioUrl(item.contentPath)
+      if (audioUrlCached) setAudioUrl(audioUrlCached)
+
+      rd(item.contentPath)
+        .then((j) => {
+          const m = JSON.parse(j.markdown)
+          if (live) {
+            setMediaMime(m.mime || '')
+            setMediaManifest(m)
+            if (isAudioEntry(item) || m.mediaKind === 'audio' || (m.mime && m.mime.startsWith('audio/'))) {
+              resolveAudioUrlFast(item, m).then((u) => { if (live && u) setAudioUrl(u) })
+            }
+          }
+        })
+        .catch((e) => { if (live) setMediaErr(String((e && e.message) || e || 'manifeste illisible')) })
+    }
+    if (item && item.type === 'page' && item.contentPath) {
+      rd(item.contentPath).then((j) => { if (live && j && j.markdown != null) setPage({ img: firstImg(j.markdown), md: j.markdown }) })
+    } else if (item && item.type === 'image' && item.contentPath) {
+      // Instantané façon Eagle : manifest depuis le cache mémoire de la grille (zéro réseau si déjà vu),
+      // puis URL d'affichage depuis le cache persistant IndexedDB (objectURL local, pas de re-download à froid).
+      ;(async () => {
+        let m = await readImgManifestCached(item.contentPath)
+        // Un raccourci demande une résolution de plus, et elle peut échouer une fois. Tant qu'on
+        // n'a pas réessayé, `page` reste null — donc une boîte vide, pas le mot « introuvable ».
+        // Annoncer une absence qu'on n'a pas confirmée envoie chercher un fichier qui existe.
+        if (!m) {
+          await new Promise((r) => setTimeout(r, 400))
+          if (!live) return
+          m = await readImgManifestCached(item.contentPath)
+        }
+        if (!m) { if (live) setPage({ manifest: null, img: null }); return }
+        // CHIFFRÉ : AFFICHAGE PROGRESSIF (2026-07-11, fix lenteur perçue) — la vignette (petite, souvent déjà
+        //   déchiffrée par la grille avant l'appui sur Espace -> cache RAM hit quasi instantané) s'affiche
+        //   D'ABORD, floutée, pendant que l'ORIGINAL complet (potentiellement 8K/40 Mo, jamais recompressé —
+        //   décision Matthieu 2026-07-07, on ne réintroduit PAS de dérivé) se récupère + déchiffre en fond.
+        //   AVANT ce fix : rien ne s'affichait avant la fin du décryptage complet -> impression de lenteur sur
+        //   les gros originaux, alors que la vignette était déjà prête. `gotFull` évite qu'un thumb qui arrive
+        //   APRÈS le plein format (rare : plein déjà en cache) ne fasse régresser l'affichage en netteté.
+        if (isEncrypted(m)) {
+          let gotFull = false
+          resolveThumbUrl(m).then((tu) => { if (live && tu && !gotFull) setPage({ manifest: m, thumb: tu, img: null }) })
+          const u = await resolveFullUrl(m)
+          gotFull = true
+          if (live) setPage((prev) => ({ manifest: m, thumb: (prev && prev.thumb) || null, img: u || null }))
+          return
+        }
+        const url = shardImgUrl(m)
+        if (!url) { if (live) setPage({ manifest: m, img: null }); return }
+        const { src, revoke: rv } = await resolveDisplayUrl(url)
+        revoke = rv
+        if (live) setPage({ manifest: m, img: src })
+        else if (rv) rv()
+      })()
+    } else if (item && item.type === 'file' && item.contentPath) {
+      if (isAudioEntry(item)) {
+        const u = getCachedAudioUrl(item.contentPath)
+        if (u) setAudioUrl(u)
+        else resolveAudioUrlFast(item).then((u2) => { if (live && u2) setAudioUrl(u2) })
+      }
+      // Archive chunkée : lire le manifeste, reconstituer, prévisualiser selon le mime.
+      setFile({ prog: 0 })
+      ;(async () => {
+        const j = await rd(item.contentPath)
+        let m = null; try { m = JSON.parse(j.markdown) } catch {}
+        if (!m) { if (live) setFile({ err: true }); return }
+        const mime = effectiveMime(m, item.name) || m.mime || ''
+        if (!filePreviewable(item.name, mime, m.size)) { if (live) setFile({ mime, ...(m.size > FILE_PREVIEW_MAX ? { tooBig: true } : { unsupported: true }) }); return }
+        try {
+          const url = await assembleFileUrl(m, mime, (x) => { if (live) setFile((f) => (f && f.prog != null ? { ...f, prog: x } : f)) })
+          if (url.startsWith('blob:')) revoke = () => URL.revokeObjectURL(url)
+          const kind = kindForName(item.name)
+          // texte/code (py, cpp, md, json, yaml…) -> on lit le contenu pour l'afficher en <pre>.
+          // Text is read by kind OR by announced mime: a name that lost its extension still previews.
+          const text = (kind === 'text' || /^text\//.test(mime)) ? await (await fetch(url)).text() : null
+          if (live) setFile({ mime, url, text, kind }); else if (revoke) revoke()
+        } catch { if (live) setFile({ mime, err: true }) }
+      })()
+    }
+    return () => { live = false; if (revoke) revoke() }
+  }, [item && item.contentPath])
+
+  useEffect(() => {
+    const h = (e) => {
+      // While the shrink animation runs, swallow every key so nothing else (grid arrows, Space reopen) reacts.
+      if (closingRef.current) { e.preventDefault(); return }
+      if (e.key === 'Escape') { e.preventDefault(); requestClose() }
+      else if (e.code === 'Space') {
+        if (isAudio) {
+          // Sur un fichier audio, la touche Espace controle la lecture et la pause sans fermer QuickLook
+          return
+        }
+        e.preventDefault(); requestClose()
+      }
+      else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); onNext() }
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); onPrev() }
+      else if (e.key === 'Enter') { e.preventDefault(); onOpen() }
+    }
+    window.addEventListener('keydown', h, true)
+    return () => window.removeEventListener('keydown', h, true)
+  }, [onPrev, onNext, requestClose, onOpen, isAudio])
+
+  if (!item) return null
+  const name = prettyName ? prettyName(item.name) : item.name
+  const type = item.type
+
+  let body
+  if (isAudio) {
+    const mediaUrl = mediaSwUrl || (item.contentPath ? streamUrl(item.contentPath) : null)
+    body = (
+      <QuickLookAudioPlayer
+        key={audioUrl || mediaUrl || item.contentPath}
+        src={audioUrl || mediaUrl}
+        name={name}
+        manifest={mediaManifest}
+        onPrev={onPrev}
+        onNext={onNext}
+        onDownload={item.contentPath ? () => downloadMedia(item.contentPath, item.name).catch(() => {}) : null}
+        autoPlay
+      />
+    )
+  } else if (type === 'media') {
+    // LIEN YOUTUBE (vidéo OU audio — un seul champ, manifest.type==='youtube', distingué par audioOnly) :
+    // AUCUN binaire déchiffrable à /api/stream (le contenu vit sur YouTube), donc on NE PASSE PAS par le flux
+    // chiffré ci-dessous — on réutilise TEL QUEL le même lecteur que partout ailleurs dans l'app (VideoPlayer2,
+    // qui bascule lui-même entre le cadre vidéo 16:9 et le widget audio compact selon manifest.audioOnly).
+    // Bug trouvé le 2026-07-04 (Matthieu) : ce Quick Look ignorait ce type et retombait sur un <video>/<audio>
+    // natif pointé vers /api/stream, qui n'a rien à servir pour un lien externe -> lecteur bloqué à 0:00.
+    // 2 October 2026: phone .MOV uploads are `video-raw` manifests (private, AES-GCM parts read through the
+    // service worker). VideoPlayer2 already knows video-raw / dash / hls, so Quick Look reuses it as-is.
+    if (!mediaManifest) {
+      body = <div style={{ width: 'min(900px, 88vw)', height: '50vh', display: 'grid', placeItems: 'center', color: '#fff', opacity: .78, fontSize: 'var(--zr-ui-md)' }}>
+        {mediaErr ? `Aperçu indisponible : ${mediaErr}` : <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}><SpinnerApple taille={16} couleur="#fff" />Chargement…</span>}
+      </div>
+    } else if (isUnifiedVideoManifest(mediaManifest)) {
+      body = (
+        <div style={{ width: 'min(900px, 88vw)' }}>
+          <React.Suspense fallback={<div style={{ color: '#fff', opacity: 0.7 }}>chargement…</div>}>
+            <LazyVideoPlayer2 key={item.contentPath} t={t} path={item.contentPath} manifest={mediaManifest} shared />
+          </React.Suspense>
+        </div>
+      )
+    } else if (mediaManifest && mediaManifest.type === 'gmaps' && mediaManifest.embedUrl) {
+      // LIEN GOOGLE MAPS (2026-07-04) : même logique que YouTube ci-dessus — aucun binaire à /api/stream, on
+      // réutilise le lecteur dédié (GmapsViewer) directement dans Quick Look.
+      body = (
+        <div style={{ width: 'min(900px, 88vw)' }}>
+          <React.Suspense fallback={<div style={{ color: '#fff', opacity: 0.7 }}>chargement…</div>}>
+            <LazyGmapsViewer t={t} path={item.contentPath} manifest={mediaManifest} shared />
+          </React.Suspense>
+        </div>
+      )
+    } else {
+      // .media.json chiffré. VOIE PRINCIPALE (2026-07-20, dépréciation du streaming Vercel) :
+      // public -> mediaSwUrl (SW range-shim, octets jsDelivr déchiffrés client) dès qu'il est résolu.
+      // REPLI : /api/stream (privé, SW indisponible, résolution encore en vol). Le PDF reste sur
+      // /api/stream volontairement : l'iframe du viewer PDF fait un GET plein-corps dont la
+      // sémantique n'est pas garantie par le range-shim -- choix conservateur, pas un oubli.
+      const nm = item.name || ''
+      const mm = mediaMime || ''
+      const mediaUrl = mediaSwUrl || (item.contentPath ? streamUrl(item.contentPath) : null)
+      const isAudioMedia = mm.startsWith('audio/') || /\.(mp3|wav|m4a|flac|ogg|aac)$/i.test(nm)
+      const isVideoMedia = mm.startsWith('video/') || mediaManifest?.type === 'dash' || mediaManifest?.type === 'hls' || Array.isArray(mediaManifest?.ladder)
+      const waitBox = (label) => <div style={{ width: '82vw', height: '70vh', display: 'grid', placeItems: 'center', color: '#fff', opacity: .78, fontSize: 'var(--zr-ui-md)' }}>{label}</div>
+      body = docPreview
+        ? (docPreview.err
+            ? waitBox(`Aperçu indisponible : ${docPreview.err}`)
+            : docPreview.kind === 'pdf'
+              ? (docPreview.url ? <iframe title={name} src={docPreview.url} style={{ width: '82vw', height: '86vh', border: 'none', borderRadius: RADII.md, background: '#fff' }} /> : waitBox(`Déchiffrement… ${Math.round((docPreview.prog || 0) * 100)}%`))
+              : docPreview.kind === 'html'
+                ? (docPreview.url ? <iframe title={name} src={docPreview.url} sandbox="allow-same-origin" style={{ width: '82vw', height: '86vh', border: 'none', borderRadius: RADII.md, background: '#fff' }} /> : waitBox(`Déchiffrement… ${Math.round((docPreview.prog || 0) * 100)}%`))
+                : (docPreview.text != null ? <pre style={{ width: '82vw', height: '86vh', margin: 0, padding: 18, overflow: 'auto', borderRadius: RADII.md, background: 'rgba(20,20,24,.96)', color: '#e8e8ea', fontSize: 'var(--zr-ui-sm)', lineHeight: 1.5, fontFamily: "var(--zr-police-sans)", whiteSpace: 'pre-wrap' }}>{docPreview.text}</pre> : waitBox(`Déchiffrement… ${Math.round((docPreview.prog || 0) * 100)}%`)))
+        : isAudioMedia
+          ? (
+            <QuickLookAudioPlayer
+              key={audioUrl || mediaUrl || item.contentPath}
+              src={audioUrl || mediaUrl}
+              name={name}
+              manifest={mediaManifest}
+              onPrev={onPrev}
+              onNext={onNext}
+              onDownload={item.contentPath ? () => downloadMedia(item.contentPath, item.name).catch(() => {}) : null}
+              autoPlay
+            />
+          )
+          : isVideoMedia
+            ? <video key={mediaUrl} src={mediaUrl} controls autoPlay style={{ maxWidth: '92vw', maxHeight: '82vh', borderRadius: RADII.md, background: '#000' }} />
+            : waitBox(`Pas d'aperçu pour ce format (${nm.split('.').pop() || mm || 'binaire'}) — utilise Ouvrir/Télécharger.`)
+    }
+  } else if (type === 'image') {
+    // Affichage progressif : plein format net dès qu'il est prêt ; sinon vignette (déjà là, quasi
+    // instantanée) en attendant, agrandie au MÊME encombrement ; sinon le texte de chargement (tout
+    // premier accès à froid).
+    //
+    // BOÎTE DE TAILLE FIXE (2026-07-11, fix "effet pop up" signalé par Matthieu) : vignette et plein
+    // format ont le MÊME ratio (vérifié en réel : 384×216 vs 7680×4320, tous deux 16:9 -> la génération
+    // de vignette préserve bien le ratio, ce n'était pas le bug) mais PAS la même taille en PIXELS.
+    // Avec `maxWidth/maxHeight` posés directement sur le <img>, une image plus petite que la limite
+    // s'affiche à sa taille NATIVE (384 px, minuscule au milieu de l'écran) au lieu de remplir l'espace
+    // disponible -> "pop" brutal quand le plein format (bien plus grand) arrive ensuite.
+    //
+    // CORRECTION (2026-07-11, le fix `aspectRatio` seul restait insuffisant, signalé par Matthieu en prod) :
+    // poser `aspectRatio` sur un <div> SANS largeur explicite, dans un flex column `align-items:center`
+    // (donc "shrink-to-fit"), dont le seul contenu est un <img> à width:100%/height:100%, crée une
+    // dépendance circulaire (la taille du conteneur dépend de son contenu, le contenu dépend de la taille
+    // du conteneur) -> résolution ambiguë, potentiellement différente d'un moteur de rendu à l'autre. Fix
+    // définitif : calculer width ET height explicitement via calc()/min() à partir du seul ratio du
+    // manifeste (jamais du contenu) -> taille 100% déterministe, identique vignette/plein format, sur
+    // tous les navigateurs.
+    const mw = page && page.manifest && page.manifest.w
+    const mh = page && page.manifest && page.manifest.h
+    const ratio = (mw && mh) ? mw / mh : null
+    const box = ratio
+      ? { width: `min(92vw, calc(82vh * ${ratio}))`, height: `min(82vh, calc(92vw / ${ratio}))` }
+      : { maxWidth: '92vw', maxHeight: '82vh' }
+    // PLUS DE FLOU, PLUS DE SPINNER, PLUS DE TEXTE D'ATTENTE (2026-07-13, demande Matthieu : tout
+    // indicateur de chargement crée une saccade). La boîte (dimensionnée par le ratio du manifeste)
+    // reste simplement VIDE les quelques millisecondes avant la vignette, puis : vignette 1080p nette
+    // en fondu -> plein format superposé en douceur. L'œil ne voit qu'une image qui apparaît.
+    // ORDRE D'APPARITION : la vignette de l'index d'abord — zero appel —, puis celle du manifeste,
+    // puis le plein format. Chaque etape remplace la precedente sans jamais revenir en arriere.
+    if (page === null && vignettePrete) body = (
+      <div style={{ position: 'relative', ...box }}><FadeImg key={'i' + vignettePrete} src={vignettePrete} alt={name} /></div>
+    )
+    else if (page === null) body = <div style={box} />
+    else if (page.img || page.thumb) body = (
+      <div style={{ position: 'relative', ...box }}>
+        {page.thumb && <FadeImg key={'t' + page.thumb} src={page.thumb} alt={name} />}
+        {page.img && <FadeImg key={'f' + page.img} src={page.img} alt={name} overlay={!!page.thumb} />}
+      </div>
+    )
+    else if (vignettePrete) body = (
+      // Le manifeste a echoue mais l'index a la vignette : montrer l'image vaut mieux qu'annoncer
+      // une absence qui n'en est pas une.
+      <div style={{ position: 'relative', ...box }}><FadeImg key={'i' + vignettePrete} src={vignettePrete} alt={name} /></div>
+    )
+    else body = <div style={{ color: '#fff', opacity: 0.7 }}>image introuvable</div>
+  } else if (type === 'page') {
+    if (page === null) body = <div style={{ color: '#fff', opacity: 0.7 }}>chargement…</div>
+    else if (page.img) body = <img src={page.img} alt={name} style={{ maxWidth: '92vw', maxHeight: '82vh', objectFit: 'contain', borderRadius: RADII.md, boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }} />
+    else body = <div className="zr-quicklook-chrome" style={{ maxWidth: 'min(820px,90vw)', maxHeight: '82vh', overflow: 'auto', padding: '28px 34px', borderRadius: RADII.lg, color: '#ECECEA', whiteSpace: 'pre-wrap', fontSize: 'var(--zr-ui-xl)', lineHeight: 1.6 }}>{(page.md || '').slice(0, 6000)}</div>
+  } else if (type === 'file') {
+    const f = file
+    const mime = (f && f.mime) || ''
+    if (!f || (f.prog != null && !f.url)) body = <div style={{ color: '#fff', opacity: 0.7 }}>reconstitution…{f && f.prog != null ? ` ${Math.round(f.prog * 100)}%` : ''}</div>
+    else if (f.err) body = <div style={{ color: '#fff', opacity: 0.7 }}>erreur de reconstitution</div>
+    else if (f.tooBig) body = <div style={{ color: '#fff', opacity: 0.7 }}>trop volumineux pour l’aperçu — Entrée pour télécharger</div>
+    else if (f.unsupported) body = <div style={{ color: '#fff', opacity: 0.7 }}>aperçu indisponible pour ce type — Entrée pour ouvrir</div>
+    // LIB (docx/xlsx/heic/tiff/epub/3D) : décodeur dynamique lazy. AVANT le branchement image (heic a mime image/* mais exige heic2any).
+    else if (f.url && LIB_KINDS.has(f.kind)) body = <React.Suspense fallback={<div style={{ color: '#fff', opacity: 0.7 }}>décodage…</div>}><LazyLibPreview url={f.url} name={item.name} kind={f.kind} /></React.Suspense>
+    else if (f.url && mime.startsWith('image/')) body = <img src={f.url} alt={name} style={{ maxWidth: '92vw', maxHeight: '82vh', objectFit: 'contain', borderRadius: RADII.md, boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }} />
+    else if (f.url && mime.startsWith('video/') && !f.playErr) body = <video src={f.url} controls autoPlay onError={() => setFile((x) => (x ? { ...x, playErr: true } : x))} style={{ maxWidth: '92vw', maxHeight: '82vh', borderRadius: RADII.md, background: '#000' }} />
+    else if (f.url && f.playErr) body = <div style={{ color: '#fff', opacity: 0.7, textAlign: 'center', lineHeight: 1.6 }}>Codec non lisible par le navigateur (.mov ProRes/HEVC).<br />Entrée pour télécharger.</div>
+    else if (f.url && mime.startsWith('audio/')) body = (
+      <QuickLookAudioPlayer
+        key={f.url}
+        src={f.url}
+        name={name}
+        manifest={null}
+        onPrev={onPrev}
+        onNext={onNext}
+        onDownload={item.contentPath ? () => downloadMedia(item.contentPath, item.name).catch(() => {}) : null}
+        autoPlay
+      />
+    )
+    else if (f.url && mime === 'application/pdf') body = <iframe title={name} src={f.url} style={{ width: '82vw', height: '82vh', border: 'none', borderRadius: RADII.md, background: '#fff' }} />
+    // 2026-09-11 An archived HTML page is SHOWN rendered, in an isolated frame (scripts allowed, no access to
+    // the app's origin), not dumped as source. FR : une page HTML archivée s'affiche rendue, dans un cadre isolé.
+    else if (f.url && (mime === 'text/html' || /\.html?$/i.test(item.name || ''))) body = <iframe title={name} src={f.url} sandbox="allow-scripts" style={{ width: '82vw', height: '86vh', border: 'none', borderRadius: RADII.md, background: '#fff' }} />
+    else if (f.url && f.text != null) body = <div className="zr-quicklook-chrome" style={{ maxWidth: 'min(820px,90vw)', maxHeight: '82vh', overflow: 'auto', padding: '28px 34px', borderRadius: RADII.lg, color: '#ECECEA', whiteSpace: 'pre-wrap', fontFamily: 'var(--zr-police-sans)', fontSize: 'var(--zr-ui-md)', lineHeight: 1.55 }}>{(f.text || '').slice(0, 100000)}</div>
+    else body = <div style={{ color: '#fff', opacity: 0.7 }}>aperçu indisponible</div>
+  } else if (type === 'db') {
+    body = <div className="zr-quicklook-chrome" style={{ padding: '40px 56px', borderRadius: RADII.lg, color: '#fff', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}><Icon name="tablecells" size={46} grad /><div>Table — Entrée pour ouvrir</div></div>
+  } else {
+    body = <div className="zr-quicklook-chrome" style={{ padding: '40px 56px', borderRadius: RADII.lg, color: '#fff', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}><Icon name="folder" size={46} grad /><div>Dossier — Entrée pour ouvrir</div></div>
+  }
+
+  // Provenance du média, UNIFIÉE en une liste de segments {label,color} pour image/file/media -> rendue
+  // derrière une pastille toggle (masquée par défaut depuis 2026-07-12 : le texte technique cassait le
+  // design minimaliste ; on garde l'info, accessible en un clic). [] si inconnue (ex. manifeste image pas
+  // encore chargé) -> aucune pastille affichée.
+  // 100% des types passent par le même helper (spec pastilles 2026-07-20) : vert = jsDelivr,
+  // bleu = raw.github/API REST, jaune = proxy Vercel. Pour un .file.json le manifeste est déjà
+  // chargé dans `file`? Non -- il n'est pas conservé ici : nodeType 'file' suffit (chunks raw.github).
+  const srcSegs = type === 'image' ? mediaSourceSegments(page && page.manifest, 'image')
+    : type === 'file' ? mediaSourceSegments({ mode: 'chunked' }, 'file')
+    : type === 'media' ? mediaSourceSegments(mediaManifest)
+    : []
+
+  // 9 October 2026, 01:38 CEST: Keep the overlay outside gallery transforms and restore the page theme.
+  const isDark = t?.textPrimary === PALETTE.textPrimaryDark
+  return createPortal(
+    <div className={`zr-quicklook-backdrop${isDark ? ' zr-dark' : ''}`} onClick={requestClose} style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', animation: `${closing ? 'zrQlFadeOut' : 'zrQlFadeIn'} ${QUICKLOOK_ANIM_MS}ms ease forwards` }}>
+      {/* nav gauche/droite */}
+      <button onClick={(e) => { e.stopPropagation(); onPrev() }} style={navBtn('left')}><Icon name="chevron.left" size={24} weight={1.8} color="#fff" /></button>
+      <button onClick={(e) => { e.stopPropagation(); onNext() }} style={navBtn('right')}><Icon name="chevron.right" size={24} weight={1.8} color="#fff" /></button>
+      <div onClick={(e) => e.stopPropagation()} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, ...(extraDetails ? { maxHeight: 'calc(100dvh - var(--assets-page-padding, 28px) * 2)', overflowY: 'auto' } : {}), animation: `${closing ? 'zrQlOut' : 'zrQlIn'} ${QUICKLOOK_ANIM_MS}ms cubic-bezier(.2,.7,.3,1) forwards` }}>
+        {body}
+        {/* 3 October 2026, 22:16 CEST: callers can show observed file locations without altering other previews. */}
+        {extraDetails}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, color: '#fff' }}>
+          <span style={{ fontSize: 'var(--zr-ui-lg)', fontWeight: 600, maxWidth: '70vw', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+          {/* BADGE SOURCE CDN — d'où vient RÉELLEMENT le média (jsDelivr chiffré / raw.github / YouTube / …).
+              MASQUÉ par défaut (2026-07-12, demande Matthieu : le texte technique cassait le minimalisme) :
+              on n'affiche qu'une petite PASTILLE de la couleur de la source ; clic -> déplie le texte complet ;
+              re-clic -> replie. srcSegs (calculé plus haut) porte la vraie provenance, jamais figée. */}
+          {srcSegs.length > 0 && (
+            showSrc ? (
+              <span onClick={(e) => { e.stopPropagation(); setShowSrc(false) }} title="Masquer la source" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-xs)', color: 'rgba(255,255,255,0.82)', background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.18)', borderRadius: 999, padding: '4px 11px', cursor: 'pointer' }}>
+                {srcSegs.map((s, i) => (
+                  <React.Fragment key={i}>
+                    {i > 0 && <span style={{ opacity: 0.5 }}>·</span>}
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><i style={{ width: 7, height: 7, borderRadius: '50%', background: s.color }} />{s.label}</span>
+                  </React.Fragment>
+                ))}
+              </span>
+            ) : (
+              <button onClick={(e) => { e.stopPropagation(); setShowSrc(true) }} title="Afficher la source du média" aria-label="Afficher la source du média" style={{ background: 'transparent', border: 'none', padding: 4, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', lineHeight: 0 }}>
+                <i style={{ width: 9, height: 9, borderRadius: '50%', background: srcSegs[0].color, boxShadow: '0 0 0 3px rgba(255,255,255,0.14)' }} />
+              </button>
+            )
+          )}
+          {/* TRIER — à GAUCHE de « Télécharger », comme demandé le 2026-08-30. Ce bouton n'envoie
+              PAS la photo : il pose une référence de ~150 octets dans l'espace de tri, l'original
+              ne bougeant pas de son dossier. C'est ce qui permet de trier en plusieurs tas sans
+              jamais dupliquer un octet ni perdre le rangement d'origine. */}
+          {estTriable(item) && tri && tri.espaces && tri.espaces.length > 0 && (
+            <BoutonTri tri={tri} item={item} libelle={name} />
+          )}
+          {item.contentPath && (type === 'image' || type === 'file' || type === 'media' || isAudio || isAudioEntry(item)) && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); downloadMedia(item.contentPath, item.name).catch(() => {}) }}
+              style={{ background: 'rgba(255,255,255,0.16)', color: '#fff', border: 'none', borderRadius: RADII.sm, padding: '6px 14px', cursor: 'pointer', fontSize: 'var(--zr-ui-md)', fontWeight: 600 }}
+            >
+              Télécharger
+            </button>
+          )}
+          <button onClick={(e) => { e.stopPropagation(); onOpen() }} style={{ background: PALETTE.gradient, color: '#fff', border: 'none', borderRadius: RADII.sm, padding: '6px 16px', cursor: 'pointer', fontSize: 'var(--zr-ui-md)', fontWeight: 600 }}>Ouvrir</button>
+        </div>
+      </div>
+      <div style={{ position: 'fixed', top: 18, right: 22, color: 'rgba(255,255,255,0.6)', fontSize: 'var(--zr-ui-sm)', fontFamily: 'var(--zr-police-sans)' }}>{isAudio ? 'Espace lecture/pause · Échap fermer · ←/→ naviguer' : 'Espace/Échap fermer · ←/→ naviguer'}</div>
+    </div>,
+    document.body
+  )
+}
+
+// Quick Look resolves the placement before it mounts its media effects.  This
+// prevents the previous double-hop (link manifest, then target manifest) and
+// gives Space the same HLS/MSE/YouTube/file path as the normal viewer.
+export default function QuickLookOverlay({ item, ...props }) {
+  // ═══ NE JAMAIS RENDRE UN ÉCRAN VIDE EN ATTENDANT UNE RÉPONSE DÉJÀ CONNUE ═══════════════════════
+  //
+  // RÉGRESSION DE VITESSE mesurée le 2026-08-31 : ouvrir un aperçu prenait près de deux secondes,
+  // là où il doit s'ouvrir en un dixième. Le budget, mesuré et non supposé :
+  //
+  //   un aller-retour vers l'API      150 à 250 ms
+  //   déchiffrer une vignette 1080      0,1 ms
+  //   déchiffrer un plein format 4 Mo   0,9 ms
+  //
+  // Le déchiffrement n'est donc RIEN : ce sont les allers-retours qui coûtent tout. Or ce composant
+  // en payait un ici même, en rendant `<div />` — un écran vide — pendant que la résolution du lien
+  // partait sur le réseau. Le corps, qui sait déjà afficher la vignette du cache puis le plein
+  // format, ne démarrait qu'après.
+  //
+  // CE QUI REND L'ATTENTE INUTILE : la grille vient d'afficher cette même image, donc la réponse est
+  // déjà en mémoire dans neuf cas sur dix. `eaglePathConnu` la rend sans attendre. Et quand elle
+  // n'est pas connue, on monte quand même le corps avec le chemin d'origine plutôt qu'un écran vide :
+  // `readImgManifestCached` sait résoudre un lien tout seul, elle le faisait déjà avant ce composant.
+  const dejaConnu = eaglePathConnu(item?.contentPath)
+  const [resolved, setResolved] = useState(dejaConnu || null)
+  useEffect(() => {
+    let live = true
+    const connu = eaglePathConnu(item?.contentPath)
+    setResolved(connu || null)
+    if (connu) return () => { live = false }
+    resolveEaglePath(item?.contentPath).then((value) => { if (live) setResolved(value) })
+    return () => { live = false }
+  }, [item?.contentPath])
+  if (!item) return null
+  // La résolution n'est pas encore revenue : on affiche le corps AVEC le chemin d'origine plutôt
+  // qu'un vide. Pour une image ordinaire — l'immense majorité — c'est déjà le bon chemin, et le
+  // premier pixel arrive sans avoir rien attendu.
+  if (!resolved) return <QuickLookBody {...props} item={item} />
+  if (resolved.error) return <div style={{ position: 'fixed', inset: 0, zIndex: 9999, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.82)', color: '#fff' }}>Lien média indisponible.</div>
+  return <QuickLookBody {...props} item={{ ...item, contentPath: resolved.path }} />
+}
+function navBtn(side) {
+  return { position: 'fixed', top: '50%', [side]: 24, transform: 'translateY(-50%)', background: 'rgba(255,255,255,0.14)', border: 'none', color: '#fff', width: 48, height: 48, borderRadius: 99, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 201 }
+}
+
+
+// ═══ LE BOUTON DE TRI DU QUICK LOOK ═════════════════════════════════════════════════════════════
+//
+// UN SEUL ESPACE : un bouton, un clic, c'est fini. PLUSIEURS ESPACES : le clic vise le dernier tas
+// rempli (on continue le tri en cours, c'est le geste de la rafale) et un chevron ouvre la liste.
+// Deux formes plutôt qu'une seule générique, parce qu'un menu déroulant pour un unique choix est
+// un clic volé à chaque image, et que ce bouton sert précisément à aller vite.
+//
+// LE GARDE CONTRE LE DOUBLE ENVOI. Une image triée deux fois par un double-clic involontaire
+// créerait deux références dans le même tas, avec un nom dédoublonné, donc un doublon silencieux
+// qu'on ne remarque qu'au comptage. Le bouton se verrouille le temps du geste.
+// SORT JOBS ARE TRACKED PER IMAGE, IN A MODULE-LEVEL STORE (2 October 2026, request of Matthieu): the loading
+// state must stay visible on the image being sorted while he moves on to the next ones.
+// ONE WORKER DRAINS THE QUEUE, AND IT BATCHES: every job waiting for the same sort space leaves in ONE request
+// (one commit for up to TRI_LOT_MAX images instead of one commit per image, each of which takes seconds and
+// fights the others for the git ref). If a batch fails, its images are retried one by one so a single bad image
+// cannot sink the others.
+const TRI_LOT_MAX = 12
+const triJobs = new Map() // item key -> { etat: 'pending' | 'fait' | 'echec', nom }
+const triListeners = new Set()
+let triVersion = 0
+const triFile = []        // waiting jobs: { key, item, espace, tri, carte }
+let triEnCours = false
+const triSubscribe = (fn) => { triListeners.add(fn); return () => triListeners.delete(fn) }
+const triSnapshot = () => triVersion
+const triSet = (key, job) => { triJobs.set(key, job); triVersion++; triListeners.forEach((fn) => fn()) }
+const triKey = (item) => item.dir || item.contentPath || item.name
+export const resetTriJobsForTests = () => { triJobs.clear(); triFile.length = 0; triEnCours = false; triVersion++; triListeners.forEach((fn) => fn()) }
+
+// `trier` answers `false` when the links were NOT created (the cause is in its own notification): that must never
+// end as a green « fait ». Any other value, including undefined from older callers, counts as success.
+async function triExecuter(lot) {
+  const dernier = lot[lot.length - 1]
+  try { return (await dernier.tri.trier(lot.map((job) => job.item), dernier.espace)) !== false } catch { return false }
+}
+function triTerminer(job, ok) {
+  if (ok) { triSet(job.key, { etat: 'fait', nom: job.espace.nom }); job.carte.done({ label: 'Tri · fait', body: `→ ${job.espace.nom}` }) }
+  else { triSet(job.key, { etat: 'echec', nom: job.espace.nom }); job.carte.fail({ label: 'Tri · échec', body: `Envoi vers ${job.espace.nom} impossible · réessaie` }) }
+}
+async function triVider() {
+  if (triEnCours) return
+  triEnCours = true
+  try {
+    while (triFile.length) {
+      const tete = triFile[0]
+      const lot = []
+      for (let i = 0; i < triFile.length && lot.length < TRI_LOT_MAX;) {
+        if (triFile[i].espace.chemin === tete.espace.chemin) lot.push(...triFile.splice(i, 1)); else i++
+      }
+      for (const job of lot) job.carte.set({ body: `Vers ${job.espace.nom}${lot.length > 1 ? ` · lot de ${lot.length}` : ''}…` })
+      const ok = await triExecuter(lot)
+      if (ok || lot.length === 1) { for (const job of lot) triTerminer(job, ok) }
+      else for (const job of lot) triTerminer(job, await triExecuter([job])) // isolate the bad image
+    }
+  } finally { triEnCours = false }
+}
+
+export function BoutonTri({ tri, item, libelle }) {
+  const [ouvert, setOuvert] = React.useState(false)
+  React.useSyncExternalStore(triSubscribe, triSnapshot)
+  const job = triJobs.get(triKey(item))
+  const enCours = !!job && job.etat === 'pending'
+  const fait = job && job.etat === 'fait' ? job.nom : null
+  const espaces = tri.espaces || []
+  const defaut = tri.defaut || espaces[espaces.length - 1]
+
+  const envoyer = (espace) => {
+    const key = triKey(item)
+    if (enCours) return
+    setOuvert(false)
+    triSet(key, { etat: 'pending', nom: espace.nom })
+    // Top-right macOS card for this job: Apple spinner + image name + sliding capsule. It lives in the global
+    // notification host, so it stays visible after the Quick Look closes and while he browses other images.
+    const carte = notifyProgress({ icon: 'photo', tint: PALETTE.primary, label: 'Tri', title: libelle || item.name, body: `Vers ${espace.nom} · en attente…`, indeterminate: true })
+    triFile.push({ key, item, espace, tri, carte })
+    triVider()
+  }
+
+  const styleBase = {
+    background: 'rgba(255,255,255,0.16)', color: '#fff', border: 'none',
+    padding: '6px 12px', cursor: enCours ? 'default' : 'pointer',
+    fontSize: 'var(--zr-ui-md)', fontWeight: 600, opacity: enCours ? 0.6 : 1,
+  }
+
+  return (
+    <span style={{ position: 'relative', display: 'inline-flex' }} onClick={(e) => e.stopPropagation()}>
+      <button
+        onClick={(e) => { e.stopPropagation(); envoyer(defaut) }}
+        title={`Poser une référence dans ${defaut.nom} — l’image ne bouge pas de son dossier`}
+        style={{ ...styleBase, borderRadius: espaces.length > 1 ? `${RADII.sm}px 0 0 ${RADII.sm}px` : RADII.sm }}>
+        {enCours && <span style={{ display: 'inline-flex', marginRight: 7, verticalAlign: '-1px' }}><SpinnerApple taille={12} couleur="#fff" titre="Envoi en cours" /></span>}
+        {enCours ? `Envoi · ${job.nom.replace('tmp-img-selection', '')}` : fait ? `→ ${fait}` : `Trier · ${defaut.nom.replace('tmp-img-selection', '')}`}
+      </button>
+      {espaces.length > 1 && (
+        <button
+          onClick={(e) => { e.stopPropagation(); setOuvert((v) => !v) }}
+          title="Choisir l’espace de tri"
+          style={{ ...styleBase, padding: '6px 9px', borderRadius: `0 ${RADII.sm}px ${RADII.sm}px 0`, borderLeft: '1px solid rgba(255,255,255,0.18)' }}>
+          ⌄
+        </button>
+      )}
+      {ouvert && (
+        <div style={{
+          position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 30, minWidth: 210,
+          background: 'rgba(32,32,34,0.97)', borderRadius: 12, padding: 5,
+          boxShadow: '0 18px 44px -12px rgba(0,0,0,0.6)',
+          backdropFilter: 'blur(18px)', WebkitBackdropFilter: 'blur(18px)',
+        }}>
+          {espaces.map((esp) => (
+            <button key={esp.n} onClick={(e) => { e.stopPropagation(); envoyer(esp) }}
+              style={{
+                display: 'block', width: '100%', textAlign: 'left', background: 'transparent',
+                border: 'none', color: '#fff', padding: '8px 11px', borderRadius: 8, cursor: 'pointer',
+                fontSize: 'var(--zr-ui-sm)', fontFamily: 'var(--zr-police-sans)',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.10)' }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}>
+              {esp.nom}{esp.neuf ? <span style={{ opacity: 0.5 }}>  ·  nouveau</span> : null}
+            </button>
+          ))}
+        </div>
+      )}
+    </span>
+  )
+}

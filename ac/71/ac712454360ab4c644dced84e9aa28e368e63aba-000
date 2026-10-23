@@ -1,0 +1,276 @@
+#!/usr/bin/env node
+// ZenRayMedia — VÉRIFIER UN COMPOSANT : une image, pas une page.
+//
+//   node scripts/zrm-check.mjs <theme> <zone>      # une planche PNG : source / rendu / superposé
+//
+// POURQUOI CE FICHIER EXISTE, ET POURQUOI CE N'EST PAS UN HTML
+// -----------------------------------------------------------
+// Matthieu, 2026-07-28 : « tu vas faire quoi, refaire un HTML de comparaison ? ça brûlera du
+// token pour rien ». Il a raison, et pas seulement sur le coût. Une planche HTML de 307 lignes
+// mélange ce qui est fini et ce qui ne l'est pas, se régénère en entier pour un composant, et
+// personne ne la lit jusqu'en bas. Elle donne l'illusion d'un tableau de bord là où il faut un
+// verdict sur UN composant.
+//
+// Ici, une seule image par composant : la source en haut, le rendu au milieu, les deux fondus en
+// bas. C'est le fondu qui tranche — deux images côte à côte laissent croire qu'elles se
+// ressemblent, superposées elles montrent le décalage au pixel. Un fichier, un regard, un verdict.
+//
+// La zone déclare où trouver son rendu dans `regions.json` :
+//   { "name": "roue-de-dialogue", "rect": [...], "html": "parts/04-dialogue-wheel.html",
+//     "selector": ".zrm-wheel" }
+// Tant qu'une zone n'a pas ces deux champs, elle n'est pas écrite — et le script le dit.
+
+import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+import { chromium } from 'playwright'
+import { ROOT, themeDir as themeDirOf, workDir, regionsPath } from './zrm-paths.mjs'
+
+async function main() {
+  const [id, zoneArg] = process.argv.slice(2)
+  if (!id || !zoneArg) throw new Error('usage : node scripts/zrm-check.mjs <theme> <zone>')
+
+  const dir = themeDirOf(id)
+  const work = workDir(id)
+  const spec = JSON.parse(await readFile(regionsPath(id), 'utf8'))
+
+  // Un même nom vit sur plusieurs captures : « titre-ecran » coiffe vingt écrans. La capture de
+  // RÉFÉRENCE est celle qui porte le rendu déclaré ; prendre la première venue reviendrait à
+  // comparer le composant à un autre écran, et à corriger contre une source qui n'est pas la
+  // sienne. On accepte aussi l'adressage explicite `CAPTURE__zone`.
+  let found = null, fallback = null
+  for (const [rel, zones] of Object.entries(spec.images)) {
+    const stem = rel.replace(/[/\\]/g, '__').replace(/\.(png|jpe?g)$/i, '').replace(/^raw_v2__/, '')
+    for (const z of zones) {
+      if (z.name !== zoneArg && `${stem}__${z.name}` !== zoneArg) continue
+      if (z.html) { found = { rel, z }; break }
+      fallback = fallback || { rel, z }
+    }
+    if (found) break
+  }
+  found = found || fallback
+  const zoneName = found?.z.name
+  if (!found) throw new Error(`zone inconnue : ${zoneArg}`)
+  const { rel, z } = found
+  if (!z.html || !z.selector) {
+    throw new Error(`la zone « ${zoneName} » n'a pas de rendu déclaré.\n`
+      + `  Ajouter "html" et "selector" dans regions.json une fois le composant écrit.`)
+  }
+
+  const htmlPath = path.join(dir, z.html)
+  if (!existsSync(htmlPath)) throw new Error(`composant introuvable : ${z.html}`)
+
+  const cropPath = path.join(work, 'crops',
+    `${rel.replace(/[/\\]/g, '__').replace(/\.(png|jpe?g)$/i, '').replace(/^raw_v2__/, '')}__${zoneName}.png`)
+  if (!existsSync(cropPath)) throw new Error(`crop introuvable : ${path.basename(cropPath)} — relancer --cut`)
+
+  const iconsPath = path.join(dir, 'parts', '00-icons.html')
+  // SEULE la planche de <symbol> (le bloc <svg class="zrm-signs">...</defs></svg>) doit être
+  // injectée. `00-icons.html` porte AUSSI un <div class="zrm-sheet"> : c'est son propre corps
+  // visible, affiché quand la planche est elle-même posée comme composant. L'injecter partout
+  // faisait apparaître toute la planche d'icônes en incrustation sur CHAQUE composant comparé —
+  // exactement le bug remonté par Matthieu. On n'extrait donc que les <symbol>.
+  const icons00raw = existsSync(iconsPath) ? await readFile(iconsPath, 'utf8') : ''
+  const symbolsMatch = icons00raw.match(/<svg[^>]*class="zrm-signs"[\s\S]*?<\/svg>/)
+  const icons00 = symbolsMatch ? symbolsMatch[0] : ''
+
+  const browser = await chromium.launch()
+  const page = await browser.newPage()
+
+  // Le rendu est capturé à la TAILLE DE LA SOURCE : sans ça, on compare deux échelles et tout
+  // écart de proportion se lit comme un écart de position. C'est l'erreur qui avait fait passer
+  // un composant faux d'un facteur 2,4 pour un composant presque juste.
+  const crop = await readFile(cropPath)
+  const dims = await page.evaluate(async (u) => {
+    const i = new Image(); i.src = u; await i.decode()
+    return [i.naturalWidth, i.naturalHeight]
+  }, 'data:image/png;base64,' + crop.toString('base64'))
+
+  // LE COMPOSANT EST UN FRAGMENT, PAS UNE PAGE. Ouvert seul, il tombe sur un fond blanc, sans les
+  // tokens du thème ni les polices : un anneau blanc devient invisible, un halo disparaît, et la
+  // largeur suit la fenêtre au lieu de la composition. On le juge alors sur des défauts qui
+  // n'existent pas et on rate ceux qui existent.
+  //
+  // On le remonte donc dans SA scène : tokens.css, fond sombre, et un conteneur à la LARGEUR DE
+  // LA SOURCE. C'est cette largeur qui compte — un composant en `cqw` se dimensionne par rapport
+  // à son conteneur, donc lui donner la largeur du crop, c'est le mettre à l'échelle exacte de la
+  // capture, sans facteur de conversion nulle part.
+  const tokens = existsSync(path.join(dir, 'tokens.css'))
+    ? await readFile(path.join(dir, 'tokens.css'), 'utf8') : ''
+
+  // LES POLICES DU THÈME, EN CHEMINS DE FICHIER.
+  //
+  // Le défaut le plus coûteux de cet outil, et il ne s'est pas vu pendant trois tours : la page
+  // est montée par `setContent`, donc SANS URL de base. Un `@font-face` qui pointe vers
+  // `/zrm-fonts/barlow/...` ne résout rien, le navigateur retombe silencieusement sur la police
+  // système, et on mesure de l'Arial en croyant mesurer du Barlow.
+  //
+  // Le symptôme trompe parfaitement : les lettres sont trop larges, alors on réduit
+  // l'interlettrage ; elles sont trop courtes, alors on grossit le corps. Chaque correction
+  // améliore le chiffre et éloigne du vrai — on répare la mauvaise cause avec application.
+  // C'est la faute n° 3 du protocole : ajuster une valeur fausse au lieu de demander si elle
+  // devrait exister.
+  // Deuxième temps du même piège : même avec les bons chemins, Chromium REFUSE de charger une
+  // police en `file://` depuis une page montée par `setContent` — origine opaque, aucune erreur
+  // visible, retour silencieux à la police système. Les fichiers sont donc EMBARQUÉS en base64.
+  // On n'embarque que les familles déclarées par le thème : 137 familles sont installées, les
+  // embarquer toutes ferait une page de plusieurs mégaoctets pour vérifier un titre.
+  const fontsRoot = path.join(ROOT, 'public', 'zrm-fonts')
+
+  // LA GRAISSE DE CHAQUE FICHIER, LUE DANS LE REGISTRE.
+  //
+  // Une famille STATIQUE installe un fichier par graisse. Les déclarer tous `font-weight:100 900`
+  // — ce que je faisais — revient à dire au navigateur que n'importe lequel convient pour
+  // n'importe quelle graisse : il prend le dernier et le rend pour tout. Un titre en 300 sortait
+  // en 900 sans la moindre erreur, et aucun réglage de `font-weight` n'y changeait rien.
+  // Le registre `fonts.js` porte la vraie graisse de chaque fichier ; on la lit plutôt que de la
+  // supposer.
+  const registry = await readFile(path.join(ROOT, 'src', 'zenraymedia', 'fonts.js'), 'utf8')
+  const weightOf = new Map()
+  for (const m of registry.matchAll(/\/zrm-fonts\/([^"']+\.woff2)"[^}]*?weight:\s*"([^"]+)"/g)) {
+    weightOf.set(m[1], m[2])
+  }
+
+  const themeJson = existsSync(path.join(dir, 'theme.json'))
+    ? JSON.parse(await readFile(path.join(dir, 'theme.json'), 'utf8')) : {}
+  let faces = ''
+  for (const family of themeJson.fonts || []) {
+    const slug = family.toLowerCase().replace(/\s+/g, '-')
+    const famDir = path.join(fontsRoot, slug)
+    if (!existsSync(famDir)) { console.log(`  ⚠ police déclarée mais non installée : ${family}`); continue }
+    for (const f of (await readdir(famDir)).filter((f) => /^normal-latin-\d+\.woff2$/.test(f))) {
+      const b64 = (await readFile(path.join(famDir, f))).toString('base64')
+      faces += `@font-face{font-family:'${family}';`
+        + `src:url(data:font/woff2;base64,${b64}) format('woff2');font-style:normal;`
+        + `font-weight:${weightOf.get(`${slug}/${f}`) || '400'};font-display:block}\n`
+    }
+  }
+  // LE COMPOSANT EST UN GABARIT : son texte vient du brief. Pour le comparer à SA capture, on lui
+  // rend le texte de cette capture, déclaré dans la zone sous `sample`. Sans ça, le vérificateur
+  // afficherait « {{title}} » et on comparerait des accolades à un titre. Ce qui reste non
+  // substitué est vidé plutôt que laissé visible — un gabarit incomplet doit se voir comme un
+  // trou, pas comme du texte.
+  let part = await readFile(htmlPath, 'utf8')
+  for (const [k, v] of Object.entries(z.sample || {})) {
+    part = part.replaceAll(`{{${k}}}`, v).replaceAll(`{{{${k}}}}`, v)
+  }
+  part = part.replace(/\{\{[#/]?\{?[\w.]+\}?\}\}/g, '')
+  // LA MARGE DU CROP DOIT ÊTRE RENDUE, PAS OUBLIÉE. Le crop fait `rect + marge` de chaque côté ;
+  // si on donne toute cette largeur au composant, il s'étale dans la marge et paraît trop large
+  // d'exactement deux fois la marge. On lui donne donc la largeur VRAIE du composant, décalée de
+  // la marge — les deux images se superposent alors au pixel, et un écart visible est un vrai
+  // écart. Sans ce détail, chaque composant semblerait faux de 24 px et on corrigerait dans le
+  // vide.
+  const inset = [Math.round((dims[0] - z.rect[2]) / 2), Math.round((dims[1] - z.rect[3]) / 2)]
+  const shell = `<!doctype html><meta charset="utf-8">
+<style>${faces}${tokens}
+  html,body{margin:0;background:#0a0d12}
+  .zrm-frame{width:${dims[0]}px;height:${dims[1]}px;padding:${inset[1]}px ${inset[0]}px;
+    box-sizing:border-box}
+  .zrm-scene{width:${z.rect[2]}px;height:${z.rect[3]}px;container-type:size}
+</style>
+${icons00}<div class="zrm-frame"><div class="zrm-scene">${part}</div></div>`
+
+  await page.setViewportSize({ width: dims[0] + 40, height: Math.max(dims[1] + 200, 600) })
+  await page.setContent(shell, { waitUntil: 'domcontentloaded', timeout: 120000 })
+  await page.evaluate(() => document.fonts.ready)
+  await page.waitForTimeout(500)   // les filtres et dégradés radiaux demandent une frame de plus
+  // Sonde de calibration : la valeur CSS ne dit pas la taille rendue (unités de conteneur,
+  // héritage, repli de police). On lit ce que le navigateur a VRAIMENT appliqué.
+  if (process.env.ZRM_SONDE) {
+    console.log(await page.evaluate((sel) => {
+      const box = document.querySelector(sel)
+      const out = []
+      for (const e of box.querySelectorAll('*')) {
+        const cs = getComputedStyle(e)
+        if (!e.textContent.trim() && !e.className) continue
+        out.push(`  ${e.tagName.toLowerCase()}.${e.className || '-'} font=${cs.fontSize} famille=${cs.fontFamily.split(',')[0]} lh=${cs.lineHeight} largeur-conteneur=${box.getBoundingClientRect().width}`)
+      }
+      return out.join('\n')
+    }, z.selector))
+  }
+  const el = await page.$(z.selector)
+  if (!el) throw new Error(`sélecteur absent de la page : ${z.selector}`)
+  const shot = await el.screenshot()
+
+  const sheet = await page.evaluate(async ([a, b, W, H]) => {
+    const [src, out] = await Promise.all([a, b].map(async (u) => {
+      const i = new Image(); i.src = u; await i.decode(); return i
+    }))
+    const gap = 14, lab = 22
+    const c = document.createElement('canvas')
+    c.width = W
+    c.height = (H + lab + gap) * 3
+    const g = c.getContext('2d')
+    g.fillStyle = '#0d0f12'; g.fillRect(0, 0, c.width, c.height)
+    g.font = '600 13px -apple-system, sans-serif'; g.textBaseline = 'top'
+
+    const draw = (img, y, label) => {
+      g.fillStyle = '#7f8fa0'; g.fillText(label, 0, y)
+      g.drawImage(img, 0, y + lab, W, H)
+    }
+    draw(src, 0, 'SOURCE')
+    draw(out, H + lab + gap, 'RENDU')
+    // Le fondu : c'est lui qui donne le verdict. Un écart de quelques pixels, invisible quand les
+    // deux images sont l'une sous l'autre, devient un dédoublement net une fois superposées.
+    const y3 = (H + lab + gap) * 2
+    g.fillStyle = '#7f8fa0'; g.fillText('SUPERPOSÉ', 0, y3)
+    g.drawImage(src, 0, y3 + lab, W, H)
+    g.globalAlpha = 0.5
+    g.drawImage(out, 0, y3 + lab, W, H)
+    g.globalAlpha = 1
+    return c.toDataURL('image/png')
+  }, ['data:image/png;base64,' + crop.toString('base64'),
+      'data:image/png;base64,' + shot.toString('base64'), dims[0], dims[1]])
+
+  // LE VERDICT CHIFFRÉ. Regarder la planche dit « c'est un peu trop large » ; le balayage dit
+  // « 34 px de trop, et la capitale fait 51 au lieu de 47 ». La première phrase se corrige au
+  // jugé et se retrompe ; la seconde se corrige une fois. On segmente les deux images en suites
+  // de colonnes encrées — chaque suite est un glyphe ou une pièce — et on met les deux listes
+  // côte à côte.
+  const runs = await page.evaluate(async ([a, b, seuil]) => {
+    const scan = async (u) => {
+      const img = new Image(); img.src = u; await img.decode()
+      const c = document.createElement('canvas')
+      c.width = img.naturalWidth; c.height = img.naturalHeight
+      const g = c.getContext('2d'); g.drawImage(img, 0, 0)
+      const d = g.getImageData(0, 0, c.width, c.height).data
+      const out = []; let cur = null
+      for (let x = 0; x < c.width; x++) {
+        let top = null, bot = null
+        for (let y = 0; y < c.height; y++) {
+          const i = (y * c.width + x) * 4
+          const L = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]
+          if (L > seuil) { if (top === null) top = y; bot = y }
+        }
+        if (top === null) { if (cur) { out.push(cur); cur = null } continue }
+        if (!cur) cur = { x0: x, x1: x, top, bot }
+        else { cur.x1 = x; cur.top = Math.min(cur.top, top); cur.bot = Math.max(cur.bot, bot) }
+      }
+      if (cur) out.push(cur)
+      return out
+    }
+    return { src: await scan(a), out: await scan(b) }
+  }, ['data:image/png;base64,' + crop.toString('base64'),
+      'data:image/png;base64,' + shot.toString('base64'), Number(process.env.ZRM_SEUIL || 150)])
+
+  await browser.close()
+
+  const line = (r) => r ? `${String(r.x0).padStart(3)}-${String(r.x1).padStart(3)} h${String(r.bot - r.top + 1).padStart(2)} y${String(r.top).padStart(2)}` : '            —      '
+  const n = Math.max(runs.src.length, runs.out.length)
+  console.log(`\n  ${'SOURCE'.padEnd(20)}  ${'RENDU'.padEnd(20)}  écart`)
+  for (let i = 0; i < n; i++) {
+    const s = runs.src[i], o = runs.out[i]
+    const d = s && o ? `x${o.x0 - s.x0 >= 0 ? '+' : ''}${o.x0 - s.x0} h${o.bot - o.top - (s.bot - s.top) >= 0 ? '+' : ''}${o.bot - o.top - (s.bot - s.top)}` : ''
+    console.log(`  ${line(s)}  ${line(o)}  ${d}`)
+  }
+  console.log(`  ${runs.src.length} pièce(s) à la source, ${runs.out.length} au rendu\n`)
+
+  const outDir = path.join(work, 'check')
+  await mkdir(outDir, { recursive: true })
+  const out = path.join(outDir, `${zoneName}.png`)
+  await writeFile(out, Buffer.from(sheet.split(',')[1], 'base64'))
+  console.log(`${path.relative(ROOT, out)}  (${dims[0]}×${dims[1]})`)
+}
+
+main().catch((e) => { console.error(e.message || e); process.exit(1) })

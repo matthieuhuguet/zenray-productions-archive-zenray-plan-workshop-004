@@ -1,0 +1,110 @@
+// Héberge et sert les images depuis le repo drive privé zenray-data.
+// GET ?path=uploads/x.webp | gallery/x.avif -> récupère le blob via token et le sert
+//   (repo privé => ce proxy rend l'image chargeable ; cache edge Vercel via s-maxage).
+// POST { dataUrl, dir } (dir = uploads|gallery) -> commit -> { url, path }.
+import { logStart, logEnd, describeCommand } from './cmdlog.js'
+import { fetchGithubResilient } from './github-retry.js'
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+const ctFor = (path) => {
+  const e = path.split('.').pop().toLowerCase()
+  const audio = { mp3: 'audio/mpeg', m4a: 'audio/mp4', ogg: 'audio/ogg', oga: 'audio/ogg', wav: 'audio/wav', flac: 'audio/flac', opus: 'audio/opus' }
+  if (audio[e]) return audio[e]
+  const text = { vtt: 'text/vtt', ass: 'text/plain; charset=utf-8', ssa: 'text/plain; charset=utf-8', srt: 'text/plain; charset=utf-8' }
+  if (text[e]) return text[e]
+  if (e === 'bin') return 'application/octet-stream'
+  return e === 'avif' ? 'image/avif' : e === 'png' ? 'image/png' : (e === 'jpg' || e === 'jpeg') ? 'image/jpeg' : e === 'gif' ? 'image/gif' : e === 'svg' ? 'image/svg+xml' : 'image/webp'
+}
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(200).json({ error: 'no-token' })
+
+  if (req.method === 'GET') {
+    const path = (req.query.path || '').toString()
+    if (!(path.startsWith('uploads/') || path.startsWith('gallery/') || path.startsWith('media/') || path.startsWith('references/') || path.startsWith('audio/') || path.startsWith('sfx/')) || path.includes('..')) return res.status(400).end()
+    try {
+      // QUOTA : ces chemins (uploads/gallery/media/references/audio/sfx) sont horodatés/hashés donc IMMUABLES.
+      // On les sert via raw.githubusercontent.com (NE COMPTE PAS dans la limite REST 5000/h) au lieu de l'API
+      // contents qui la consommait. Sans ça, parcourir l'audio/SFX ou lire une vidéo sous-titrée vidait le quota
+      // -> 403 -> média muet/figé (même panne que /api/shard a corrigée pour les images). raw lit le contenu
+      // privé de zenray-data avec le token, exactement comme page.js?raw=1 sur le MÊME repo.
+      const r = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(path)}`, {
+        headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' },
+      })
+      if (!r.ok) return res.status(404).end()
+      const buf = Buffer.from(await r.arrayBuffer())
+      res.setHeader('Content-Type', ctFor(path))
+      // Chemins horodatés/aléatoires (Date.now()-rand.ext) jamais réécrits -> immuables : cache navigateur LONG.
+      // L'ancien max-age=0 forçait un re-fetch réseau à CHAQUE scroll en local (le navigateur ne cachait jamais).
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+      // Support HTTP Range : l'ancien index plat Music (tr.path) et TOUS les SFX passent par /api/img.
+      // Sans 206/Accept-Ranges le <audio> ne peut pas seek (saccades / seek ignoré). On annonce
+      // Accept-Ranges même sur le 200 complet (images), et on sert une tranche exacte si Range demandé.
+      const total = buf.length
+      res.setHeader('Accept-Ranges', 'bytes')
+      const range = req.headers.range
+      if (range) {
+        const mt = /bytes=(\d*)-(\d*)/.exec(range)
+        if (mt) {
+          let start = mt[1] ? parseInt(mt[1], 10) : 0
+          let end = mt[2] ? parseInt(mt[2], 10) : total - 1
+          if (Number.isNaN(start)) start = 0
+          if (Number.isNaN(end) || end > total - 1) end = total - 1
+          if (start > end || start >= total) { res.setHeader('Content-Range', `bytes */${total}`); return res.status(416).end() }
+          const slice = buf.subarray(start, end + 1)
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`)
+          res.setHeader('Content-Length', String(slice.length))
+          return res.status(206).send(slice)
+        }
+      }
+      res.setHeader('Content-Length', String(total))
+      return res.status(200).send(buf)
+    } catch { return res.status(500).end() }
+  }
+
+  if (req.method === 'POST') {
+    let body = req.body
+    if (typeof body === 'string') { try { body = JSON.parse(body) } catch { body = {} } }
+    let dataUrl = body && body.dataUrl
+    const remoteUrl = body && body.url
+    const dir = ['uploads', 'gallery', 'sfx', 'audio', 'references'].includes(body && body.dir) ? body.dir : 'uploads'
+    if (!dataUrl && remoteUrl && /^https?:\/\//.test(remoteUrl)) {
+      try {
+        const rFetch = await fetch(remoteUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36', Accept: 'image/*,*/*' } })
+        if (rFetch.ok) {
+          const ct = rFetch.headers.get('content-type') || 'image/jpeg'
+          const buf = Buffer.from(await rFetch.arrayBuffer())
+          dataUrl = `data:${ct};base64,${buf.toString('base64')}`
+        }
+      } catch {}
+    }
+    if (!dataUrl || !(dataUrl.startsWith('data:image/') || dataUrl.startsWith('data:audio/'))) return res.status(400).json({ url: null, error: 'bad' })
+    const mime = dataUrl.slice(5, dataUrl.indexOf(';'))
+    const EXT = { 'image/avif': 'avif', 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/flac': 'flac' }
+    const ext = EXT[mime] || (mime.startsWith('audio/') ? 'mp3' : 'webp')
+    const b64 = dataUrl.split(',')[1]
+    const path = `${dir}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}.${ext}`
+    const logId = logStart({ repo: REPO, dir: `contents/${path}`, action: 'put', command: describeCommand('PUT', `contents/${path}`) })
+    try {
+      // L'ECRITURE SE REESSAIE, parce qu'elle echouait pour une raison de MOMENT et non de contenu.
+      // Matthieu, le 2026-08-28 : coller une image rendait parfois une erreur GitHub, « si je
+      // persevere ca marche ». Une erreur qui disparait a l'identique au second essai est une
+      // course sur la reference de branche (409), une bascule de noeud (5xx) ou une limite
+      // secondaire (429). Les erreurs definitives, elles, sortent toujours du premier coup : le
+      // detail et la liste des statuts concernes sont dans `github-retry.js`.
+      const r = await fetchGithubResilient(() => fetch(`https://api.github.com/repos/${REPO}/contents/${path}`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress' },
+        body: JSON.stringify({ message: 'media blob', content: b64, branch: BRANCH }),
+      }))
+      if (!r.ok) { const t = await r.text(); logEnd(logId, { httpStatus: r.status, detail: t.slice(0, 160) }); return res.status(200).json({ url: null, error: 'github', detail: t.slice(0, 160) }) }
+      logEnd(logId, { httpStatus: r.status })
+      return res.status(200).json({ url: `/api/img?path=${path}`, path })
+    } catch (e) { logEnd(logId, { status: 'failed', detail: e && e.message }); return res.status(200).json({ url: null, error: 'fetch' }) }
+  }
+
+  res.setHeader('Allow', 'GET, POST')
+  return res.status(405).end()
+}

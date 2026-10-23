@@ -1,0 +1,178 @@
+// upload-mapped-git.mjs : Git-only upload of files that each have their OWN destination folder and title.
+// FR : upload 100 % Git de fichiers dont chacun a son dossier et son titre propres (table de correspondance JSON).
+// 2 October 2026 : written for the wedding album (one folder per author, author name in the title), reusable for any
+// "sort while uploading" job. Images -> public shard (jsDelivr), videos -> private shard (95 MiB parts), same ingestion
+// code as upload-img-list-git.mjs / upload-vidraw-list.mjs, only the manifest writing differs (clone + one push per batch).
+//
+// Usage : GITHUB_TOKEN=.. ZR_ZDATA_CLONE=<isolated sparse clone> node scripts/upload-mapped-git.mjs <plan.json> [--plan] [--only=img|vid]
+//   plan.json = [{ "src": "/abs/file", "dest": "pages/…/<Author>", "name": "<Author> - IMG_1.HEIC", "by": "<Author>" }, …]
+//   --plan : prints the table (counts per folder, already-online skips) and stops, zero network, zero shard.
+// REST used : 1 call per new shard (repo creation), index-add once at the end. Never a per-file REST call.
+
+import { makeImgShardCtx, ingestImageBulk, resolveImgManifest } from './img-ingest.mjs'
+import { makeVidRawShardCtx, ingestVideoRaw } from './video-raw-lib.mjs'
+import { jsDelivrUrl, GIT_ENV } from './lib/img-pipeline.mjs'
+import { withCloneLock } from './lib/clone-lock.mjs'
+import { kindForName } from '../src/lib/fileKinds.js'
+import { appendPublicDelta, thumbsForPaths } from '../server/page.js'
+import { execFileSync } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
+import { mkdir, writeFile, rm, stat } from 'node:fs/promises'
+import path from 'node:path'
+
+const REPO = '/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress'
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const token = process.env.GITHUB_TOKEN
+const CLONE = process.env.ZR_ZDATA_CLONE
+const args = process.argv.slice(2)
+const planFile = args.find((a) => !a.startsWith('--'))
+const PLAN_ONLY = args.includes('--plan')
+const ONLY = (args.find((a) => a.startsWith('--only=')) || '').slice(7) // '', 'img' or 'vid'
+const BATCH = Number(process.env.ZR_MAPPED_BATCH || 100) // manifests committed every BATCH files (checkpoint)
+if (!planFile) { console.error('usage: GITHUB_TOKEN=.. ZR_ZDATA_CLONE=.. node upload-mapped-git.mjs <plan.json> [--plan] [--only=img|vid]'); process.exit(1) }
+if (!PLAN_ONLY && (!token || !CLONE)) { console.error('GITHUB_TOKEN and ZR_ZDATA_CLONE (isolated sparse clone of zenray-data) are required'); process.exit(1) }
+if (CLONE && !existsSync(path.join(CLONE, '.git'))) { console.error(`clone not found: ${CLONE}`); process.exit(1) }
+
+const plan = JSON.parse(readFileSync(planFile, 'utf8'))
+const kindOf = (e) => { const k = kindForName(e.src); return k === 'video' ? 'vid' : (k === 'image' || k === 'image-lib') ? 'img' : 'other' }
+const stemOf = (name) => name.replace(/\.[^.]+$/, '')
+const extLower = (name) => name.split('.').pop().toLowerCase()
+const manifestPathOf = (e) => (kindOf(e) === 'vid'
+  ? `${e.dest}/${stemOf(e.name)}.${extLower(e.src)}.media.json`
+  : `${e.dest}/${e.name}.img.json`)
+
+const GENV = { ...process.env, ...GIT_ENV }
+const git = (a, timeout = 300000) => execFileSync('git', ['-C', CLONE, ...a], { env: GENV, timeout, encoding: 'utf8' })
+// 12 October 2026: the CMAF attach of the previous film writes to this clone at the same time; both take the clone lock.
+// FR : l'empaquetage du film precedent ecrit dans ce clone en meme temps ; les deux prennent le verrou du clone.
+if (!PLAN_ONLY) {
+  await withCloneLock(CLONE, 'upload-mapped-git start', async () => {
+    if (git(['status', '--porcelain']).trim()) throw new Error('clone is dirty, refusing to start')
+    git(['pull', '--rebase', '-q'])
+  })
+}
+
+// 1) validation + local skips (zero network) / FR : validation et sauts locaux
+const bad = [], other = [], todo = []
+const names = new Set()
+for (const e of plan) {
+  const k = kindOf(e)
+  if (k === 'other') { other.push(e.src); continue }
+  if (ONLY && ONLY !== k) continue
+  const key = manifestPathOf(e)
+  if (names.has(key)) throw new Error(`duplicate target ${key}`)
+  names.add(key)
+  try { await stat(e.src) } catch { bad.push(e.src); continue }
+  if (CLONE && existsSync(path.join(CLONE, key))) continue // already online
+  todo.push({ ...e, kind: k, key })
+}
+const perDest = {}
+for (const e of todo) perDest[e.dest] = (perDest[e.dest] || { img: 0, vid: 0 }), perDest[e.dest][e.kind]++
+console.log(`plan: ${plan.length} entries, to upload ${todo.length} (img ${todo.filter((e) => e.kind === 'img').length}, vid ${todo.filter((e) => e.kind === 'vid').length}), missing sources ${bad.length}, unknown kinds ${other.length}`)
+for (const [d, c] of Object.entries(perDest).sort()) console.log(`  ${d.split('/').slice(-1)[0].padEnd(24)} img ${String(c.img).padStart(4)}  vid ${String(c.vid).padStart(4)}`)
+if (bad.length) console.log('missing:', bad.slice(0, 5))
+if (other.length) console.log('unknown kinds:', other.slice(0, 5))
+if (PLAN_ONLY || !todo.length || bad.length || other.length) process.exit(bad.length || other.length ? 1 : 0)
+
+// 2) commit + push manifests, checkpoint after every batch (retry on non-fast-forward) / FR : point de reprise
+const writtenPaths = []
+async function commitManifests(blobs, label) {
+  if (!blobs.length) return
+  await withCloneLock(CLONE, `upload-mapped-git commit ${label}`, async () => {
+    for (const b of blobs) { const abs = path.join(CLONE, b.path); await mkdir(path.dirname(abs), { recursive: true }); await writeFile(abs, b.content) }
+    git(['add', '--', ...blobs.map((b) => b.path)])
+    git(['commit', '-q', '-m', `add: ${label} (${blobs.length} manifests)`])
+    for (let a = 0; a < 5; a++) {
+      try { git(['push', '-q', 'origin', 'HEAD:main'], 600000); break }
+      catch (e) { console.log(`push rejected, pull --rebase and retry ${a + 1}/5`); git(['pull', '--rebase', '-q']); if (a === 4) throw e }
+    }
+  })
+  for (const b of blobs) writtenPaths.push(b.path)
+  console.log(`  checkpoint: ${blobs.length} manifests pushed (${writtenPaths.length} total)`)
+}
+
+const withBy = (content, e) => { const m = JSON.parse(content); if (e.by) m.by = e.by; return JSON.stringify(m) }
+const runWork = path.join(process.env.HOME, '.zr-archive-work-mapped', `run-${process.pid}-${Date.now().toString(36)}`)
+let ok = 0, failed = 0
+const failures = []
+const imgCtxRepos = new Set()
+try {
+  // 3) images -> public shard
+  const imgs = todo.filter((e) => e.kind === 'img')
+  if (imgs.length) {
+    const ctx = makeImgShardCtx({ token, work: path.join(runWork, 'img'), repoRoot: REPO, log: (...a) => console.log('   ', ...a) })
+    await ctx.openShard()
+    for (let i = 0; i < imgs.length; i += BATCH) {
+      const slice = imgs.slice(i, i + BATCH), pendings = []
+      for (const e of slice) {
+        try { pendings.push({ e, p: await ingestImageBulk(e.src, e.name, e.dest, ctx) }) }
+        catch (err) { failed++; failures.push(e.src); console.log(`✗ FAIL ${e.name}: ${(err && err.message || err).toString().slice(0, 160)}`) }
+      }
+      await ctx.flush()
+      const blobs = []
+      for (const { e, p } of pendings) {
+        try { const sb = resolveImgManifest(p, ctx); blobs.push({ path: sb.path, content: withBy(sb.content, e) }); imgCtxRepos.add(p.repo) }
+        catch (err) { failed++; failures.push(e.src); console.log(`✗ resolve ${e.name}: ${(err && err.message || err).toString().slice(0, 120)}`) }
+      }
+      await commitManifests(blobs, `images ${i + 1}-${i + slice.length}`)
+      ok += blobs.length
+      console.log(`  images ${Math.min(i + BATCH, imgs.length)}/${imgs.length} online`)
+    }
+  }
+  // 4) videos -> private shard (one flush per video inside ingestVideoRaw)
+  const vids = todo.filter((e) => e.kind === 'vid')
+  if (vids.length) {
+    const vctx = makeVidRawShardCtx({ token, work: path.join(runWork, 'vid'), log: (...a) => console.log('   ', ...a), type: 'vid', vis: 'private', cleanupClosedShards: true })
+    // One shared private shard for the whole job: ingestVideoRaw calls beginFile() per video, which would open a NEW repo for every
+    // clip (179 repos for 179 clips, measured 2 October 2026). A no-op beginFile keeps one shard, rollover stays at SHARD_CAP.
+    // FR : un seul shard privé partagé ; sans cela, un repo neuf par clip (179 repos pour 179 clips, mesuré le 2 October 2026).
+    vctx.beginFile = async () => {}
+    let blobs = []
+    for (let i = 0; i < vids.length; i++) {
+      const e = vids[i]
+      try {
+        const { manifestPath, manifest } = await ingestVideoRaw(e.src, { dest: e.dest, base: stemOf(e.name), vctx, workDir: path.join(runWork, 'remux'), log: () => {} })
+        if (manifestPath !== e.key) throw new Error(`manifest path mismatch ${manifestPath} != ${e.key}`)
+        manifest.name = e.name // title carries the author / FR : le titre porte l'auteur
+        if (e.by) manifest.by = e.by
+        blobs.push({ path: manifestPath, content: JSON.stringify(manifest) })
+        console.log(`✓ [${i + 1}/${vids.length}] ${e.name}`)
+      } catch (err) { failed++; failures.push(e.src); console.log(`✗ FAIL ${e.name}: ${(err && err.message || err).toString().slice(0, 160)}`) }
+      if (blobs.length >= BATCH || (i === vids.length - 1 && blobs.length)) { await commitManifests(blobs, `videos to ${i + 1}`); ok += blobs.length; blobs = [] }
+    }
+    // 12 October 2026: the archive push of the videos runs through the push batch policy (lib/push-batch-policy.mjs); its measures
+    // are printed once per job (batches, failed attempts, average and effective throughput, largest pack ratio).
+    // FR : la poussee des videos suit la politique de lots ; ses mesures sont affichees une fois par travail.
+    const pushSummary = vctx.pushSummary()
+    if (pushSummary.attempts) {
+      console.log(`  push policy: ${pushSummary.batches} push(es) of ${(pushSummary.payloadBytes / 1048576).toFixed(0)} MiB, `
+        + `${pushSummary.failedAttempts} failed attempt(s), average ${(pushSummary.averageThroughputBps / 1048576).toFixed(1)} MiB/s, `
+        + `effective ${(pushSummary.effectiveThroughputBps / 1048576).toFixed(1)} MiB/s, wait ${(pushSummary.waitMs / 1000).toFixed(0)} s, `
+        + `pack ratio ${pushSummary.packRatio ?? 'n/a'}, mode ${vctx.pushPolicy.state().mode}, level ${vctx.pushPolicy.state().level} parts`)
+    }
+  }
+} finally {
+  await rm(runWork, { recursive: true, force: true }).catch(() => {})
+}
+
+// 5) one single index-add with the full list (never several, see INDEX-ERREURS-FEATURES 2026-07-14) / FR : un seul index-add
+// 12 October 2026: ZR_DEFER_INDEX_ADD=1 spools the paths instead (one path per line) and skips the REST calls: each index-add
+// rereads, rewrites and reposts an 11 MB delta (4 content-creating requests, about 20 s) and the film queue paid it per film,
+// feeding GitHub's secondary rate limit. The worker flushes the spool every few films with scripts/index-add-paths.mjs.
+// FR : ZR_DEFER_INDEX_ADD=1 met les chemins en file d'attente ; le worker les ajoute a l'index par lots.
+if (writtenPaths.length && process.env.ZR_DEFER_INDEX_ADD === '1') {
+  const spool = process.env.ZR_INDEX_SPOOL || path.join(process.env.HOME, '.zr-archive-work-mapped', 'IndexAddSpool.txt')
+  await mkdir(path.dirname(spool), { recursive: true })
+  await writeFile(spool, writtenPaths.join('\n') + '\n', { flag: 'a' })
+  console.log(`  index-add: ${writtenPaths.length} path(s) deferred to ${spool}`)
+} else if (writtenPaths.length) {
+  try {
+    const allThumbs = {}
+    for (let i = 0; i < writtenPaths.length; i += 200) Object.assign(allThumbs, await thumbsForPaths(token, writtenPaths.slice(i, i + 200)))
+    const idxOk = await appendPublicDelta(token, writtenPaths, allThumbs)
+    console.log(`  index-add: ${idxOk ? writtenPaths.length : 0}/${writtenPaths.length} paths added to the public delta`)
+  } catch (e) { console.log(`  ⚠ index-add failed (recoverable with scripts/index-add-paths.mjs): ${(e && e.message || e).toString().slice(0, 120)}`) }
+}
+console.log(`\n✓✓ MAPPED GIT UPLOAD DONE: ${ok} manifests online, ${failed} failure(s).`)
+if (failures.length) console.log('failed sources:', failures.join('\n  '))
+process.exit(failed ? 1 : 0)

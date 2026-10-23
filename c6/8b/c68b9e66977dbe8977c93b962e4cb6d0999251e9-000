@@ -1,0 +1,60 @@
+// 2 October 2026, 13:08 CEST: history is a view of original feedback and progress, never a rewritten journal.
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+
+export function feedbackEvents(markdown, { projectId, sourcePath = '' } = {}) {
+  const sections = String(markdown).split(/(?=^#{1,3}\s)/m)
+  const events = []
+  const codexIterationKeys = new Map()
+  for (const section of sections) {
+    const heading = section.match(/^#{1,3}\s+(.+)/)?.[1]
+    if (!heading) continue
+    const date = heading.match(/\d{1,2} (?:January|February|March|April|May|June|July|August|September|October|November|December) \d{4}(?:,? \d{2}:\d{2}(?::\d{2})?(?: [+-]\d{4})?)?|\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?/i)?.[0]
+    const type = section.match(/kind:\s*(\w+)/)?.[1] || (/prompt|demande/i.test(heading) ? 'prompt' : /iteration|itération/i.test(heading) ? 'iteration' : /décision|decision/i.test(heading) ? 'decision' : 'feedback')
+    // 3 October 2026, 15:14 CEST: unwrap the writer's dated quote without rewriting historical Markdown or authored dates.
+    const source = section.match(/^- Source: (.+)\. \(/m)?.[1] || null
+    const checkpoint = source?.startsWith('checkpoint:')
+    const provider = source?.includes('/.codex/sessions/') ? 'Codex' : source?.includes('/.claude/projects/') ? 'Claude Code' : checkpoint ? source.split(':')[1] : null
+    // 3 October 2026, 22:25 CEST: a delegated transcript carries its real agent identity separately from human discussion.
+    const subagentId = source?.includes('/subagents/') ? source.split('/').pop().match(/^agent-(.+)\.jsonl$/)?.[1] : null
+    const quoted = section.split('\n').filter(line => /^>/.test(line))
+    const body = quoted.length && /^- Project:/m.test(section) ? quoted.map(line => {
+      let text = line.replace(/^> ?/, '')
+      const suffix = ` (${date})`
+      if (date && text.endsWith(suffix)) text = text.slice(0, -suffix.length)
+      return text
+    }).join('\n').trim() : section.split('\n').slice(1).filter((line) => !/^<!--|^- Project:|^- Source:/.test(line)).join('\n').trim()
+    if (!body) continue
+    const parsed = date ? Date.parse(date.replace(',', '')) : NaN
+    const event = { id: section.match(/<!-- feedback-event:([a-f0-9]{64})/)?.[1] || createHash('sha256').update(`${projectId}:${sourcePath}:${section}`).digest('hex'), projectId,
+      type, title: heading, body, provenance: { provider, mode: checkpoint ? 'checkpoint' : provider ? 'transcript' : 'feedback', ...(subagentId ? { actor: 'subagent', agentId: subagentId } : {}), ...(source && !checkpoint ? { transcriptFile: source.split('/').pop() } : {}) }, ...(Number.isFinite(parsed) ? { createdAt: new Date(parsed).toISOString() } : {}), sourcePath }
+    // 9 October 2026, 14:12 CEST: task_complete and response_item can archive one Codex final under different event hashes.
+    const codexKey = provider === 'Codex' && type === 'iteration' && source?.includes('/.codex/sessions/') ? JSON.stringify([source, date, body]) : null
+    const previousIndex = codexKey ? codexIterationKeys.get(codexKey) : undefined
+    if (previousIndex !== undefined) {
+      const previous = events[previousIndex]
+      previous.duplicateCount = (previous.duplicateCount || 1) + 1
+      continue
+    }
+    if (codexKey) codexIterationKeys.set(codexKey, events.length)
+    events.push(event)
+  }
+  return events
+}
+
+export function progressEvents(markdown, project) {
+  const identities = [project.id, project.name, project.feedbackPath, ...project.sources.map((source) => source.localPath)].filter(Boolean)
+  return String(markdown).split(/(?=^\d{4}-\d{2}-\d{2} \d{2}:\d{2})/m).filter((entry) => /^\d{4}-/.test(entry) && identities.some((identity) => entry.toLowerCase().includes(identity.toLowerCase())))
+    .map((entry) => ({ id: createHash('sha256').update(entry).digest('hex'), projectId: project.id, type: 'progress',
+      createdAt: entry.split('\n')[0].replace(' ', 'T') + '+02:00', title: entry.match(/^- Fait\s*:\s*(.+)/m)?.[1] || 'Progression du projet', body: entry.split('\n').slice(1).join('\n').trim() }))
+}
+
+export async function readProjectHistory(project, localFiles, operationalEvents, { progressPath } = {}) {
+  const sources = new Set([project.feedbackPath, ...localFiles.filter((file) => /(?:^|\/)(?:feedback[^/]*|[^/]*feedback)\.md$/i.test(file.relativePath)).map((file) => file.localPath)].filter(Boolean))
+  const outcomes = await Promise.allSettled([...sources].map(async (file) => feedbackEvents(await readFile(file, 'utf8'), { projectId: project.id, sourcePath: file })))
+  const events = [...operationalEvents, ...outcomes.filter((result) => result.status === 'fulfilled').flatMap((result) => result.value)]
+  if (progressPath) {
+    try { events.push(...progressEvents(await readFile(progressPath, 'utf8'), project)) } catch (error) { if (error.code !== 'ENOENT') throw error }
+  }
+  return [...new Map(events.map((event) => [event.id, event])).values()].sort((left, right) => (right.createdAt || '').localeCompare(left.createdAt || ''))
+}

@@ -1,0 +1,67 @@
+// THE BROWSER SIDE OF THE GUEST UPLOADER (2 October 2026): hashing, thumbnail, blob slicing, the HTTP call, network state, and the memory of
+// what was already sent. Everything the platform-free core (uploadCore.js) needs and cannot do itself.
+import { GUEST } from '../config/guestUpload.js'
+import { THUMB_MAX_SHORT, THUMB_QUALITY, THUMB_GRID_MAX_WIDTH, THUMB_GRID_QUALITY_PCT } from '../config/thumbnail.js'
+
+const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('')
+
+// One decode gives both the picture size (as DISPLAYED: EXIF rotation applied) and the thumbnail. WebP when the browser can encode it,
+// JPEG otherwise (Safari answers PNG when asked for WebP): never a PNG thumbnail.
+async function makeThumb(file) {
+  let bmp
+  try { bmp = await createImageBitmap(file) } catch { return null }        // HEIC in a browser that cannot decode it: no thumbnail, the photo is still stored
+  const w = bmp.width, h = bmp.height
+  if (!w || !h) { bmp.close && bmp.close(); return null }
+  const scale = Math.min(1, THUMB_MAX_SHORT / Math.min(w, h))
+  const tw = Math.max(1, Math.round(w * scale)), th = Math.max(1, Math.round(h * scale))
+  try {
+    const canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(tw, th) : Object.assign(document.createElement('canvas'), { width: tw, height: th })
+    const ctx = canvas.getContext('2d')
+    ctx.drawImage(bmp, 0, 0, tw, th)
+    const toBlob = (type, q) => (canvas.convertToBlob ? canvas.convertToBlob({ type, quality: q }) : new Promise((res) => canvas.toBlob(res, type, q)))
+    let blob = await toBlob('image/webp', THUMB_QUALITY)
+    if (!blob || blob.type !== 'image/webp') blob = await toBlob('image/jpeg', 0.84)
+    if (!blob) return { bytes: null, w, h }
+    const out = { bytes: new Uint8Array(await blob.arrayBuffer()), mime: blob.type, w, h, thumbW: tw, thumbH: th }
+    // Light GRID thumbnail from the same decode (520 px wide): best-effort, a photo without it just loads its tile more slowly.
+    try {
+      const gs = Math.min(1, THUMB_GRID_MAX_WIDTH / w), gw = Math.max(1, Math.round(w * gs)), gh = Math.max(1, Math.round(h * gs))
+      const gc = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(gw, gh) : Object.assign(document.createElement('canvas'), { width: gw, height: gh })
+      gc.getContext('2d').drawImage(bmp, 0, 0, gw, gh)
+      const gBlob = await (gc.convertToBlob ? gc.convertToBlob({ type: blob.type, quality: THUMB_GRID_QUALITY_PCT / 100 }) : new Promise((res) => gc.toBlob(res, blob.type, THUMB_GRID_QUALITY_PCT / 100)))
+      if (gBlob && gBlob.size) out.grid = { bytes: new Uint8Array(await gBlob.arrayBuffer()), thumbSW: gw, thumbSH: gh }
+    } catch { /* no grid thumbnail */ }
+    return out
+  } catch { return { bytes: null, w, h } } finally { bmp.close && bmp.close() }
+}
+
+const seenKey = (token) => `zr-guest-seen:${String(token).slice(-24)}`
+function loadSeen(token) { try { return new Set(JSON.parse(localStorage.getItem(seenKey(token)) || '[]')) } catch { return new Set() } }
+
+export function makeBrowserAdapters({ token, url = GUEST.ROUTE } = {}) {
+  const seen = loadSeen(token)
+  let saveTimer = null
+  return {
+    readBlob: async (file, a, b) => new Uint8Array(await file.slice(a, b).arrayBuffer()),
+    hashBytes: async (u8) => hex(await crypto.subtle.digest('SHA-256', u8)),
+    makeThumb,
+    send: (frame, { onProgress } = {}) => new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest()
+      x.open('POST', url)
+      x.setRequestHeader('content-type', 'application/octet-stream')
+      x.timeout = 180_000
+      if (onProgress && x.upload) x.upload.onprogress = (e) => { if (e.lengthComputable && e.total) onProgress(e.loaded / e.total) }
+      x.onload = () => { if (x.status >= 200 && x.status < 300) { try { resolve(JSON.parse(x.responseText)) } catch { reject(new Error('bad-json')) } } else reject(new Error(`http-${x.status}`)) }
+      x.onerror = () => reject(new Error('network')); x.ontimeout = () => reject(new Error('timeout')); x.onabort = () => reject(new Error('abort'))
+      x.send(frame)
+    }),
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    isOnline: () => (typeof navigator === 'undefined' ? true : navigator.onLine !== false),
+    waitOnline: (maxMs = 8000) => new Promise((resolve) => {
+      const done = () => { window.removeEventListener('online', done); clearTimeout(t); resolve() }
+      const t = setTimeout(done, maxMs); window.addEventListener('online', done)
+    }),
+    seen: (h) => seen.has(h),
+    remember: (h) => { seen.add(h); clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { localStorage.setItem(seenKey(token), JSON.stringify([...seen].slice(-4000))) } catch { /* private mode */ } }, 400) },
+  }
+}

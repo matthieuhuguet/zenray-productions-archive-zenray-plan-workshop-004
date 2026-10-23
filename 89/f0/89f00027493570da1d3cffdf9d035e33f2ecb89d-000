@@ -1,0 +1,126 @@
+// backfill-grid-thumbs-git.mjs : adds the light GRID thumbnail (thumbS) to images already online, 100 % Git.
+// FR : ajoute la vignette légère de GRILLE (thumbS) aux images déjà en ligne, 100 % Git.
+// 2 October 2026 : the standard thumbnail (1080 short side, q90) weighs ~300 KB; a gallery grid of 40 tiles downloaded 12 MB.
+// This derives a 520 px wide / q80 thumbnail (~30-70 KB) FROM THE EXISTING THUMBNAIL (download, decrypt, resize, encrypt), so no original is needed.
+// Link placements (zenray-eagle-link/v1) are followed to their source manifest through the registry (`pages/.zr-resources/<id>.json`).
+//
+// Usage : GITHUB_TOKEN=.. ZR_ZDATA_CLONE=<isolated sparse clone with the folder and pages/.zr-resources> node scripts/backfill-grid-thumbs-git.mjs "<folder in the clone>" [--plan]
+//   --plan : counts what would be done (no network, no shard). Safe to re-run: manifests that already carry thumbS are skipped.
+// REST used : 1 call (creation of ONE new public shard for all the grid thumbnails). Manifests are written in the clone, one commit per batch.
+
+import { makeImgShardCtx } from './img-ingest.mjs'
+import { sha256Hex, encryptDeterministic, shardPathFor, jsDelivrUrl, GIT_ENV } from './lib/img-pipeline.mjs'
+import { makeThumbAt } from './img-ingest.mjs'
+import { THUMB_GRID_MAX_WIDTH, THUMB_GRID_QUALITY_PCT } from '../src/config/thumbnail.js'
+import { appendPublicDelta } from '../server/page.js'
+import { execFileSync } from 'node:child_process'
+import { createDecipheriv } from 'node:crypto'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { mkdir, writeFile, rm } from 'node:fs/promises'
+import path from 'node:path'
+import os from 'node:os'
+
+const REPO = '/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress'
+const token = process.env.GITHUB_TOKEN
+const CLONE = process.env.ZR_ZDATA_CLONE
+const folder = process.argv[2]
+const PLAN_ONLY = process.argv.includes('--plan')
+const BATCH = Number(process.env.ZR_GRID_BATCH || 100)
+const PARALLEL = Number(process.env.ZR_GRID_PARALLEL || 12)
+if (!folder || !CLONE || (!PLAN_ONLY && !token)) { console.error('usage: GITHUB_TOKEN=.. ZR_ZDATA_CLONE=.. node backfill-grid-thumbs-git.mjs "<folder>" [--plan]'); process.exit(1) }
+if (!existsSync(path.join(CLONE, '.git'))) { console.error(`clone not found: ${CLONE}`); process.exit(1) }
+
+const GENV = { ...process.env, ...GIT_ENV }
+const git = (a, timeout = 300000) => execFileSync('git', ['-C', CLONE, ...a], { env: GENV, timeout, encoding: 'utf8' })
+if (!PLAN_ONLY) { if (git(['status', '--porcelain']).trim()) throw new Error('clone is dirty, refusing to start'); git(['pull', '--rebase', '-q']) }
+
+// 1) every manifest under the folder, links followed to their source / FR : tous les manifestes, liens suivis jusqu'à leur source
+const walk = (dir) => readdirSync(path.join(CLONE, dir)).flatMap((n) => {
+  const rel = `${dir}/${n}`
+  return statSync(path.join(CLONE, rel)).isDirectory() ? walk(rel) : (n.endsWith('.img.json') ? [rel] : [])
+})
+const targets = new Map() // real manifest path -> manifest
+let missingSource = 0, notPublic = 0
+for (const rel of walk(folder)) {
+  let m = JSON.parse(readFileSync(path.join(CLONE, rel), 'utf8')), real = rel
+  if (m.type === 'zenray-eagle-link/v1') {
+    const reg = path.join(CLONE, 'pages/.zr-resources', `${m.resourceId}.json`)
+    if (!existsSync(reg)) { missingSource++; continue }
+    real = JSON.parse(readFileSync(reg, 'utf8')).sourcePath
+    if (!real || !existsSync(path.join(CLONE, real))) { missingSource++; continue }
+    m = JSON.parse(readFileSync(path.join(CLONE, real), 'utf8'))
+  }
+  if (m.vis !== 'public' || !m.thumb || !m.thumbIv) { notPublic++; continue }
+  if (m.thumbS && m.thumbSIv) continue // already done
+  targets.set(real, m)
+}
+console.log(`to do: ${targets.size} manifests | links without a readable source: ${missingSource} | no standard thumbnail: ${notPublic}`)
+if (PLAN_ONLY || !targets.size) process.exit(0)
+
+// 2) derive, encrypt, push in ONE new public shard, then write manifests per batch / FR : dériver, chiffrer, pousser, écrire les manifestes
+const runWork = path.join(os.homedir(), '.zr-archive-work-grid', `run-${process.pid}-${Date.now().toString(36)}`)
+await mkdir(runWork, { recursive: true })
+const ctx = makeImgShardCtx({ token, work: runWork, repoRoot: REPO, log: (...a) => console.log('   ', ...a) })
+const decrypt = (cipher, ivB64) => {
+  const d = createDecipheriv('aes-256-gcm', ctx.key, Buffer.from(ivB64, 'base64'))
+  d.setAuthTag(cipher.subarray(cipher.length - 16))
+  return Buffer.concat([d.update(cipher.subarray(0, cipher.length - 16)), d.final()])
+}
+async function download(url) {
+  for (let a = 0; a < 6; a++) {
+    try { const r = await fetch(url); if (r.ok) return Buffer.from(await r.arrayBuffer()) } catch { /* retry */ }
+    await new Promise((r) => setTimeout(r, 1500 * (a + 1)))
+  }
+  const raw = /^https:\/\/cdn\.jsdelivr\.net\/gh\/([^/]+)\/([^@/]+)@([0-9a-f]{40})\/(.+)$/.exec(url)
+  if (raw) { const r = await fetch(`https://raw.githubusercontent.com/${raw[1]}/${raw[2]}/${raw[3]}/${raw[4]}`); if (r.ok) return Buffer.from(await r.arrayBuffer()) }
+  throw new Error('download failed ' + url.slice(-60))
+}
+
+const entries = [...targets.entries()]
+let done = 0, failed = 0
+await ctx.openShard()
+try {
+  for (let i = 0; i < entries.length; i += BATCH) {
+    const slice = entries.slice(i, i + BATCH), pend = []
+    for (let j = 0; j < slice.length; j += PARALLEL) {
+      // download + decrypt + resize in parallel (CPU and network), push into the shard one after the other
+      const made = await Promise.all(slice.slice(j, j + PARALLEL).map(async ([rel, m]) => {
+        try {
+          const plain = decrypt(await download(m.thumb), m.thumbIv)
+          const tmp = path.join(runWork, `src-${sha256Hex(Buffer.from(rel)).slice(0, 16)}.webp`)
+          await writeFile(tmp, plain)
+          const t = makeThumbAt(tmp, runWork, 0, THUMB_GRID_QUALITY_PCT, { maxWidth: THUMB_GRID_MAX_WIDTH })
+          await rm(tmp, { force: true })
+          if (!t) throw new Error('resize failed')
+          return { rel, m, t }
+        } catch (e) { failed++; console.log(`✗ ${rel.split('/').pop()}: ${(e && e.message || e).toString().slice(0, 100)}`); return null }
+      }))
+      for (const x of made.filter(Boolean)) {
+        const hash = sha256Hex(x.t.buf)
+        const enc = encryptDeterministic(x.t.buf, ctx.key, hash)
+        const p = shardPathFor(hash, 'webp')
+        const repo = await ctx.writeBinary(p, enc.cipher)
+        pend.push({ ...x, p, repo, iv: enc.iv })
+      }
+    }
+    await ctx.flush()
+    const written = []
+    for (const x of pend) {
+      const commit = ctx.commitOf[x.repo]
+      if (!commit) { failed++; console.log(`✗ no commit for ${x.repo}`); continue }
+      const next = { ...x.m, thumbS: jsDelivrUrl(ctx.owner, x.repo, commit, x.p), thumbSIv: x.iv, thumbSW: x.t.w, thumbSH: x.t.h }
+      await writeFile(path.join(CLONE, x.rel), JSON.stringify(next))
+      written.push(x.rel)
+    }
+    if (written.length) {
+      git(['add', '--', ...written]); git(['commit', '-q', '-m', `add: grid thumbnails (${written.length} manifests)`])
+      for (let a = 0; a < 5; a++) {
+        try { git(['push', '-q', 'origin', 'HEAD:main'], 600000); break } catch (e) { console.log(`push rejected, pull --rebase and retry ${a + 1}/5`); git(['pull', '--rebase', '-q']); if (a === 4) throw e }
+      }
+      done += written.length
+    }
+    console.log(`  ${Math.min(i + BATCH, entries.length)}/${entries.length} processed, ${done} manifests updated`)
+  }
+} finally { await rm(runWork, { recursive: true, force: true }).catch(() => {}) }
+console.log(`\n✓✓ GRID THUMBNAILS DONE: ${done} manifests updated, ${failed} failure(s). REST used: 1 call (shard creation).`)
+process.exit(failed ? 1 : 0)

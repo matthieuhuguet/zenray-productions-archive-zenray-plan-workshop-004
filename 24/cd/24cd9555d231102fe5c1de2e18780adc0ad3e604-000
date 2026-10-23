@@ -1,0 +1,288 @@
+// ═══ LE MINUTEUR VIT AU-DESSUS DES VUES, ET C'EST TOUT LE CORRECTIF (2026-08-27) ══════════════════
+//
+// LE BUG, DANS LES MOTS DE MATTHIEU : « quand je quitte la page de la nav le timer s'arrête alors
+// qu'il devrait continuer ». Le mot « s'arrête » décrit ce qu'on voit, pas ce qui se passe. Rien ne
+// l'arrêtait : `ZenRayTimer` n'était monté que sous `view === 'timer'`, si bien que changer de nav le
+// DÉMONTAIT, avec son `useState`, son `setInterval` et son heure de fin. Il ne se mettait pas en
+// pause, il cessait d'exister, et revenir en fabriquait un neuf à quinze minutes.
+//
+// LA PARADE EST DÉJÀ ÉCRITE DANS CE DÉPÔT, il suffisait de la lire : ZenRay Audio ne survit pas à la
+// navigation par magie, il survit parce que `PlayerProvider` enveloppe l'application ENTIÈRE et que
+// `PlayerBar` se rend hors du commutateur de vues. Même architecture ici, même raison. Chercher le
+// geste (« qu'est-ce qui, dans cette app, survit déjà à un changement de vue ») plutôt que la
+// fonctionnalité a évité d'inventer un stockage ou un ouvrier de fond dont personne n'avait besoin.
+//
+// CE QUI RESTE DANS LA VUE, ET POURQUOI. Le fournisseur porte le TEMPS et le FAIT : l'heure de fin,
+// les secondes restantes, le son, l'écriture dans le Plan. La vue garde tout ce qui est de l'ordre du
+// spectacle, particules et secousse, parce que ces choses n'ont de sens que là où on les regarde. Le
+// fournisseur se contente de SIGNALER les moments ; la vue décide comment les dessiner quand elle est
+// là, et personne ne dessine quand elle n'y est pas.
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+// Une seule définition des paliers et des habitudes, celle du Plan, sortie dans son propre fichier le
+// 2026-08-27 : ce fournisseur est monté dès le premier écran, et importer `PlanBoard.jsx` aurait tiré
+// 1 676 lignes dans le lot initial pour cinq constantes.
+import { DURATION_PRESETS, DUREE_DEFAUT, majTitreHabitude } from '../create/planHabitudes.js'
+import { notify } from '../components/Notifications.jsx'
+// La phrase du titre se met à l'échelle (« 24 h » plutôt que « 1440 min ») ; le champ `durationMin`,
+// lui, reste en minutes entières, parce que c'est la DONNÉE que le Plan lit et non la phrase.
+import { formaterDuree } from './dureeSaisie.js'
+// L'index de recherche est la source que la vue Plan utilise DÉJÀ pour lister tous les `.plan.json` où
+// qu'ils soient. J'avais d'abord tapé `/api/page?action=index` à la main : la route rend du HTML, pas
+// du JSON, et le résolveur échouait silencieusement en « aucun plan trouvé ».
+import { loadSearchIndex, getIndexPaths } from '../search/searchIndexClient.js'
+
+// ── L'INTERFACE DE PARAMÈTRES (loi HDA) ───────────────────────────────────────────────────────────
+// Tout ce qui se juge à l'œil ou à l'oreille vit ICI et nulle part ailleurs. Changer la durée d'une
+// secousse, la hauteur d'une note ou le nombre d'étincelles se fait sur une ligne, et toutes les
+// instances suivent, la page comme la pastille flottante.
+export const TB = {
+  // Les paliers ne sont pas redéclarés : ce sont EXACTEMENT ceux du Time block du Plan, importés, pour
+  // que modifier l'un modifie l'autre. Le même geste doit rendre le même résultat aux deux endroits.
+  paliers: DURATION_PRESETS.map((d) => d.minutes),
+  defaut: DUREE_DEFAUT,
+  anneau: { taille: 340, rExt: 152, rInt: 116, trait: 14 },
+  // Secousse : « la plus faible valeur qui se sente encore », jamais la plus forte qui passe encore.
+  secousse: { legere: 3, moyenne: 7, forte: 16, duree: 420 },
+  // PARTICULES. « enlève les confettis, plutôt un feu d'artifice, des particules blanches très fines »
+  // (Matthieu, 2026-08-27). Le confetti était coloré, large et tournoyant : lisible, mais bruyant. La
+  // gerbe blanche tient sur trois valeurs, un rayon minuscule, une pesanteur presque nulle, une vie
+  // longue, et c'est cette lenteur qui la rend élégante là où le confetti se contentait d'être gai.
+  particules: {
+    parPalier: 22, parFin: 150, gravite: 0.055, friction: 0.978, vieMs: 2200,
+    rayon: [0.4, 1.7],      // en pixels. Au-delà de 2 on retombe dans la pastille, et la finesse est perdue.
+    halo: 3.2,              // multiplicateur du rayon pour le voile lumineux qui entoure chaque étincelle
+    scintille: 0.34,        // amplitude du battement de luminosité ; à 0 la gerbe devient une poussière morte
+  },
+  // La pastille flottante reste visible quelques secondes après la fin, puis s'efface d'elle-même. Sans
+  // ce délai elle camperait à l'écran jusqu'à ce qu'on retourne sur la page du minuteur, ce qui
+  // transformerait une réussite en corvée de rangement.
+  pastille: { survieApresFin: 9000 },
+  // SONS, remplaçables un par un par des fichiers. Chaque entrée décrit une note : forme d'onde,
+  // fréquence en hertz, durée, volume, et une éventuelle glissade vers une seconde fréquence.
+  // Le registre est celui des sons système d'Apple : sinus doux, attaque immédiate, extinction courte,
+  // aucune harmonique agressive. Un accord plutôt qu'un bip dès qu'un moment compte.
+  sons: {
+    survol:   [{ onde: 'sine', f: 880,  duree: 0.05, vol: 0.05 }],
+    choix:    [{ onde: 'sine', f: 660,  duree: 0.10, vol: 0.13 }, { onde: 'sine', f: 990, duree: 0.14, vol: 0.09, retard: 0.03 }],
+    depart:   [{ onde: 'sine', f: 523.25, duree: 0.14, vol: 0.15 }, { onde: 'sine', f: 783.99, duree: 0.22, vol: 0.12, retard: 0.07 }],
+    pause:    [{ onde: 'sine', f: 392,  duree: 0.14, vol: 0.11, vers: 294 }],
+    tic:      [{ onde: 'sine', f: 1320, duree: 0.03, vol: 0.035 }],
+    // La fin est le seul moment qui mérite un vrai accord : do, mi, sol, do, égrenés.
+    fin:      [{ onde: 'sine', f: 523.25, duree: 0.5, vol: 0.16 },
+               { onde: 'sine', f: 659.25, duree: 0.5, vol: 0.14, retard: 0.09 },
+               { onde: 'sine', f: 783.99, duree: 0.5, vol: 0.13, retard: 0.18 },
+               { onde: 'sine', f: 1046.5, duree: 0.7, vol: 0.12, retard: 0.27 }],
+    annule:   [{ onde: 'sine', f: 330,  duree: 0.18, vol: 0.10, vers: 220 }],
+  },
+}
+
+// ── SON ───────────────────────────────────────────────────────────────────────────────────────────
+// Synthétisé, sans aucun fichier : quatre notes de sinus valent mieux qu'un téléchargement, et se
+// règlent au hertz près depuis `TB.sons`.
+//
+// LE CONTEXTE AUDIO NE S'OUVRE QU'AU PREMIER GESTE, et ce n'est pas une précaution technique mais une
+// règle de politesse que les navigateurs ont eu raison d'imposer : un son qu'on n'a pas demandé est une
+// agression, jamais du juice. Une fois ouvert par un clic, il reste ouvert, si bien que l'accord de fin
+// sonne même si Matthieu a quitté la page du minuteur entre-temps, ce qui est exactement le but.
+let ctxAudio = null
+const contexte = () => {
+  if (typeof window === 'undefined') return null
+  if (!ctxAudio) { const C = window.AudioContext || window.webkitAudioContext; if (C) ctxAudio = new C() }
+  if (ctxAudio && ctxAudio.state === 'suspended') ctxAudio.resume().catch(() => {})
+  return ctxAudio
+}
+export function jouer(nom, muet) {
+  if (muet) return
+  const ctx = contexte()
+  const notes = TB.sons[nom]
+  if (!ctx || !notes) return
+  for (const n of notes) {
+    const t0 = ctx.currentTime + (n.retard || 0)
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.type = n.onde
+    // VARIATION DE HAUTEUR À CHAQUE FOIS. Le même son rendu cent fois à l'identique cesse d'être un son
+    // et devient une gêne ; un pour cent d'écart suffit à ce que l'oreille ne s'en lasse pas.
+    const f = n.f * (1 + (Math.random() - 0.5) * 0.02)
+    osc.frequency.setValueAtTime(f, t0)
+    if (n.vers) osc.frequency.exponentialRampToValueAtTime(n.vers, t0 + n.duree)
+    // Attaque très courte plutôt qu'instantanée : un saut net de volume produit un clic parasite.
+    gain.gain.setValueAtTime(0.0001, t0)
+    gain.gain.exponentialRampToValueAtTime(n.vol, t0 + 0.012)
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + n.duree)
+    osc.connect(gain); gain.connect(ctx.destination)
+    osc.start(t0); osc.stop(t0 + n.duree + 0.02)
+  }
+}
+
+// Le Plan ne compte qu'en minutes entières : une durée libre de 90 secondes y devient une tâche d'une
+// minute plutôt qu'une tâche de zéro, qui serait un mensonge plus grave que l'arrondi.
+const minutesEntieres = (m) => Math.max(1, Math.round(m))
+
+const Ctx = createContext(null)
+export function useTimer() { return useContext(Ctx) }
+
+export function TimerProvider({ children }) {
+  const [minutes, setMinutes] = useState(TB.defaut)
+  const [reste, setReste] = useState(TB.defaut * 60)
+  const [enCours, setEnCours] = useState(false)
+  const [fini, setFini] = useState(false)
+  const [titre, setTitre] = useState('')
+  const [habit, setHabit] = useState('')
+  const [muet, setMuet] = useState(false)
+  const [enregistre, setEnregistre] = useState('')
+  // Horodatage de la fin, pour que la pastille flottante sache quand se retirer. Une valeur plutôt
+  // qu'un minuteur d'effacement : si Matthieu relance un bloc entre-temps, elle redevient nulle et rien
+  // n'a besoin d'être annulé.
+  const [finiA, setFiniA] = useState(0)
+
+  // LE CANAL D'ÉVÉNEMENTS. La vue ne peut pas deviner qu'un tic a sonné pendant qu'elle ne regardait
+  // pas ; le fournisseur lui dit CE QUI VIENT D'ARRIVER, elle décide seule s'il faut des étincelles.
+  // Un compteur plutôt qu'un simple nom : deux tics d'affilée portent le même nom et doivent pourtant
+  // déclencher deux fois, ce qu'un `useEffect` sur le nom seul ne ferait jamais.
+  const [evenement, setEvenement] = useState({ nom: '', n: 0 })
+  const signaler = useCallback((nom) => setEvenement((e) => ({ nom, n: e.n + 1 })), [])
+
+  const total = minutes * 60
+  const avance = total ? 1 - reste / total : 0
+
+  // ── LE BATTEMENT ────────────────────────────────────────────────────────────────────────────────
+  // Un intervalle d'une seconde suffit à l'affichage, mais PAS à la justesse : un onglet en arrière-plan
+  // ralentit les minuteurs, et un bloc de quinze minutes finirait par en durer dix-sept sans qu'on
+  // sache pourquoi. On garde donc l'HEURE DE FIN comme vérité et on en déduit le reste à chaque
+  // battement, ce qui rend le compte exact quoi qu'il arrive au fil d'exécution. C'est aussi ce qui
+  // rend la navigation inoffensive : changer de vue ne touche pas à une heure de fin.
+  const finPrevue = useRef(0)
+  const dernierTic = useRef(0)
+  const refTerminer = useRef(null)
+
+  useEffect(() => {
+    if (!enCours) return undefined
+    const id = setInterval(() => {
+      const restant = Math.max(0, Math.round((finPrevue.current - Date.now()) / 1000))
+      setReste(restant)
+      if (restant !== dernierTic.current) {
+        dernierTic.current = restant
+        // Le tic ne sonne que sur les dix dernières secondes : sonner chaque seconde pendant quinze
+        // minutes serait une torture, se taire jusqu'au bout ferait rater la fin.
+        if (restant <= 10 && restant > 0) { jouer('tic', muet); signaler('tic') }
+      }
+      if (restant <= 0) { clearInterval(id); refTerminer.current?.() }
+    }, 200)
+    return () => clearInterval(id)
+  }, [enCours, muet, signaler])
+
+  // ── LA FIN, ET CE QU'ELLE PRODUIT ───────────────────────────────────────────────────────────────
+  // Le bloc terminé n'est pas un événement d'interface, c'est un FAIT : il part dans le plan du jour,
+  // marqué fait, avec sa durée réelle. C'est tout l'intérêt de l'exercice, sinon on a chronométré dans
+  // le vide, et rien n'en reste demain. Depuis que ce code vit ici, le fait s'inscrit même si Matthieu
+  // était sur une autre page à la seconde où le bloc s'est achevé.
+  const enregistrerDansPlan = useCallback(async (min, tx) => {
+    const chemin = await trouverPlanDuJour()
+    if (!chemin) { setEnregistre('aucun plan trouvé'); return }
+    const jour = new Date()
+    const iso = `${jour.getFullYear()}-${String(jour.getMonth() + 1).padStart(2, '0')}-${String(jour.getDate()).padStart(2, '0')}`
+    const tache = {
+      id: `tb${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      // Le champ porte DÉJÀ « Japonais - 15 min - … » quand une habitude est choisie ; y ajouter la durée
+      // une seconde fois donnerait « Japonais - 15 min - lecture - 15 min ». On ne la recolle donc que
+      // pour un titre libre, qui ne la porte pas.
+      title: tx.trim() ? tx.trim().replace(/\s*-\s*$/, '') : `Bloc de concentration - ${formaterDuree(Math.round(min * 60))}`,
+      date: iso,
+      startTime: `${String(jour.getHours()).padStart(2, '0')}:${String(jour.getMinutes()).padStart(2, '0')}`,
+      durationMin: minutesEntieres(min),
+      status: 'done',
+      note: null, image: null,
+      doneAt: new Date().toISOString(), createdAt: new Date().toISOString(),
+    }
+    const res = await saveJsonWithRetry(chemin, (cur) => ({ ...(cur || {}), tasks: [...((cur && cur.tasks) || []), tache] }))
+    if (res.ok) {
+      setEnregistre(`enregistré dans Plan · ${tache.title}`)
+      notify({ label: 'ZenRayTimer', title: 'Bloc terminé', body: tache.title })
+      window.dispatchEvent(new CustomEvent('zr:plan-changed'))
+    } else setEnregistre('non enregistré : ' + String(res.error || 'échec'))
+  }, [])
+
+  const terminer = useCallback(async () => {
+    setEnCours(false); setReste(0); setFini(true); setFiniA(Date.now())
+    jouer('fin', muet)
+    signaler('fin')
+    await enregistrerDansPlan(minutes, titre)
+  }, [muet, minutes, titre, signaler, enregistrerDansPlan])
+  // Le battement appelle `terminer` par une référence, jamais directement : le refermer dans
+  // l'intervalle y figerait le titre et la durée du moment où le bloc a démarré, et un titre corrigé
+  // en cours de route serait perdu à l'inscription.
+  refTerminer.current = terminer
+
+  const choisir = useCallback((m) => {
+    if (enCours) return
+    setMinutes(m); setReste(m * 60); setFini(false); setEnregistre(''); setFiniA(0)
+    // Le préfixe suit la durée, comme dans le composeur du Plan, et lui seul : ce qui est tapé derrière
+    // n'est jamais touché.
+    setTitre((tx) => majTitreHabitude(tx, habit, m))
+    jouer('choix', muet); signaler('choix')
+  }, [enCours, habit, muet, signaler])
+
+  const demarrer = useCallback(() => {
+    finPrevue.current = Date.now() + reste * 1000
+    setEnCours(true); setFini(false); setFiniA(0)
+    jouer('depart', muet); signaler('depart')
+  }, [reste, muet, signaler])
+
+  const suspendre = useCallback(() => { setEnCours(false); jouer('pause', muet); signaler('pause') }, [muet, signaler])
+
+  const annuler = useCallback(() => {
+    setEnCours(false); setFini(false); setEnregistre(''); setFiniA(0)
+    setReste(minutes * 60)
+    jouer('annule', muet); signaler('annule')
+  }, [minutes, muet, signaler])
+
+  // DURÉE LIBRE, en secondes (demande de Matthieu, 2026-08-27). `minutes` devient fractionnaire, ce qui
+  // est sans effet sur `total` et sur `avance` qui en dérivent, et fait justement que plus AUCUNE part du
+  // camembert n'est allumée : une durée libre n'est pas un palier, et l'interface ne doit pas prétendre
+  // le contraire. Seule l'écriture dans le Plan arrondit, parce qu'une tâche porte des minutes entières.
+  const choisirDuree = useCallback((secondes) => {
+    if (enCours) return
+    setMinutes(secondes / 60); setReste(secondes)
+    setFini(false); setEnregistre(''); setFiniA(0)
+    jouer('choix', muet); signaler('choix')
+  }, [enCours, muet, signaler])
+
+  const nouveauBloc = useCallback(() => {
+    setFini(false); setFiniA(0); setEnregistre(''); setReste(minutes * 60)
+  }, [minutes])
+
+  const choisirHabitude = useCallback((h, fabriquerTitre) => {
+    setHabit(h); setTitre(fabriquerTitre(h))
+    jouer('choix', muet); signaler('choix')
+  }, [muet, signaler])
+
+  const valeur = useMemo(() => ({
+    minutes, reste, enCours, fini, finiA, titre, habit, muet, enregistre, evenement, avance, total,
+    setTitre, setHabit, setMuet, choisir, choisirDuree, demarrer, suspendre, annuler, terminer, nouveauBloc, choisirHabitude,
+  }), [minutes, reste, enCours, fini, finiA, titre, habit, muet, enregistre, evenement, avance, total,
+    choisir, choisirDuree, demarrer, suspendre, annuler, terminer, nouveauBloc, choisirHabitude])
+
+  return <Ctx.Provider value={valeur}>{children}</Ctx.Provider>
+}
+
+// Le plan du jour se CHERCHE dans l'index plutôt que de se deviner par convention de nom : un chemin
+// deviné qui n'existe pas créerait un second plan fantôme à côté du vrai, exactement la faute déjà
+// payée sur la note du jour le 2026-08-15.
+async function trouverPlanDuJour() {
+  try {
+    // Le plan ÉPINGLÉ fait foi quand il existe : c'est celui que Matthieu a désigné lui-même comme le
+    // sien, et le deviner autrement serait lui imposer un choix qu'il a déjà fait.
+    try {
+      const epingles = JSON.parse(localStorage.getItem('zr:plan:pinned') || '[]')
+      if (Array.isArray(epingles) && epingles.length) return epingles[0]
+    } catch { /* stockage indisponible : on retombe sur l'index */ }
+    await loadSearchIndex()
+    const plans = (getIndexPaths() || []).filter((p) => typeof p === 'string' && p.endsWith('.plan.json'))
+    if (!plans.length) return null
+    // À défaut d'un critère plus fin, le plan le plus « proche » est celui dont le chemin est le plus
+    // court : les plans de travail vivent haut dans l'arbre, les archives s'enfoncent.
+    return plans.sort((a, b) => a.length - b.length)[0]
+  } catch { return null }
+}

@@ -1,0 +1,92 @@
+// @vitest-environment node
+// 23 October 2026: the knowledge base never keeps an answer without a proof copied from its source, never keeps a secret,
+// and merges the same question asked twice. Each guard is tested green on a good case and red on a broken one.
+import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { checkEntry } from './lib/Validate.mjs'
+import { mergeEntries, parseDate } from './lib/Store.mjs'
+import { candidatesFromOutput } from './lib/Pipeline.mjs'
+import { cutUnits, looksLikeQuestion, pairsFromEntries, redact } from './lib/Sources.mjs'
+import { buildFiles } from './lib/Publish.mjs'
+import { glassTabPath } from '../../src/knowledge/glassTab.js'
+
+const config = JSON.parse(readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'KnowledgeConfig.json'), 'utf8'))
+const source = "## Typographie (23 October 2026)\nLes titres utilisent GT Sectra LCG Regular, jamais l'italique, et le corps reste en Anthropic Serif Regular 400."
+
+describe('proof gate', () => {
+  const good = { q: 'Quelle police pour les titres ?', a: ['GT Sectra LCG Regular, sans italique.'], d: 'Design et typographie', kw: ['police'], proof: 'Les titres utilisent GT Sectra LCG Regular', date: '23 October 2026' }
+  it('accepts a proof copied from the source, with its date', () => {
+    const v = checkEntry(good, source, config)
+    expect(v.ok).toBe(true); expect(v.entry.date).toBe('23 October 2026')
+  })
+  it('accepts a proof whose quotes and spaces differ', () => {
+    expect(checkEntry({ ...good, proof: "jamais l’italique,  et le corps" }, source, config).ok).toBe(true)
+  })
+  it('rejects a reworded proof, an invented date, a secret, a long answer', () => {
+    expect(checkEntry({ ...good, proof: 'Les titres sont en GT Sectra LCG Regular' }, source, config).reason).toBe('proof-not-in-source')
+    expect(checkEntry({ ...good, date: '1 January 2020' }, source, config).entry.date).toBe(null)
+    expect(checkEntry({ ...good, a: ['Le mot de passe du drive est 123456.'] }, source, config).reason).toBe('secret')
+    expect(checkEntry({ ...good, a: ['a', 'b', 'c', 'd'] }, source, config).reason).toBe('answer-shape')
+    expect(checkEntry({ ...good, q: 'Quelle police' }, source, config).reason).toBe('question')
+  })
+  it('replaces long dashes instead of keeping them', () => {
+    expect(checkEntry({ ...good, a: ['GT Sectra — sans italique.'] }, source, config).entry.a[0]).toBe('GT Sectra, sans italique.')
+  })
+})
+
+describe('sources', () => {
+  it('drops credential sections and secret lines', () => {
+    const text = '# A\nok\n## API / Passwords\nclé: abc\n### sous\nencore\n## B\nvisible\ntoken: ghp_ABCDEFGH1234\n'
+    const out = redact(text, config.memory.dropSections)
+    expect(out).toContain('visible'); expect(out).not.toContain('abc'); expect(out).not.toContain('encore'); expect(out).not.toContain('ghp_')
+  })
+  it('cuts on headings under the limit', () => {
+    const units = cutUnits('# a\n' + 'x'.repeat(50) + '\n# b\n' + 'y'.repeat(50), 70)
+    expect(units).toHaveLength(2); expect(units.every((u) => u.length <= 70)).toBe(true)
+  })
+  it('pairs a question with the final answer that follows it', () => {
+    const entries = [{ kind: 'prompt', text: "c'est quoi les Cloudflare rules ?", timestamp: '2026-08-20T08:27:00Z' }, { kind: 'iteration', text: 'Des règles.', timestamp: 't' }, { kind: 'prompt', text: 'déploie', timestamp: 't2' }, { kind: 'iteration', text: 'ok', timestamp: 't3' }]
+    const pairs = pairsFromEntries(entries, { kind: 'claude', session: 's', project: 'p' }, config)
+    expect(pairs).toHaveLength(1); expect(pairs[0].answer).toBe('Des règles.'); expect(pairs[0].at).toBe('2026-08-20T08:27:00Z')
+    expect(looksLikeQuestion('status ?')).toBe(true)
+  })
+})
+
+describe('store and pipeline', () => {
+  it('reads dates written three ways', () => {
+    expect(parseDate('12 October 2026')).toBe('2026-10-12T12:00:00.000Z')
+    expect(parseDate('2026-08-17')).toBe('2026-08-17T12:00:00.000Z')
+    expect(parseDate('rien')).toBe(null)
+  })
+  it('merges the same question asked twice and counts both dates', () => {
+    const entries = []
+    const c = (at) => ({ q: "C'est quoi les Cloudflare rules ?", a: ['x'], d: 'Tech et drive', kw: ['cloudflare'], asked: true, src: { kind: 'claude', ref: 'p/s', at, proof: 'xxxxxxxxxxxxxx' } })
+    const added = mergeEntries(entries, [c('2026-08-20T08:27:00Z'), { ...c('2026-08-21T09:00:00Z'), q: 'cloudflare rules, c’est quoi ?' }])
+    expect(added).toHaveLength(1); expect(entries[0].asked).toEqual(['2026-08-20T08:27:00Z', '2026-08-21T09:00:00Z']); expect(entries[0].lastAt).toBe('2026-08-21T09:00:00Z')
+  })
+  it('keeps only kept conversation pairs whose proof is in the answer', () => {
+    const unit = { kind: 'conversation', pairs: [{ id: 'c1', kind: 'claude', session: 's', project: 'p', at: '2026-08-20T08:27:00Z', q: "c'est quoi les rules ?", answer: 'Ce sont des règles que Cloudflare applique avant le site.' }, { id: 'c2', kind: 'claude', session: 's', project: 'p', at: 't', q: 'status ?', answer: 'déployé' }] }
+    const out = { pairs: [{ id: 'c1', keep: true, q: "C'est quoi les Cloudflare rules ?", a: ['Des règles appliquées avant le site.'], d: 'Tech et drive', kw: [], proof: 'règles que Cloudflare applique' }, { id: 'c2', keep: false }] }
+    const { candidates, rejected } = candidatesFromOutput(unit, out, config)
+    expect(candidates).toHaveLength(1); expect(candidates[0].src.at).toBe('2026-08-20T08:27:00Z'); expect(rejected).toEqual([])
+    const bad = candidatesFromOutput(unit, { pairs: [{ ...out.pairs[0], proof: 'Cloudflare protège le site' }] }, config)
+    expect(bad.candidates).toHaveLength(0); expect(bad.rejected).toEqual(['proof-not-in-source'])
+  })
+  it('publishes shards under the size limit with an index mapping', () => {
+    const entries = Array.from({ length: 50 }, (_, i) => ({ id: `q${i}`, q: `Question ${i} sur Houdini ?`, a: ['x'.repeat(400)], d: 'Houdini et 3D', kw: ['houdini'], asked: [], firstAt: 't', lastAt: 't', src: [{ kind: 'memory', ref: 'r', at: 't', proof: 'p' }] }))
+    const files = buildFiles({ ...config, index: { ...config.index, shardBytes: 5000 } }, entries, {})
+    const index = JSON.parse(files['knowledge/index.json'])
+    expect(index.count).toBe(50); expect(index.shards.length).toBeGreaterThan(1)
+    expect(index.shards.reduce((n, s) => n + JSON.parse(files[s.path]).length, 0)).toBe(50)
+    expect(index.map.houdini.length).toBe(100)
+  })
+})
+
+describe('glass tab', () => {
+  it('starts and ends at the same corner with a continuous top edge', () => {
+    const d = glassTabPath({ width: 1000, rowHeight: 60, tabWidth: 480, height: 300, R: 26, r: 16, f: 14 })
+    expect(d.startsWith('M 16 0 H 974')).toBe(true); expect(d.endsWith('Z')).toBe(true); expect(d).toContain('V 74 A 14 14 0 0 0 466 60')
+  })
+})

@@ -1,0 +1,164 @@
+import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { PALETTE, RADII, SHADOWS, TRANSITIONS } from '../theme.js'
+import { playRemux, playTranscode, pickPipeline } from '../media/remuxPlayer.js'
+import { releaseFFmpeg } from '../media/ffmpegCore.js'
+import { vttUrlFromSrt, decodeSubBytes } from '../media/subtitles/srt2vtt.js'
+import SubtitleLayer from './subtitles/SubtitleLayer.jsx'
+import { fmt, Menu, SPEEDS } from '../media/playerControls.jsx'
+import { PLAYER_PREF_KEYS, readPlayerPrefs, writePlayerPref, playerStorage, trackLang } from '../media/playerPrefs.js'
+
+const enc = encodeURIComponent
+const WASM_SAFE_LIMIT = 700 * 1024 * 1024 // review fix : au-delà, ffmpeg.wasm (wasm32) sature -> download
+
+export default function VideoPlayer({ t, path, manifest, onUnsupported }) {
+  const videoRef = useRef(null)
+  const objUrlRef = useRef(null)
+  const blobUrlsRef = useRef([])
+  const abortRef = useRef(null)
+  const inputRef = useRef(null) // cache des octets du fichier (review fix : pas de re-download au switch audio)
+
+  const [state, setState] = useState('Initialisation…')
+  const [pct, setPct] = useState(0)
+  const [loadPct, setLoadPct] = useState(0)
+  const [fatal, setFatal] = useState(null)
+  const [playing, setPlaying] = useState(false)
+  const [cur, setCur] = useState(0)
+  const [dur, setDur] = useState(0)
+  const [buffered, setBuffered] = useState(0)
+  // 14 October 2026: speed and subtitle language follow from one video to the next (src/media/playerPrefs.js).
+  // FR : la vitesse et la langue des sous-titres suivent d'une video a l'autre.
+  const [speed, setSpeed] = useState(() => readPlayerPrefs(playerStorage()).speed)
+  const [audioTrack, setAudioTrack] = useState(null)
+  const [openMenu, setOpenMenu] = useState(null)
+  const [subTrack, setSubTrack] = useState(null)
+
+  const probe = manifest.probe
+  const audioItems = (probe && probe.audio || []).map((a, i) => ({ id: i, label: `${a.lang && a.lang !== 'und' ? a.lang : 'Piste'} ${i + 1}${a.codec ? ' · ' + a.codec : ''}` }))
+  const subItems = [{ id: null, label: 'Désactivés', format: null, src: null },
+    ...((probe && probe.subs || []).filter((s) => s.path).map((s) => ({ id: `emb-${s.index}`, lang: s.lang, label: `${s.label || (s.lang !== 'und' ? s.lang : 'Sous-titres')} (${s.format})`, format: s.format === 'ssa' ? 'ass' : (s.format === 'subrip' ? 'vtt' : s.format), src: `/api/img?path=${enc(s.path)}` })))]
+
+  const mount = useCallback(async (chosenAudio) => {
+    const video = videoRef.current
+    if (!video || !('MediaSource' in window)) { onUnsupported && onUnsupported(); return }
+    if (manifest.size > WASM_SAFE_LIMIT) { onUnsupported && onUnsupported(); return }
+    setFatal(null); setState('Initialisation…'); setPct(0); setLoadPct(0)
+    if (abortRef.current) abortRef.current.abort()
+    const ctrl = new AbortController(); abortRef.current = ctrl
+    const pipeline = pickPipeline(probe)
+    try {
+      let res
+      const onProgress = (r) => setLoadPct(r)
+      if (pipeline === 'transcode') {
+        res = await playTranscode({ path, manifest, video, input: inputRef.current, onPct: setPct, onState: setState, signal: ctrl.signal })
+      } else {
+        try {
+          res = await playRemux({ path, manifest, video, audioTrack: chosenAudio, input: inputRef.current, onState: setState, onProgress, signal: ctrl.signal })
+        } catch (e) {
+          if (e.name === 'AbortError') return
+          // Si ffmpeg.wasm n'a pas pu charger, inutile de retenter en transcode (même moteur) -> download.
+          // Code structuré posé par ffmpegCore.js (getFFmpeg) plutôt qu'un motif de texte libre sur le
+          // message d'une librairie tierce, qui cesserait silencieusement de matcher si son libellé change.
+          if (e && e.code === 'ffmpeg-load-failed') { onUnsupported && onUnsupported(); return }
+          setState('Codec non remuxable, transcodage…')
+          res = await playTranscode({ path, manifest, video, input: inputRef.current, onPct: setPct, onState: setState, signal: ctrl.signal })
+        }
+      }
+      if (res && res.input) inputRef.current = res.input // cache
+      if (objUrlRef.current) URL.revokeObjectURL(objUrlRef.current)
+      objUrlRef.current = res.objUrl
+    } catch (e) {
+      if (e.name === 'AbortError') return
+      setFatal(String(e.message || e))
+    }
+  }, [path, manifest]) // eslint-disable-line
+
+  useEffect(() => {
+    inputRef.current = null
+    mount(audioTrack)
+    return () => {
+      if (abortRef.current) abortRef.current.abort()
+      if (objUrlRef.current) { URL.revokeObjectURL(objUrlRef.current); objUrlRef.current = null }
+      blobUrlsRef.current.forEach((u) => URL.revokeObjectURL(u)); blobUrlsRef.current = []
+      inputRef.current = null
+      releaseFFmpeg()
+    }
+  }, [path]) // eslint-disable-line
+
+  const syncDur = () => { const v = videoRef.current; const d = (v && isFinite(v.duration) && v.duration) || (probe && probe.duration) || 0; setDur(d) }
+  const onLoadedMeta = () => { const v = videoRef.current; syncDur(); v.playbackRate = speed; for (const k of ['preservesPitch', 'webkitPreservesPitch']) if (k in v) v[k] = true }
+  const onTimeUpdate = () => { const v = videoRef.current; setCur(v.currentTime); if (v.buffered.length) setBuffered(v.buffered.end(v.buffered.length - 1)) }
+  const togglePlay = () => { const v = videoRef.current; if (v.paused) v.play().catch(() => {}); else v.pause() }
+  const seek = (e) => { const v = videoRef.current; const rect = e.currentTarget.getBoundingClientRect(); const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)); v.currentTime = ratio * (v.duration || 0) }
+  const applySpeed = (s) => { setSpeed(s); setOpenMenu(null); writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.speed, s); const v = videoRef.current; if (v) { v.playbackRate = s; for (const k of ['preservesPitch', 'webkitPreservesPitch']) if (k in v) v[k] = true } }
+  const pickAudio = (id) => { setOpenMenu(null); if (id === audioTrack) return; setAudioTrack(id); mount(id) }
+  const pickSub = async (id) => {
+    setOpenMenu(null)
+    writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.subsOn, id === null ? '0' : '1')
+    if (id === null) { setSubTrack(null); return }
+    const item = subItems.find((s) => s.id === id); if (!item) return
+    const lang = trackLang(item); if (lang) writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.subLang, lang)
+    if (item.format === 'srt') { const bytes = new Uint8Array(await (await fetch(item.src)).arrayBuffer()); const url = vttUrlFromSrt(decodeSubBytes(bytes)); blobUrlsRef.current.push(url); setSubTrack({ format: 'vtt', src: url }) }
+    else setSubTrack({ format: item.format, src: item.src })
+  }
+
+  // the track in the saved language opens by itself when the film has it. FR : la piste de la langue sauvegardee s'ouvre seule.
+  const subSignature = subItems.map((s) => String(s.id)).join('|')
+  useEffect(() => {
+    const prefs = readPlayerPrefs(playerStorage())
+    if (!prefs.subsOn || !prefs.subLang) return
+    const item = subItems.find((s) => s.id !== null && trackLang(s) === prefs.subLang)
+    if (item) pickSub(item.id)
+  }, [subSignature]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const wrap = { position: 'relative', maxWidth: 980, margin: '0 auto', borderRadius: RADII.md, background: '#000' }
+  const bar = { position: 'absolute', left: 0, right: 0, bottom: 0, padding: '10px 12px', background: 'linear-gradient(to top, rgba(0,0,0,.78), transparent)', display: 'flex', flexDirection: 'column', gap: 8, borderBottomLeftRadius: RADII.md, borderBottomRightRadius: RADII.md }
+  const iconBtn = { background: 'rgba(255,255,255,.14)', border: 'none', color: '#fff', minWidth: 36, height: 36, borderRadius: RADII.sm, cursor: 'pointer', fontSize: 'var(--zr-ui-lg)', transition: TRANSITIONS.base, padding: '0 8px' }
+  const progRatio = dur ? cur / dur : 0
+  const bufRatio = dur ? buffered / dur : 0
+
+  return (
+    <div style={{ padding: 24 }}>
+      <div style={wrap}>
+        <video ref={videoRef} onClick={togglePlay} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onLoadedMetadata={onLoadedMeta} onDurationChange={syncDur} onProgress={syncDur} onTimeUpdate={onTimeUpdate} style={{ width: '100%', display: 'block', background: '#000', borderRadius: RADII.md }} />
+        <SubtitleLayer videoRef={videoRef} track={subTrack} />
+
+        {(state || fatal) && (
+          <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 12, background: 'rgba(0,0,0,.5)', color: '#fff' }}>
+            {fatal ? (<>
+              <div style={{ fontSize: 'var(--zr-ui-lg)', color: PALETTE.primaryLight }}>Lecture impossible : {fatal}</div>
+              <button onClick={() => onUnsupported && onUnsupported()} style={{ ...iconBtn, width: 'auto', padding: '8px 16px', background: PALETTE.gradient }}>Télécharger le fichier</button>
+            </>) : (<>
+              <div style={{ fontSize: 'var(--zr-ui-md)' }}>{state}</div>
+              {(loadPct > 0 && loadPct < 1) && <div style={{ width: 260, height: 6, borderRadius: 99, background: 'rgba(255,255,255,.25)', overflow: 'hidden' }}><div style={{ width: `${Math.round(loadPct * 100)}%`, height: '100%', background: PALETTE.gradient }} /></div>}
+              {pct > 0 && <div style={{ width: 260, height: 6, borderRadius: 99, background: 'rgba(255,255,255,.25)', overflow: 'hidden' }}><div style={{ width: `${Math.round(pct * 100)}%`, height: '100%', background: PALETTE.gradient, transition: TRANSITIONS.smooth }} /></div>}
+            </>)}
+          </div>
+        )}
+
+        {!state && !fatal && (
+          <div style={bar}>
+            <div onClick={seek} style={{ position: 'relative', height: 8, borderRadius: 99, background: 'rgba(255,255,255,.2)', cursor: 'pointer' }}>
+              <div style={{ position: 'absolute', inset: 0, width: `${bufRatio * 100}%`, height: '100%', borderRadius: 99, background: 'rgba(255,255,255,.35)' }} />
+              <div style={{ position: 'absolute', inset: 0, width: `${progRatio * 100}%`, height: '100%', borderRadius: 99, background: PALETTE.gradient }} />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, position: 'relative' }}>
+              <button onClick={togglePlay} style={iconBtn}>{playing ? '❚❚' : '▶'}</button>
+              <span style={{ color: '#fff', fontSize: 'var(--zr-ui-sm)', fontFamily: 'var(--zr-police-sans)', minWidth: 92 }}>{fmt(cur)} / {fmt(dur)}</span>
+              <div style={{ flex: 1 }} />
+              {audioItems.length > 1 && <button onClick={() => setOpenMenu(openMenu === 'audio' ? null : 'audio')} style={iconBtn} title="Pistes audio">A</button>}
+              {subItems.length > 1 && <button onClick={() => setOpenMenu(openMenu === 'subs' ? null : 'subs')} style={iconBtn} title="Sous-titres">CC</button>}
+              <button onClick={() => setOpenMenu(openMenu === 'speed' ? null : 'speed')} style={{ ...iconBtn, fontWeight: 700, fontSize: 'var(--zr-ui-sm)' }}>{speed}×</button>
+              {openMenu === 'audio' && <Menu t={t} items={audioItems} activeId={audioTrack} onPick={pickAudio} />}
+              {openMenu === 'subs' && <Menu t={t} items={subItems} activeId={subTrack ? (subItems.find((s) => s.src === subTrack.src)?.id ?? null) : null} onPick={pickSub} />}
+              {openMenu === 'speed' && (
+                <div style={{ position: 'absolute', bottom: 52, right: 8, background: t.surface, border: `1px solid ${t.border}`, borderRadius: RADII.md, boxShadow: SHADOWS.lg, padding: 8, display: 'flex', flexWrap: 'wrap', gap: 6, width: 210, zIndex: 30 }}>
+                  {SPEEDS.map((s) => <button key={s} onClick={() => applySpeed(s)} style={{ padding: '5px 11px', borderRadius: RADII.sm, border: 'none', cursor: 'pointer', fontSize: 'var(--zr-ui-sm)', fontWeight: 600, background: s === speed ? PALETTE.gradient : t.btnSecondaryBg, color: s === speed ? '#fff' : t.btnSecondaryText }}>{s}×</button>)}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}

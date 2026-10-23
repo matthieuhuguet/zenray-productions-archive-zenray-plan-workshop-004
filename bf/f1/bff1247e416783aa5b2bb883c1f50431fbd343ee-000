@@ -1,0 +1,100 @@
+// classify.js — SOURCE DE VÉRITÉ UNIQUE de la classification d'un fichier vers sa pipeline d'ingestion.
+//
+// EN CLAIR (pour tout le monde, du sales à la mamie) : quand on dépose un fichier dans l'app, il faut
+// décider QUOI en faire. Une photo doit aller dans le rangement « images » (consultable tout de suite,
+// avec une vignette). Une vidéo doit être découpée en petits morceaux pour le streaming (comme YouTube).
+// Un son va dans le rangement « média ». Et seulement les fichiers qu'on ne peut PAS ouvrir directement
+// (un projet, un zip, un format propriétaire) finissent en « morceaux binaires » bruts. Ce fichier répond
+// à UNE seule question : « ce fichier, c'est quel genre, et donc quelle pipeline ? ».
+//
+// POURQUOI UN MODULE À PART (le pivot du refactor) : la même décision doit être prise à 3 endroits —
+//   (a) le drop/coller/capture DANS l'app (navigateur),
+//   (b) le script d'archive en masse (Node, hors navigateur),
+//   (c) l'upload mobile.
+// Avant, cette décision était une cascade de `if` DUPLIQUÉE et coincée dans `routeFile`. On l'extrait ici.
+//
+// CONTRAINTE DE PURETÉ ABSOLUE (le piège qui aurait planté l'import Node) : ce module est ISOMORPHE,
+// c.-à-d. exécutable IDENTIQUEMENT dans le navigateur ET dans Node. Donc il NE TOUCHE À RIEN d'extérieur :
+//   - pas de `location` (Node n'en a pas → le gating « est-on sur localhost ? » reste chez l'appelant),
+//   - pas de `notify` (la notif vidéo « app locale requise » reste chez l'appelant),
+//   - pas de `vis` (la visibilité public/privé reste un paramètre de l'appelant).
+// Il rend SEULEMENT un verdict pur : { kind, pipeline }. Aucun effet de bord, aucun import navigateur.
+
+// Extension en minuscules, dérivée du nom, sinon du sous-type MIME (copie 1:1 de extOf, L100 universalCapture.js).
+// Réexportée pour que Node l'utilise aussi (un seul algo d'extension partout).
+export function extOf(name = '', mime = '') {
+  const m = name.match(/\.([a-z0-9]+)$/i)
+  if (m) return m[1].toLowerCase()
+  const sub = (mime.split('/')[1] || '').toLowerCase()
+  return sub || 'bin'
+}
+
+// Extensions image reconnues SANS MIME fiable (drop de fichier nu, file.type vide).
+const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'tiff', 'heic']
+// Extensions vidéo reconnues SANS MIME. 'ogg' est VOLONTAIREMENT ABSENT (voir cascade ci-dessous).
+const VIDEO_EXTS = ['mp4', 'webm', 'mkv', 'avi', 'mov', 'm4v', 'ts', 'flv', 'wmv']
+// Extensions audio reconnues SANS MIME (le cas .ogg/.oga/.wav/.flac nus). 'ogg' est ICI (audio par défaut).
+// Upload support is intentionally broader than native browser decode support: unsupported
+// codecs remain stored bit-exact and downloadable instead of being misclassified as documents.
+export const AUDIO_EXTS = [
+  'mp3', 'mp2', 'mp1', 'm4a', 'm4b', 'm4p', 'aac', 'adts', 'wav', 'wave',
+  'flac', 'alac', 'opus', 'oga', 'ogg', 'spx', 'aiff', 'aif', 'aifc', 'caf',
+  'wma', 'ape', 'wv', 'tta', 'mka', 'ac3', 'eac3', 'dts', 'amr', '3ga',
+  'au', 'snd', 'ra', 'ram', 'dsf', 'dff', 'mid', 'midi', 'weba',
+]
+
+// classify({ name, mime }) -> { kind, pipeline }
+//   kind     : 'image' | 'video' | 'audio' | 'text' | 'pdf' | 'binary'  (le « genre » humain du fichier)
+//   pipeline : 'img' | 'hls' | 'media' | 'text' | 'chunk'               (le rail d'ingestion technique)
+//
+// L'ORDRE de la cascade est SIGNIFIANT et reproduit EXACTEMENT routeFile (L660-708). Ne pas réordonner :
+//   1. image (mime image/* OU ext image)                  -> { image, img }
+//   2. audio EXPLICITE (mime audio/*) AVANT vidéo          -> { audio, media }
+//      (un audio/ogg doit primer sur l'ext 'ogg' ambiguë, sinon la branche vidéo le happerait à tort)
+//   3. vidéo (mime video/* OU ext vidéo, 'ogg' EXCLU)      -> { video, hls }
+//   4. texte (md/txt, text/markdown, text/plain)          -> { text, text }
+//   5. audio PAR EXTENSION (file.type vide, .wav/.ogg nu)  -> { audio, media }
+//   6. pdf (application/pdf OU ext pdf)                    -> { pdf, media }  (famille média dédiée)
+//   7. fallback : tout le reste                            -> { binary, chunk }
+export function classify({ name = '', mime = '' } = {}) {
+  const ext = extOf(name, mime)
+
+  // 1) IMAGE — consultable tout de suite, vignette réelle, servie web. Jamais en chunks.
+  if (mime.startsWith('image/') || IMAGE_EXTS.includes(ext)) {
+    return { kind: 'image', pipeline: 'img' }
+  }
+
+  // 2) AUDIO EXPLICITE — le MIME audio/* prime sur l'ext. .ogg/.oga sont des conteneurs partagés
+  //    audio/vidéo : sans ce garde, un audio/ogg tomberait dans la branche vidéo via l'ext 'ogg'.
+  if (mime.startsWith('audio/')) {
+    return { kind: 'audio', pipeline: 'media' }
+  }
+
+  // 3) VIDÉO — streaming HLS adaptatif. 'ogg' EST ABSENT de VIDEO_EXTS : un .ogg nu (file.type vide) est
+  //    bien plus souvent audio (Vorbis/Opus) que vidéo (Theora rarissime). Un .ogg vidéo réel porte
+  //    presque toujours mime video/* et reste donc capté ici par mime.startsWith('video/').
+  if (mime.startsWith('video/') || VIDEO_EXTS.includes(ext)) {
+    return { kind: 'video', pipeline: 'hls' }
+  }
+
+  // 4) TEXTE — page Markdown brute.
+  if (mime === 'text/markdown' || ext === 'md' || ext === 'txt' || mime === 'text/plain') {
+    return { kind: 'text', pipeline: 'text' }
+  }
+
+  // 5) AUDIO PAR EXTENSION — à ce point le MIME n'est jamais audio/* (capté en 2). Ne sert donc QUE le cas
+  //    extension audio sans file.type (fréquent pour .wav/.flac/.ogg nus). L'appelant déduira le MIME via ext.
+  if (AUDIO_EXTS.includes(ext)) {
+    return { kind: 'audio', pipeline: 'media' }
+  }
+
+  // 6) PDF — famille média dédiée (lecteur PDF inline).
+  if (mime === 'application/pdf' || ext === 'pdf') {
+    return { kind: 'pdf', pipeline: 'media' }
+  }
+
+  // 7) FALLBACK — tout le reste (projets, zip, RAW, formats propriétaires) : morceaux binaires opaques.
+  //    C'est le SEUL cas qui doit produire des chunks .file.json. L'invariant anti-chunk repose là-dessus :
+  //    aucun format ouvrable (image/vidéo/audio/pdf) ne peut atteindre ce return.
+  return { kind: 'binary', pipeline: 'chunk' }
+}

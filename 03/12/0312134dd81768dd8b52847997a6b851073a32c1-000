@@ -1,0 +1,256 @@
+// ZenRayMedia — sorties navigateur (pipelines P1, P2, P3, P7 de 01-PLAN §7).
+//
+// Ce que le navigateur SAIT faire de façon fiable : page HTML autonome, image fixe, PDF via
+// l'impression, texte au presse-papiers. C'est fait ici, réellement.
+// Ce qu'il ne sait PAS faire de façon fiable : encoder du ProRes 4444 alpha. C'est la Forge
+// locale (`forge.js`), et le produit le dit au lieu de faire semblant.
+
+import { FONTS, essentialFaces } from './fonts.js'
+
+const FONT_FILES = {
+  AnthropicSerif: '/fonts/AnthropicSerif-Romans.woff2',
+  AnthropicSans: '/fonts/AnthropicSans-Romans.woff2',
+  AnthropicMono: '/fonts/AnthropicMono.woff2',
+}
+
+// Les familles Google Fonts installées, indexées par nom -> liste de fichiers WOFF2.
+// Elles sont sous licence libre (OFL/Apache) : les EMBARQUER dans un fichier livré à un client
+// est autorisé, ce qui est précisément ce dont une page autonome a besoin.
+const THEME_FONT_FILES = Object.fromEntries(FONTS.map((f) => [f.family, f.faces]))
+
+const fontCache = new Map()
+
+/** Lit un fichier de police servi par le site et le rend en data URI. Mis en cache. */
+async function fileDataUrl(url) {
+  if (fontCache.has(url)) return fontCache.get(url)
+  const promise = (async () => {
+    try {
+      const res = await fetch(url)
+      if (!res.ok) return null
+      const bytes = new Uint8Array(await res.arrayBuffer())
+      let binary = ''
+      const CHUNK = 0x8000
+      for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+      return `data:font/woff2;base64,${btoa(binary)}`
+    } catch { return null }
+  })()
+  fontCache.set(url, promise)
+  return promise
+}
+
+async function fontDataUrl(family) {
+  if (fontCache.has(family)) return fontCache.get(family)
+  const url = FONT_FILES[family]
+  if (!url) return null
+  const promise = (async () => {
+    try {
+      const res = await fetch(url)
+      if (!res.ok) return null
+      const buf = await res.arrayBuffer()
+      let binary = ''
+      const bytes = new Uint8Array(buf)
+      const CHUNK = 0x8000
+      for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+      return `data:font/woff2;base64,${btoa(binary)}`
+    } catch { return null }
+  })()
+  fontCache.set(family, promise)
+  return promise
+}
+
+// ZM-L6-02 : polices EN BASE64 dans la page. Une page exportée qui va chercher sa police sur le
+// réseau n'est pas autonome — ouverte hors ligne ou chez un client, elle change d'apparence.
+export async function embedFonts(html) {
+  const faces = []
+
+  // 1. Les trois familles Anthropic (chrome et thèmes maison).
+  for (const family of Object.keys(FONT_FILES).filter((f) => html.includes(f))) {
+    const data = await fontDataUrl(family)
+    if (data) faces.push(`@font-face{font-family:'${family}';src:url(${data}) format('woff2');font-weight:100 900;font-style:normal;font-display:block;}`)
+  }
+
+  // 2. Les familles Google Fonts que la page utilise réellement. On embarque CHAQUE coupe
+  //    (romain, italique, sous-ensembles) avec son unicode-range : sans lui, le navigateur
+  //    chargerait la première coupe pour tous les alphabets et l'accentuation casserait.
+  for (const [family, entryFaces] of Object.entries(THEME_FONT_FILES)) {
+    if (!html.includes(family)) continue
+    // On n'embarque que les coupes utiles, cf. `essentialFaces` : trente-six fichiers par famille
+    // dont six servaient, c'est ce qui produisait les 3,8 Mo signalés par le Critique.
+    for (const face of essentialFaces(family).length ? essentialFaces(family) : entryFaces) {
+      const data = await fileDataUrl(face.file)
+      if (!data) continue
+      faces.push(`@font-face{font-family:'${family}';font-style:${face.style};font-weight:${face.weight};font-display:block;src:url(${data}) format('woff2');${face.unicodeRange ? `unicode-range:${face.unicodeRange};` : ''}}`)
+    }
+  }
+
+  if (!faces.length) return html
+  const block = `<style data-zrm-fonts>${faces.join('')}</style>`
+  return html.includes('</head>') ? html.replace('</head>', `${block}</head>`) : `${block}${html}`
+}
+
+const imageCache = new Map()
+
+/** Lit une image (locale ou distante) et la rend en data URI. Le type MIME vient de l'en-tête HTTP
+ * réel (`Content-Type`), jamais deviné depuis l'extension du nom de fichier, qui ment parfois (un
+ * CDN sert souvent du WebP sous une adresse sans extension). Mis en cache. */
+async function imageDataUrl(url) {
+  if (imageCache.has(url)) return imageCache.get(url)
+  const promise = (async () => {
+    try {
+      const res = await fetch(url)
+      if (!res.ok) return null
+      const mime = res.headers.get('content-type') || 'image/png'
+      const bytes = new Uint8Array(await res.arrayBuffer())
+      let binary = ''
+      const CHUNK = 0x8000
+      for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+      return `data:${mime};base64,${btoa(binary)}`
+    } catch { return null }
+  })()
+  imageCache.set(url, promise)
+  return promise
+}
+
+// FAMILLE ILLUSTRATOR I7 · IMAGES INCORPORÉES. Une image de calque reste une simple ADRESSE
+// (voie LIÉE, `<img src="…">`) tant qu'on prévisualise ou édite. À l'export, la page doit pouvoir
+// vivre hors ligne ou chez un client sans que l'image disparaisse si la source bouge : elle est
+// alors INCORPORÉE en base64, exactement comme `embedFonts` le fait déjà pour les polices. Corrige
+// au passage un échec déjà nommé plus bas dans l'erreur d'`exportPng` : une image distante non
+// incorporée peut « tainter » le canvas et faire échouer l'export PNG entièrement.
+export async function embedImages(html) {
+  const srcs = [...new Set([...html.matchAll(/<img[^>]+src="([^"]+)"/g)].map((m) => m[1]).filter((src) => src && !src.startsWith('data:')))]
+  if (!srcs.length) return html
+  let next = html
+  for (const src of srcs) {
+    const data = await imageDataUrl(src)
+    if (data) next = next.split(`src="${src}"`).join(`src="${data}"`)
+  }
+  return next
+}
+
+export function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  // Révocation différée : Safari lit l'URL après le clic, une révocation immédiate annule le
+  // téléchargement sans erreur visible.
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
+export async function exportHtml(html, filename) {
+  const withFonts = await embedFonts(html)
+  const withImages = await embedImages(withFonts)
+  downloadBlob(new Blob([withImages], { type: 'text/html;charset=utf-8' }), filename)
+  return { bytes: new Blob([withImages]).size, container: 'html' }
+}
+
+// Image fixe : SVG foreignObject -> canvas -> PNG.
+// Sérialisation via XMLSerializer sur un DOM parsé : c'est ce qui garantit un XHTML bien formé
+// (`<br/>`, `<img/>`…). Une concaténation de chaînes casserait au premier élément vide.
+export async function exportPng(html, format, filename, { scale = 1 } = {}) {
+  const width = format.canvas.w
+  const height = format.canvas.h || 1200
+  const withFonts = await embedFonts(html)
+  // Une image DISTANTE non incorporée peut tainter le canvas (message d'erreur juste plus bas) :
+  // l'incorporer ICI, avant le rendu SVG->canvas, est ce qui rend cet export fiable.
+  const withImages = await embedImages(withFonts)
+
+  const parsed = new DOMParser().parseFromString(withImages, 'text/html')
+  const svgNS = 'http://www.w3.org/2000/svg'
+  const xhtmlNS = 'http://www.w3.org/1999/xhtml'
+  const svg = document.createElementNS(svgNS, 'svg')
+  svg.setAttribute('xmlns', svgNS)
+  svg.setAttribute('width', String(width))
+  svg.setAttribute('height', String(height))
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`)
+  const fo = document.createElementNS(svgNS, 'foreignObject')
+  fo.setAttribute('x', '0'); fo.setAttribute('y', '0')
+  fo.setAttribute('width', String(width)); fo.setAttribute('height', String(height))
+  const wrapper = document.createElementNS(xhtmlNS, 'div')
+  wrapper.setAttribute('style', `width:${width}px;height:${height}px;overflow:hidden;`)
+  for (const style of parsed.querySelectorAll('style')) wrapper.appendChild(document.importNode(style, true))
+  for (const child of Array.from(parsed.body.childNodes)) wrapper.appendChild(document.importNode(child, true))
+  fo.appendChild(wrapper)
+  svg.appendChild(fo)
+
+  const serialized = new XMLSerializer().serializeToString(svg)
+  const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(serialized)}`
+
+  const image = await new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error("Image non rendue. Cause la plus fréquente : un média distant dans un emplacement. Utilise un fichier déposé (encodé dans la page) plutôt qu'une adresse externe."))
+    img.src = svgUrl
+  })
+
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.round(width * scale)
+  canvas.height = Math.round(height * scale)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
+
+  const blob = await new Promise((resolve, reject) => {
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Encodage PNG refusé par le navigateur.'))), 'image/png')
+  })
+  downloadBlob(blob, filename)
+  return { bytes: blob.size, container: 'png', width: canvas.width, height: canvas.height }
+}
+
+// PDF : on passe par l'impression du navigateur, seul chemin qui produit un vrai PDF vectoriel
+// (texte sélectionnable, 300 dpi réels) sans embarquer de bibliothèque.
+export async function exportPdf(html) {
+  const withFonts = await embedFonts(html)
+  const withImages = await embedImages(withFonts)
+  const frame = document.createElement('iframe')
+  frame.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0;'
+  // AUDIT P0-T8 · ce cadre ne portait AUCUN `sandbox` : un `<script>` dans le HTML imprimé
+  // s'exécuterait avec les pleins droits de l'application, capable de lire `window.parent`. Ce
+  // cadre n'a besoin que d'imprimer du HTML/CSS statique, jamais d'exécuter du script — `allow-
+  // same-origin` SANS `allow-scripts` garde `contentDocument` lisible depuis le parent (l'attente
+  // des polices plus bas continue de fonctionner) tout en refusant catégoriquement tout script,
+  // même présent dans le document, exactement le premier chemin sûr documenté pour l'aperçu.
+  frame.setAttribute('sandbox', 'allow-same-origin')
+  document.body.appendChild(frame)
+  await new Promise((resolve) => {
+    frame.onload = resolve
+    frame.srcdoc = withImages
+  })
+  // Laisse au moteur le temps de poser les polices avant d'ouvrir la boîte d'impression.
+  try { await frame.contentDocument?.fonts?.ready } catch { /* fonts API absente : sans effet */ }
+  await new Promise((r) => setTimeout(r, 120))
+  frame.contentWindow?.focus()
+  frame.contentWindow?.print()
+  setTimeout(() => frame.remove(), 60_000)
+  return { container: 'pdf' }
+}
+
+export async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    // Repli sans API presse-papiers (contexte non sécurisé, permission refusée).
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.cssText = 'position:fixed;opacity:0;'
+    document.body.appendChild(ta)
+    ta.select()
+    let ok = false
+    try { ok = document.execCommand('copy') } catch { ok = false }
+    ta.remove()
+    return ok
+  }
+}
+
+export function safeFileName(text, extension) {
+  const base = String(text || 'zenraymedia')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase().slice(0, 60) || 'zenraymedia'
+  return `${base}.${extension}`
+}

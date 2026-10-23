@@ -1,0 +1,194 @@
+import { buildJsDelivrUrl } from '../capture/shardNaming.js'
+
+export const AUDIO_MANIFEST_VERSION = 3
+
+const JSDELIVR_HOST = 'cdn.jsdelivr.net'
+const PINNED_CDN_PATH = /^\/gh\/[^/]+\/[^/@]+@[a-f0-9]{7,64}\/.+/i
+// Un IV AES-GCM de 12 octets donne exactement 16 caractères Base64, sans padding.
+const BASE64_12_BYTES = /^[A-Za-z0-9+/]{16}$/
+
+function positiveInteger(value, label) {
+  const number = Number(value)
+  if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`${label} invalide`)
+  return number
+}
+
+function nonNegativeNumber(value, label) {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number < 0) throw new Error(`${label} invalide`)
+  return number
+}
+
+function isPinnedCdnUrl(value) {
+  try {
+    const url = new URL(String(value || ''))
+    return url.protocol === 'https:' && url.hostname === JSDELIVR_HOST && PINNED_CDN_PATH.test(url.pathname)
+  } catch {
+    return false
+  }
+}
+
+function validateObjectParts(parts, total, chunkSize, { requireIv, requirePinnedCdn }) {
+  let cursor = 0
+  for (const part of parts) {
+    const start = Number(part?.start)
+    const end = Number(part?.end)
+    const size = Number(part?.size)
+    const expectedSize = Math.min(chunkSize, total - cursor)
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || !Number.isSafeInteger(size) ||
+      start !== cursor || size !== expectedSize || end !== start + size - 1) {
+      throw new Error('chunk audio invalide')
+    }
+    if (requirePinnedCdn && !isPinnedCdnUrl(part.url)) throw new Error('URL CDN audio non immuable')
+    if (requireIv && !BASE64_12_BYTES.test(String(part.iv || ''))) throw new Error('IV audio invalide')
+    cursor = end + 1
+  }
+  if (cursor !== total) throw new Error('taille audio incohérente')
+}
+
+function normalizeObjectPart(part) {
+  return {
+    url: String(part.url || ''),
+    start: Number(part.start),
+    end: Number(part.end),
+    size: Number(part.size),
+    ...(part.iv ? { iv: String(part.iv) } : {}),
+  }
+}
+
+/**
+ * Construit le contrat unique utilisé par toutes les NOUVELLES écritures audio.
+ *
+ * Deux entrées de stockage sont acceptées :
+ * - capture navigateur : noms de parts + cdnRepo/cdnCommit/dir + ivs ;
+ * - upload Git bulk : parts déjà résolues en objets (rollover multi-repo possible).
+ *
+ * La sortie est toujours identique : parts objet, offsets clairs continus et URLs jsDelivr
+ * épinglées sur un commit. `size` désigne toujours le clair, jamais le ciphertext AES-GCM.
+ */
+export function buildAudioManifestV3({
+  name,
+  mime,
+  size,
+  chunkSize,
+  cdnRepo,
+  cdnCommit,
+  dir,
+  parts,
+  ivs = [],
+  duration = 0,
+  title = '',
+  artist = '',
+  album = '',
+  track = '',
+  cover = '',
+  contentHash = '',
+  addedAt = new Date().toISOString(),
+}) {
+  const total = positiveInteger(size, 'taille audio')
+  const clearChunk = positiveInteger(chunkSize, 'taille de chunk')
+  const safeDuration = nonNegativeNumber(duration || 0, 'durée audio')
+  if (!String(name || '').trim()) throw new Error('nom audio absent')
+  if (!Array.isArray(parts) || !parts.length) throw new Error('chunks audio absents')
+
+  let normalizedParts
+  if (typeof parts[0] === 'object' && parts[0] !== null) {
+    if (!parts.every((part) => part && typeof part === 'object' && !Array.isArray(part))) throw new Error('formats de chunks audio mélangés')
+    normalizedParts = parts.map(normalizeObjectPart)
+  } else {
+    if (!cdnRepo || !cdnCommit || !dir || ivs.length !== parts.length) throw new Error('stockage audio incomplet')
+    let start = 0
+    normalizedParts = parts.map((part, index) => {
+      const clearSize = Math.min(clearChunk, total - start)
+      if (clearSize <= 0) throw new Error('trop de chunks audio')
+      const filename = String(part).endsWith('.bin') ? String(part) : `${part}.bin`
+      const normalized = {
+        url: buildJsDelivrUrl(cdnRepo, cdnCommit, `${dir}/${filename}`),
+        start,
+        end: start + clearSize - 1,
+        size: clearSize,
+        iv: String(ivs[index] || ''),
+      }
+      start += clearSize
+      return normalized
+    })
+  }
+
+  const manifest = {
+    type: 'chunked-media',
+    v: AUDIO_MANIFEST_VERSION,
+    mediaKind: 'audio',
+    name: String(name),
+    title: String(title || name).replace(/\.[^.]+$/, ''),
+    artist: String(artist || ''),
+    album: String(album || ''),
+    track: String(track || ''),
+    mime: String(mime || 'audio/mpeg'),
+    size: total,
+    duration: safeDuration,
+    probe: { duration: safeDuration, audio: [], subs: [] },
+    vis: 'public',
+    alg: 'AES-GCM',
+    chunkSize: clearChunk,
+    count: normalizedParts.length,
+    parts: normalizedParts,
+    cover: String(cover || ''),
+    ...(contentHash ? { contentHash: String(contentHash) } : {}),
+    addedAt: String(addedAt),
+  }
+  validateAudioManifest(manifest, { allowLegacy: false })
+  return manifest
+}
+
+/**
+ * Valide le contrat audio sans casser le stock historique :
+ * - v1 : parts nommées, éventuellement publiques chiffrées (cdnRepo/ivs) ou brutes zenray-data ;
+ * - v2 : première génération à parts objet ;
+ * - v3 : contrat strict de toutes les nouvelles écritures.
+ */
+export function validateAudioManifest(manifest, { allowLegacy = true } = {}) {
+  if (!manifest || manifest.type !== 'chunked-media' ||
+    !(manifest.mediaKind === 'audio' || String(manifest.mime || '').startsWith('audio/'))) {
+    throw new Error('manifeste audio attendu')
+  }
+  const version = Number(manifest.v)
+  if (!Number.isInteger(version) || version < 1 || version > AUDIO_MANIFEST_VERSION) throw new Error('version audio non supportée')
+  if (!allowLegacy && version !== AUDIO_MANIFEST_VERSION) throw new Error('manifeste audio legacy refusé')
+
+  const total = positiveInteger(manifest.size, 'taille audio')
+  const chunkSize = positiveInteger(manifest.chunkSize, 'taille de chunk')
+  if (!Array.isArray(manifest.parts) || !manifest.parts.length) throw new Error('chunks audio absents')
+  if (manifest.count != null && Number(manifest.count) !== manifest.parts.length) throw new Error('nombre de chunks audio incohérent')
+
+  const objectParts = typeof manifest.parts[0] === 'object' && manifest.parts[0] !== null
+  if (objectParts) {
+    if (!manifest.parts.every((part) => part && typeof part === 'object' && !Array.isArray(part))) throw new Error('formats de chunks audio mélangés')
+    validateObjectParts(manifest.parts, total, chunkSize, {
+      requireIv: version >= 2 || manifest.alg === 'AES-GCM',
+      requirePinnedCdn: version >= 2,
+    })
+  } else {
+    if (version >= AUDIO_MANIFEST_VERSION) throw new Error('v3 exige des chunks objet')
+    if (!manifest.parts.every((part) => typeof part === 'string' && part.length > 0)) throw new Error('chunk audio legacy invalide')
+    if (!String(manifest.dir || '').trim()) throw new Error('dossier audio legacy absent')
+    const expectedCount = Math.ceil(total / chunkSize)
+    if (manifest.parts.length !== expectedCount) throw new Error('taille audio legacy incohérente')
+    if (manifest.alg === 'AES-GCM' || manifest.vis === 'public') {
+      if (!manifest.cdnRepo || !manifest.cdnCommit || !Array.isArray(manifest.ivs) || manifest.ivs.length !== manifest.parts.length) {
+        throw new Error('stockage audio legacy incomplet')
+      }
+      for (const iv of manifest.ivs) if (!BASE64_12_BYTES.test(String(iv || ''))) throw new Error('IV audio legacy invalide')
+    }
+  }
+
+  if (version === AUDIO_MANIFEST_VERSION) {
+    if (manifest.mediaKind !== 'audio' || !String(manifest.mime || '').startsWith('audio/')) throw new Error('type MIME audio v3 invalide')
+    if (manifest.vis !== 'public' || manifest.alg !== 'AES-GCM') throw new Error('chiffrement audio v3 invalide')
+    nonNegativeNumber(manifest.duration, 'durée audio')
+    if (!String(manifest.name || '').trim()) throw new Error('nom audio absent')
+    if (manifest.cover && !isPinnedCdnUrl(manifest.cover)) throw new Error('pochette audio non immuable')
+    if (manifest.contentHash && !/^[a-f0-9]{64}$/i.test(manifest.contentHash)) throw new Error('hash audio invalide')
+    if (!Number.isFinite(Date.parse(manifest.addedAt))) throw new Error('date audio invalide')
+  }
+  return true
+}

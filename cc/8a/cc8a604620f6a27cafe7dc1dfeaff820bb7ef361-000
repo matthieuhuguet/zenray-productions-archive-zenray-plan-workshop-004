@@ -1,0 +1,72 @@
+// THE GUEST UPLOADER AS A REACT HOOK (2 October 2026): one uploader per share link, owned by the page (so closing the sheet never stops an upload),
+// with the photos kept in IndexedDB until they are sent, a screen wake lock while photos are going out, and a warning before the tab is closed.
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createGuestUploader } from './uploadCore.js'
+import { makeBrowserAdapters } from './browserAdapters.js'
+import { listPending, savePending, removePending } from './uploadStore.js'
+import { cleanSubPath } from '../lib/guestNames.js'
+
+const NAME_KEY = 'zr-guest-name'
+export const rememberedName = () => { try { return localStorage.getItem(NAME_KEY) || '' } catch { return '' } }
+const rememberName = (n) => { try { localStorage.setItem(NAME_KEY, n) } catch { /* private mode */ } }
+
+export function useGuestUploader({ token, onSent }) {
+  const [snap, setSnap] = useState(null)
+  const frame = useRef(0)
+  const latest = useRef(null)
+  const forgotten = useRef(new Set())
+  const onSentRef = useRef(onSent); onSentRef.current = onSent
+  const lastDone = useRef(0)
+
+  const uploader = useMemo(() => {
+    if (!token) return null
+    return createGuestUploader({
+      token, adapters: makeBrowserAdapters({ token }),
+      onChange: (s) => { latest.current = s; if (!frame.current) frame.current = requestAnimationFrame(() => { frame.current = 0; setSnap(latest.current) }) },
+    })
+  }, [token])
+
+  // a photo that is sent (or definitively skipped) no longer needs its copy in IndexedDB; the gallery is told when new photos landed
+  useEffect(() => {
+    if (!snap) return
+    for (const it of snap.items) if ((it.status === 'done' || it.status === 'skipped') && it.tag && !forgotten.current.has(it.tag)) { forgotten.current.add(it.tag); removePending(token, it.tag) }
+    if (snap.counts.done > lastDone.current) { lastDone.current = snap.counts.done; if (onSentRef.current) onSentRef.current(snap) }
+  }, [snap, token])
+
+  // photos left over from an earlier visit (phone killed the tab) are picked up again
+  useEffect(() => {
+    if (!uploader) return undefined
+    let dead = false
+    listPending(token).then((rows) => { if (!dead && rows.length) uploader.add(rows.map((r) => ({ file: r.blob, rel: r.sub ? `${r.sub}/${r.name}` : r.name, tag: r.tag }))) })
+    return () => { dead = true }
+  }, [uploader, token])
+
+  // keep the screen on while photos go out, and warn before closing the tab with photos still waiting
+  const active = !!snap && (snap.counts.active > 0 || snap.counts.waiting > 0) && !snap.idle
+  useEffect(() => {
+    if (!active) return undefined
+    let lock = null
+    const take = async () => { try { if (navigator.wakeLock) lock = await navigator.wakeLock.request('screen') } catch { /* optional */ } }
+    take()
+    const vis = () => { if (document.visibilityState === 'visible') take() }
+    const warn = (e) => { e.preventDefault(); e.returnValue = '' }
+    document.addEventListener('visibilitychange', vis); window.addEventListener('beforeunload', warn)
+    return () => { document.removeEventListener('visibilitychange', vis); window.removeEventListener('beforeunload', warn); try { lock && lock.release() } catch { /* already released */ } }
+  }, [active])
+
+  useEffect(() => () => { if (frame.current) cancelAnimationFrame(frame.current) }, [])
+
+  const add = useCallback((entries) => {
+    if (!uploader || !entries.length) return 0
+    const sub = (latest.current && latest.current.sub) || ''
+    const tagged = entries.map((e, i) => ({ ...e, tag: `${Date.now().toString(36)}-${i}-${Math.floor(Math.random() * 1e6).toString(36)}` }))
+    for (const e of tagged) {
+      const relDirs = e.rel && e.rel.includes('/') ? e.rel.split('/').slice(0, -1) : []
+      savePending(token, e.tag, e.file, { rel: e.rel || '', sub: cleanSubPath([...(sub ? sub.split('/') : []), ...relDirs]) })
+    }
+    return uploader.add(tagged)
+  }, [uploader, token])
+
+  const setName = useCallback((n) => { if (!uploader) return; uploader.setName(n); rememberName(uploader.getName()) }, [uploader])
+  return { uploader, snap, add, setName, createFolder: (n) => (uploader ? uploader.createFolder(n) : Promise.resolve(null)), setSub: (s) => uploader && uploader.setSub(s) }
+}

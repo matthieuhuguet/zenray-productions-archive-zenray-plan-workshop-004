@@ -1,0 +1,70 @@
+import { describe, it, expect } from 'vitest'
+import { reportFromActivity, holdReport } from './uploadReport.js'
+
+const NOW = Date.parse('2026-10-14T08:00:00.000Z')
+const fresh = new Date(NOW - 5000).toISOString()
+
+describe('reportFromActivity', () => {
+  it('shows the running upload with its real percentage', () => {
+    const r = reportFromActivity({ active: [{ kind: 'upload', title: 'Films et séries', phase: 'pushing', currentItem: '/x/Le Sens De La Fete.mkv', currentStep: '[3/15] Empaquetage CMAF', completedUnits: 3, totalUnits: 15, updatedAt: fresh }] }, NOW)
+    expect(r.done).toBe(false)
+    expect(r.summary.progress).toBeCloseTo(0.2, 3)
+    expect(r.message).toContain('Films et séries')
+    expect(r.message).toContain('Le Sens De La Fete.mkv')
+  })
+  it('ignores a stale job, falls back to the finished report, and is null without anything (red controls)', () => {
+    const stale = { kind: 'upload', title: 'Vieux', updatedAt: new Date(NOW - 3600000).toISOString() }
+    expect(reportFromActivity({ active: [stale] }, NOW)).toBeNull()
+    expect(reportFromActivity({ active: [stale], uploadTiming: { message: 'fini', done: true } }, NOW).message).toBe('fini')
+    expect(reportFromActivity(null, NOW)).toBeNull()
+  })
+})
+
+describe('queue report and hold', () => {
+  const queue = { updatedAt: fresh, running: true, total: 15, finished: 6, counts: { failed: 1, archive: 2 }, items: [{ name: '/x/a.mkv', stage: 'archive' }, { name: 'b.mkv', stage: 'done' }, { name: 'c.mkv', stage: 'failed' }] }
+  it('reports the per-file queue first, with real counts and one label per file', () => {
+    const r = reportFromActivity({ uploadQueue: queue, active: [{ kind: 'upload', updatedAt: fresh }] }, NOW)
+    expect(r.message).toBe("Envoi : 6 sur 15 terminés, 1 à relancer, 1 en cours (envoi de l'archive vers github)")
+    expect(r.summary.progress).toBeCloseTo(0.4, 3)
+    expect(r.queue.map((q) => q.label)).toEqual(["Envoi de l'archive vers GitHub", 'Terminé', 'À relancer (échec)'])
+  })
+  it('keeps a running queue for hours and drops a finished one after 30 minutes (red controls)', () => {
+    const old = new Date(NOW - 2 * 3600000).toISOString()
+    expect(reportFromActivity({ uploadQueue: { ...queue, updatedAt: old } }, NOW)).not.toBeNull()
+    expect(reportFromActivity({ uploadQueue: { ...queue, updatedAt: old, running: false } }, NOW)).toBeNull()
+  })
+  it('does not blink: the last report is held 10 minutes, then dropped', () => {
+    const first = holdReport(null, { message: 'x' }, NOW)
+    expect(first.held).toBe(false)
+    const held = holdReport(first.state, null, NOW + 60000)
+    expect(held.report.message).toBe('x')
+    expect(held.held).toBe(true)
+    expect(holdReport(first.state, null, NOW + 11 * 60000).report).toBeNull()
+  })
+  it('clears a finished band one minute after it was first seen done, and never brings it back (17 October 2026)', () => {
+    const done = { message: 'Envoi : 2 sur 2 terminés', done: true }
+    const first = holdReport(null, done, NOW)
+    expect(first.report).toBe(done)
+    const still = holdReport(first.state, done, NOW + 30000)
+    expect(still.report).toBe(done)
+    const gone = holdReport(still.state, done, NOW + 61000)
+    expect(gone.report).toBeNull()
+    expect(holdReport(gone.state, done, NOW + 120000).report).toBeNull()
+    expect(holdReport(gone.state, { message: 'new', done: false }, NOW + 130000).report.message).toBe('new')
+    expect(holdReport(first.state, null, NOW + 5000).report).toBeNull() // a done report is not held when the relay goes silent
+  })
+  it('shows the real time percentage of a stage in the file label, only while that stage is active (14 October 2026)', () => {
+    const q = { updatedAt: fresh, running: true, total: 2, finished: 0, counts: {}, items: [{ name: 'a.mkv', stage: 'cmaf', percent: 42 }, { name: 'b.mkv', stage: 'done', percent: 100 }] }
+    const r = reportFromActivity({ uploadQueue: q }, NOW)
+    expect(r.queue[0].label).toBe('Préparation du streaming 42 %')
+    expect(r.queue[1].label).toBe('Terminé')
+  })
+  it('names the stage in plain French and carries the detail sentence while the stage is active (17 October 2026)', () => {
+    const q = { updatedAt: fresh, running: true, total: 2, finished: 0, counts: {}, items: [{ name: 'a.mkv', stage: 'push', percent: 40, detail: '4.6 Go envoyes sur 11.3 Go, a 9.7 Mo/s, reste environ 12 min' }, { name: 'b.mkv', stage: 'done', detail: 'old' }] }
+    const r = reportFromActivity({ uploadQueue: q }, NOW)
+    expect(r.queue[0].label).toBe('Envoi vers GitHub 40 %')
+    expect(r.queue[0].detail).toContain('reste environ 12 min')
+    expect(r.queue[1].detail).toBe('')
+    expect(r.message).toContain('envoi vers github')
+  })
+})

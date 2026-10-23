@@ -1,0 +1,273 @@
+// ZenRayMedia — L11 : le Critique.
+//
+// 01-PLAN §9 : « Le Critique est le poste qui fait la différence entre premium et amateur. Sans
+// lui, la machine produit mille médias moyens. » C'est le SEUL poste obligatoire du cycle :
+// aucun livrable ne sort sans son passage, et un défaut bloquant interdit la publication.
+//
+// Deux familles de contrôles :
+//   - STATIQUES : sur les données (brief, cut, thème, format). Aucun rendu nécessaire.
+//   - MESURÉS   : sur la page réellement rendue (débordement, zones de sécurité, taille de
+//                 texte). Mesurés dans le document, jamais estimés — une estimation qui se
+//                 trompe est pire que pas de contrôle du tout.
+
+import { validate, sentenceCount } from './contracts.js'
+import { isTemporal, durationOf } from './formats.js'
+import { omittedCount, visibleBeats } from './compile.js'
+import { slotsWeight, countSlots, MAX_SLOTS } from './cut.js'
+import { missingFamilies, fontsWeight } from './fonts.js'
+
+export const SEVERITY = { blocking: 'blocking', warning: 'warning', info: 'info' }
+
+const issue = (severity, code, message, fix = null) => ({ severity, code, message, fix })
+
+// --- Couleur et contraste ---------------------------------------------------------------------
+export function parseColor(input) {
+  const s = String(input || '').trim()
+  let m = /^#([0-9a-f]{3,8})$/i.exec(s)
+  if (m) {
+    const h = m[1]
+    if (h.length === 3 || h.length === 4) {
+      const [r, g, b, a = 'f'] = h.split('')
+      return { r: parseInt(r + r, 16), g: parseInt(g + g, 16), b: parseInt(b + b, 16), a: parseInt(a + a, 16) / 255 }
+    }
+    if (h.length === 6 || h.length === 8) {
+      return { r: parseInt(h.slice(0, 2), 16), g: parseInt(h.slice(2, 4), 16), b: parseInt(h.slice(4, 6), 16), a: h.length === 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1 }
+    }
+  }
+  m = /^rgba?\(([^)]+)\)$/i.exec(s)
+  if (m) {
+    const parts = m[1].split(/[,\s/]+/).filter(Boolean).map(Number)
+    if (parts.length >= 3 && parts.slice(0, 3).every((n) => Number.isFinite(n))) {
+      return { r: parts[0], g: parts[1], b: parts[2], a: Number.isFinite(parts[3]) ? parts[3] : 1 }
+    }
+  }
+  return null
+}
+
+function channelLuminance(c) {
+  const v = c / 255
+  return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)
+}
+
+export function relativeLuminance(color) {
+  return 0.2126 * channelLuminance(color.r) + 0.7152 * channelLuminance(color.g) + 0.0722 * channelLuminance(color.b)
+}
+
+// Compose une couleur semi-transparente sur son fond : sans ça, un `rgba(20,22,26,.56)` sur blanc
+// serait mesuré comme du quasi-noir et le contraste serait faux.
+export function composite(fg, bg) {
+  const a = fg.a ?? 1
+  return { r: fg.r * a + bg.r * (1 - a), g: fg.g * a + bg.g * (1 - a), b: fg.b * a + bg.b * (1 - a), a: 1 }
+}
+
+export function contrastRatio(foreground, background) {
+  const fg = parseColor(foreground)
+  const bg = parseColor(background)
+  if (!fg || !bg) return null
+  const composed = composite(fg, { ...bg, a: 1 })
+  const l1 = relativeLuminance(composed)
+  const l2 = relativeLuminance(bg)
+  const [hi, lo] = l1 > l2 ? [l1, l2] : [l2, l1]
+  return Math.round(((hi + 0.05) / (lo + 0.05)) * 100) / 100
+}
+
+// --- Contrôles statiques -----------------------------------------------------------------------
+export function inspectStatic({ brief, cut, theme, format, dark = false, composed = false }) {
+  const issues = []
+
+  for (const [kind, value] of [['brief', brief], ['cut', cut], ['theme', theme], ['format', format]]) {
+    for (const err of validate(kind, value)) {
+      issues.push(issue(SEVERITY.blocking, `${kind}.${err.code}`, err.message))
+    }
+  }
+  if (issues.length) return issues // inutile de mesurer une structure invalide
+
+  // ZM-L2-02 — message unique.
+  if (sentenceCount(brief.message) > 1) {
+    issues.push(issue(SEVERITY.blocking, 'message.multi', 'Le message tient en une seule phrase.'))
+  }
+
+  // ZM-L11-02 — contraste réel de l'encre sur le fond, au seuil posé par le thème.
+  const ink = dark ? theme.palette.inkDark : theme.palette.ink
+  const bg = dark ? theme.surface.backgroundDark : theme.surface.background
+  const ratio = contrastRatio(ink, bg)
+  const minContrast = theme.palette.minContrast || 4.5
+  if (ratio == null) {
+    issues.push(issue(SEVERITY.warning, 'contrast.unreadable', 'Couleurs du thème non analysables : contraste non vérifié.'))
+  } else if (ratio < minContrast) {
+    issues.push(issue(SEVERITY.blocking, 'contrast.low', `Contraste ${ratio}:1 sous le seuil ${minContrast}:1 du thème (mode ${dark ? 'sombre' : 'clair'}).`))
+  }
+  const muted = dark ? theme.palette.mutedDark : theme.palette.muted
+  const mutedRatio = contrastRatio(muted, bg)
+  if (mutedRatio != null && mutedRatio < 4.5) {
+    issues.push(issue(SEVERITY.warning, 'contrast.muted', `Texte secondaire à ${mutedRatio}:1 : sous 4,5:1, il devient pénible à lire.`))
+  }
+
+  // ZM-L4 — le thème déclare-t-il ce format ?
+  if (Array.isArray(theme.formats) && !theme.formats.includes(format.id)) {
+    issues.push(issue(SEVERITY.warning, 'theme.format', `« ${theme.name} » ne déclare pas le format ${format.label} : le rendu peut être approximatif.`))
+  }
+
+  // ZM-L3-03 — nombre de beats imposé par le thème.
+  const count = cut.beats.length
+  const { min, max } = theme.beatCount || { min: 1, max: 99 }
+  if (count < min) issues.push(issue(SEVERITY.warning, 'cut.tooFew', `${count} beat(s) pour un thème qui en attend ${min} au minimum.`, 'refit'))
+  if (count > max) issues.push(issue(SEVERITY.warning, 'cut.tooMany', `${count} beats pour un thème qui en accepte ${max} au maximum.`, 'refit'))
+
+  // ZM-L11-04 — durée dans les bornes du format.
+  if (isTemporal(format)) {
+    const d = durationOf(cut, format)
+    if (d <= format.time.min) issues.push(issue(SEVERITY.warning, 'duration.short', `Durée ${d}s au plancher du format (${format.time.min}s) : le contenu a été comprimé.`))
+    if (d >= format.time.max) issues.push(issue(SEVERITY.blocking, 'duration.long', `Durée ${d}s au plafond du format (${format.time.max}s) : retire ou raccourcis un beat.`))
+  }
+
+  // ZM-L2-08 — les mentions obligatoires apparaissent dans le contenu.
+  const haystack = `${brief.title} ${brief.message} ${cut.beats.map((b) => b.text).join(' ')}`.toLowerCase()
+  for (const mention of brief.constraints?.mentions || []) {
+    if (mention && !haystack.includes(String(mention).toLowerCase())) {
+      issues.push(issue(SEVERITY.blocking, 'mention.missing', `Mention obligatoire absente du contenu : « ${mention} ».`))
+    }
+  }
+
+  // Politique de contenu du format : ce qui n'est pas affiché doit être DIT. Un bloc qui
+  // disparaît sans un mot est la pire des interfaces -- on croit avoir publié son texte entier.
+  // ... SAUF sur la voie composée, où les blocs ne sont plus la source de la page : celle-ci est
+  // faite des pièces posées, et compter des blocs « omis » y raconte une histoire fausse. C'est le
+  // second point où le Critique parlait de l'ancien modèle en regardant le nouveau.
+  const omitted = composed ? 0 : omittedCount(cut, format)
+  if (omitted > 0) {
+    issues.push(issue(SEVERITY.info, 'fit.omitted',
+      `Ce format montre ${visibleBeats(cut, format).length} bloc(s) sur ${cut.beats.length} : ${omitted} restent réservés aux formats de lecture (Web, A4). C'est voulu — une image ne porte pas un article.`))
+  }
+
+  // Poids des médias encodés. Un document de plusieurs mégaoctets alourdit chaque enregistrement
+  // dans le drive et chaque relecture : on le dit AVANT que ça devienne pénible, pas après.
+  const mediaBytes = slotsWeight(cut)
+  if (mediaBytes > 6_000_000) {
+    issues.push(issue(SEVERITY.warning, 'doc.heavy', `${Math.round(mediaBytes / 1e6)} Mo d'images encodées dans le document : au-delà de 6 Mo, chaque enregistrement devient lent. Retire une image ou attends le stockage en shards.`))
+  }
+  const slots = countSlots(cut)
+  if (slots > 0 && format.kind === 'web' && slots > cut.beats.length * MAX_SLOTS) {
+    issues.push(issue(SEVERITY.warning, 'slots.many', `${slots} images pour ${cut.beats.length} blocs : la page devient lourde à charger.`))
+  }
+
+  // ZM-L4-11 — polices du thème. Une famille absente du disque n'est pas une erreur : la page
+  // retombe sur sa pile système. Mais le rendu ne sera PAS celui mesuré sur les captures, et
+  // c'est exactement le genre d'écart qu'on ne voit pas et qu'on livre quand même.
+  const missing = missingFamilies(theme.fonts || [])
+  if (missing.length) {
+    issues.push(issue(SEVERITY.warning, 'font.missing',
+      `Police non installée : ${missing.join(', ')}. Le rendu utilise un repli système, donc pas la typographie mesurée. Installer avec « node scripts/zrm-fonts.mjs --cjk » si c'est une famille japonaise.`))
+  }
+  const fontBytes = fontsWeight(theme.fonts || [])
+  if (fontBytes > 1_500_000) {
+    issues.push(issue(SEVERITY.warning, 'font.heavy',
+      `${Math.round(fontBytes / 1e6 * 10) / 10} Mo de polices embarquées à l'export : la page devient lente à ouvrir. Retire une graisse ou une famille.`))
+  }
+
+  // ZM-L11-06 — un beat d'un seul mot n'est pas un beat.
+  cut.beats.forEach((beat, i) => {
+    const words = String(beat.text).trim().split(/\s+/).filter(Boolean).length
+    if (words < 3) issues.push(issue(SEVERITY.warning, 'beat.thin', `Beat ${i + 1} (${beat.role}) : ${words} mot(s). Trop court pour porter quoi que ce soit.`))
+  })
+
+  // Un cut sans appel final quand l'intention est de vendre ou convaincre.
+  if (['vendre', 'convaincre'].includes(brief.intent) && !cut.beats.some((b) => b.role === 'cta')) {
+    issues.push(issue(SEVERITY.warning, 'cut.noCta', `Intention « ${brief.intent} » sans beat d'appel : le lecteur ne saura pas quoi faire.`))
+  }
+
+  return issues
+}
+
+// --- Contrôles mesurés sur la page rendue -------------------------------------------------------
+// `doc` est le document de l'iframe d'aperçu. On MESURE, on n'estime pas.
+export function inspectRendered(doc, format) {
+  const issues = []
+  if (!doc || !doc.body) return issues
+  const view = doc.defaultView
+  if (!view) return issues
+
+  // LE CRITIQUE ÉTAIT AVEUGLE À LA VOIE LEGO, et cela produisait un faux positif systématique.
+  //
+  // Il cherchait `.zrm-page`, que seule la voie à jetons produit ; la voie composée écrit
+  // `.zrm-lego-page`. Faute de la trouver, il mesurait le `body`, lequel fait exactement la taille
+  // du canevas, et le comparait à l'espace utile, c'est-à-dire au canevas MOINS les zones de
+  // sécurité. Le verdict tombait donc toujours, et toujours du même chiffre : la somme des zones
+  // de sécurité. En Carré 1080, quarante-huit en haut plus quarante-huit en bas, soit les 96 px
+  // annoncés sur les deux axes à la fois. Un débordement identique en hauteur et en largeur n'est
+  // jamais du contenu, c'est une constante ; c'est ce qui a mis sur la piste.
+  const legoPage = doc.querySelector('.zrm-lego-page')
+  const page = legoPage || doc.querySelector('.zrm-page') || doc.body
+  const fixed = format?.canvas?.h > 0
+  const safe = format?.safe || { top: 0, bottom: 0, sides: 0 }
+
+  // ZM-L11-03 — débordement réel.
+  // On mesure la page CONTRE L'ESPACE UTILE (canevas moins zones de sécurité), pas contre le
+  // body. Le cadre centre son contenu en flex avec `overflow:hidden` : un contenu trop haut y
+  // déborde SYMÉTRIQUEMENT et se fait rogner en haut ET en bas, sans que `scrollHeight` du body
+  // ne bouge. Mesurer le body laisserait donc passer une coupe franche sans rien signaler.
+  if (fixed) {
+    const usableH = format.canvas.h - safe.top - safe.bottom
+    const usableW = format.canvas.w - safe.sides * 2
+    // La page composée RÉSERVE elle-même ses zones de sécurité, sous forme de remplissage. Son
+    // débordement se lit donc dans sa propre boîte, et non contre une largeur utile qu'elle a déjà
+    // déduite : la mesurer comme l'autre voie reviendrait à retrancher deux fois la même marge.
+    const overflowY = legoPage
+      ? Math.round(legoPage.scrollHeight - legoPage.clientHeight)
+      : Math.round(page.getBoundingClientRect().height - usableH)
+    if (overflowY > 2) {
+      issues.push(issue(SEVERITY.blocking, 'overflow.vertical', `Le contenu dépasse de ${overflowY} px la hauteur utile du format : il sera rogné en haut et en bas.`, 'shrink'))
+    }
+    const overflowX = legoPage
+      ? Math.round(legoPage.scrollWidth - legoPage.clientWidth)
+      : Math.round(page.scrollWidth - usableW)
+    if (overflowX > 2) {
+      issues.push(issue(SEVERITY.blocking, 'overflow.horizontal', `Le contenu dépasse de ${overflowX} px la largeur utile du format.`, 'shrink'))
+    }
+  }
+
+  // ZM-L11-01 — zones de sécurité des plateformes.
+  if (fixed && format?.safe) {
+    const H = format.canvas.h
+    const W = format.canvas.w
+    for (const el of doc.querySelectorAll('.zrm-title, .zrm-beat-text, .zrm-standfirst, .zrm-byline, .zrm-kicker')) {
+      const r = el.getBoundingClientRect()
+      if (r.width === 0 && r.height === 0) continue
+      if (r.top < safe.top - 1) { issues.push(issue(SEVERITY.blocking, 'safe.top', `Du texte entre dans la zone haute réservée à l'interface (${Math.round(safe.top - r.top)} px trop haut).`, 'shrink')); break }
+      if (r.bottom > H - safe.bottom + 1) { issues.push(issue(SEVERITY.blocking, 'safe.bottom', `Du texte entre dans la zone basse réservée à l'interface (${Math.round(r.bottom - (H - safe.bottom))} px trop bas).`, 'shrink')); break }
+      if (r.left < safe.sides - 1 || r.right > W - safe.sides + 1) { issues.push(issue(SEVERITY.blocking, 'safe.sides', 'Du texte sort des marges latérales de sécurité.', 'shrink')); break }
+    }
+  }
+
+  // ZM-L11-05 — plancher de lisibilité. 12 px est la règle du projet sur poste fixe ; sur un
+  // format à canevas fixe, le plancher est relatif au canevas (1,1 % de la hauteur).
+  const floor = fixed ? Math.max(12, Math.round(format.canvas.h * 0.011)) : 12
+  for (const el of doc.querySelectorAll('.zrm-beat-text, .zrm-standfirst')) {
+    const size = parseFloat(view.getComputedStyle(el).fontSize)
+    if (Number.isFinite(size) && size < floor) {
+      issues.push(issue(SEVERITY.warning, 'type.tooSmall', `Texte à ${Math.round(size)} px, sous le plancher de ${floor} px : illisible à l'échelle de diffusion.`))
+      break
+    }
+  }
+
+  // ZM-L11-06 — ligne isolée en fin de bloc (veuve).
+  for (const el of doc.querySelectorAll('.zrm-beat-text')) {
+    const words = String(el.textContent || '').trim().split(/\s+/).filter(Boolean)
+    if (words.length < 8) continue
+    const lineHeight = parseFloat(view.getComputedStyle(el).lineHeight)
+    const lines = Number.isFinite(lineHeight) && lineHeight > 0 ? Math.round(el.getBoundingClientRect().height / lineHeight) : 1
+    if (lines > 1 && words[words.length - 1].length <= 3) {
+      issues.push(issue(SEVERITY.info, 'type.widow', 'Un mot très court finit seul une ligne : insécable recommandé.'))
+      break
+    }
+  }
+
+  return issues
+}
+
+export function summarize(issues) {
+  const blocking = issues.filter((i) => i.severity === SEVERITY.blocking)
+  const warnings = issues.filter((i) => i.severity === SEVERITY.warning)
+  const infos = issues.filter((i) => i.severity === SEVERITY.info)
+  return { blocking, warnings, infos, canPublish: blocking.length === 0, total: issues.length }
+}

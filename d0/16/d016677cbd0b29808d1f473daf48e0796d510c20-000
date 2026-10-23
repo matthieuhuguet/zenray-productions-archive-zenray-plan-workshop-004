@@ -1,0 +1,165 @@
+// ═══ DÉPRÉCIÉ (2026-07-13) — NE PLUS UTILISER ═══════════════════════════════════════════════════
+// Ce script date de l'ère vignettes 384px/q72, remplacée par le standard 1080px/q60 (makeThumbAt,
+// scripts/img-ingest.mjs). Pour régénérer des vignettes aujourd'hui : scripts/regen-thumbs-bulk.mjs
+// (en masse, association par hash) ou scripts/regen-thumbs-oriented.mjs (correction EXIF).
+// Gardé UNIQUEMENT comme référence historique. Le garde ci-dessous empêche toute exécution accidentelle.
+if (!process.env.ZR_RUN_DEPRECATED) { console.error("DÉPRÉCIÉ : voir l'en-tête du fichier. (ZR_RUN_DEPRECATED=1 pour forcer, déconseillé.)"); process.exit(1) }
+
+// RÉGÉNÉRATION DES VIGNETTES MANQUANTES (images dont la .webp n'a jamais été créée -> tuile grise).
+//
+// CAUSE : ~16k images ont leur AVIF plein CHIFFRÉ sur le CDN public mais aucune vignette .webp (pas de thumbIv
+// dans le manifeste). L'index pointe vers une webp inexistante -> 404 -> gris. On les régénère :
+//   AVIF chiffré (CDN) -> déchiffre (clé maître) -> avifdec PNG -> cwebp 384px -> rechiffre -> push webp ->
+//   maj manifeste (.img.json) : cdnCommit = nouveau commit du repo img + thumbIv -> reindex -> {u,iv} valide.
+//
+// Le décodage/encodage est du CPU LOCAL (parallélisé). Les webps sont poussés par GIT (clone partiel blob:none +
+// read-tree : n'upload QUE les nouvelles webps, jamais les Go existants). Les manifestes sont mis à jour par lots
+// (Git Data API inline-tree sur zenray-data). Lecture des manifestes/AVIF via raw (hors quota REST).
+//
+// Usage : GITHUB_TOKEN=$(gh auth token) node Scripts/regen-thumbnails.mjs [--folder <sous-chemin>] [--limit N] [--apply] [--reindex]
+//   défaut = DRY (inventaire). --apply pousse. --folder filtre (ex: _Unsorted). --limit borne (pilote).
+import { readFileSync, writeFileSync } from 'node:fs'
+import { mkdir, rm, writeFile, mkdtemp } from 'node:fs/promises'
+import { execFileSync, execFile, spawnSync } from 'node:child_process'
+const pexec = (cmd, args) => new Promise((res, rej) => execFile(cmd, args, { maxBuffer: 64 * 1024 * 1024 }, (e) => e ? rej(e) : res()))
+import { webcrypto, createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import os from 'node:os'
+import path from 'node:path'
+
+const OWNER = 'matthieuhuguet', DATA = 'zenray-data', BRANCH = 'main'
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN requis'); process.exit(1) }
+const arg = (k) => { const i = process.argv.indexOf(k); return i >= 0 ? process.argv[i + 1] : null }
+const FOLDER = arg('--folder') || ''
+const LIMIT = parseInt(arg('--limit') || '0', 10) || 0
+const APPLY = process.argv.includes('--apply')
+const REINDEX = process.argv.includes('--reindex')
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
+const WORK = path.join(os.tmpdir(), 'zr-thumbs')
+const RAW = 'https://raw.githubusercontent.com'
+
+const keyB64 = (process.env.ZENRAY_MEDIA_KEY && /^[A-Za-z0-9+/=]{40,}$/.test(process.env.ZENRAY_MEDIA_KEY)) ? process.env.ZENRAY_MEDIA_KEY.trim() : readFileSync(path.join(SCRIPT_DIR, '..', '.zenray-media-key'), 'utf8').trim()
+const rawKey = Uint8Array.from(Buffer.from(keyB64, 'base64'))
+const decKey = await webcrypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt'])
+const encKey = await webcrypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt'])
+const b64 = (u8) => Buffer.from(u8).toString('base64')
+const fromB64 = (s) => Uint8Array.from(Buffer.from(s, 'base64'))
+async function decrypt(bytes, ivB64) { return new Uint8Array(await webcrypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(ivB64) }, decKey, bytes)) }
+async function encrypt(bytes) { const iv = webcrypto.getRandomValues(new Uint8Array(12)); const ct = new Uint8Array(await webcrypto.subtle.encrypt({ name: 'AES-GCM', iv }, encKey, bytes)); return { iv: b64(iv), cipher: ct } }
+const webpOf = (p) => p.replace(/\.[^./]+$/, '.webp')
+async function gh(p, init = {}, tries = 6) {
+  for (let a = 0; a < tries; a++) {
+    const r = await fetch(`https://api.github.com/${p}`, { ...init, headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zr-thumbs', ...(init.headers || {}) } })
+    if (r.ok) return r
+    const rem = r.headers.get('x-ratelimit-remaining')
+    if (r.status === 403 && rem === '0') { const reset = +(r.headers.get('x-ratelimit-reset') || 0) * 1000; const wait = Math.max(2000, reset - Date.now() + 2000); console.log(`  rate-limit (data), pause ${Math.round(wait / 1000)}s ...`); await new Promise((s) => setTimeout(s, wait)); continue }
+    if (r.status === 429 || r.status >= 500) { await new Promise((s) => setTimeout(s, 2000 * (a + 1))); continue }
+    return r
+  }
+  return fetch(`https://api.github.com/${p}`, { headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zr-thumbs' } })
+}
+
+// ── 1) cibles : index public déchiffré -> images à vignette CLAIR (sans iv) = cassées ──────────────
+console.log('lecture index public (head + shards) ...')
+const IDX = `${RAW}/${OWNER}/zenray-index-public/main`
+const head = await (await fetch(`${IDX}/head.json`, { cache: 'no-store' })).json()
+let thumbs = {}, paths = []
+for (const s of head.shards) {
+  const blob = await (await fetch(`${IDX}/s/${s.h}-${s.part}.json`)).json()
+  const clear = await decrypt(fromB64(blob.ct), blob.iv)
+  const d = JSON.parse(new TextDecoder().decode(clear))
+  Object.assign(thumbs, d.thumbs || {}); paths = paths.concat(d.paths)
+}
+let targets = paths.filter((p) => p.endsWith('.img.json') && thumbs[p] && thumbs[p].u && !thumbs[p].iv)
+if (FOLDER) targets = targets.filter((p) => p.includes(`/${FOLDER}/`) || p.includes(`${FOLDER}/`))
+if (LIMIT) targets = targets.slice(0, LIMIT)
+console.log(`cibles (vignette manquante)${FOLDER ? ` dans ${FOLDER}` : ''}${LIMIT ? ` [limite ${LIMIT}]` : ''} : ${targets.length}`)
+if (!targets.length) { console.log('rien à régénérer.'); process.exit(0) }
+
+// ── 2) génère chaque webp (parallèle, CPU local) ──────────────────────────────────────────────────
+await rm(WORK, { recursive: true, force: true }).catch(() => {}); await mkdir(WORK, { recursive: true })
+const rawHdr = { headers: { Authorization: `Bearer ${TOKEN}`, 'User-Agent': 'zr-thumbs' } }
+const made = [] // { manifestPath, repo, webpPath, cipher, thumbIv, m }
+let done = 0, skip = 0, fail = 0
+// Goulot = téléchargement des AVIF pleins (I/O réseau), pas le CPU (décode/encode = bursts courts). On lance
+// donc BEAUCOUP plus de workers que de cœurs pour paralléliser les fetches. Réglable via --conc (défaut 48).
+const CPU = parseInt(arg('--conc') || '0', 10) || 48
+let qi = 0
+async function worker(wid) {
+  const tmp = await mkdtemp(path.join(WORK, `w${wid}-`))
+  while (qi < targets.length) {
+    const mp = targets[qi++]
+    try {
+      const mr = await fetch(`${RAW}/${OWNER}/${DATA}/${BRANCH}/${mp.split('/').map(encodeURIComponent).join('/')}`, rawHdr)
+      if (!mr.ok) { skip++; continue }
+      const m = JSON.parse(await mr.text())
+      if (m.thumbIv) { skip++; continue } // déjà une vignette chiffrée
+      if (m.vis !== 'public' || !m.cdnRepo || !m.cdnPath || !m.cdnCommit || !m.iv) { skip++; continue }
+      const ar = await fetch(`${RAW}/${OWNER}/${m.cdnRepo}/${m.cdnCommit}/${m.cdnPath}`)
+      if (!ar.ok) { fail++; continue }
+      const clearAvif = await decrypt(new Uint8Array(await ar.arrayBuffer()), m.iv)
+      const aP = path.join(tmp, 'i.avif'), pP = path.join(tmp, 'i.png'), wP = path.join(tmp, 'i.webp')
+      writeFileSync(aP, clearAvif)
+      // ASYNC (pas execFileSync) : ne bloque PAS la boucle Node -> les fetches des autres workers se chevauchent
+      // vraiment avec le décode/encode. C'est ça la vraie parallélisation (pas 16 process séparés).
+      await pexec('avifdec', ['--jobs', '1', aP, pP])
+      await pexec('cwebp', ['-quiet', '-q', '80', '-resize', '384', '0', pP, '-o', wP])
+      const webpBytes = readFileSync(wP)
+      const { iv, cipher } = await encrypt(webpBytes)
+      made.push({ manifestPath: mp, repo: m.cdnRepo, webpPath: webpOf(m.cdnPath), cipher, thumbIv: iv, m })
+      done++
+      if (done % 25 === 0) console.log(`  généré ${done}/${targets.length} (skip ${skip}, fail ${fail})`)
+    } catch (e) { fail++; if (fail <= 3) console.error('  err', mp.split('/').pop(), (e.message || '').slice(0, 80)) }
+  }
+}
+await Promise.all(Array.from({ length: CPU }, (_, i) => worker(i)))
+console.log(`vignettes générées : ${made.length} | skip ${skip} | fail ${fail}`)
+if (!APPLY) { console.log('\nDRY-RUN (aucun push). Ajoute --apply pour pousser.'); await rm(WORK, { recursive: true, force: true }).catch(() => {}); process.exit(0) }
+if (!made.length) { process.exit(0) }
+
+// ── 3) push des webps par repo via GIT (clone --filter=blob:none --no-checkout + read-tree) ──────────
+// git push N'EST PAS soumis au cap REST 5000/h (protocole Git séparé) -> on uploade 16k webps sans throttle.
+// blob:none + no-checkout = AUCUN blob existant téléchargé ; read-tree remplit l'index (arbre complet par sha) ->
+// le commit préserve les Go existants et n'uploade QUE les nouvelles webps. ~10 repos, pas 16k appels.
+const byRepo = new Map()
+for (const x of made) { if (!byRepo.has(x.repo)) byRepo.set(x.repo, []); byRepo.get(x.repo).push(x) }
+const newCommit = {} // repo -> sha
+for (const [repo, list] of byRepo) {
+  const dir = path.join(WORK, '_push_' + repo)
+  await rm(dir, { recursive: true, force: true }).catch(() => {})
+  execFileSync('git', ['clone', '--quiet', '--filter=blob:none', '--no-checkout', '--depth=1', `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`, dir], { stdio: 'inherit' })
+  const g = (...a) => execFileSync('git', ['-C', dir, ...a], { stdio: 'pipe' })
+  for (const [k, v] of [['user.email', 'thumbs@zenray'], ['user.name', 'zr-thumbs'], ['http.version', 'HTTP/1.1'], ['http.postBuffer', '524288000']]) g('config', k, v)
+  g('read-tree', 'HEAD') // index = arbre complet (par sha), sans matérialiser ni télécharger les blobs
+  for (const x of list) { const dst = path.join(dir, x.webpPath); await mkdir(path.dirname(dst), { recursive: true }); writeFileSync(dst, x.cipher) }
+  g('add', '-f', ...list.map((x) => x.webpPath))
+  g('commit', '-q', '-m', `thumbnails +${list.length}`)
+  execFileSync('git', ['-C', dir, 'push', '-q', 'origin', 'HEAD:main'], { stdio: 'inherit' })
+  newCommit[repo] = g('rev-parse', 'HEAD').toString().trim()
+  console.log(`  ${repo} : +${list.length} webps -> ${newCommit[repo].slice(0, 7)} (git push, hors quota REST)`)
+  await rm(dir, { recursive: true, force: true }).catch(() => {})
+}
+
+// ── 4) maj manifestes (.img.json) : cdnCommit=nouveau commit + thumbIv -> lots inline-tree sur zenray-data ──
+async function commitInline(files, msg) {
+  for (let a = 0; a < 8; a++) {
+    const ref = await (await gh(`repos/${OWNER}/${DATA}/git/ref/heads/${BRANCH}`)).json(); const hsha = ref.object?.sha; if (!hsha) { await new Promise(r => setTimeout(r, 1500)); continue }
+    const base = (await (await gh(`repos/${OWNER}/${DATA}/git/commits/${hsha}`)).json()).tree?.sha; if (!base) continue
+    const nt = await (await gh(`repos/${OWNER}/${DATA}/git/trees`, { method: 'POST', body: JSON.stringify({ base_tree: base, tree: files.map(f => ({ path: f.path, mode: '100644', type: 'blob', content: f.content })) }) })).json(); if (!nt.sha) { await new Promise(r => setTimeout(r, 2000)); continue }
+    const nc = await (await gh(`repos/${OWNER}/${DATA}/git/commits`, { method: 'POST', body: JSON.stringify({ message: msg, tree: nt.sha, parents: [hsha] }) })).json(); if (!nc.sha) continue
+    const up = await gh(`repos/${OWNER}/${DATA}/git/refs/heads/${BRANCH}`, { method: 'PATCH', body: JSON.stringify({ sha: nc.sha, force: false }) })
+    if (up.ok) return true
+  }
+  return false
+}
+const updates = made.map((x) => { const m = { ...x.m, cdnCommit: newCommit[x.repo], thumbIv: x.thumbIv }; return { path: x.manifestPath, content: JSON.stringify(m) } })
+console.log(`maj ${updates.length} manifestes (.img.json) ...`)
+for (let i = 0; i < updates.length; i += 500) {
+  if (!await commitInline(updates.slice(i, i + 500), `thumbnails: ${i + 1}-${Math.min(i + 500, updates.length)}/${updates.length}`)) throw new Error('manifests')
+  console.log(`  manifestes ${Math.min(i + 500, updates.length)}/${updates.length} ✓`)
+}
+await rm(WORK, { recursive: true, force: true }).catch(() => {})
+console.log(`\n=== ${made.length} vignettes régénérées ===`)
+if (REINDEX) { console.log('reindex ...'); spawnSync('node', [path.join(SCRIPT_DIR, 'build-search-index.mjs'), '--apply'], { stdio: 'inherit', env: process.env }) }
+else console.log('Lance ensuite : node Scripts/build-search-index.mjs --apply (pour que l\'index pointe les nouvelles vignettes).')

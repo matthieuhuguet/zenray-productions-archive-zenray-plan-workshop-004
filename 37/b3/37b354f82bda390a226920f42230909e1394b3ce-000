@@ -1,0 +1,62 @@
+// 3 October 2026, 04:08 CEST: map observed references to declared inventory identities without claiming runtime portability.
+import { projectDependencies } from './projectContextIndex.js'
+
+const isAbsolutePath = (value) => typeof value === 'string' && value.startsWith('/')
+const isRelativePath = (value) => typeof value === 'string' && value.length > 0 && !value.startsWith('/') && !value.includes('\\') && !value.split('/').some((part) => part === '..' || part === '.')
+const projectIdentity = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+const nodePath = /^\/(obj|mat|stage|out|shop|img|ch)(?:\/[^\s]+)*$/
+
+export function mapSceneReferences({ projectId, sceneFileId, sceneSha256, audit, projects }) {
+  const registry = new Map(projects.map((project) => [project.id, project]))
+  const project = registry.get(projectId)
+  if (!project || !projectIdentity.test(projectId)) throw new Error('Unknown scene project')
+  if (!project.files?.some((file) => file.id === sceneFileId)) throw new Error('Unknown scene file')
+  if (!sceneSha256 || audit?.sceneSha256 !== sceneSha256) throw new Error('Stale scene audit')
+  if (!Array.isArray(audit.references)) throw new Error('Invalid scene references')
+
+  const issues = [], visited = new Set(), visiting = new Set(), paths = new Map(), relocations = new Map()
+  const visit = (id) => {
+    if (visiting.has(id)) { issues.push({ code: 'dependency-cycle', projectId: id }); return }
+    if (visited.has(id)) return
+    const current = registry.get(id)
+    visiting.add(id)
+    for (const file of current.files || []) {
+      if (!isAbsolutePath(file.canonicalPath) || !isRelativePath(file.relativePath) || !projectIdentity.test(file.sourceId) || file.id !== `${file.sourceId}:${file.relativePath}`) continue
+      const target = { projectId: id, fileId: file.id, sourceId: file.sourceId, relativePath: file.relativePath,
+        status: file.status ?? null, sha256: file.sha256 ?? null, size: file.size ?? null }
+      const candidates = paths.get(file.canonicalPath) || []
+      candidates.push(target); paths.set(file.canonicalPath, candidates)
+      // 3 October 2026, 05:00 CEST: an origin identity can locate its LOAD copy without claiming the scene reads that copy yet.
+      if (file.loadedCopy && isAbsolutePath(file.originCanonicalPath) && file.originCanonicalPath !== file.canonicalPath) {
+        const relocated = relocations.get(file.originCanonicalPath) || []
+        relocated.push(target); relocations.set(file.originCanonicalPath, relocated)
+      }
+    }
+    for (const dependency of projectDependencies(current).dependencies) {
+      if (!registry.has(dependency)) issues.push({ code: 'dependency-missing', projectId: id, dependency })
+      else visit(dependency)
+    }
+    visiting.delete(id); visited.add(id)
+  }
+  visit(projectId)
+
+  const references = audit.references.map((reference, index) => {
+    const role = ['input', 'output'].includes(reference.mode) ? reference.mode : 'unknown'
+    const parameterPath = typeof reference.parameterPath === 'string' && nodePath.test(reference.parameterPath) && !reference.parameterPath.includes('/Users/') ? reference.parameterPath : null
+    const base = { referenceId: index, parameterPath, role }
+    if (reference.internal || reference.pathKind === 'internal') return { ...base, type: 'internal' }
+    if (role === 'output') return { ...base, type: 'output' }
+    // 3 October 2026, 04:16 CEST: an observed directory is not a resource file or an archive target.
+    if (reference.fileKind === 'directory') return { ...base, type: 'directory' }
+    if (reference.dynamic) return { ...base, type: 'dynamic', sequenceVerified: false }
+    if (reference.pathKind === 'uri' || reference.pathKind === 'relative') return { ...base, type: reference.pathKind }
+    if (!isAbsolutePath(reference.canonicalPath)) return { ...base, type: 'unresolved' }
+    const targets = paths.get(reference.canonicalPath) || []
+    if (targets.length) return { ...base, type: targets.length === 1 ? 'mapped' : 'ambiguous', targets }
+    const relocated = relocations.get(reference.canonicalPath) || []
+    if (relocated.length) return { ...base, type: relocated.length === 1 ? 'relocation-required' : 'ambiguous', targets: relocated, existsAtCurrentFrame: reference.existsAtCurrentFrame ?? null }
+    return { ...base, type: reference.existsAtCurrentFrame === true ? 'outside-mapping' : 'unresolved', existsAtCurrentFrame: reference.existsAtCurrentFrame ?? null }
+  })
+  return { schemaVersion: 1, projectId, sceneFileId, sceneSha256, checkedAt: audit.checkedAt ?? null,
+    dependencies: [...visited].filter((id) => id !== projectId).sort(), references, issues, portabilityVerified: false }
+}

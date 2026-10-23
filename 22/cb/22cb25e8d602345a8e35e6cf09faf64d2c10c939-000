@@ -1,0 +1,184 @@
+// push-policy-guard.test.mjs (12 October 2026): fails when an upload script runs `git push` outside the push batch policy and is not
+// in the explicit allowlist with a reason. Both directions: green on the repository, red on every kind of broken tree.
+// Run: node --test scripts/lib/push-policy-guard.test.mjs
+// (node:test file, like the other .test.mjs files of this repository; scripts/lib/push-batch-policy.test.js runs the same scan
+// under vitest so that `npm test` enforces it too.)
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { PUSH_ALLOWLIST, scanPushPaths, scanPinnedBatches } from './push-policy-guard.mjs'
+import { loadPushPolicyConfig, partsPerRepo, repoCapBytes } from './push-batch-policy.mjs'
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
+const MiB = 1024 * 1024
+
+function fixture(files) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'push-guard-'))
+  for (const [relative, content] of Object.entries(files)) {
+    const target = path.join(root, relative)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, content)
+  }
+  return root
+}
+
+test('the repository has no script that pushes outside the policy without a reason', () => {
+  const report = scanPushPaths({ root: ROOT })
+  assert.deepEqual(report.unlisted, [], `scripts that run git push outside the policy and are not allowlisted: ${report.unlisted.join(', ')}`)
+  assert.deepEqual(report.stale, [], `allowlist entries that no longer match: ${report.stale.join(', ')}`)
+  assert.deepEqual(report.weak, [], `allowlist entries without a real reason: ${report.weak.join(', ')}`)
+  assert.deepEqual(report.pinned, [], `files that pin a fixed push batch: ${report.pinned.join(', ')}`)
+  for (const routed of ['scripts/video-raw-lib.mjs', 'scripts/lib/video-git-shard.mjs']) {
+    assert.ok(report.routed.includes(routed), `${routed} must import the push batch policy`)
+  }
+})
+
+test('every allowlist entry names an existing file and gives a reason of a real sentence', () => {
+  for (const entry of PUSH_ALLOWLIST) {
+    assert.ok(fs.existsSync(path.join(ROOT, entry.file)), `${entry.file} does not exist`)
+    assert.ok(entry.reason.trim().length >= 20, `${entry.file} has no reason`)
+    assert.ok(entry.kind, `${entry.file} has no kind`)
+  }
+  assert.equal(new Set(PUSH_ALLOWLIST.map((entry) => entry.file)).size, PUSH_ALLOWLIST.length, 'duplicate allowlist entry')
+})
+
+test('RED: an upload script that runs git push without the policy and without a reason fails the guard', () => {
+  const root = fixture({
+    'scripts/new-upload.mjs': "import { spawnSync } from 'node:child_process'\nspawnSync('git', ['-C', dir, 'push', 'origin', 'HEAD:main'])\n",
+  })
+  try {
+    const report = scanPushPaths({ root, allowlist: [] })
+    assert.deepEqual(report.unlisted, ['scripts/new-upload.mjs'])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('RED: a python and a shell upload script are covered as well', () => {
+  const root = fixture({
+    'scripts/Films/worker.py': "subprocess.run(['git', '-C', clone, 'push', '-q', 'origin', 'HEAD:main'])\n",
+    'scripts/mirror.sh': 'git -C "$DIR" "push" origin HEAD:main\n',
+    'scripts/unquoted.sh': 'set -e\ngit -C "$DIR" push origin HEAD:main\n',
+  })
+  try {
+    const report = scanPushPaths({ root, allowlist: [] })
+    assert.deepEqual(report.unlisted, ['scripts/Films/worker.py', 'scripts/mirror.sh', 'scripts/unquoted.sh'])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('GREEN: the same script passes when it imports the policy, or when it is allowlisted with a reason', () => {
+  const root = fixture({
+    'scripts/routed.mjs': "import { sharedPushController } from './lib/push-batch-policy.mjs'\nrun(['push', 'origin'])\n",
+    'scripts/listed.mjs': "run(['push', 'origin'])\n",
+  })
+  try {
+    const report = scanPushPaths({ root, allowlist: [{ file: 'scripts/listed.mjs', kind: 'manifest-text', reason: 'A few KiB of manifests, never a media payload.' }] })
+    assert.deepEqual(report.unlisted, [])
+    assert.deepEqual(report.stale, [])
+    assert.deepEqual(report.routed, ['scripts/routed.mjs'])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('RED: a mention of the policy in a comment is not routing', () => {
+  const root = fixture({
+    'scripts/pretender.mjs': "// TODO use lib/push-batch-policy.mjs one day\nrun(['push', 'origin'])\n",
+  })
+  try {
+    assert.deepEqual(scanPushPaths({ root, allowlist: [] }).unlisted, ['scripts/pretender.mjs'])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('RED: a payload sent through the Git Data API (POST git/blobs) without a push word is a push path', () => {
+  const root = fixture({
+    'scripts/api-upload.mjs': "await fetch(`https://api.github.com/repos/o/r/git/blobs`, { method: 'POST', body })\n",
+    'scripts/api-read.mjs': "await fetch(`https://api.github.com/repos/o/r/git/blobs/${sha}`)\n",
+  })
+  try {
+    const report = scanPushPaths({ root, allowlist: [] })
+    assert.deepEqual(report.unlisted, ['scripts/api-upload.mjs'])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('RED: importing the policy for its numbers while running an own push loop is not routing', () => {
+  const root = fixture({
+    'scripts/own-loop.mjs': "import { loadPushPolicyConfig } from './lib/push-batch-policy.mjs'\nrun(['push', 'origin'])\n",
+    'scripts/engine.mjs': "import { runPushBatch } from './lib/push-batch-policy.mjs'\nawait runPushBatch({})\nrun(['push', 'origin'])\n",
+  })
+  try {
+    const report = scanPushPaths({ root, allowlist: [] })
+    assert.deepEqual(report.unlisted, ['scripts/own-loop.mjs'])
+    assert.deepEqual(report.routed, ['scripts/engine.mjs'])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('RED: a stale allowlist entry, an entry that became routed and an entry without a reason are reported', () => {
+  const root = fixture({
+    'scripts/now-routed.mjs': "import { runPushBatch } from './lib/push-batch-policy.mjs'\nrunPushBatch()\nrun(['push'])\n",
+    'scripts/weak.mjs': "run(['push'])\n",
+  })
+  try {
+    const report = scanPushPaths({
+      root,
+      allowlist: [
+        { file: 'scripts/gone.mjs', kind: 'manifest-text', reason: 'This file was deleted long ago and the entry stayed.' },
+        { file: 'scripts/now-routed.mjs', kind: 'manifest-text', reason: 'Used to push by hand before the policy existed.' },
+        { file: 'scripts/weak.mjs', kind: 'manifest-text', reason: 'ok' },
+      ],
+    })
+    assert.equal(report.stale.length, 2)
+    assert.ok(report.stale.some((line) => line.startsWith('scripts/gone.mjs')))
+    assert.ok(report.stale.some((line) => line.startsWith('scripts/now-routed.mjs')))
+    assert.deepEqual(report.weak, ['scripts/weak.mjs'])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('RED: a fixed push batch written as a literal (the 190 MiB pin of the film worker) is reported', () => {
+  const root = fixture({
+    'scripts/Films/worker.py': "up_env['ZR_SHARD_PUSH_BATCH_MB'] = '190'\n",
+    'scripts/launcher.mjs': "env.ZR_SHARD_PUSH_BATCH_MB = '190'\n",
+    'scripts/reader.mjs': 'const mb = Number(process.env.ZR_SHARD_PUSH_BATCH_MB)\n',
+  })
+  try {
+    const report = scanPushPaths({ root, allowlist: [] })
+    assert.deepEqual(report.pinned, ['scripts/Films/worker.py', 'scripts/launcher.mjs'])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('the delivered numbers: 1 900 MiB in 20 parts, 7.2 % under 2 048 MiB, 43 parts in a 4 096 MiB repository', () => {
+  const config = loadPushPolicyConfig({})
+  assert.equal(config.topParts, 20)
+  assert.equal(config.targetMiB, 1900)
+  assert.equal(config.partBytes, 95 * MiB + 16)
+  assert.ok(20 * config.partBytes <= 1900 * MiB + 400)
+  assert.ok(Math.abs((2048 - 1900) / 2048 - 0.072) < 0.001)
+  assert.equal(repoCapBytes(config, 'film'), 4096 * MiB)
+  assert.equal(partsPerRepo(config, 'film'), 43)
+  assert.equal(partsPerRepo(config, 'folder'), 21)
+})
+
+test('RED/GREEN: a deployed copy of worker scripts outside the repository is scanned for a pinned batch', () => {
+  const dirty = fixture({ 'Scripts/ResumeMoviesUpload.py': "    env['ZR_SHARD_PUSH_BATCH_MB'] = '190'\n", 'Scripts/Other.py': "print('ok')\n" })
+  const clean = fixture({ 'Scripts/ResumeMoviesUpload.py': "env.pop('ZR_SHARD_PUSH_BATCH_MB', None)\n" })
+  try {
+    assert.deepEqual(scanPinnedBatches(path.join(dirty, 'Scripts')), ['ResumeMoviesUpload.py'])
+    assert.deepEqual(scanPinnedBatches(path.join(clean, 'Scripts')), [])
+    assert.deepEqual(scanPinnedBatches(path.join(clean, 'missing')), [])
+  } finally { fs.rmSync(dirty, { recursive: true, force: true }); fs.rmSync(clean, { recursive: true, force: true }) }
+})
+
+// Set ZR_DEPLOYED_SCRIPTS_DIR to the directory of the running worker to check the real deployed copy (skipped when unset).
+test('the deployed worker scripts do not pin a fixed batch (only when ZR_DEPLOYED_SCRIPTS_DIR is set)', { skip: !process.env.ZR_DEPLOYED_SCRIPTS_DIR }, () => {
+  assert.deepEqual(scanPinnedBatches(process.env.ZR_DEPLOYED_SCRIPTS_DIR), [])
+})
+
+// 14 October 2026: the CMAF segment push hands the WHOLE list to pushFiles; a fixed stage limit in the caller (350 MiB) once cut every
+// push to 350 MiB whatever the line. This static check fails if a fixed batch constant comes back. FR : plus de limite fixe de lot.
+import { readFileSync as readSource } from 'node:fs'
+import { fileURLToPath as toPath } from 'node:url'
+test('AttachVideoCmafDashHls hands the whole segment list to pushFiles, without a fixed batch limit', () => {
+  const source = readSource(toPath(new URL('../AttachVideoCmafDashHls.mjs', import.meta.url)), 'utf8')
+  const code = source.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n')
+  assert.doesNotMatch(code, /BATCH_STAGE_LIMIT|batchBytes\s*>=|\* 1024 \* 1024[^\n]*batch/i)
+  assert.equal((code.match(/shard\.pushFiles\(/g) || []).length, 1)
+})

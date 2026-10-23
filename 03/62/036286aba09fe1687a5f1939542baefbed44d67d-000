@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+# 4 October 2026, 09:50 CEST: decode original visible messages using the installed program's measured schema and safe SQLite capture.
+import datetime
+import hashlib
+import importlib.util
+import json
+import pathlib
+import sqlite3
+import sys
+import tempfile
+import zlib
+
+SCHEMA = json.loads(pathlib.Path(__file__).with_name('AntigravitySchema.json').read_text())
+
+def fields(data):
+    result, cursor = {}, 0
+    def varint():
+        nonlocal cursor
+        value, shift = 0, 0
+        while cursor < len(data) and shift < 70:
+            byte = data[cursor]; cursor += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value
+            shift += 7
+        raise ValueError('Truncated protobuf integer')
+    while cursor < len(data):
+        tag = varint(); number, wire = tag >> 3, tag & 7
+        if not number:
+            raise ValueError('Invalid protobuf field')
+        if wire == 0:
+            value = varint()
+        elif wire in (1, 2, 5):
+            length = varint() if wire == 2 else 8 if wire == 1 else 4
+            if cursor + length > len(data):
+                raise ValueError('Truncated protobuf value')
+            value = data[cursor:cursor + length]; cursor += length
+        else:
+            raise ValueError('Unsupported protobuf wire type')
+        result.setdefault(number, []).append((wire, value))
+    return result
+
+def values(message, type_name, name, wire):
+    number = SCHEMA['messages'][type_name][name]['number']
+    selected = message.get(number, [])
+    if any(kind != wire for kind, value in selected):
+        raise ValueError('Protobuf schema mismatch: ' + name)
+    return [value for kind, value in selected]
+
+def text(message, type_name, name):
+    return '\n'.join(value.decode('utf-8') for value in values(message, type_name, name, 2))
+
+def decode_step(index, kind, payload, metadata, step_format, session_id):
+    if step_format != 0:
+        raise ValueError('Unsupported native step format: ' + str(step_format))
+    outer = fields(payload)
+    outer_kind = values(outer, 'Step', 'type', 0)
+    if outer_kind != [kind]:
+        raise ValueError('Native step type disagrees with SQLite')
+    status = values(outer, 'Step', 'status', 0)
+    if status == [SCHEMA['stepStatuses']['CORTEX_STEP_STATUS_CLEARED']]:
+        return None
+    types = SCHEMA['stepTypes']
+    if kind == types['CORTEX_STEP_TYPE_USER_INPUT']:
+        message = fields(values(outer, 'Step', 'user_input', 2)[0])
+        body = text(message, 'CortexStepUserInput', 'query')
+        if not body:
+            body = '\n'.join(text(fields(item), 'TextOrScopeItem', 'text') for item in values(message, 'CortexStepUserInput', 'items', 2))
+        event_kind = 'prompt'
+    elif kind == types['CORTEX_STEP_TYPE_PLANNER_RESPONSE']:
+        message = fields(values(outer, 'Step', 'planner_response', 2)[0])
+        body = text(message, 'CortexStepPlannerResponse', 'modified_response') or text(message, 'CortexStepPlannerResponse', 'response')
+        event_kind = 'iteration'
+    elif kind == types['CORTEX_STEP_TYPE_NOTIFY_USER']:
+        message = fields(values(outer, 'Step', 'notify_user', 2)[0])
+        body = text(message, 'CortexStepNotifyUser', 'notification_content')
+        event_kind = 'iteration'
+    else:
+        return None
+    if not body.strip():
+        return None
+    timestamps = values(fields(metadata), 'CortexStepMetadata', 'created_at', 2)
+    timestamp = None
+    if timestamps:
+        raw = fields(timestamps[0]); seconds = raw.get(1, [(0, 0)])[0][1]; nanos = raw.get(2, [(0, 0)])[0][1]
+        timestamp = datetime.datetime.fromtimestamp(seconds + nanos / 1e9, datetime.timezone.utc).isoformat()
+    return {'id': hashlib.sha256((session_id + ':' + str(index)).encode()).hexdigest(), 'text': body, 'kind': event_kind, 'timestamp': timestamp, 'stepIndex': index}
+
+def read_conversation(filename, before=None, session_id=None):
+    source = pathlib.Path(filename).resolve()
+    with tempfile.TemporaryDirectory(prefix='assets-gemini-read-') as directory:
+        snapshot = pathlib.Path(directory) / 'read.db'
+        capture = export_snapshot(str(source), str(snapshot))
+        with sqlite3.connect(snapshot) as connection:
+            meta = connection.execute('select cascade_id from trajectory_meta limit 1').fetchone()
+            if not meta or meta[0] != (session_id or source.stem):
+                raise ValueError('Native cascade identity does not match its file')
+            first = connection.execute('select idx, step_type, step_payload, metadata, step_format from steps where step_type = ? and status != 5 order by idx limit 1', (SCHEMA['stepTypes']['CORTEX_STEP_TYPE_USER_INPUT'],)).fetchone()
+            first_message = decode_step(*first, source.stem) if first else None
+            title = ' '.join(first_message['text'].split())[:140] if first_message else None
+            maximum = connection.execute('select max(idx) from steps').fetchone()[0]
+            end = (maximum + 1) if before is None and maximum is not None else before
+            if end is None:
+                return {'messages': [], 'nextBefore': None}
+            if not isinstance(end, int) or end < 0:
+                raise ValueError('Invalid native conversation cursor')
+            rows = connection.execute('select idx, step_type, step_payload, metadata, step_format from steps where idx < ? and step_type in (14,15,82) and status != 5 order by idx desc limit 100', (end,)).fetchall()
+            messages = []
+            for row in reversed(rows):
+                decoded = decode_step(*row, meta[0])
+                if decoded:
+                    messages.append(decoded)
+            minimum = min((row[0] for row in rows), default=0)
+            more = connection.execute('select 1 from steps where idx < ? and step_type in (14,15,82) and status != 5 limit 1', (minimum,)).fetchone()
+            cleared = connection.execute('select count(*) from steps where status = 5 and step_type in (14,15,82)').fetchone()[0]
+            return {'clearedMessages': cleared, 'messages': messages, 'nextBefore': minimum if more else None, 'captureSha256': capture['sha256'], 'title': title, 'updatedAt': max((message['timestamp'] for message in messages if message['timestamp']), default=None)}
+
+def export_snapshot(filename, destination):
+    source = pathlib.Path(filename).resolve()
+    spec = importlib.util.spec_from_file_location('agent_backup', pathlib.Path.home() / '.claude/Scripts/session-backup.py')
+    backup = importlib.util.module_from_spec(spec); spec.loader.exec_module(backup)
+    with tempfile.TemporaryDirectory(prefix='assets-gemini-export-') as directory:
+        store = pathlib.Path(directory)
+        capture = backup.capture(source, store)
+        digest = hashlib.sha256()
+        with pathlib.Path(destination).open('xb') as output:
+            for key in capture['chunks']:
+                data = zlib.decompress((store / 'blobs' / key[:2] / (key + '.zlib')).read_bytes())
+                digest.update(data); output.write(data)
+        if digest.hexdigest() != capture['sha256']:
+            raise ValueError('SQLite export hash mismatch')
+        with sqlite3.connect(destination) as connection:
+            first = connection.execute('select idx, step_type, step_payload, metadata, step_format from steps where step_type = ? and status != 5 order by idx limit 1', (SCHEMA['stepTypes']['CORTEX_STEP_TYPE_USER_INPUT'],)).fetchone()
+            first_message = decode_step(*first, source.stem) if first else None
+            title = ' '.join(first_message['text'].split())[:140] if first_message else None
+        return {'sha256': capture['sha256'], 'size': capture['size'], 'title': title}
+
+
+if __name__ == '__main__':
+    try:
+        arguments = sys.argv[1:]
+        session_id = None
+        if '--session-id' in arguments:
+            position = arguments.index('--session-id'); session_id = arguments[position + 1]; del arguments[position:position + 2]
+        result = export_snapshot(arguments[1], arguments[2]) if arguments[0] == '--snapshot' else read_conversation(arguments[0], int(arguments[1]) if len(arguments) > 1 else None, session_id)
+        print(json.dumps(result, ensure_ascii=False))
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)

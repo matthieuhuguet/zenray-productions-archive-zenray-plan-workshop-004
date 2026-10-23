@@ -1,0 +1,85 @@
+#!/usr/bin/env node
+// ZenRayMedia — PLANCHES DE VÉRIFICATION DES CADRAGES.
+//
+//   node scripts/zrm-check-rects.mjs <theme>/compare.json [--only nom,nom]
+//
+// POURQUOI CE FICHIER EXISTE
+// --------------------------
+// Reproche de Matthieu, 2026-07-27 : « je vois pas du tout le bottleneck, t'es capable de voir une
+// image, donc je comprends pas pourquoi tu te trompes à cette étape ». Il avait raison. J'avais
+// jugé trente-six vignettes sur UNE planche 1920 px : chacune faisait moins de 90 px de haut. À
+// cette taille on ne voit pas un composant, on voit une tache — et j'en avais déclaré dix-huit
+// bonnes alors qu'une sur neuf l'était.
+//
+// Le défaut n'est pas de savoir regarder : c'est de regarder trop petit. Ce script impose la
+// taille. HAUTEUR MINIMALE 300 px par crop, 8 crops par planche. Une planche de plus coûte une
+// seconde ; un cadrage faux coûte un composant reproduit contre la mauvaise zone.
+
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import path from 'node:path'
+import { chromium } from 'playwright'
+
+const H = 300      // hauteur d'affichage minimale d'un crop — non négociable
+const PER = 8      // crops par planche
+
+async function main() {
+  const spec = process.argv[2]
+  if (!spec) throw new Error('usage : node scripts/zrm-check-rects.mjs <theme>/compare.json [--only a,b]')
+  const i = process.argv.indexOf('--only')
+  const only = i > 0 ? new Set(process.argv[i + 1].split(',')) : null
+
+  const base = path.dirname(spec)
+  const items = JSON.parse(await readFile(spec, 'utf8')).compare
+    .filter((c) => c.rect && (!only || only.has(c.name)))
+
+  const browser = await chromium.launch()
+  const page = await browser.newPage()
+  const outDir = path.join(base, 'check')
+  await mkdir(outDir, { recursive: true })
+  const sheets = []
+
+  for (let s = 0; s < items.length; s += PER) {
+    const batch = items.slice(s, s + PER)
+    const cells = []
+    for (const c of batch) {
+      const file = path.resolve(base, c.ref)
+      const buf = await readFile(file)
+      const ext = path.extname(file).slice(1).toLowerCase().replace('jpg', 'jpeg')
+      const src = `data:image/${ext};base64,${buf.toString('base64')}`
+      const url = await page.evaluate(async ([u, r]) => {
+        const img = new Image(); img.src = u; await img.decode()
+        const cv = document.createElement('canvas')
+        cv.width = r[2]; cv.height = r[3]
+        cv.getContext('2d').drawImage(img, r[0], r[1], r[2], r[3], 0, 0, r[2], r[3])
+        return cv.toDataURL('image/png')
+      }, [src, c.rect])
+      cells.push({ name: c.name, ref: path.basename(c.ref), rect: c.rect, url })
+    }
+    // Chaque crop est agrandi à AU MOINS 300 px de haut. Un crop large et plat (une barre
+    // d'invites) reste lisible parce que la largeur suit le ratio, pas une case fixe.
+    const html = `<!doctype html><meta charset="utf-8"><style>
+      body{margin:0;padding:16px;background:#0d0f12;color:#cfd8e3;
+        font:13px/1.4 -apple-system,BlinkMacSystemFont,sans-serif}
+      figure{margin:0 0 18px;background:#14181d;border:1px solid #232a32;border-radius:8px;padding:10px 12px}
+      figcaption{display:flex;gap:10px;margin:0 0 8px;color:#8fa3b8}
+      figcaption b{color:#fff;font-weight:600}
+      figcaption code{margin-left:auto;color:#5d6b7a;font:11px ui-monospace,monospace}
+      img{display:block;height:${H}px;width:auto;max-width:100%;object-fit:contain;
+        background:#000;border:1px solid #232a32;border-radius:4px}
+    </style>${cells.map((c) => `<figure>
+      <figcaption><b>${c.name}</b><span>${c.ref}</span><code>${c.rect.join(',')}</code></figcaption>
+      <img src="${c.url}"></figure>`).join('')}`
+    await page.setContent(html)
+    await page.setViewportSize({ width: 1500, height: 1000 })
+    await page.waitForTimeout(150)
+    const out = path.join(outDir, `rects-${String(Math.floor(s / PER) + 1).padStart(2, '0')}.png`)
+    await page.screenshot({ path: out, fullPage: true })
+    sheets.push(out)
+  }
+  await browser.close()
+  console.log(`${items.length} cadrages sur ${sheets.length} planche(s) :`)
+  for (const s of sheets) console.log(`  ${s}`)
+  console.log(`\nLES REGARDER EN GRAND. Un cadrage faux invalide tout le composant qui en dépend.`)
+}
+
+main().catch((e) => { console.error(e.message || e); process.exit(1) })

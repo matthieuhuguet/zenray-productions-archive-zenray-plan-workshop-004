@@ -1,0 +1,64 @@
+// @vitest-environment node
+import { describe, expect, it, vi } from 'vitest'
+import { makeGitHub, GhError } from './githubGraphql.js'
+
+const res = (body, status = 200, headers = {}) => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status, headers })
+const make = (fetchImpl, extra = {}) => makeGitHub({ token: 't', fetchImpl, sleep: async () => {}, ...extra })
+
+describe('githubGraphql.read', () => {
+  it('rend la tête, la taille et un item par chemin (blob, arbre, absent)', async () => {
+    const fetchImpl = vi.fn(async () => res({ data: { repository: { diskUsage: 12, ref: { target: { oid: 'abc' } }, a0: { __typename: 'Blob', text: '{"x":1}', byteSize: 7, isBinary: false }, a1: { __typename: 'Tree', oid: 'tt' }, a2: null } } }))
+    const gh = make(fetchImpl)
+    const r = await gh.read('zenray-data', ['a.json', 'dir', 'none'])
+    expect(r.oid).toBe('abc'); expect(r.diskUsageKb).toBe(12)
+    expect(r.items.map((i) => i.kind)).toEqual(['blob', 'tree', null]); expect(r.items[0].text).toBe('{"x":1}')
+    const body = JSON.parse(fetchImpl.mock.calls[0][1].body)
+    expect(body.variables.e0).toBe('main:a.json')       // paths travel as VARIABLES, never spliced into the query text
+    expect(body.query).not.toContain('a.json')
+  })
+})
+
+describe('githubGraphql.commit et erreurs typées', () => {
+  it('rend l’oid du commit et encode les fichiers en base64', async () => {
+    const fetchImpl = vi.fn(async () => res({ data: { createCommitOnBranch: { commit: { oid: 'c1' } } } }))
+    const gh = make(fetchImpl)
+    const oid = await gh.commit('shard', { expectedHeadOid: 'h0', headline: 'x', additions: [{ path: 'a.bin', bytes: new Uint8Array([1, 2, 3]) }, { path: 'b.json', text: '{}' }] })
+    expect(oid).toBe('c1')
+    const input = JSON.parse(fetchImpl.mock.calls[0][1].body).variables.input
+    expect(input.expectedHeadOid).toBe('h0'); expect(input.fileChanges.additions[0].contents).toBe('AQID'); expect(input.branch.repositoryNameWithOwner).toBe('matthieuhuguet/shard')
+  })
+  it('STALE_DATA -> GhError stale (l’appelant relit et recommence)', async () => {
+    const gh = make(async () => res({ data: { createCommitOnBranch: null }, errors: [{ type: 'STALE_DATA', message: 'Expected branch to point to "x" but it did not.' }] }))
+    await expect(gh.commit('r', { expectedHeadOid: 'x', headline: 'h', additions: [] })).rejects.toMatchObject({ kind: 'stale' })
+  })
+  it('499 / 5xx / réseau coupé sont retentés puis réussissent', async () => {
+    let n = 0
+    const gh = make(async () => { n++; if (n === 1) return res('', 499); if (n === 2) throw new Error('reset'); if (n === 3) return res('', 502); return res({ data: { repository: { diskUsage: 1, ref: { target: { oid: 'ok' } } } } }) })
+    const r = await gh.read('r', [])
+    expect(r.oid).toBe('ok'); expect(n).toBe(4)
+  })
+  it('429 avec un long Retry-After est rendu au client (kind rate, waitMs), jamais dormi côté serveur', async () => {
+    const sleep = vi.fn(async () => {})
+    const gh = makeGitHub({ token: 't', sleep, fetchImpl: async () => res('', 429, { 'retry-after': '90' }) })
+    await expect(gh.read('r', [])).rejects.toMatchObject({ kind: 'rate', waitMs: 90000 })
+    expect(sleep).not.toHaveBeenCalled()
+  })
+  it('un échec définitif (permission) est fatal et non retenté', async () => {
+    const f = vi.fn(async () => res({ errors: [{ type: 'FORBIDDEN', message: 'nope' }] }))
+    await expect(make(f).read('r', [])).rejects.toBeInstanceOf(GhError)
+    expect(f).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('githubGraphql.createShard', () => {
+  it('crée un dépôt PUBLIC zenrayshards-img-<hex12> puis attend sa première tête', async () => {
+    let polls = 0
+    const f = vi.fn(async (url) => {
+      if (String(url).endsWith('/user/repos')) return res({ ok: true }, 201)
+      polls++; return res({ data: { repository: { diskUsage: 0, ref: polls < 3 ? null : { target: { oid: 'h' } } } } })
+    })
+    const name = await make(f).createShard()
+    expect(name).toMatch(/^zenrayshards-img-[0-9a-f]{12}$/); expect(polls).toBe(3)
+    expect(JSON.parse(f.mock.calls[0][1].body).private).toBe(false)
+  })
+})

@@ -1,0 +1,72 @@
+// 10 October 2026, 14:40 CEST: Verify local activity detection without contacting a remote service.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { collectActivity, parseProcessTable } from './activity-source.mjs'
+
+test('parseProcessTable preserves process identity and quoted arguments', () => {
+  const processes = parseProcessTable('123 1 123 00:08 /opt/node /repo/upload-mapped-git.mjs "/Users/example person/ReadyUploadPlan.json"')
+  assert.equal(processes.length, 1)
+  assert.equal(processes[0].pid, 123)
+  assert.equal(processes[0].args.at(-1), '/Users/example person/ReadyUploadPlan.json')
+})
+
+test('collectActivity reports measured upload progress, live pushes, and only fresh plan files', async (t) => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-activity-'))
+  t.after(() => fs.rmSync(homeDir, { recursive: true, force: true }))
+  const jobRoot = path.join(homeDir, '.claude', 'tmp', 'tmp-movies-series-upload')
+  const manifestRoot = path.join(jobRoot, 'ManifestClone')
+  const movieDir = path.join(manifestRoot, 'pages', 'Movies')
+  fs.mkdirSync(movieDir, { recursive: true })
+  const planPath = path.join(jobRoot, 'ReadyUploadPlan.json')
+  fs.mkdirSync(jobRoot, { recursive: true })
+  const recentManifest = path.join(movieDir, 'New Film.mkv.media.json')
+  const oldManifest = path.join(movieDir, 'Old Film.mkv.media.json')
+  fs.writeFileSync(recentManifest, '{}')
+  fs.writeFileSync(oldManifest, '{}')
+  const now = Date.now()
+  fs.utimesSync(recentManifest, now / 1000, now / 1000)
+  fs.utimesSync(oldManifest, (now - 25 * 60 * 60 * 1000) / 1000, (now - 25 * 60 * 60 * 1000) / 1000)
+  fs.writeFileSync(planPath, JSON.stringify([
+    { src: '/private/secret/old.mkv', dest: 'pages/Movies', name: 'Old Film.mkv' },
+    { src: '/private/secret/new.mkv', dest: 'pages/Movies', name: 'New Film.mkv' },
+  ]))
+  fs.writeFileSync(path.join(jobRoot, 'ResumeMoviesUpload.log'), '✓ [1/4] Old Film.mkv\n✓ [2/4] New Film.mkv\n')
+
+  const psText = [
+    `90 1 90 00:10 /usr/bin/python3 ${jobRoot}/Scripts/ResumeMoviesUpload.py`,
+    `91 90 90 00:09 /usr/bin/node /repo/scripts/upload-mapped-git.mjs ${planPath}`,
+    '92 91 90 00:02 /usr/bin/git -C /private/.cloud-repo push -q origin HEAD:main',
+    '93 1 93 00:01 /usr/bin/git push origin HEAD:main',
+  ].join('\n')
+  const payload = await collectActivity({
+    homeDir,
+    now,
+    psText,
+    cwdForPid: async (pid) => pid === 93 ? '/private/another-repo' : null,
+  })
+  const upload = payload.active.find((item) => item.kind === 'upload')
+  assert.equal(upload.title, 'Films et séries')
+  assert.equal(upload.phase, 'pushing')
+  assert.equal(upload.completedUnits, 2)
+  assert.equal(upload.totalUnits, 4)
+  assert.equal(payload.active.filter((item) => item.kind === 'push').length, 2)
+  assert.deepEqual(payload.recentFiles.map((item) => item.name), ['New Film.mkv'])
+  assert.ok(!JSON.stringify(payload).includes('/private/secret'))
+})
+
+test('collectActivity does not expose an unrelated plan outside the task TMP root', async () => {
+  const processes = parseProcessTable('101 1 101 00:02 /usr/bin/node /repo/scripts/upload-mapped-git.mjs /private/UploadPlan.json')
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-activity-outside-'))
+  try {
+    const payload = await collectActivity({ homeDir, now: Date.now(), psText: '101 1 101 00:02 /usr/bin/node /repo/scripts/upload-mapped-git.mjs /private/UploadPlan.json' })
+    assert.equal(payload.active.length, 1)
+    assert.equal(payload.active[0].completedUnits, undefined)
+    assert.deepEqual(payload.recentFiles, [])
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true })
+  }
+  assert.equal(processes.length, 1)
+})

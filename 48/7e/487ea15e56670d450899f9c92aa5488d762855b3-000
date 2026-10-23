@@ -1,0 +1,161 @@
+// repo-create-policy.mjs (14 October 2026): never be blocked by GitHub again when archiving many files.
+// WHY GitHub blocked us (measured 14 October 2026): not the number of repositories (limit 100 000) and not their size (repos of 10 GB
+// accept pushes): the secondary rate limit on CONTENT CREATION reacts to a BURST of creations. The worker opened one new private
+// repository per film: 12 repositories in 4 minutes (07:44 to 07:48 UTC), plus other services of the account creating repositories
+// at the same time, then every blocked process retried the creation every 1 to 5 minutes, which lengthens a block.
+// Two measures, both here:
+//   1. REUSE: a process claims a "lane" (one writer per repository); the lane remembers its open repository and the bytes in it,
+//      so 15 small episodes fill one repository up to the cap (4 096 MiB) instead of opening 15.
+//   2. GATE: repository creations of this machine are spaced (minimum interval, hourly budget), and a block seen by ONE process is
+//      shared (blockedUntil) so nobody else sends a request, then the probes back off 5, 10, 20, 30 minutes.
+// FR : GitHub bloque la CREATION en rafale (pas le nombre ni la taille des depots) ; on reutilise un depot par voie et on espace les creations.
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+// Every tunable value in one place (HDA rule), with environment overrides. / FR : toutes les valeurs reglables au meme endroit.
+export const REPO_CREATE_POLICY = Object.freeze({
+  directory: path.join(os.homedir(), '.zr-archive-work-mapped', 'RepoPool'),
+  slots: 4, // concurrent writer processes that can each keep their own open repository
+  minCreateIntervalMs: 120_000, // two creations are never closer than this on this machine
+  maxCreatesPerHour: 12, // far under the documented 500 content requests per hour: creations are the sensitive ones
+  hourMs: 3_600_000,
+  blockedBackoffMs: Object.freeze([300_000, 600_000, 1_200_000, 1_800_000]),
+  lockStaleMs: 60_000, // a gate lock older than this belongs to a dead process
+  // 14 October 2026: the limits FOLLOW the work instead of being fixed. The hourly budget is the baseline (maxCreatesPerHour) raised to
+  // what the measured line needs (bytes per hour / repository cap, with a safety factor) up to a hard ceiling; a block halves it
+  // (learned scale, floor 0.25) and it recovers by a step every blockRelaxMs without a block.
+  // FR : les limites SUIVENT le travail ; un blocage divise le budget par deux et il remonte par paliers sans blocage.
+  maxCreatesPerHourCeiling: 24,
+  demandSafety: 1.5,
+  blockScaleFloor: 0.25,
+  blockRelaxMs: 6 * 3_600_000,
+  blockRelaxStep: 0.25,
+})
+
+export function loadRepoCreatePolicy(env = process.env, overrides = {}) {
+  const num = (name, fallback) => {
+    if (env[name] === undefined || env[name] === '') return fallback
+    const value = Number(env[name])
+    if (!Number.isFinite(value) || value < 0) throw new Error(`repo create policy: ${name} must be a number >= 0, got ${env[name]}`)
+    return value
+  }
+  return Object.freeze({
+    ...REPO_CREATE_POLICY,
+    directory: env.ZR_REPO_POOL_DIR || REPO_CREATE_POLICY.directory,
+    slots: num('ZR_REPO_POOL_SLOTS', REPO_CREATE_POLICY.slots),
+    minCreateIntervalMs: num('ZR_REPO_CREATE_MIN_INTERVAL_S', REPO_CREATE_POLICY.minCreateIntervalMs / 1000) * 1000,
+    maxCreatesPerHour: num('ZR_REPO_CREATE_MAX_PER_HOUR', REPO_CREATE_POLICY.maxCreatesPerHour),
+    maxCreatesPerHourCeiling: num('ZR_REPO_CREATE_CEILING_PER_HOUR', REPO_CREATE_POLICY.maxCreatesPerHourCeiling),
+    ...overrides,
+  })
+}
+
+const alive = (pid) => { try { process.kill(pid, 0); return true } catch (error) { return error.code === 'EPERM' } }
+const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return fallback } }
+const writeJson = (file, data) => { const tmp = `${file}.${process.pid}.tmp`; fs.writeFileSync(tmp, JSON.stringify(data)); fs.renameSync(tmp, file) }
+
+/** A tiny cross process lock: mkdir is atomic, the owner pid is stored so a dead owner can be replaced. */
+function tryLock(lockDir, { pid = process.pid, staleMs = Infinity, now = Date.now() } = {}) {
+  try { fs.mkdirSync(lockDir); fs.writeFileSync(path.join(lockDir, 'owner'), JSON.stringify({ pid, at: now })); return true } catch (error) {
+    if (error.code !== 'EEXIST') throw error
+    const owner = readJson(path.join(lockDir, 'owner'), null)
+    const dead = !owner || !alive(owner.pid) || now - owner.at > staleMs
+    if (!dead) return false
+    fs.rmSync(lockDir, { recursive: true, force: true })
+    try { fs.mkdirSync(lockDir); fs.writeFileSync(path.join(lockDir, 'owner'), JSON.stringify({ pid, at: now })); return true } catch { return false }
+  }
+}
+
+/**
+ * Claims a lane: one process is the only writer of the repository remembered by that lane.
+ * Returns { slot, read(), write(state), release() } or null when every lane is busy (the caller then creates a fresh repository as before).
+ */
+export function claimRepoPoolSlot({ type, vis, policy = loadRepoCreatePolicy(), pid = process.pid } = {}) {
+  if (!type || !vis) throw new Error('repo pool: type and vis are required')
+  fs.mkdirSync(policy.directory, { recursive: true })
+  for (let slot = 0; slot < policy.slots; slot += 1) {
+    const base = path.join(policy.directory, `${type}-${vis}-lane${slot}`)
+    if (!tryLock(`${base}.lock`, { pid })) continue
+    let released = false
+    const release = () => { if (released) return; released = true; fs.rmSync(`${base}.lock`, { recursive: true, force: true }) }
+    process.once('exit', release)
+    return { slot, read: () => readJson(`${base}.json`, null), write: (state) => writeJson(`${base}.json`, { ...state, updatedAt: new Date().toISOString() }), release }
+  }
+  return null
+}
+
+/** True when the remembered repository can take `incomingBytes` more without passing the cap. */
+export function canReuse(state, incomingBytes, capBytes) {
+  return Boolean(state && state.repo && !state.full && Number.isFinite(state.bytes) && state.bytes + Math.max(0, incomingBytes) <= capBytes)
+}
+
+/**
+ * The hourly budget and the minimum spacing in force, from the learned scale of the gate and the measured demand.
+ * demand = { throughputBps, capBytes }: at 25 MB/s and 4 GiB repositories the line needs 21 repositories an hour, so a fixed 12 would
+ * throttle the upload itself; at 2 MB/s it needs 2 and the baseline stays.
+ */
+export function creationLimits(gate, policy = loadRepoCreatePolicy(), demand = {}) {
+  const need = demand.throughputBps > 0 && demand.capBytes > 0 ? Math.ceil((demand.throughputBps * 3600 / demand.capBytes) * policy.demandSafety) : 0
+  const base = Math.min(policy.maxCreatesPerHourCeiling, Math.max(policy.maxCreatesPerHour, need))
+  const scale = Math.min(1, Math.max(policy.blockScaleFloor, Number.isFinite(gate.scale) ? gate.scale : 1))
+  const perHour = Math.max(1, Math.floor(base * scale))
+  const intervalMs = Math.min(policy.minCreateIntervalMs, Math.floor((policy.hourMs / perHour) * 0.8))
+  return { perHour, intervalMs, scale, need }
+}
+
+/**
+ * How long this process must wait before sending a repository creation, from the shared gate file.
+ * Pure on its inputs: { lastCreateAt, blockedUntil, scale, creates: [timestamps] }.
+ */
+export function creationWaitMs(gate, now, policy = loadRepoCreatePolicy(), demand = {}) {
+  const limits = creationLimits(gate, policy, demand)
+  const waits = [0]
+  if (gate.blockedUntil && gate.blockedUntil > now) waits.push(gate.blockedUntil - now)
+  if (gate.lastCreateAt) waits.push(gate.lastCreateAt + limits.intervalMs - now)
+  const recent = (gate.creates || []).filter((at) => now - at < policy.hourMs).sort((a, b) => a - b)
+  if (recent.length >= limits.perHour) waits.push(recent[recent.length - limits.perHour] + policy.hourMs - now)
+  return Math.max(...waits)
+}
+
+export function backoffAfterBlock(consecutiveBlocks, policy = loadRepoCreatePolicy()) {
+  return policy.blockedBackoffMs[Math.min(Math.max(consecutiveBlocks, 1), policy.blockedBackoffMs.length) - 1]
+}
+
+/** The shared gate: wait(), created(), blocked(). State in one file, updates under a short lock. */
+export function createRepoGate({ policy = loadRepoCreatePolicy(), now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log = () => {} } = {}) {
+  fs.mkdirSync(policy.directory, { recursive: true })
+  const file = path.join(policy.directory, 'CreateGate.json')
+  const lockDir = path.join(policy.directory, 'CreateGate.lock')
+  const update = async (mutate) => {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (tryLock(lockDir, { staleMs: policy.lockStaleMs, now: now() })) {
+        try { const gate = readJson(file, { creates: [], blocks: 0 }); const next = mutate(gate) || gate; writeJson(file, next); return next } finally { fs.rmSync(lockDir, { recursive: true, force: true }) }
+      }
+      await sleep(50)
+    }
+    throw new Error('repo create gate: could not take its lock')
+  }
+  return {
+    file,
+    async wait(demand = {}) {
+      for (;;) {
+        const waitMs = creationWaitMs(readJson(file, { creates: [] }), now(), policy, demand)
+        if (waitMs <= 0) return
+        log(`  repository creation gate: waiting ${Math.ceil(waitMs / 1000)} s (spacing, hourly budget or a block seen by another process)`)
+        await sleep(Math.min(waitMs, 60_000))
+      }
+    },
+    created: () => update((gate) => {
+      // a long stretch without a block gives the budget back, one step at a time
+      const quiet = !gate.lastBlockAt || now() - gate.lastBlockAt >= policy.blockRelaxMs
+      const scale = quiet ? Math.min(1, (Number.isFinite(gate.scale) ? gate.scale : 1) + policy.blockRelaxStep) : (Number.isFinite(gate.scale) ? gate.scale : 1)
+      return { ...gate, scale, lastCreateAt: now(), blocks: 0, blockedUntil: 0, creates: [...(gate.creates || []).filter((at) => now() - at < policy.hourMs), now()] }
+    }),
+    blocked: () => update((gate) => {
+      const blocks = (gate.blocks || 0) + 1
+      const scale = Math.max(policy.blockScaleFloor, (Number.isFinite(gate.scale) ? gate.scale : 1) / (gate.blocks ? 1 : 2))
+      return { ...gate, blocks, scale, lastBlockAt: now(), blockedUntil: now() + backoffAfterBlock(blocks, policy) }
+    }),
+  }
+}

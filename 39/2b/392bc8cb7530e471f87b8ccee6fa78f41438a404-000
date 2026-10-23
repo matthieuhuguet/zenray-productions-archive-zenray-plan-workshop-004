@@ -1,0 +1,146 @@
+// RANGER / RENOMMER une archive DÉJÀ uploadée, SANS rien re-uploader.
+//
+// BUT : réorganiser les manifestes .file.json (zenray-data) pour MIROIR une arborescence locale (Mac),
+// et/ou renommer/déplacer le dossier d'archive sur le site. Les binaires (chunks, repos shards) ne bougent
+// JAMAIS : un .file.json référence repo+commit+chunks de façon absolue, donc déplacer le manifeste suffit.
+//
+// Usage :
+//   GITHUB_TOKEN=$(gh auth token) node Scripts/archive-organize.mjs <dossierMacModele> <ancienDirSite> <nouveauDirSite> [--reindex]
+// Ex :
+//   ... "/Users/zenray/Downloads/DJI/16 Juin 2026" "pages/Build/DJI" "pages/Build/DJI/16 Juin 2026"
+//
+// Règles :
+//   - Pour chaque fichier du dossier Mac modèle : si un manifeste existe (nom + sha256 vérifié) dans
+//     l'ancien dir site, on le PLACE au chemin miroir sous le nouveau dir (COPIE si le même fichier apparaît
+//     à plusieurs endroits, ex. BestOf). Le champ `rel` du manifeste est mis à jour au nouveau chemin relatif.
+//   - Fichier Mac SANS manifeste (dérivé _silent, fichier ajouté après l'upload) -> NON placé, listé.
+//   - Manifeste uploadé SANS emplacement Mac (fichier retiré du Mac depuis) -> rangé par TYPE en fallback
+//     (<nouveauDir>/Photos|Videos|Autres/<nom>) pour ne RIEN perdre de l'archive. Listé.
+//   - Un seul commit zenray-data (move/copy + suppression des anciens), push. --reindex relance l'index.
+import { readdir, stat, mkdir, rm, writeFile, readFile, cp } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN requis'); process.exit(1) }
+const OWNER = 'matthieuhuguet', DATA = 'zenray-data', BRANCH = 'main'
+const MAC = process.argv[2] && path.resolve(process.argv[2])
+const OLD = (process.argv[3] || '').replace(/\/+$/, '')
+const NEW = (process.argv[4] || '').replace(/\/+$/, '')
+const REINDEX = process.argv.includes('--reindex')
+if (!MAC || !OLD || !NEW) { console.error('usage: node Scripts/archive-organize.mjs <dossierMac> <ancienDirSite> <nouveauDirSite> [--reindex]'); process.exit(1) }
+const WORK = '/tmp/zr-organize'
+const GENV = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+const git = (a) => spawnSync('git', ['-C', WORK, ...a], { encoding: 'utf8', env: GENV })
+
+// 1) Inventaire du dossier Mac modèle : nom de fichier -> [{abs,rel}] (un nom peut être à plusieurs endroits).
+const byName = new Map()
+async function walk(abs, rel) {
+  for (const e of await readdir(abs, { withFileTypes: true })) {
+    if (e.name === '.DS_Store') continue
+    const a = path.join(abs, e.name), r = rel ? `${rel}/${e.name}` : e.name
+    if (e.isDirectory()) await walk(a, r)
+    else if (e.isFile()) { if (!byName.has(e.name)) byName.set(e.name, []); byName.get(e.name).push({ abs: a, rel: r }) }
+  }
+}
+await walk(MAC, '')
+console.log(`Mac modèle : ${[...byName.values()].reduce((n, a) => n + a.length, 0)} fichier(s), ${byName.size} nom(s) unique(s)`)
+
+// 2) Clone SPARSE de zenray-data limité à l'ancien dir (récupère juste les manifestes, pas tout le repo).
+await rm(WORK, { recursive: true, force: true })
+const url = `https://x-access-token:${TOKEN}@github.com/${OWNER}/${DATA}.git`
+const topDir = OLD.split('/').slice(0, 2).join('/') // ex pages/Build -> couvre OLD et NEW (tous deux sous pages/Build)
+let cl = spawnSync('git', ['clone', '--quiet', '--filter=blob:none', '--no-checkout', url, WORK], { encoding: 'utf8', env: GENV, timeout: 120000 })
+if (cl.status !== 0) { console.error('clone:', (cl.stderr || '').slice(-300)); process.exit(1) }
+git(['sparse-checkout', 'set', topDir]); git(['checkout', BRANCH])
+git(['config', 'user.email', 'bot@zenray']); git(['config', 'user.name', 'zenray-bot'])
+
+// 3) Liste des manifestes existants dans l'ancien dir (à plat ou non).
+const oldAbs = path.join(WORK, OLD)
+const manifests = []
+async function listMani(abs, rel) {
+  let ents = []
+  try { ents = await readdir(abs, { withFileTypes: true }) } catch { return }
+  for (const e of ents) {
+    const a = path.join(abs, e.name), r = rel ? `${rel}/${e.name}` : e.name
+    if (e.isDirectory()) await listMani(a, r)
+    else if (e.name.endsWith('.file.json')) manifests.push({ abs: a, rel: r, base: e.name.replace(/\.file\.json$/, '') })
+  }
+}
+await listMani(oldAbs, '')
+console.log(`Manifestes trouvés dans ${OLD} : ${manifests.length}`)
+
+// 4) Mapping + écriture. Pour chaque manifeste : cible(s) = emplacements Mac du même nom de fichier.
+const newAbs = path.join(WORK, NEW)
+const placed = [], orphans = [], hashMismatches = [], written = new Set(), usedLocal = new Set()
+const hashCache = new Map()
+const sha256File = (file) => {
+  if (!hashCache.has(file)) hashCache.set(file, new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(file)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.on('end', () => resolve(hash.digest('hex')))
+    stream.on('error', reject)
+  }))
+  return hashCache.get(file)
+}
+for (const m of manifests) {
+  const candidates = byName.get(m.base) || []
+  const content = JSON.parse(await readFile(m.abs, 'utf8'))
+  let targets = []
+  if (content.sha256) {
+    for (const candidate of candidates) {
+      if (await sha256File(candidate.abs) === content.sha256) targets.push(candidate.rel)
+    }
+    if (candidates.length && !targets.length) hashMismatches.push(m.base)
+  } else if (candidates.length > 1) {
+    throw new Error(`Association ambiguë refusée : ${m.base} existe ${candidates.length} fois localement et son manifeste n'a pas de sha256.`)
+  } else {
+    targets = candidates.map((candidate) => candidate.rel)
+  }
+  const dests = targets.length ? targets : [fallbackRel(m.base)]
+  if (!targets.length) orphans.push(m.base)
+  for (const relPath of dests) {
+    const dest = path.join(newAbs, `${relPath}.file.json`)
+    await mkdir(path.dirname(dest), { recursive: true })
+    await writeFile(dest, JSON.stringify({ ...content, rel: relPath })) // rel mis au nouveau chemin
+    written.add(path.relative(WORK, dest))
+    placed.push(relPath)
+    if (targets.length) usedLocal.add(relPath)
+  }
+}
+function fallbackRel(base) {
+  const ext = base.split('.').pop().toLowerCase()
+  const sub = ['mp4', 'mov', 'mkv', 'webm', 'm4v'].includes(ext) ? 'Videos' : (['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'heic'].includes(ext) ? 'Photos' : 'Autres')
+  return `${sub}/${base}`
+}
+
+// 5) Fichiers Mac SANS manifeste (non plaçables sans upload).
+const noManifest = []
+for (const entries of byName.values()) for (const entry of entries) if (!usedLocal.has(entry.rel)) noManifest.push(entry.rel)
+
+// 6) Supprimer chaque ancien manifeste dont l'emplacement n'est PAS réutilisé tel quel par le nouveau plan
+// (cas idempotent : re-run où l'ancien chemin = un nouveau chemin -> on le garde). Sinon on le retire.
+for (const m of manifests) { if (!written.has(path.join(OLD, m.rel))) await rm(m.abs, { force: true }) }
+
+git(['add', '-A'])
+const msg = `organize: ${OLD} -> ${NEW} (miroir ${path.basename(MAC)}, ${placed.length} manifestes, ${orphans.length} orphelins)`
+const ci = git(['commit', '-q', '-m', msg])
+if (ci.status !== 0 && !/nothing to commit/.test((ci.stdout || '') + (ci.stderr || ''))) { console.error('commit:', ci.stderr); process.exit(1) }
+const ps = git(['push', '-q', 'origin', `HEAD:${BRANCH}`])
+if (ps.status !== 0) { console.error('push:', (ps.stderr || '').slice(-300)); process.exit(1) }
+
+console.log(`\n=== RANGÉ ===`)
+console.log(`Placés : ${placed.length} manifestes sous ${NEW}`)
+console.log(`Orphelins (uploadés mais absents du Mac, rangés par type) : ${orphans.length}${orphans.length ? ' -> ' + orphans.slice(0, 10).join(', ') + (orphans.length > 10 ? '…' : '') : ''}`)
+console.log(`Refusés par empreinte (même nom, contenu différent) : ${hashMismatches.length}${hashMismatches.length ? ' -> ' + hashMismatches.slice(0, 10).join(', ') + (hashMismatches.length > 10 ? '…' : '') : ''}`)
+console.log(`Non plaçables (sur le Mac mais PAS dans l'archive, à uploader si voulu) : ${noManifest.length}${noManifest.length ? '\n   - ' + noManifest.join('\n   - ') : ''}`)
+
+if (REINDEX) {
+  console.log('\nreindex…')
+  spawnSync('node', [path.join(path.dirname(new URL(import.meta.url).pathname), 'build-search-index.mjs'), '--apply'], { stdio: 'inherit', env: process.env })
+}
+await rm(WORK, { recursive: true, force: true }).catch(() => {})
+console.log('\nFait. Les binaires (shards) n\'ont pas bougé ; seuls les manifestes ont été réorganisés.')

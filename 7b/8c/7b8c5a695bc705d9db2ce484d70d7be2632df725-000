@@ -1,0 +1,370 @@
+// 10 October 2026: Read local upload logs, LiveTransferStatus.json, and live Git push processes without network access.
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const run = promisify(execFile)
+
+// Sticky film job (10 October 2026): a process scan can miss the worker for one sample; keep its last item while its live file says running for up to 10 minutes.
+const STICKY_SEQUENTIAL_MS = 10 * 60 * 1000
+// 11 October 2026: a LiveTransferStatus.json written within this window means the job is alive, whatever ps shows.
+const STATUS_FRESH_MS = 15 * 60 * 1000
+let stickySequential = null
+const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000
+const MAX_LOG_BYTES = 4 * 1024 * 1024
+
+export function parseProcessTable(text) {
+  return String(text || '').split(/\r?\n/).flatMap((line) => {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/)
+    if (!match) return []
+    return [{ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), elapsed: match[4], command: match[5], args: tokenizeCommand(match[5]) }]
+  })
+}
+
+function tokenizeCommand(command) {
+  const tokens = []
+  let value = ''
+  let quote = ''
+  let escaped = false
+  for (const char of String(command || '')) {
+    if (escaped) { value += char; escaped = false; continue }
+    if (char === '\\' && quote !== "'") { escaped = true; continue }
+    if (quote) { if (char === quote) quote = ''; else value += char; continue }
+    if (char === '"' || char === "'") { quote = char; continue }
+    if (/\s/.test(char)) { if (value) tokens.push(value); value = ''; continue }
+    value += char
+  }
+  if (value) tokens.push(value)
+  return tokens
+}
+
+function safeChild(root, relative) {
+  if (typeof relative !== 'string' || !relative || path.isAbsolute(relative)) return null
+  const target = path.resolve(root, relative)
+  const delta = path.relative(root, target)
+  return delta && !delta.startsWith(`..${path.sep}`) && delta !== '..' ? target : null
+}
+
+function readTail(filePath) {
+  try {
+    const fd = fs.openSync(filePath, 'r')
+    try {
+      const size = fs.fstatSync(fd).size
+      const length = Math.min(size, MAX_LOG_BYTES)
+      const buffer = Buffer.alloc(length)
+      fs.readSync(fd, buffer, 0, length, size - length)
+      return buffer.toString('utf8')
+    } finally { fs.closeSync(fd) }
+  } catch { return '' }
+}
+
+function parseCompletion(text) {
+  const matches = [...text.matchAll(/✓\s*\[(\d+)\/(\d+)\]\s+([^\r\n]+)/g)]
+  if (!matches.length) return null
+  const match = matches[matches.length - 1]
+  return { completedUnits: Number(match[1]), totalUnits: Number(match[2]) }
+}
+
+// Resolution du dossier de chantier sous ~/.claude/tmp pour les workers d'upload et de verification (10 October 2026)
+function resolveUploadRoot(processInfo, processByPid, tempRoot) {
+  let current = processInfo
+  let depth = 0
+  while (current && depth < 6) {
+    const scriptIndex = current.args.findIndex((arg) => /(?:^|\/)(?:ResumeMoviesUpload|ProcessFilmsSequentially|FinishFilteredUploads)\.py$/.test(arg))
+    if (scriptIndex >= 0) {
+      const candidate = path.resolve(path.dirname(current.args[scriptIndex]), '..')
+      return path.relative(tempRoot, candidate).startsWith('..') ? null : candidate
+    }
+    current = processByPid.get(current.ppid)
+    depth += 1
+  }
+  const scriptIndex = processInfo.args.findIndex((arg) => /(?:^|\/)upload-mapped-git\.mjs$/.test(arg))
+  const planPath = scriptIndex >= 0 ? processInfo.args[scriptIndex + 1] : ''
+  if (!planPath || !path.isAbsolute(planPath)) return null
+  const candidate = path.dirname(planPath)
+  return path.relative(tempRoot, candidate).startsWith('..') ? null : candidate
+}
+
+function recentManifestFiles(plan, manifestRoot, now) {
+  if (!Array.isArray(plan)) return []
+  const files = []
+  for (const entry of plan.slice(0, 5000)) {
+    if (!entry) continue
+    const rawName = typeof entry.name === 'string' ? entry.name : (typeof entry.source === 'string' ? path.basename(entry.source) : '')
+    const rawDest = typeof entry.dest === 'string' ? entry.dest : 'pages/Movies_Series-yl1x'
+    if (!rawName || !rawDest) continue
+    const relative = path.join(rawDest, `${rawName}.media.json`)
+    const manifestPath = safeChild(manifestRoot, relative)
+    if (!manifestPath) continue
+    try {
+      const stat = fs.statSync(manifestPath)
+      if (!stat.isFile() || stat.mtimeMs > now || now - stat.mtimeMs > RECENT_WINDOW_MS) continue
+      // 11 October 2026: path and folder let the Assets panel open the media where it lives in Create.
+      files.push({ name: path.basename(rawName), updatedAt: new Date(stat.mtimeMs).toISOString(), path: relative.split(path.sep).join('/'), folder: rawDest })
+    } catch {}
+  }
+  return files.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+}
+
+// Returns the live state only while the pipeline still reports running or retrying (10 October 2026)
+function readRunningStatus(root) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(root, 'LiveTransferStatus.json'), 'utf8'))
+    if (!/^(running|retrying|paused)$/.test(String(parsed.status || ''))) return null
+    return readLiveTransferStatus(root)
+  } catch {
+    return null
+  }
+}
+
+// Lecture de l'etat temps reel LiveTransferStatus.json produit par ProcessFilmsSequentially.py (10 October 2026)
+function readLiveTransferStatus(root) {
+  try {
+    const livePath = path.join(root, 'LiveTransferStatus.json')
+    if (!fs.existsSync(livePath)) return null
+    const parsed = JSON.parse(fs.readFileSync(livePath, 'utf8'))
+    if (!parsed || typeof parsed !== 'object') return null
+    return {
+      completedUnits: Number.isFinite(Number(parsed.completedUnits)) ? Number(parsed.completedUnits) : undefined,
+      totalUnits: Number.isFinite(Number(parsed.totalUnits)) ? Number(parsed.totalUnits) : undefined,
+      completedBytes: Number.isFinite(Number(parsed.completedBytes)) ? Number(parsed.completedBytes) : undefined,
+      totalBytes: Number.isFinite(Number(parsed.totalBytes)) ? Number(parsed.totalBytes) : undefined,
+      bytesPerSecond: Number.isFinite(Number(parsed.bytesPerSecond)) ? Number(parsed.bytesPerSecond) : undefined,
+      freedBytes: Number.isFinite(Number(parsed.freedBytes)) ? Number(parsed.freedBytes) : undefined,
+      freedGiB: Number.isFinite(Number(parsed.freedGiB)) ? Number(parsed.freedGiB) : undefined,
+      currentItem: typeof parsed.currentItem === 'string' ? parsed.currentItem : undefined,
+      currentStep: typeof parsed.currentStep === 'string' ? parsed.currentStep : undefined,
+      onDriveCount: Number.isFinite(Number(parsed.onDriveCount)) ? Number(parsed.onDriveCount) : undefined,
+      hlsDashVerifiedCount: Number.isFinite(Number(parsed.hlsDashVerifiedCount)) ? Number(parsed.hlsDashVerifiedCount) : undefined,
+      fullRecoveryVerifiedCount: Number.isFinite(Number(parsed.fullRecoveryVerifiedCount)) ? Number(parsed.fullRecoveryVerifiedCount) : undefined,
+    }
+  } catch {
+    return null
+  }
+}
+
+// 14 October 2026: the newest UploadTiming.json (written by scripts/UploadTimingReport.mjs) found two levels under ~/.claude/tmp, still fresh.
+// FR : le rapport UploadTiming.json le plus recent, trouve a deux niveaux sous ~/.claude/tmp, tant qu'il est frais.
+const UPLOAD_TIMING_RELAY = { fileName: 'UploadTiming.json', freshMs: 24 * 60 * 60 * 1000, depth: 2 }
+export function readUploadTiming(tempRoot, now = Date.now(), config = UPLOAD_TIMING_RELAY) {
+  const candidates = []
+  const visit = (dir, level) => {
+    let entries = []
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.isFile() && entry.name === config.fileName) candidates.push(full)
+      else if (entry.isDirectory() && level < config.depth && !entry.name.startsWith('.') && entry.name !== 'node_modules') visit(full, level + 1)
+    }
+  }
+  visit(tempRoot, 1)
+  let best = null
+  for (const file of candidates) {
+    try {
+      const report = JSON.parse(fs.readFileSync(file, 'utf8'))
+      const at = Date.parse(report?.generatedAt)
+      if (!report || typeof report.message !== 'string' || !Number.isFinite(at) || now - at > config.freshMs) continue
+      if (!best || at > best.at) best = { at, report }
+    } catch {}
+  }
+  return best ? best.report : null
+}
+
+// 14 October 2026: the newest UploadQueueStatus.json (per-file status written by the film worker, scripts/Films/QueueStatus.py).
+// A running queue stays visible for queueRunningMs after its last write (a worker waiting for GitHub writes nothing for a while);
+// a finished queue stays for queueFinishedMs. FR : le statut par fichier de la file d'envoi ; une file en cours reste visible longtemps.
+const UPLOAD_QUEUE_RELAY = { fileName: 'UploadQueueStatus.json', runningMs: 3 * 60 * 60 * 1000, finishedMs: 30 * 60 * 1000, depth: 2 }
+export function readUploadQueue(tempRoot, now = Date.now(), config = UPLOAD_QUEUE_RELAY) {
+  const candidates = []
+  const visit = (dir, level) => {
+    let entries = []
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.isFile() && entry.name === config.fileName) candidates.push(full)
+      else if (entry.isDirectory() && level < config.depth && !entry.name.startsWith('.') && entry.name !== 'node_modules') visit(full, level + 1)
+    }
+  }
+  visit(tempRoot, 1)
+  let best = null
+  for (const file of candidates) {
+    try {
+      const queue = JSON.parse(fs.readFileSync(file, 'utf8'))
+      const at = Date.parse(queue?.updatedAt)
+      if (!queue || !Array.isArray(queue.items) || !Number.isFinite(at)) continue
+      // a worker that died leaves running = true: its pid tells (14 October 2026). FR : un worker mort laisse running vrai ; son pid le dit.
+      if (queue.running && Number.isInteger(queue.pid)) { try { process.kill(queue.pid, 0) } catch (error) { if (error.code === 'ESRCH') queue.running = false } }
+      const maxAge = queue.running ? config.runningMs : config.finishedMs
+      if (now - at > maxAge) continue
+      if (!best || at > best.at) best = { at, queue }
+    } catch {}
+  }
+  return best ? best.queue : null
+}
+
+function gitPushes(processes, now, cwdByPid = new Map()) {
+  const jobs = []
+  for (const processInfo of processes) {
+    const args = processInfo.args
+    if (path.basename(args[0] || '') !== 'git' || !args.includes('push')) continue
+    const gitIndex = args.findIndex((arg) => path.basename(arg) === 'git')
+    let root = null
+    for (let index = gitIndex + 1; index < args.length - 1; index += 1) {
+      if (args[index] === '-C') { root = args[index + 1]; break }
+    }
+    root ||= cwdByPid.get(processInfo.pid) || ''
+    const repo = root ? path.basename(root.replace(/[\\/]+$/, '')) : ''
+    jobs.push({
+      id: `git-push-${processInfo.pid}`,
+      kind: 'push',
+      title: repo ? `Push • ${repo}` : 'Push Git en cours',
+      phase: 'pushing',
+      updatedAt: new Date(now).toISOString(),
+      processGroup: processInfo.pgid,
+    })
+  }
+  return jobs
+}
+
+export async function collectActivity({ homeDir = os.homedir(), now = Date.now(), psText, cwdForPid } = {}) {
+  if (typeof psText !== 'string') {
+    const result = await run('ps', ['-Ao', 'pid=,ppid=,pgid=,etime=,command='], { maxBuffer: 8 * 1024 * 1024 })
+    psText = result.stdout
+  }
+  const processes = parseProcessTable(psText)
+  const processByPid = new Map(processes.map((item) => [item.pid, item]))
+  const home = path.resolve(homeDir)
+  const tempRoot = path.join(home, '.claude', 'tmp')
+  const cwdByPid = new Map()
+  if (cwdForPid) {
+    const unresolved = processes.filter((item) => path.basename(item.args[0] || '') === 'git' && item.args.includes('push') && !item.args.includes('-C'))
+    const results = await Promise.all(unresolved.map(async (item) => [item.pid, await cwdForPid(item.pid)]))
+    for (const [pid, cwd] of results) if (cwd) cwdByPid.set(pid, cwd)
+    // 11 October 2026: a worker started as "python3 Scripts/ProcessFilmsSequentially.py" has a RELATIVE script path;
+    // resolve it against that process's own cwd, otherwise the films job disappears from the panel.
+    // FR : chemin de script relatif resolu avec le dossier de travail du processus, sinon le job films disparait.
+    const scriptPattern = /(?:^|\/)(?:ResumeMoviesUpload|ProcessFilmsSequentially|FinishFilteredUploads)\.py$/
+    const relative = processes.filter((item) => item.args.some((arg) => scriptPattern.test(arg) && !path.isAbsolute(arg)))
+    for (const item of relative) {
+      const cwd = await cwdForPid(item.pid)
+      if (cwd) item.args = item.args.map((arg) => (scriptPattern.test(arg) && !path.isAbsolute(arg) ? path.resolve(cwd, arg) : arg))
+    }
+  }
+
+  const pushes = gitPushes(processes, now, cwdByPid)
+  const uploaders = processes.filter((item) => item.args.some((arg) => /(?:^|\/)upload-mapped-git\.mjs$/.test(arg)))
+  const sequentialWorkers = processes.filter((item) => item.args.some((arg) => /(?:^|\/)ProcessFilmsSequentially\.py$/.test(arg)))
+  const active = []
+  const recentFiles = []
+  const seenRoots = new Set()
+
+  for (const uploader of uploaders) {
+    const root = resolveUploadRoot(uploader, processByPid, tempRoot)
+    let progress = null
+    let liveStatus = null
+    let title = 'Envoi de fichiers'
+    let plan = []
+    if (root) {
+      seenRoots.add(root)
+      const planArgumentIndex = uploader.args.findIndex((arg) => /\.json$/.test(arg) && path.isAbsolute(arg))
+      const planPath = planArgumentIndex >= 0 ? uploader.args[planArgumentIndex] : ''
+      if (planPath) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(planPath, 'utf8'))
+          if (Array.isArray(parsed)) plan = parsed
+        } catch {}
+      }
+      if (path.basename(root).includes('movies') || path.basename(root).includes('films')) title = 'Films et séries'
+      progress = parseCompletion(readTail(path.join(root, 'ResumeMoviesUpload.log')))
+      liveStatus = readLiveTransferStatus(root)
+      recentFiles.push(...recentManifestFiles(plan, path.join(root, 'ManifestClone'), now))
+    }
+    const hasPush = pushes.some((push) => push.processGroup === uploader.pgid)
+    active.push({
+      id: `upload-${uploader.pid}`,
+      kind: 'upload',
+      title,
+      phase: hasPush ? 'pushing' : 'uploading',
+      ...(progress || {}),
+      ...(liveStatus || {}),
+      updatedAt: new Date(now).toISOString(),
+    })
+  }
+
+  // Si ProcessFilmsSequentially.py tourne (empaquetage HLS/DASH, verification SHA-256 ou unload entre deux appels a upload-mapped-git.mjs) (10 October 2026)
+  let sequentialRoot = null
+  for (const worker of sequentialWorkers) {
+    const root = resolveUploadRoot(worker, processByPid, tempRoot)
+    if (!root || seenRoots.has(root)) continue
+    seenRoots.add(root)
+    sequentialRoot = root
+    const liveStatus = readLiveTransferStatus(root)
+    const progress = parseCompletion(readTail(path.join(root, 'ResumeMoviesUpload.log')))
+    for (const planName of ['ReadyUploadPlan.json', 'FullFilteredQueue.json']) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(path.join(root, planName), 'utf8'))
+        if (Array.isArray(parsed)) {
+          recentFiles.push(...recentManifestFiles(parsed, path.join(root, 'ManifestClone'), now))
+        }
+      } catch {}
+    }
+    const hasPush = pushes.length > 0
+    active.push({
+      id: `sequential-${worker.pid}`,
+      kind: 'upload',
+      title: 'Films et séries',
+      phase: hasPush ? 'pushing' : 'uploading',
+      ...(progress || {}),
+      ...(liveStatus || {}),
+      updatedAt: new Date(now).toISOString(),
+    })
+  }
+
+  if (sequentialRoot) {
+    stickySequential = { root: sequentialRoot, item: active.find((item) => String(item.id || '').startsWith('sequential-')), seenAt: now }
+  } else if (stickySequential && now - stickySequential.seenAt < STICKY_SEQUENTIAL_MS) {
+    const live = readRunningStatus(stickySequential.root)
+    if (live) active.push({ ...stickySequential.item, ...live, updatedAt: new Date(now).toISOString() })
+  }
+
+  // 11 October 2026: last resort, independent of process detection: any workshop whose LiveTransferStatus.json
+  // was written in the last STATUS_FRESH_MS minutes is an upload in progress. FR : le fichier de statut frais fait foi.
+  if (!active.some((item) => /^(sequential|upload)-/.test(String(item.id || '')))) {
+    let dirs = []
+    try { dirs = fs.readdirSync(tempRoot, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => path.join(tempRoot, d.name)) } catch {}
+    for (const root of dirs) {
+      let stat = null
+      try { stat = fs.statSync(path.join(root, 'LiveTransferStatus.json')) } catch { continue }
+      const workerAlive = processes.some((item) => item.args.some((arg) => /ProcessFilmsSequentially\.py$/.test(arg))) && fs.existsSync(path.join(root, 'Scripts', 'ProcessFilmsSequentially.py'))
+      if (!workerAlive && now - stat.mtimeMs > STATUS_FRESH_MS) continue
+      const live = readRunningStatus(root)
+      if (!live) continue
+      active.push({ id: `sequential-status-${path.basename(root)}`, kind: 'upload', title: 'Films et séries', phase: 'uploading', ...live, updatedAt: new Date(now).toISOString() })
+      for (const planName of ['ReadyUploadPlan.json', 'FullFilteredQueue.json']) {
+        try { recentFiles.push(...recentManifestFiles(JSON.parse(fs.readFileSync(path.join(root, planName), 'utf8')), path.join(root, 'ManifestClone'), now)) } catch {}
+      }
+    }
+  }
+
+  for (const push of pushes) {
+    const { processGroup, ...visible } = push
+    active.push(visible)
+  }
+  return {
+    uploadTiming: readUploadTiming(tempRoot, now),
+    uploadQueue: readUploadQueue(tempRoot, now),
+    active: active.slice(0, 40),
+    recentFiles: [...new Map(recentFiles.map((file) => [file.name, file])).values()]
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 100),
+  }
+}
+
+export async function localCwdForPid(pid) {
+  try {
+    // 11 October 2026: launchd's PATH has no /usr/sbin, so lsof must be called by its absolute path.
+    const result = await run(fs.existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { timeout: 1500, maxBuffer: 64 * 1024 })
+    return result.stdout.split(/\r?\n/).find((line) => line.startsWith('n'))?.slice(1) || null
+  } catch { return null }
+}

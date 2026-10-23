@@ -1,0 +1,95 @@
+// 13 October 2026: LLM-agnostic resume brief of a project, built only from FEEDBACK.md, Rules.md and ConversationIndex.json.
+// EN: any agent (Claude, Codex, Gemini, Antigravity, or ChatGPT by copy-paste) resumes a project from the last things that were said, without the global PROGRESS.md and without reading a 400 KB feedback file. The brief names the latest conversation, the last dated prompts, the last iterations or checkpoints and the last order of work, every line with its date.
+// FR : brief de reprise agnostique du modele ; chaque ligne garde sa date ; rien n'est reformule, les textes sont seulement coupes avec le nombre de caracteres retires.
+// 13 October 2026: every knob lives here, like an HDA; the CLI flags override them (Resume.mjs --prompts 10 --max-chars 1200).
+export const RESUME_SETTINGS = { prompts: 6, iterations: 3, orders: 1, conversations: 3, maxChars: 700 }
+
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+const TRAILING_DATE = /\s*\((\d{1,2} [A-Z][a-z]+ \d{4}[^()]*)\)\s*$/
+const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
+// 13 October 2026: dates in English, month spelled out (doctrine of 30 September 2026), Paris time.
+const PARIS = new Intl.DateTimeFormat('en-GB', { dateStyle: 'long', timeStyle: 'short', timeZone: 'Europe/Paris' })
+
+// 13 October 2026: "12 October 2026, 11:46:37 +0200" -> epoch milliseconds (null when the heading has no time).
+export function feedbackDate(text) {
+  const match = String(text || '').match(/(\d{1,2}) ([A-Z][a-z]+) (\d{4})(?:, (\d{2}):(\d{2})(?::(\d{2}))?(?: ([+-])(\d{2})(\d{2}))?)?/)
+  if (!match) return null
+  const month = MONTHS.indexOf(match[2]); if (month < 0) return null
+  const [hours, minutes, seconds] = [match[4], match[5], match[6]].map(value => Number(value || 0))
+  const offset = match[7] ? (match[7] === '-' ? -1 : 1) * (Number(match[8]) * 60 + Number(match[9])) : 0
+  return Date.UTC(Number(match[3]), month, Number(match[1]), hours, minutes, seconds) - offset * 60_000
+}
+
+// 13 October 2026: source line -> provider and real session id (checkpoint:<agent>:<session> or a transcript path).
+export function sourceIdentity(source) {
+  const text = String(source || '')
+  const checkpoint = text.match(/^checkpoint:([a-z]+):([A-Za-z0-9_-]+)/)
+  if (checkpoint) return { provider: checkpoint[1], sessionId: checkpoint[2], checkpoint: true }
+  const ids = text.match(UUID); if (!ids) return null
+  const provider = text.includes('/.codex/') ? 'codex' : text.includes('/.claude/') ? 'claude' : /antigravity|\.gemini/.test(text) ? 'antigravity' : 'unknown'
+  return { provider, sessionId: ids.at(-1).toLowerCase(), checkpoint: false }
+}
+
+// 13 October 2026: FEEDBACK.md (canonical writer format) -> entries in file order; body lines lose only their trailing date stamp.
+export function parseFeedback(text) {
+  const entries = []
+  let current = null
+  for (const line of String(text || '').split('\n')) {
+    const heading = line.match(/^## (.+?) : (.+?)\s*$/)
+    if (heading) { current = { date: heading[1], at: feedbackDate(heading[1]), kind: heading[2], source: null, body: [] }; entries.push(current); continue }
+    if (!current) continue
+    const source = line.match(/^- Source: (.+)$/)
+    if (source) { current.source = source[1].replace(TRAILING_DATE, '').replace(/\.$/, ''); continue }
+    if (line.startsWith('>')) current.body.push(line.replace(/^> ?/, '').replace(TRAILING_DATE, ''))
+  }
+  return entries.map(entry => ({ ...entry, body: entry.body.join('\n').trim(), identity: sourceIdentity(entry.source) }))
+}
+
+const clip = (text, maxChars) => text.length > maxChars ? `${text.slice(0, maxChars)}\n[... ${text.length - maxChars} more characters in FEEDBACK.md]` : text
+const isKind = (entry, pattern) => pattern.test(entry.kind)
+
+// 13 October 2026: pure selection; conversations merge the feedback sources and the bound sessions of ConversationIndex.json, newest first.
+export function buildResume({ projectId, feedbackText, rulesText = '', conversationIndex = null, settings = {} }) {
+  const options = { ...RESUME_SETTINGS, ...settings }
+  const entries = parseFeedback(feedbackText)
+  const sessions = new Map()
+  const touch = (key, values) => { const previous = sessions.get(key); if (!previous || (values.at || 0) >= (previous.at || 0)) sessions.set(key, { ...previous, ...values }) }
+  for (const entry of entries) if (entry.identity && entry.identity.provider !== 'unknown') touch(`${entry.identity.provider}:${entry.identity.sessionId}`, { provider: entry.identity.provider, sessionId: entry.identity.sessionId, at: entry.at, date: entry.date, via: 'feedback' })
+  for (const item of conversationIndex?.conversations || []) {
+    if (item.boundProject !== projectId) continue
+    const at = Date.parse(item.last || item.updatedAt || '') || null
+    const key = `${item.provider}:${item.sessionId}`
+    const previous = sessions.get(key)
+    sessions.set(key, { provider: item.provider, sessionId: item.sessionId, title: item.title, readerId: item.conversationId, ...(previous || {}), ...(at && (!previous?.at || at > previous.at) ? { at, date: new Date(at).toISOString(), via: 'transcript' } : {}) })
+  }
+  const conversations = [...sessions.values()].sort((left, right) => (right.at || 0) - (left.at || 0)).slice(0, options.conversations)
+  const pick = (pattern, count) => entries.filter(entry => isKind(entry, pattern) && entry.body).slice(-count)
+  const rules = String(rulesText).split('\n').filter(line => line.startsWith('- ')).length
+  const last = entries.at(-1)
+  return {
+    projectId, entries: entries.length, lastEntry: last ? { date: last.date, kind: last.kind } : null, rules,
+    conversations, prompts: pick(/^Prompt$/i, options.prompts), iterations: pick(/^Iteration$/i, options.iterations), orders: pick(/^Order of work$/i, options.orders), options,
+  }
+}
+
+const who = entry => entry.identity ? `${entry.identity.checkpoint ? 'checkpoint ' : ''}${entry.identity.provider}:${entry.identity.sessionId.slice(0, 8)}` : 'manual'
+
+export function renderResume(brief, { feedbackPath, rulesPath, generatedDate }) {
+  const { options } = brief, lines = [`# Resume ${brief.projectId} (${generatedDate})`, '']
+  lines.push(`- Generated from FEEDBACK.md, Rules.md and ConversationIndex.json; derived, never edited by hand, never a substitute for the originals. (${generatedDate})`)
+  lines.push(`- Pinned rules, read first: [Rules.md](${rulesPath}) (${brief.rules} rules). (${generatedDate})`)
+  lines.push(`- Canonical feedback: [FEEDBACK.md](${feedbackPath}), ${brief.entries} entries, last ${brief.lastEntry ? `${brief.lastEntry.kind} at ${brief.lastEntry.date}` : 'none'}. (${generatedDate})`, '')
+  lines.push(`## Latest conversations (${generatedDate})`, '')
+  if (!brief.conversations.length) lines.push(`- No conversation linked yet. (${generatedDate})`)
+  brief.conversations.forEach((item, position) => lines.push(`- ${position === 0 ? 'LATEST ' : ''}${item.provider}:${item.sessionId}${item.title ? `, « ${String(item.title).slice(0, 70)} »` : ''}, last activity ${item.at ? PARIS.format(new Date(item.at)) : 'unknown'} Paris (from ${item.via || 'index'}). Original: \`node scripts/Assets/ConversationDigest.mjs ${item.readerId || `${item.provider}:${item.sessionId}`} --out <file.md>\`. (${generatedDate})`))
+  const section = (title, list) => {
+    lines.push('', `## ${title} (${generatedDate})`, '')
+    if (!list.length) { lines.push(`- None recorded. (${generatedDate})`); return }
+    for (const entry of list) lines.push(`### ${entry.date} · ${entry.kind} · ${who(entry)}`, '', clip(entry.body, options.maxChars).split('\n').map(line => `> ${line}`).join('\n'), '')
+  }
+  section(`Last ${options.prompts} prompts of Matthieu, oldest first`, brief.prompts)
+  section(`Last ${options.iterations} iterations or checkpoints`, brief.iterations)
+  section('Last order of work', brief.orders)
+  lines.push('', `Next step: reread the latest prompt above, check it against Rules.md, then continue; append through feedback.py and close the turn with Client.mjs checkpoint. (${generatedDate})`)
+  return lines.join('\n') + '\n'
+}

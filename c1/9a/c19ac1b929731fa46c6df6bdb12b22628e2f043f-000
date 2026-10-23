@@ -1,0 +1,240 @@
+// ZenRayMedia — L3 : le Cut (la partition).
+//
+// Le poste « Le Monteur » de 01-PLAN §9 tourne ICI, en local et sans appel réseau : il découpe
+// une note en beats et leur attribue un rôle. C'est déterministe, gratuit, instantané, et chaque
+// beat reste éditable à la main — un modèle distant pourra le remplacer plus tard sans rien
+// changer au contrat (entrée : Brief + notes ; sortie : Cut valide).
+//
+// Le nombre de beats est imposé par le THÈME (`theme.beatCount`), pas par l'humeur du texte :
+// c'est la règle ZM-L3-03. Changer de thème change le découpage, jamais le contenu.
+
+import { BEAT_ROLES, makeId, ROLE_LABELS } from './contracts.js'
+
+// Ordre de dévoilement d'un récit court. Les rôles centraux se répètent quand il y a plus de
+// blocs que de rôles : c'est la structure « accroche · développement · chute · appel ».
+const OPENING = ['hook', 'context']
+const MIDDLE = ['proof', 'demo', 'turn']
+const CLOSING = ['payoff', 'cta']
+
+export function splitIntoBlocks(text) {
+  return String(text || '')
+    .replace(/\r\n?/g, '\n')
+    .split(/\n{2,}/)
+    .map((b) => b.trim())
+    .filter(Boolean)
+}
+
+// Regroupe ou éclate les blocs pour atteindre exactement `target` beats, sans jamais perdre un
+// mot : on fusionne les plus courts, on scinde les plus longs sur une frontière de phrase.
+function fitBlocks(blocks, target) {
+  let out = blocks.slice()
+  if (out.length === 0) return []
+
+  while (out.length > target) {
+    let shortest = 0
+    for (let i = 1; i < out.length; i++) if (out[i].length < out[shortest].length) shortest = i
+    const neighbour = shortest === out.length - 1 ? shortest - 1 : shortest + 1
+    const [a, b] = shortest < neighbour ? [shortest, neighbour] : [neighbour, shortest]
+    out.splice(a, 2, `${out[a]}\n\n${out[b]}`)
+  }
+
+  while (out.length < target) {
+    let longest = 0
+    for (let i = 1; i < out.length; i++) if (out[i].length > out[longest].length) longest = i
+    const piece = out[longest]
+    const sentences = piece.split(/(?<=[.!?…])\s+/).filter(Boolean)
+    if (sentences.length < 2) break // insécable : on s'arrête plutôt que de couper un mot
+    const half = Math.ceil(sentences.length / 2)
+    out.splice(longest, 1, sentences.slice(0, half).join(' '), sentences.slice(half).join(' '))
+  }
+  return out
+}
+
+export function roleForPosition(index, total) {
+  if (total <= 1) return 'hook'
+  if (index === 0) return 'hook'
+  if (index === total - 1) return total >= 4 ? 'cta' : 'payoff'
+  if (index === total - 2 && total >= 4) return 'payoff'
+  if (index === 1 && total >= 4) return 'context'
+  const middleIndex = index - (total >= 4 ? 2 : 1)
+  return MIDDLE[middleIndex % MIDDLE.length]
+}
+
+// Poids d'accent : l'ouverture et la chute portent, le corps soutient. Modulé par la longueur
+// relative du bloc — un bloc deux fois plus long pèse plus lourd, sans jamais sortir de [0,1].
+function weightFor(role, length, maxLength) {
+  const base = { hook: 0.9, context: 0.45, proof: 0.55, demo: 0.6, turn: 0.7, payoff: 0.85, cta: 0.8 }[role] ?? 0.5
+  const ratio = maxLength > 0 ? length / maxLength : 0.5
+  return Math.round(Math.min(1, Math.max(0.1, base * 0.75 + ratio * 0.25)) * 100) / 100
+}
+
+const TEMPO_FOR_ROLE = { hook: 'snap', context: 'calm', proof: 'calm', demo: 'drive', turn: 'drive', payoff: 'still', cta: 'snap' }
+
+/**
+ * Construit un Cut à partir d'un Brief et de ses notes.
+ * @param {object} brief
+ * @param {string} notes  texte brut (les blocs séparés par une ligne vide deviennent des beats)
+ * @param {object} theme  fournit beatCount ; facultatif
+ */
+export function buildCut(brief, notes, theme) {
+  const blocks = splitIntoBlocks(notes)
+  const min = theme?.beatCount?.min ?? 3
+  const max = theme?.beatCount?.max ?? 7
+  const target = Math.min(max, Math.max(min, blocks.length || min))
+  const fitted = fitBlocks(blocks.length ? blocks : [brief?.message || ''], target)
+  const maxLength = fitted.reduce((m, b) => Math.max(m, b.length), 0)
+
+  const beats = fitted.map((text, i) => {
+    const role = roleForPosition(i, fitted.length)
+    return {
+      id: makeId('beat', text, i),
+      role,
+      text,
+      slots: [],
+      weight: weightFor(role, text.length, maxLength),
+      tempo: TEMPO_FOR_ROLE[role] || 'calm',
+    }
+  })
+
+  return {
+    id: makeId('cut', `${brief?.id || ''}${notes || ''}`, beats.length),
+    briefId: brief?.id || '',
+    beats,
+    audio: { bed: null, cues: [] },
+    locked: false,
+    // AUDIT P1-R11 : compteur qui ne recule JAMAIS, jamais réutilisé même après suppression ou
+    // fusion — même principe que `composition.serial` pour les calques. `addBeat`/`splitBeat`
+    // dérivaient leur id de la POSITION courante, qu'une suppression puis une insertion identique
+    // pouvait reproduire à l'identique.
+    serial: beats.length,
+  }
+}
+
+// Ré-applique le nombre de beats imposé par un NOUVEAU thème, sans perdre les textes édités
+// à la main (ZM-L3-03 + ZM-L3-13 : un cut verrouillé ne bouge plus).
+export function refitCut(cut, theme) {
+  if (!cut || cut.locked) return cut
+  const min = theme?.beatCount?.min ?? 3
+  const max = theme?.beatCount?.max ?? 7
+  const count = cut.beats.length
+  if (count >= min && count <= max) return cut
+  const texts = fitBlocks(cut.beats.map((b) => b.text), Math.min(max, Math.max(min, count)))
+  const maxLength = texts.reduce((m, b) => Math.max(m, b.length), 0)
+  let serial = cut.serial || 0
+  const beats = texts.map((text, i) => {
+    const previous = cut.beats[i]
+    const role = roleForPosition(i, texts.length)
+    // AUDIT P1-R11 : un beat NEUF (au-delà de ceux préservés depuis `cut.beats`) prend le compteur
+    // monotone, jamais la position `i` — la même faille d'identifiant que `addBeat`/`splitBeat`.
+    const id = previous?.id || makeId('beat', text, ++serial)
+    return { id, role, text, slots: previous?.slots || [], weight: weightFor(role, text.length, maxLength), tempo: TEMPO_FOR_ROLE[role] || 'calm' }
+  })
+  return { ...cut, beats, serial }
+}
+
+// AUDIT P1-R11 : Verrouillé bloque désormais TOUTE mutation directe, pas seulement `refitCut` — le
+// bouton qui l'affiche promet déjà « un article verrouillé ne bouge plus », une promesse que ces
+// neuf fonctions ignoraient jusqu'ici pour toutes sauf `refitCut`.
+export function moveBeat(cut, from, to) {
+  if (!cut || cut.locked || from === to) return cut
+  const beats = cut.beats.slice()
+  if (from < 0 || from >= beats.length || to < 0 || to >= beats.length) return cut
+  const [moved] = beats.splice(from, 1)
+  beats.splice(to, 0, moved)
+  return { ...cut, beats }
+}
+
+export function mergeBeats(cut, index) {
+  if (!cut || cut.locked || index < 0 || index >= cut.beats.length - 1) return cut
+  const beats = cut.beats.slice()
+  const a = beats[index]
+  const b = beats[index + 1]
+  const slots = [...(a.slots || []), ...(b.slots || [])]
+  // AUDIT P1-R11 : refuse la fusion plutôt que de couper silencieusement au-delà de MAX_SLOTS — un
+  // `slice(0,4)` sans avertissement supprimait de vraies images posées par Matthieu.
+  if (slots.length > MAX_SLOTS) return cut
+  beats.splice(index, 2, { ...a, text: `${a.text}\n\n${b.text}`, slots })
+  return { ...cut, beats }
+}
+
+export function splitBeat(cut, index) {
+  if (!cut || cut.locked || index < 0 || index >= cut.beats.length) return cut
+  const beat = cut.beats[index]
+  const sentences = String(beat.text).split(/(?<=[.!?…])\s+/).filter(Boolean)
+  if (sentences.length < 2) return cut
+  const half = Math.ceil(sentences.length / 2)
+  const beats = cut.beats.slice()
+  const serial = (cut.serial || 0) + 1
+  beats.splice(index, 1,
+    { ...beat, id: makeId('beat', beat.text, serial), text: sentences.slice(0, half).join(' ') },
+    { ...beat, id: makeId('beat', beat.text, serial + 1), text: sentences.slice(half).join(' '), slots: [] })
+  return { ...cut, beats, serial: serial + 1 }
+}
+
+export function updateBeat(cut, index, patch) {
+  if (!cut || cut.locked || index < 0 || index >= cut.beats.length) return cut
+  const beats = cut.beats.slice()
+  beats[index] = { ...beats[index], ...patch }
+  return { ...cut, beats }
+}
+
+export function removeBeat(cut, index) {
+  if (!cut || cut.locked || cut.beats.length <= 1) return cut
+  return { ...cut, beats: cut.beats.filter((_, i) => i !== index) }
+}
+
+export function addBeat(cut, afterIndex) {
+  if (!cut || cut.locked) return cut
+  const beats = cut.beats.slice()
+  const at = Math.min(beats.length, Math.max(0, afterIndex + 1))
+  const serial = (cut.serial || 0) + 1
+  beats.splice(at, 0, { id: makeId('beat', 'nouveau', serial), role: 'proof', text: 'Nouveau bloc.', slots: [], weight: 0.5, tempo: 'calm' })
+  return { ...cut, beats, serial }
+}
+
+// --- Emplacements média (ZM-L3-06) ------------------------------------------------------------
+// Un bloc porte au plus 4 emplacements (contrat L0). Les images sont stockées en `dataUrl` :
+// la page compilée reste AUTONOME, l'export PNG ne se heurte à aucune image distante (qui
+// souillerait le canevas et ferait échouer l'encodage), et le document se rouvre hors ligne.
+// Contrepartie assumée : le document grossit. Le Critique le surveille (`doc.heavy`).
+export const MAX_SLOTS = 4
+
+export function addSlot(cut, index, slot) {
+  if (!cut || cut.locked || index < 0 || index >= cut.beats.length || !slot) return cut
+  const beat = cut.beats[index]
+  const slots = [...(beat.slots || [])]
+  if (slots.length >= MAX_SLOTS) return cut
+  slots.push({ kind: slot.kind || 'image', ...slot })
+  return updateBeat(cut, index, { slots })
+}
+
+export function removeSlot(cut, index, slotIndex) {
+  if (!cut || cut.locked || index < 0 || index >= cut.beats.length) return cut
+  const slots = (cut.beats[index].slots || []).filter((_, i) => i !== slotIndex)
+  return updateBeat(cut, index, { slots })
+}
+
+export function moveSlot(cut, index, from, to) {
+  if (!cut || cut.locked || index < 0 || index >= cut.beats.length) return cut
+  const slots = [...(cut.beats[index].slots || [])]
+  if (from < 0 || from >= slots.length || to < 0 || to >= slots.length) return cut
+  const [moved] = slots.splice(from, 1)
+  slots.splice(to, 0, moved)
+  return updateBeat(cut, index, { slots })
+}
+
+/** Poids total des médias encodés dans le cut, en octets approximatifs. */
+export function slotsWeight(cut) {
+  return (cut?.beats || []).reduce((total, beat) => total + (beat.slots || []).reduce((n, slot) => {
+    const data = slot.dataUrl || ''
+    // base64 : 4 caractères pour 3 octets.
+    return n + Math.round((data.length - (data.indexOf(',') + 1)) * 0.75)
+  }, 0), 0)
+}
+
+export function countSlots(cut) {
+  return (cut?.beats || []).reduce((n, beat) => n + (beat.slots || []).length, 0)
+}
+
+export const ROLE_OPTIONS = BEAT_ROLES.map((r) => ({ value: r, label: ROLE_LABELS[r] }))
+export { OPENING, MIDDLE, CLOSING }

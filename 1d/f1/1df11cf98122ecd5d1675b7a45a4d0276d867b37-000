@@ -1,0 +1,283 @@
+# 10 October 2026: Build FilmsIndexMapping.json and FilmsIndexMapping.md with live cloud, HLS/DASH, recovery, and unload receipts.
+import json
+import os
+import sys
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import WorkCategories as WORK_CATEGORIES
+
+ROOT = Path('/Users/zenray/.claude/tmp/tmp-films-series')
+BASE = Path('/Users/zenray/.claude/tmp/tmp-movies-series-upload')
+CLONE = BASE / 'ManifestClone'
+RECOVERY_DIR = BASE / 'RecoveryReceipts'
+UNLOAD_DIR = BASE / 'UnloadAudit'
+DATE = '10 October 2026'
+
+def read(name):
+    return json.loads((BASE / name).read_text())
+
+def link(path):
+    return f'[{path}](<{path}>)'
+
+inventory = read('Inventory.json')
+ready = {x['src']: x for x in read('ReadyUploadPlan.json')}
+filtered = {x['source']: x for x in read('FullFilteredQueue.json')}
+duplicates = {}
+for item in read('DuplicateProof.json'):
+    members = [item['source']] + item['identicalCopies']
+    admitted = [p for p in members if p in ready or p in filtered]
+    assert len(admitted) == 1, 'Each duplicate group needs one admitted path'
+    for member in members:
+        if member != admitted[0]:
+            duplicates[member] = admitted[0]
+assert not (set(ready) & set(filtered) or set(ready) & set(duplicates) or set(filtered) & set(duplicates))
+
+state = read('ResumeMoviesUpload.state.json')
+initial_proof = read('InitialDCloudRecovery.json')
+assert initial_proof['completeCloudRecoveryVerified'] and initial_proof['localSha256'] == initial_proof['restoredSha256']
+
+# Indexation des preuves de restauration cloud par chemin source (10 October 2026)
+recovery_by_source = {
+    initial_proof['source']: {
+        'path': str(BASE / 'InitialDCloudRecovery.json'),
+        'data': initial_proof,
+    }
+}
+if RECOVERY_DIR.exists():
+    for rec_file in sorted(RECOVERY_DIR.glob('*.json')):
+        try:
+            rec_data = json.loads(rec_file.read_text())
+            if rec_data.get('completeCloudRecoveryVerified') and rec_data.get('localSha256') == rec_data.get('restoredSha256'):
+                src_key = rec_data.get('source') or rec_data.get('localPath')
+                if src_key:
+                    recovery_by_source[src_key] = {'path': str(rec_file), 'data': rec_data}
+        except Exception:
+            pass
+
+# Indexation des preuves d'unload (suppression locale apres verification complete) (10 October 2026)
+unload_by_source = {}
+if UNLOAD_DIR.exists():
+    for unl_file in sorted(UNLOAD_DIR.glob('*.json')):
+        try:
+            unl_data = json.loads(unl_file.read_text())
+            src_key = unl_data.get('localPath') or unl_data.get('source')
+            if src_key and (unl_data.get('unloaded') or unl_data.get('status') == 'unloaded'):
+                unload_by_source[src_key] = {'path': str(unl_file), 'data': unl_data}
+        except Exception:
+            pass
+
+video_by_source = {x['source']: x for x in inventory}
+# 11 October 2026: Natsume's Book of Friends is deleted on Matthieu's decision; it leaves the video set explicitly.
+NATSUME_KEYS = {k for k in video_by_source if 'natsume' in k.lower()}
+for k in NATSUME_KEYS:
+    video_by_source.pop(k, None)
+video_paths = set(video_by_source.keys())
+assert len(video_paths) + len(NATSUME_KEYS) == len(inventory) == 233
+
+def planned_manifest_for(key, path_obj):
+    if key in ready:
+        x = ready[key]
+        return x['dest'] + '/' + x['name'] + '.media.json'
+    if key in filtered:
+        name = path_obj.name
+        dest = WORK_CATEGORIES.full_destination(name)  # 14 October 2026: decided from the known-works table. FR : table des oeuvres.
+        return None if dest is None else dest + '/' + name + '.media.json'
+    return None
+
+def check_manifest_state(rel_manifest):
+    if not rel_manifest:
+        return {'onDrive': False, 'hlsDashVerified': False}
+    abs_m = CLONE / rel_manifest
+    if not abs_m.exists():
+        return {'onDrive': False, 'hlsDashVerified': False}
+    try:
+        m = json.loads(abs_m.read_text())
+        has_parts = bool(m.get('parts'))
+        has_hls_dash = bool(m.get('hlsDashVerified') and m.get('master') and m.get('mpd'))
+        return {'onDrive': has_parts, 'hlsDashVerified': has_hls_dash}
+    except Exception:
+        return {'onDrive': False, 'hlsDashVerified': False}
+
+files = []
+seen_sources = set()
+
+for folder, dirs, names in os.walk(ROOT, followlinks=False):
+    for name in names:
+        path = Path(folder) / name
+        if path.is_symlink() or not path.is_file():
+            continue
+        stat = path.stat()
+        key = str(path)
+        seen_sources.add(key)
+        category = 'associated-file-outside-video-queue'
+        destination = planned_manifest_for(key, path)
+        reference = None
+        if key in ready:
+            category = 'ready'
+        elif key in filtered:
+            category = 'subtitle-filter-required'
+        elif key in duplicates:
+            category = 'byte-identical-duplicate'
+            reference = duplicates[key]
+            destination = planned_manifest_for(reference, Path(reference))
+        elif key in video_paths:
+            category = 'local-exception'
+
+        lookup_source = reference if category == 'byte-identical-duplicate' and reference else key
+        rec_info = recovery_by_source.get(key) or recovery_by_source.get(lookup_source)
+        receipt = rec_info['path'] if rec_info else None
+        m_state = check_manifest_state(destination)
+        files.append({
+            'source': key,
+            'relativePath': str(path.relative_to(ROOT)),
+            'bytes': stat.st_size,
+            'allocatedBytes': stat.st_blocks * 512,
+            'category': category,
+            'plannedCloudManifest': destination,
+            'identicalSource': reference,
+            'onDrive': m_state['onDrive'],
+            'fullRecoveryReceipt': receipt,
+            'hlsDashVerified': m_state['hlsDashVerified'],
+            'unloaded': False,
+            'unloadReceipt': None,
+            'freedBytes': 0,
+        })
+
+# Ajout des videos deja dechargees (unloaded) avec preuve d'unload valide (10 October 2026)
+for key, inv_item in video_by_source.items():
+    if key in seen_sources:
+        continue
+    # 11 October 2026: Natsume's Book of Friends was deleted on Matthieu's decision (local and cloud): not an error.
+    if 'natsume' in key.lower():
+        continue
+    assert key in unload_by_source, f'Missing local video without unload receipt: {key}'
+    path = Path(key)
+    category = 'local-exception'
+    destination = planned_manifest_for(key, path)
+    reference = None
+    if key in ready:
+        category = 'ready'
+    elif key in filtered:
+        category = 'subtitle-filter-required'
+    elif key in duplicates:
+        category = 'byte-identical-duplicate'
+        reference = duplicates[key]
+        destination = planned_manifest_for(reference, Path(reference))
+    lookup_source = reference if category == 'byte-identical-duplicate' and reference else key
+    rec_info = recovery_by_source.get(key) or recovery_by_source.get(lookup_source)
+    unl_info = unload_by_source[key]
+    m_state = check_manifest_state(destination)
+    size_bytes = int(inv_item.get('sizeBytes') or unl_info['data'].get('bytes') or 0)
+    files.append({
+        'source': key,
+        'relativePath': str(path.relative_to(ROOT)),
+        'bytes': size_bytes,
+        'allocatedBytes': 0,
+        'category': category,
+        'plannedCloudManifest': destination,
+        'identicalSource': reference,
+        'onDrive': m_state['onDrive'],
+        'fullRecoveryReceipt': rec_info['path'] if rec_info else unl_info['data'].get('proofPath'),
+        'hlsDashVerified': m_state['hlsDashVerified'],
+        'unloaded': True,
+        'unloadReceipt': unl_info['path'],
+        'freedBytes': size_bytes,
+    })
+
+files.sort(key=lambda x: x['relativePath'])
+assert video_paths <= {x['source'] for x in files}, 'Missing inventoried original'
+counts = Counter(x['category'] for x in files)
+# 11 October 2026: counts follow the film set actually present; Natsume (deleted by decision) is not counted.
+print('counts', dict(counts), 'expected_total', len(video_paths), flush=True)
+assert sum(counts[k] for k in ('ready', 'subtitle-filter-required', 'byte-identical-duplicate', 'local-exception')) == len(video_paths) + len(NATSUME_KEYS) - len(NATSUME_KEYS)
+
+video_entries = [x for x in files if x['source'] in video_paths]
+on_drive_count = sum(1 for x in video_entries if x['onDrive'])
+hls_dash_count = sum(1 for x in video_entries if x['hlsDashVerified'])
+recovered_count = sum(1 for x in video_entries if x['fullRecoveryReceipt'])
+unloaded_count = sum(1 for x in video_entries if x['unloaded'])
+freed_bytes = sum(x['freedBytes'] for x in video_entries)
+remaining_bytes = sum(x['bytes'] for x in files if not x['unloaded'])
+
+report = {
+    'generatedAt': datetime.now().astimezone().isoformat(),
+    'sourceRoot': str(ROOT),
+    'destinationRoot': WORK_CATEGORIES.load_table()['base'],
+    'evidenceScope': 'local files, ManifestClone state, recovery receipts, and unload audit receipts',
+    'files': files,
+    'counts': dict(counts),
+    'videoProgress': {
+        'totalVideos': 233,
+        'onDriveCount': on_drive_count,
+        'hlsDashVerifiedCount': hls_dash_count,
+        'fullRecoveryVerifiedCount': recovered_count,
+        'unloadedCount': unloaded_count,
+        'freedBytes': freed_bytes,
+        'freedGiB': round(freed_bytes / 2**30, 3),
+    },
+    'logicalBytes': remaining_bytes,
+    'allocatedFileBytes': sum(x['allocatedBytes'] for x in files),
+    'savedUploadState': state,
+    'deletionsAuthorizedByReport': unloaded_count > 0,
+}
+
+(BASE / 'FilmsIndexMapping.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+
+lines = [
+    f'# Index des 253 Gio de films ({DATE})',
+    '',
+    f'- Source locale : {link(ROOT)}. ({DATE})',
+    f'- Scan actuel : {len(files)} fichiers suivis ; {remaining_bytes / 2**30:.2f} Gio encore sur disque, **{freed_bytes / 2**30:.2f} Gio libérés** ({unloaded_count}/233 vidéos déchargées après preuve SHA-256). ({DATE})',
+    f'- Destination du dépôt cloud : `pages/Anime_Movies_Series_Documentaries/<Anime|Movies|Series|Documentaries>`. ({DATE})',
+    f'- Index exhaustif JSON : {link(BASE / "FilmsIndexMapping.json")}. ({DATE})',
+    '',
+    f'## Avancement temps réel des 233 vidéos ({DATE})',
+    '',
+    f'- **Archivées sur le Drive (`parts` chiffrées)** : {on_drive_count}/233 vidéos. ({DATE})',
+    f'- **Streaming HLS (`.m3u8`) + DASH (`.mpd`) vérifié sur jsDelivr** : {hls_dash_count}/233 vidéos. ({DATE})',
+    f'- **Restauration complète SHA-256 vérifiée (`VerifyVideoCloud.mjs`)** : {recovered_count}/233 vidéos. ({DATE})',
+    f'- **Déchargées localement (`UnloadVideoCloud.mjs`)** : {unloaded_count}/233 vidéos (**{freed_bytes / 2**30:.2f} Gio libérés**). ({DATE})',
+    f'- Répartition des 233 vidéos : 183 prêtes à envoyer, 25 à filtrer pour les sous-titres, 22 copies identiques prouvées et 3 exceptions locales. ({DATE})',
+    '',
+    f'## Sources de preuve ({DATE})',
+    '',
+]
+for name in ['Inventory.json', 'ReadyUploadPlan.json', 'FullFilteredQueue.json', 'DuplicateProof.json', 'PendingPreparation.json', 'PreparedUploadPlan.json', 'UploadPlan.md', 'ResumeMoviesUpload.state.json', 'ResumeMoviesUpload.log', 'InitialDCloudRecovery.json', 'FilteredUpload.log']:
+    lines.append(f'- {link(BASE / name)}. ({DATE})')
+lines += [
+    '',
+    f'## Mapping de chaque vidéo ({DATE})',
+    '',
+    '| Original local | Groupe | Gio | Drive | HLS+DASH | Preuve SHA-256 | Déchargé | Destination ou copie identique |',
+    '|---|---|---:|---|---|---|---|---|',
+]
+labels = {
+    'ready': 'Prête',
+    'subtitle-filter-required': 'Filtrer',
+    'byte-identical-duplicate': 'Copie identique',
+    'local-exception': 'Exception locale',
+}
+for x in files:
+    if x['source'] in video_paths:
+        dest = x['plannedCloudManifest'] or x['identicalSource'] or 'Hors upload'
+        drive_col = 'Oui' if x['onDrive'] else 'Non'
+        hls_col = 'Oui' if x['hlsDashVerified'] else 'Non'
+        rec_col = link(x['fullRecoveryReceipt']) if x['fullRecoveryReceipt'] else 'Non'
+        unl_col = 'Oui (libéré)' if x['unloaded'] else 'Non'
+        lines.append(
+            f'| {link(x["source"])} | {labels[x["category"]]} | {x["bytes"] / 2**30:.3f} | {drive_col} | {hls_col} | {rec_col} | {unl_col} | {dest.replace("|", "&#124;")} ({DATE}) |'
+        )
+(BASE / 'FilmsIndexMapping.md').write_text('\n'.join(lines) + '\n')
+print(json.dumps({
+    'index': str(BASE / 'FilmsIndexMapping.md'),
+    'files': len(files),
+    'onDrive': on_drive_count,
+    'hlsDashVerified': hls_dash_count,
+    'recoveryVerified': recovered_count,
+    'unloaded': unloaded_count,
+    'freedGiB': round(freed_bytes / 2**30, 3),
+    'remainingGiB': round(remaining_bytes / 2**30, 3),
+}, ensure_ascii=False))

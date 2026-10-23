@@ -1,0 +1,140 @@
+// TRADUCTION Request/Response <-> req/res, ISOLÉE POUR ÊTRE TESTABLE.
+//
+// Les quarante-quatre handlers de `server/` sont écrits pour l'interface Node de Vercel : un `req`
+// porteur de `method`, `headers`, `query` et `body`, et un `res` chaînable qui expose `status()`,
+// `json()`, `send()`, `setHeader()`, `write()` et `end()`. Cloudflare parle `Request` et `Response`.
+//
+// Cette fonction traduit l'un dans l'autre, et elle vit à part de `functions/api/[[route]].js`
+// pour une raison précise : testée là-bas, elle exigerait de charger les quarante-quatre handlers
+// et leurs trente-huit variables d'environnement. Isolée ici, elle se vérifie contre un handler
+// de trois lignes. Une pièce qu'on ne peut pas éprouver seule finit toujours par n'être éprouvée
+// qu'en production.
+//
+// LE POINT DÉLICAT, ET IL N'EST PAS ÉVIDENT
+// -----------------------------------------
+// Six handlers écrivent en flux (`res.write()`), dont `stream.js` et `shard.js` qui servent des
+// médias déchiffrés au fil de l'eau. Un adaptateur naïf accumulerait tout en mémoire avant de
+// rendre la réponse, ce qui transformerait un flux de plusieurs centaines de mégaoctets en un
+// tampon qui ferait tomber le Worker.
+//
+// On rend donc la `Response` **dès que le premier octet part**, avec un corps qui continue de se
+// remplir derrière. `TransformStream` sert exactement à cela : le lecteur est branché à la réponse
+// pendant que l'écrivain reste entre les mains du handler.
+
+/**
+ * Enveloppe un handler écrit pour l'interface Node de Vercel et le rend appelable par Cloudflare.
+ * @param {Function} handler        le handler `(req, res) => any`
+ * @param {Request}  request        la requête Cloudflare
+ * @param {Function} [waitUntil]    prolonge la vie du Worker tant que le handler écrit
+ * @returns {Promise<Response>}
+ */
+export async function adapterHandlerNode(handler, request, waitUntil, params) {
+  const url = new URL(request.url)
+
+  // ── `req` à la façon Node ──────────────────────────────────────────────────────────────────
+  const req = {
+    method: request.method,
+    url: url.pathname + url.search,
+    headers: Object.fromEntries(request.headers),
+    // LES PARAMÈTRES DE ROUTE VIENNENT APRÈS LA CHAÎNE DE REQUÊTE, ET C'EST L'OMISSION QUI A FAIT
+    // RENDRE 404 AU PREMIER DÉPLOIEMENT (2026-07-31).
+    //
+    // Le routeur lit `req.query.route` pour savoir quel handler appeler. Vercel remplit cette clé
+    // depuis le nom de fichier `[...route].js` ; Cloudflare, lui, la passe séparément dans
+    // `context.params`, que l'adaptateur ignorait. Le Worker tournait donc parfaitement et
+    // répondait « not-found, route: null » à tout : une panne totale qui ressemblait à une panne
+    // de routage alors que c'était une panne de transmission.
+    query: { ...Object.fromEntries(url.searchParams), ...(params || {}) },
+    body: undefined,
+  }
+  // Le corps n'est lu que lorsqu'il y en a un : lire `json()` sur un GET jette, et certains
+  // handlers reçoivent des binaires qu'il ne faut surtout pas décoder en texte.
+  if (!['GET', 'HEAD'].includes(request.method)) {
+    const type = request.headers.get('content-type') || ''
+    if (type.includes('application/json')) {
+      try { req.body = await request.json() } catch { req.body = undefined }
+    } else if (type.startsWith('text/')) {
+      req.body = await request.text()
+    } else {
+      req.body = new Uint8Array(await request.arrayBuffer())
+    }
+  }
+
+  // ── `res` à la façon Node, adossé à un flux ────────────────────────────────────────────────
+  const { readable, writable } = new TransformStream()
+  const ecrivain = writable.getWriter()
+  const encodeur = new TextEncoder()
+  const entetes = new Headers()
+
+  let statut = 200
+  let reponseRendue = false
+  let resoudreReponse
+  const reponse = new Promise((r) => { resoudreReponse = r })
+
+  // Le premier octet écrit fige les en-têtes et libère la réponse : tout ce qui suit part en flux.
+  const demarrer = () => {
+    if (reponseRendue) return
+    reponseRendue = true
+    // UN 304 NE PEUT PAS PORTER DE CORPS, ET L'IGNORER COÛTAIT 3,16 Mo PAR OUVERTURE.
+    //
+    // Bug réel trouvé le 2026-08-01 : `/api/page?action=tree` répondait **500** à toute requête
+    // conditionnelle en production. `page.js` fait `res.status(304).end()` quand l'empreinte n'a pas
+    // bougé, mais cet adaptateur attachait toujours le flux, et la plateforme refuse un corps sur les
+    // statuts « sans contenu ». Le client envoyait donc son `If-None-Match`, recevait une erreur, et
+    // retombait sur le téléchargement complet : le correctif d'ETag du 2026-07-30 était neutralisé
+    // sans que rien ne le signale, puisque la page finissait par s'afficher.
+    //
+    // Ce que ça casserait si on le retirait : chaque ouverture de la vue Plan repaierait 3,16 Mo et
+    // deux secondes, au lieu de trois cents octets.
+    const sansCorps = statut === 101 || statut === 204 || statut === 205 || statut === 304
+    resoudreReponse(new Response(sansCorps ? null : readable, { status: statut, headers: entetes }))
+  }
+
+  const ecrire = (donnee) => {
+    if (donnee === undefined || donnee === null) return
+    const octets = typeof donnee === 'string' ? encodeur.encode(donnee)
+      : donnee instanceof Uint8Array ? donnee
+      : ArrayBuffer.isView(donnee) ? new Uint8Array(donnee.buffer, donnee.byteOffset, donnee.byteLength)
+      : donnee instanceof ArrayBuffer ? new Uint8Array(donnee)
+      : encodeur.encode(String(donnee))
+    return ecrivain.write(octets)
+  }
+
+  const res = {
+    get statusCode() { return statut },
+    set statusCode(c) { statut = c },
+    get headersSent() { return reponseRendue },
+    status(c) { statut = c; return res },
+    setHeader(nom, valeur) {
+      // Un même nom peut porter plusieurs valeurs (Set-Cookie) : on ajoute au lieu d'écraser.
+      if (Array.isArray(valeur)) { entetes.delete(nom); for (const v of valeur) entetes.append(nom, String(v)) }
+      else entetes.set(nom, String(valeur))
+      return res
+    },
+    getHeader(nom) { return entetes.get(nom) },
+    removeHeader(nom) { entetes.delete(nom); return res },
+    write(donnee) { demarrer(); ecrire(donnee); return true },
+    json(objet) {
+      if (!entetes.has('content-type')) entetes.set('content-type', 'application/json; charset=utf-8')
+      demarrer(); ecrire(JSON.stringify(objet)); ecrivain.close(); return res
+    },
+    send(donnee) { demarrer(); ecrire(donnee); ecrivain.close(); return res },
+    end(donnee) { demarrer(); if (donnee !== undefined) ecrire(donnee); ecrivain.close(); return res },
+  }
+
+  // Le handler travaille pendant que la réponse est déjà partie : c'est tout l'intérêt du flux.
+  // On n'attend donc PAS sa fin avant de rendre, mais on ferme le flux s'il jette, sans quoi le
+  // client resterait suspendu sur une réponse qui ne se termine jamais.
+  const travail = Promise.resolve()
+    .then(() => handler(req, res))
+    .catch((e) => {
+      if (!reponseRendue) { statut = 500; entetes.set('content-type', 'application/json; charset=utf-8'); demarrer(); ecrire(JSON.stringify({ error: String((e && e.message) || e) })) }
+      try { ecrivain.close() } catch { /* déjà fermé par le handler */ }
+    })
+
+  // `waitUntil` garde le Worker en vie tant que le handler écrit, même après que la réponse est
+  // partie. Sans lui, un flux long serait coupé net dès le retour de cette fonction.
+  if (waitUntil) waitUntil(travail)
+
+  return reponse
+}

@@ -1,0 +1,196 @@
+// vidStream.js — pont entre le lecteur et le Service Worker « range-shim » (public/zr-stream-sw.js).
+// Enregistre le SW une fois, puis enregistre un manifeste video-raw et renvoie l'URL virtuelle /zr-stream/<id>
+// que le <video> natif peut lire (le SW sert les octets depuis les parts raw.github). HEVC décodé par l'OS.
+import { getApiSecret } from './apiAuth.js'
+import { buildJsDelivrUrl } from '../capture/shardNaming.js'
+
+let _swReady = null
+const REGISTER_ACK_TIMEOUT_MS = 1000
+const CONTROLLER_WAIT_MS = 1200
+const CONTROLLER_RETRY_MS = 450
+
+export async function ensureStreamSW() {
+  if (_swReady) return _swReady
+  _swReady = (async () => {
+    if (!('serviceWorker' in navigator)) throw new Error('Service Worker non supporté')
+    await navigator.serviceWorker.register('/zr-stream-sw.js', { scope: '/' })
+    await navigator.serviceWorker.ready
+    return true
+  })().catch((e) => { _swReady = null; throw e })
+  return _swReady
+}
+
+// Identité stable, complète et non collisionnable par simple suffixe commun. Le préfixe versionné permet
+// de distinguer sans ambiguïté ces IDs des anciens IDs tronqués si les deux générations coexistent en cache.
+export async function mediaId(manifest, stableKey = '') {
+  const firstUrl = manifest?.parts?.[0]?.url || ''
+  const source = stableKey ? `key:${String(stableKey)}` : firstUrl ? `url:${firstUrl}` : manifest?.name ? `name:${manifest.name}:${manifest.size || ''}` : ''
+  if (!source) throw new Error('identité média absente')
+  if (!globalThis.crypto?.subtle) throw new Error('SHA-256 indisponible dans ce navigateur')
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(source))
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `m2-${hex}`
+}
+
+// Converts both schemas to the range-shim contract:
+// - video-raw: parts are already {url,start,end,size,iv}
+// - chunked-media: parts are short names + dir/cdnRepo/cdnCommit/ivs
+export function normalizeRawMediaManifest(manifest) {
+  if (!manifest || !Array.isArray(manifest.parts) || !manifest.parts.length) throw new Error('manifeste média incomplet')
+  if (typeof manifest.parts[0] === 'object' && manifest.parts[0].url) return manifest
+  if (!manifest.cdnRepo || !manifest.cdnCommit || !manifest.dir) throw new Error('références CDN absentes')
+  let start = 0
+  const parts = manifest.parts.map((part, i) => {
+    const clearSize = Math.max(0, Math.min(manifest.chunkSize || manifest.size, manifest.size - start))
+    const name = String(part).endsWith('.bin') ? String(part) : `${part}.bin`
+    const out = { url: buildJsDelivrUrl(manifest.cdnRepo, manifest.cdnCommit, `${manifest.dir}/${name}`), start, end: start + clearSize - 1, size: clearSize, iv: manifest.ivs && manifest.ivs[i] }
+    start += clearSize
+    return out
+  })
+  return { ...manifest, parts, private: manifest.vis === 'private' || manifest.private === true }
+}
+
+const streamRegistrationError = (message, code, cause) => Object.assign(new Error(message, cause ? { cause } : undefined), { code })
+
+function waitForControllerChange(previous, timeoutMs) {
+  const container = navigator.serviceWorker
+  const current = container.controller
+  if (current && current !== previous) return Promise.resolve(current)
+  if (typeof container.addEventListener !== 'function') return Promise.resolve(null)
+  return new Promise((resolve) => {
+    let timer = null
+    const finish = (controller) => {
+      if (timer !== null) clearTimeout(timer)
+      container.removeEventListener?.('controllerchange', onChange)
+      resolve(controller || null)
+    }
+    const onChange = () => {
+      const next = container.controller
+      if (next && next !== previous) finish(next)
+    }
+    container.addEventListener('controllerchange', onChange)
+    timer = setTimeout(() => finish(null), timeoutMs)
+    // Ferme la course entre le premier test et l'abonnement à controllerchange.
+    onChange()
+  })
+}
+
+function registerWithAck(sw, id, media) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const ch = new MessageChannel()
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      ch.port1.onmessage = null
+      ch.port1.onmessageerror = null
+      ch.port1.close?.()
+      callback(value)
+    }
+    const timer = setTimeout(() => finish(reject, streamRegistrationError('Service Worker: délai ACK dépassé', 'stream_ack_timeout')), REGISTER_ACK_TIMEOUT_MS)
+    ch.port1.onmessage = (event) => {
+      const ack = event?.data
+      if (ack?.type === 'zr-reg-ack' && ack.ok === true && ack.id === id) finish(resolve, true)
+      else finish(reject, streamRegistrationError(`Service Worker: ACK invalide pour ${id}`, 'stream_ack_invalid'))
+    }
+    ch.port1.onmessageerror = () => finish(reject, streamRegistrationError('Service Worker: ACK illisible', 'stream_ack_invalid'))
+    try {
+      sw.postMessage({ type: 'zr-reg', id, auth: getApiSecret(), media }, [ch.port2])
+    } catch (error) {
+      finish(reject, streamRegistrationError('Service Worker: enregistrement impossible', 'stream_post_failed', error))
+    }
+  })
+}
+
+// Enregistre le manifeste auprès du SW qui CONTRÔLE réellement la page. Une URL virtuelle n'est rendue
+// qu'après un ACK typé portant le même ID. En cas de remplacement du SW pendant l'échange, un seul retry
+// est effectué sur le nouveau controller ; sinon le rejet laisse les appelants utiliser leur fallback.
+export async function registerRawMedia(manifest, stableKey = '') {
+  manifest = normalizeRawMediaManifest(manifest)
+  await ensureStreamSW()
+  await navigator.serviceWorker.ready
+  let sw = navigator.serviceWorker.controller || await waitForControllerChange(null, CONTROLLER_WAIT_MS)
+  // A page loaded with a HARD reload (⇧⌘R) bypasses the service worker and stays uncontrolled even though the worker
+  // is active. Ask the active worker to claim this page (the worker answers with clients.claim()), then wait again.
+  // If it still does not take control, the typed error below lets the player reload the page ONCE (a normal reload
+  // is always controlled).
+  if (!sw) {
+    try { const reg = await navigator.serviceWorker.getRegistration?.('/'); reg?.active?.postMessage({ type: 'zr-claim' }) } catch {}
+    sw = await waitForControllerChange(null, CONTROLLER_WAIT_MS)
+  }
+  if (!sw) throw streamRegistrationError('Service Worker actif mais page non contrôlée : recharge la page normalement (⌘R, pas ⇧⌘R)', 'stream_controller_missing')
+  const id = await mediaId(manifest, stableKey)
+  const media = { size: manifest.size, mime: manifest.mime || 'application/octet-stream', parts: manifest.parts, private: manifest.private === true }
+  try {
+    await registerWithAck(sw, id, media)
+  } catch (firstError) {
+    const replacement = navigator.serviceWorker.controller !== sw
+      ? navigator.serviceWorker.controller
+      : await waitForControllerChange(sw, CONTROLLER_RETRY_MS)
+    if (!replacement || replacement === sw) throw firstError
+    sw = replacement
+    await registerWithAck(sw, id, media)
+  }
+  // Un controller remplacé juste avant la résolution possède son propre registre mémoire : ACK obligatoire
+  // sur cette nouvelle instance également avant de laisser le lecteur requêter l'URL.
+  const current = navigator.serviceWorker.controller
+  if (current && current !== sw) await registerWithAck(current, id, media)
+  return `/zr-stream/${encodeURIComponent(id)}`
+}
+
+export const registerRawVideo = (manifest) => registerRawMedia(manifest)
+
+export async function readMediaManifest(path) {
+  const j = await fetch(`/api/page?action=read&raw=1&path=${encodeURIComponent(path)}`, { cache: 'no-store' }).then((r) => r.json())
+  if (!j || !j.markdown || j.missing) throw new Error('manifeste média absent')
+  return JSON.parse(j.markdown)
+}
+
+export async function registerChunkedMediaPath(path) {
+  const manifest = await readMediaManifest(path)
+  return { manifest, url: await registerRawMedia(manifest, path) }
+}
+
+// Metadata window may be large, but binary prefetch stays bounded: first encrypted chunk
+// of the next four tracks, max four network requests at once. Browser HTTP cache then feeds
+// the SW without a second transfer when playback advances.
+export async function prefetchRawMedia(manifests, max = 4) {
+  await ensureStreamSW()
+  const reg = await navigator.serviceWorker.ready
+  const sw = navigator.serviceWorker.controller || reg.active
+  const media = (manifests || []).slice(0, max).map((m) => {
+    try { return normalizeRawMediaManifest(m) } catch { return null }
+  }).filter(Boolean)
+  if (sw && media.length) sw.postMessage({ type: 'zr-prefetch', auth: getApiSecret(), media })
+}
+
+// PRÉCHARGEMENT AUDIO PAR CHEMIN (2026-07-22, calqué sur le prefetch d'images) — réchauffe le PREMIER
+// chunk d'une fenêtre BORNÉE de pistes locales, pour que le clic démarre sans stutter/clipping et que la
+// transition de piste soit sans trou. On lit les manifestes (raw=1, HORS quota API) avec une concurrence
+// bornée, on dédoublonne par chemin (une piste n'est réchauffée qu'une fois par session -> le cache HTTP du
+// navigateur nourrit ensuite le SW sans 2e transfert), puis on délègue à prefetchRawMedia (le SW fetch
+// parts[0]). BENCHMARK RÉEL (2026-07-22, scratchpad/bench.mjs, 8 pistes) : le coût N'EST PAS la RAM d'onglet
+// (le ciphertext va dans le cache HTTP disque, le buffer déchiffré est jeté) mais le RÉSEAU -- parts[0] fait
+// ~19 Mo depuis la politique unifiée, et jsDelivr à FROID les sert à ~1,7 Mo/s (8-19 s/chunk). Donc window=96
+// = 1,8 Go = ~18 min à froid = absurde : la fenêtre est bornée par le RÉSEAU, pas par le compte. Défaut 24
+// (≈456 Mo, une seule fois, puis servi par le cache edge). Le VRAI levier d'un start instantané serait des
+// chunks audio plus petits (façon segment HLS 2-6 s) : 19 Mo est optimal au stockage/download mais lourd au
+// DÉMARRAGE streaming (tout le 1er chunk avant le 1er son). Arbitrage de politique à discuter séparément.
+const _prefetchedMediaPaths = new Set()
+export async function prefetchMediaPaths(paths, { window = 24 } = {}) {
+  const todo = (paths || []).filter((p) => typeof p === 'string' && p.endsWith('.media.json') && !_prefetchedMediaPaths.has(p)).slice(0, window)
+  if (!todo.length) return
+  todo.forEach((p) => _prefetchedMediaPaths.add(p))
+  const manifests = []
+  let i = 0
+  const worker = async () => { while (i < todo.length) { const p = todo[i++]; try { manifests.push(await readMediaManifest(p)) } catch { /* piste illisible : ignorée */ } } }
+  await Promise.all(Array.from({ length: Math.min(4, todo.length) }, worker))
+  const playable = manifests.filter((m) => m && Array.isArray(m.parts) && m.parts.length && m.vis === 'public')
+  if (playable.length) await prefetchRawMedia(playable, window)
+}
+
+// Le SW contrôle-t-il déjà la page ? (sinon la 1re vidéo après un tout premier chargement peut nécessiter un reload)
+export function streamSWControlling() {
+  return !!(navigator.serviceWorker && navigator.serviceWorker.controller)
+}

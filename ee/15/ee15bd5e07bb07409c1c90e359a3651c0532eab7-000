@@ -1,0 +1,39 @@
+// 3 October 2026, 09:00 CEST: derive narrow preparation inputs from exact project identities and verified managed copies.
+const hdaExtension = /\.(?:hda|hdalc|hdanc|otl|otllc|otlnc)$/i
+const absolutePath = (value) => typeof value === 'string' && value.startsWith('/')
+const verifiedCopy = (file) => Boolean(file?.present && file.loadedCopy && ['verified', 'backed-up'].includes(file.status) && /^[a-f0-9]{64}$/.test(file.sha256 || '') && absolutePath(file.localPath) && absolutePath(file.workingRoot))
+
+export function buildScenePreparationPlan({ projectId, sceneFileId, projects, audit, context }) {
+  const registry = new Map(projects.map((project) => [project.id, project]))
+  const project = registry.get(projectId)
+  const scene = project?.files?.find((file) => file.id === sceneFileId)
+  if (!scene || !/\.hip(?:lc|nc)?$/i.test(scene.relativePath)) throw new Error('Inventoried Houdini scene required')
+  if (context?.state !== 'current' || context.sceneFileId !== sceneFileId || context.projectId !== projectId || !audit || context.sceneSha256 !== audit.sceneSha256) throw new Error('Current scene resource audit required')
+  const admitted = new Set([projectId, ...(context.dependencies || [])])
+  const requirements = new Map(), resources = [], unresolvedReferences = []
+  const requireLoad = (id, fileId, reason) => requirements.set(`${id}:${fileId}`, { projectId: id, fileId, reason })
+  const sceneReady = verifiedCopy(scene) && scene.sha256 === audit.sceneSha256
+  if (!sceneReady) requireLoad(projectId, sceneFileId, scene.loadedCopy ? 'scene-archive-required' : 'scene-copy-required')
+  for (const reference of context.references || []) {
+    if (['output', 'internal', 'directory'].includes(reference.type)) continue
+    const observed = audit.references?.[reference.referenceId]
+    const target = reference.targets?.length === 1 ? reference.targets[0] : null
+    const candidate = admitted.has(target?.projectId) ? registry.get(target.projectId)?.files?.find((file) => file.id === target.fileId) : null
+    const kind = reference.role === 'input' && reference.parameterPath ? 'input' : reference.role === 'unknown' && !reference.parameterPath && candidate && hdaExtension.test(candidate.relativePath) ? 'hda' : null
+    if (!['mapped', 'relocation-required'].includes(reference.type) || !kind || !candidate || !observed || observed.dynamic || observed.pathKind !== 'absolute'
+      || (kind === 'input' && !absolutePath(observed.resolvedPath))) {
+      unresolvedReferences.push({ referenceId: reference.referenceId, type: reference.type })
+      continue
+    }
+    if (!verifiedCopy(candidate)) {
+      requireLoad(target.projectId, target.fileId, candidate.loadedCopy ? 'resource-archive-required' : 'resource-copy-required')
+      continue
+    }
+    resources.push({ kind, projectId: target.projectId, fileId: target.fileId, targetPath: candidate.localPath, targetRoot: candidate.workingRoot, sha256: candidate.sha256,
+      ...(kind === 'input' ? { parameterPath: reference.parameterPath, originalPath: observed.resolvedPath } : {}) })
+  }
+  return { schemaVersion: 1, projectId, sceneFileId, ready: sceneReady && !requirements.size,
+    scenePath: scene.localPath || null, sceneRoot: scene.workingRoot || null, sceneSha256: audit.sceneSha256,
+    resources, loadRequirements: [...requirements.values()], unresolvedReferences,
+    completeReferenceCoverage: !unresolvedReferences.length && !requirements.size, portabilityVerified: false }
+}

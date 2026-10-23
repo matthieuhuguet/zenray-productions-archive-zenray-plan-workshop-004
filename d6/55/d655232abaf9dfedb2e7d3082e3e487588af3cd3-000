@@ -1,0 +1,155 @@
+// 3 October 2026, 13:44 : PostKit dashboard. A fake PostKit API answers by route; the tests check what the person SEES: the offline state with its
+// command, the key prompt, the counters, the manual last step, "n/a" instead of 0, the platform matrix and one-time secrets. (3 October 2026)
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, waitFor, fireEvent, within, cleanup } from '@testing-library/react'
+import PostKitView from './PostKitView.jsx'
+import { POSTKIT } from './postkitConfig.js'
+
+const caps = (o = {}) => ({ publish: false, messaging: false, comments: false, analytics: false, ads: false, stories: false, unpublish: false, ...o })
+const platform = (p, verification, c, extra = {}) => ({ platform: p, label: extra.label || p, verification, auth: extra.auth || 'oauth', capabilities: caps(c), rules: {}, note: extra.note || null, requiredEnv: extra.requiredEnv || [] })
+const OVERVIEW = {
+  system: { product: 'PostKit', apiVersion: '1.0.0', now: new Date().toISOString(), scheduler: { running: true, tickMs: 15000, lastTickAt: new Date().toISOString() } },
+  counts: { profiles: 1, accounts: { connected: 3, disconnected: 0, needsReconnection: 1, expiringSoon: 0 }, posts: { scheduled: 2, draft: 1, failed: 1, published: 4 }, pendingEngagement: 5, unreadConversations: 2,
+    automations: { active: 1, total: 1 }, broadcasts: { total: 0, sending: 0 }, sequences: { active: 1 }, webhooks: { enabled: 1, pendingDeliveries: 2, failedDeliveries: 1 }, apiKeys: { active: 2 }, trackedPosts: 7 },
+  queue: {
+    scheduled: [{ id: 'sp_1', title: null, content: 'Scheduled hello', status: 'scheduled', scheduledFor: '2027-01-01T08:00:00.000Z', publishedAt: null, targets: [{ accountId: 'acc_1', platform: 'instagram', status: 'pending' }] }],
+    awaitingManual: [{ id: 'sp_2', title: 'Louisiana Bayou', content: 'Church', status: 'awaiting_manual', targets: [{ accountId: 'acc_art', platform: 'artstation', status: 'awaiting_manual', handoff: { kind: 'artstation', title: 'Louisiana Bayou', tags: ['houdini'], software: ['Houdini'], images: [{}], steps: ['Open ArtStation and start a new project.'], openUrl: 'https://www.artstation.com/zenray' } }] }],
+    attention: [{ id: 'sp_3', title: null, content: 'Broken post', status: 'failed', targets: [{ accountId: 'acc_1', platform: 'instagram', status: 'failed', error: 'Token rejected' }] }],
+  },
+  recent: [{ id: 'sp_4', title: null, content: 'Live post', status: 'published', publishedAt: new Date().toISOString(), targets: [{ accountId: 'acc_1', platform: 'instagram', status: 'published', platformPostUrl: 'https://www.instagram.com/p/A/' }] }],
+  accounts: [
+    { id: 'acc_1', profileId: 'prof_1', platform: 'instagram', username: 'zenray', displayName: 'ZenRay', status: 'CONNECTED', needsReconnection: true, verification: 'mock', capabilities: caps({ publish: true, messaging: true, comments: true, analytics: true }), tokenExpiresAt: new Date(Date.now() + 3 * 86400000).toISOString() },
+    { id: 'acc_art', profileId: 'prof_1', platform: 'artstation', username: 'zenray', displayName: 'zenray', status: 'CONNECTED', verification: 'handoff', capabilities: caps({ publish: true }) },
+    { id: 'acc_li', profileId: 'prof_1', platform: 'linkedin', username: 'Matthieu', displayName: 'Matthieu', status: 'CONNECTED', verification: 'mock', capabilities: caps({ publish: true, unpublish: true }) },
+  ],
+  profiles: [{ id: 'prof_1', name: 'Brand' }],
+  usage: { period: '2026-10', total_usd: 0.215, cap_usd: 20, remaining_usd: 19.785, breakdown: [{ operation: 'X_POST', quantity: 1, cost_usd: 0.015 }] },
+  subscription: { cap_is_default: true },
+  platforms: [
+    platform('instagram', 'mock', { publish: true, messaging: true, comments: true, analytics: true, stories: true }, { label: 'Instagram', requiredEnv: ['POSTKIT_INSTAGRAM_CLIENT_ID'] }),
+    platform('linkedin', 'mock', { publish: true, unpublish: true }, { label: 'LinkedIn', note: 'Publishes to the member profile.' }),
+    platform('artstation', 'handoff', { publish: true }, { label: 'ArtStation', auth: 'handoff', note: 'No public write API.' }),
+    platform('website', 'local', { publish: true }, { label: 'Website (matthieuhuguet.com)', auth: 'local' }),
+    platform('sandbox', 'sandbox', { publish: true, messaging: true }, { label: 'Sandbox', auth: 'sandbox' }),
+  ],
+}
+
+const SUMMARY = { window: { from: 'a', to: 'b', maxHistoryDays: 550, clamped: false }, posts: { value: 4, change: 33.3 }, engagementRate: { value: 6.8, change: 0.5 }, metrics: { views: { value: 1200, change: 10 }, reach: { value: null, change: null }, likes: { value: 90, change: 5 }, comments: { value: 12, change: null }, shares: { value: 3, change: null }, saves: { value: 15, change: null }, impressions: { value: null, change: null }, clicks: { value: null, change: null } }, followers: { total: 1500, change: 20 }, bestPost: null, lastSyncAt: new Date().toISOString(), nextSyncAt: new Date(Date.now() + 600000).toISOString() }
+
+function mockApi({ overview = OVERVIEW, status = 200, extra = {} } = {}) {
+  const calls = []
+  const f = vi.fn(async (url, init = {}) => {
+    const u = new URL(String(url)); const path = u.pathname + u.search; const method = init.method || 'GET'
+    calls.push({ method, path, body: init.body ? JSON.parse(init.body) : null })
+    for (const [k, v] of Object.entries(extra)) { const [m, p] = k.split(' '); if (m === method && path.startsWith(p)) return new Response(JSON.stringify(typeof v === 'function' ? v(init) : v), { status: 200 }) }
+    if (u.pathname === '/v1/dashboard') return new Response(JSON.stringify(overview), { status })
+    if (u.pathname === '/v1/analytics/summary') return new Response(JSON.stringify(SUMMARY), { status: 200 })
+    if (u.pathname.startsWith('/v1/')) return new Response(JSON.stringify({ posts: [], accounts: [], series: [], cells: [], buckets: [], webhooks: [], apiKeys: [], apps: [], docs: [], conversations: [], engagements: [] }), { status: 200 })
+    return new Response('{}', { status: 404 })
+  })
+  vi.stubGlobal('fetch', f)
+  return { calls, f }
+}
+
+const connected = () => localStorage.setItem(POSTKIT.storageKey, JSON.stringify({ baseUrl: 'http://127.0.0.1:8787', key: 'pk_test' }))
+
+describe('PostKitView', () => {
+  beforeEach(() => { localStorage.clear() })
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() }) // no globals in this vitest config: unmount explicitly (3 October 2026)
+
+  it('asks for a key when none is stored and shows the command that creates one', async () => {
+    mockApi()
+    render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Connect to PostKit')).toBeTruthy())
+    expect(screen.getByText(POSTKIT.keyCommand)).toBeTruthy()
+  })
+
+  it('says PostKit is offline, with the exact start command, instead of a blank screen', async () => {
+    connected()
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed') }))
+    render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('PostKit is offline')).toBeTruthy())
+    expect(screen.getByText(POSTKIT.startCommand)).toBeTruthy()
+    expect(screen.getAllByText('Offline').length).toBeGreaterThan(0)
+  })
+
+  it('shows the counters, what waits for the person, what failed and the connection status', async () => {
+    connected(); mockApi()
+    render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Waiting for your step')).toBeTruthy())
+    expect(screen.getByText('Connected accounts').nextSibling.textContent).toBe('3')
+    expect(screen.getByText('1 need reconnecting')).toBeTruthy()
+    expect(screen.getByText('Broken post')).toBeTruthy(); expect(screen.getByText('Token rejected')).toBeTruthy()
+    expect(screen.getByText('Open ArtStation and start a new project.')).toBeTruthy()
+    expect(screen.getByText(/Online, last tick/)).toBeTruthy()
+  })
+
+  it('completes a manual target with the typed URL', async () => {
+    connected()
+    const api = mockApi({ extra: { 'POST /v1/posts/sp_2/targets/acc_art/complete': { id: 'sp_2', status: 'published' } } })
+    render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByLabelText('Published URL')).toBeTruthy())
+    const button = screen.getByText('Mark as published'); expect(button.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('Published URL'), { target: { value: 'https://www.artstation.com/artwork/abc' } })
+    fireEvent.click(button)
+    await waitFor(() => expect(api.calls.find((c) => c.path.includes('/complete'))).toBeTruthy())
+    expect(api.calls.find((c) => c.path.includes('/complete')).body).toEqual({ platformPostUrl: 'https://www.artstation.com/artwork/abc' })
+  })
+
+  it('the platform matrix marks the three additions and every verification level', async () => {
+    connected(); mockApi()
+    render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Waiting for your step')).toBeTruthy())
+    fireEvent.click(screen.getByRole('tab', { name: 'Platforms' }))
+    const table = await screen.findByRole('table')
+    const rows = within(table).getAllByRole('row')
+    const rowOf = (name) => rows.find((r) => r.textContent.includes(name))
+    expect(within(rowOf('LinkedIn')).getByText('added')).toBeTruthy(); expect(within(rowOf('ArtStation')).getByText('added')).toBeTruthy(); expect(within(rowOf('Website')).getByText('added')).toBeTruthy()
+    expect(within(rowOf('Instagram')).queryByText('added')).toBeNull()
+    expect(within(rowOf('ArtStation')).getByText('Handoff')).toBeTruthy(); expect(within(rowOf('Instagram')).getByText('Mock')).toBeTruthy()
+    expect(screen.getByText(/No public write API\./)).toBeTruthy()
+  })
+
+  it('analytics shows n/a for a metric the platform does not expose, never 0', async () => {
+    connected(); mockApi()
+    render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Waiting for your step')).toBeTruthy())
+    fireEvent.click(screen.getByRole('tab', { name: 'Analytics' }))
+    const tile = (label) => screen.getAllByText(label).find((el) => el.className.includes('tilelabel'))
+    await waitFor(() => expect(tile('Reach')).toBeTruthy())
+    expect(tile('Reach').nextSibling.textContent).toBe('n/a')
+    expect(tile('Impressions').nextSibling.textContent).toBe('n/a')
+    expect(tile('Views').nextSibling.textContent).toBe('1,200')
+    expect(screen.getAllByText('not exposed').length).toBe(3)
+    expect(screen.getByText(/last collected/)).toBeTruthy()
+  })
+
+  it('the composer publishes with the picked accounts and the typed text', async () => {
+    connected()
+    const api = mockApi({ extra: { 'POST /v1/posts': { id: 'sp_9', status: 'published' } } })
+    render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Waiting for your step')).toBeTruthy())
+    fireEvent.click(screen.getByRole('tab', { name: 'Posts' }))
+    await screen.findByText('Compose')
+    fireEvent.click(screen.getByLabelText('Matthieu')) // the LinkedIn account (3 October 2026)
+    fireEvent.change(screen.getByPlaceholderText('What do you want to say?'), { target: { value: 'Shipped PostKit' } })
+    fireEvent.click(screen.getByText('Publish now'))
+    await waitFor(() => expect(api.calls.find((c) => c.method === 'POST' && c.path === '/v1/posts')).toBeTruthy())
+    expect(api.calls.find((c) => c.method === 'POST' && c.path === '/v1/posts').body).toMatchObject({ profileId: 'prof_1', content: 'Shipped PostKit', accountIds: ['acc_li'], publishNow: true })
+  })
+
+  it('a created API key is shown once in a box that must be dismissed', async () => {
+    connected()
+    mockApi({ extra: { 'POST /v1/api-keys': { id: 'key_1', key: 'pk_secretvalue', name: 'ci' } } })
+    render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Waiting for your step')).toBeTruthy())
+    fireEvent.click(screen.getByRole('tab', { name: 'Webhooks & keys' }))
+    await screen.findByText('API keys')
+    fireEvent.change(screen.getByLabelText('Key name'), { target: { value: 'ci' } })
+    fireEvent.click(screen.getByText('Create key'))
+    await screen.findByText('pk_secretvalue')
+    expect(screen.getByText(/shown once/)).toBeTruthy()
+    fireEvent.click(screen.getByText('I stored it'))
+    await waitFor(() => expect(screen.queryByText('pk_secretvalue')).toBeNull())
+  })
+})

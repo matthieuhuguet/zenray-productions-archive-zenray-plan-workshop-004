@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+# 3 October 2026, 08:55 CEST: verify narrow resource reconnection in memory without saving or cooking a scene.
+import argparse
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def verify_file(filename, root, expected_hash):
+    target, scope = Path(filename), Path(root)
+    if not target.is_absolute() or not scope.is_absolute() or target.resolve(strict=True) != target or scope.resolve(strict=True) != scope:
+        raise ValueError('Absolute paths without symlink ancestors required')
+    if not target.is_relative_to(scope) or not target.is_file():
+        raise ValueError('File is outside its admitted root or is not regular')
+    if not re.fullmatch(r'[a-f0-9]{64}', expected_hash or ''):
+        raise ValueError('Exact SHA256 required')
+    with target.open('rb') as stream:
+        actual_hash = hashlib.file_digest(stream, 'sha256').hexdigest()
+    if actual_hash != expected_hash:
+        raise ValueError('File fingerprint mismatch')
+    return target
+
+
+def prepare_scene(plan):
+    import hou
+    if plan.get('schemaVersion') != 1 or not isinstance(plan.get('resources'), list):
+        raise ValueError('Invalid scene preparation plan')
+    scene = verify_file(plan['scenePath'], plan['sceneRoot'], plan['sceneSha256'])
+    resources, parameters = [], set()
+    for entry in plan['resources']:
+        if entry.get('kind') not in ('input', 'hda'):
+            raise ValueError('Only explicit inputs and HDA libraries can be prepared')
+        target = verify_file(entry['targetPath'], entry['targetRoot'], entry['sha256'])
+        if entry['kind'] == 'input':
+            if not Path(entry.get('originalPath', '')).is_absolute() or not re.fullmatch(r'/(obj|mat|stage|out|shop|img|ch)/[^\s]+', entry.get('parameterPath', '')):
+                raise ValueError('Exact input parameter and absolute observed origin required')
+            if entry['parameterPath'] in parameters:
+                raise ValueError('Duplicate input parameter')
+            parameters.add(entry['parameterPath'])
+        elif target.suffix.lower() not in ('.hda', '.hdalc', '.hdanc', '.otl', '.otllc', '.otlnc'):
+            raise ValueError('HDA library extension required')
+        resources.append((entry, target))
+    hou.setUpdateMode(hou.updateMode.Manual)
+    warnings = []
+    try:
+        hou.hipFile.load(str(scene), suppress_save_prompt=True, ignore_load_warnings=False)
+    except hou.LoadWarning as error:
+        warnings.append(str(error))
+    libraries, definitions = {}, {}
+    for entry, target in resources:
+        if entry['kind'] != 'hda' or str(target) in libraries:
+            continue
+        library_definitions = hou.hda.definitionsInFile(str(target))
+        if not library_definitions:
+            raise ValueError('Library has no HDA definitions')
+        for definition in library_definitions:
+            key = (definition.nodeTypeCategory().name(), definition.nodeTypeName())
+            if key in definitions and definitions[key] != str(target):
+                raise ValueError('Conflicting HDA definitions in preparation plan')
+            definitions[key] = str(target)
+        libraries[str(target)] = []
+    bindings = []
+    for entry, target in resources:
+        if entry['kind'] != 'input':
+            continue
+        parameter = hou.parm(entry['parameterPath'])
+        if not parameter or parameter.parmTemplate().type() != hou.parmTemplateType.String or parameter.parmTemplate().tags().get('filechooser_mode') != 'read':
+            raise ValueError('Explicit readable string parameter required')
+        # 3 October 2026, 09:03 CEST: frame, time and simulation tokens remain dynamic even inside variable braces.
+        if parameter.keyframes() or parameter.getReferencedParm() != parameter or re.search(r'\$\{?(?:F|T|SF|ST)|<UDIM>|`', parameter.unexpandedString()):
+            raise ValueError('Animated, dynamic or channel-linked inputs are not prepared')
+        observed = parameter.evalAsString()
+        if observed not in (entry['originalPath'], str(target)):
+            raise ValueError('Observed input does not match its admitted origin or target')
+        bindings.append((parameter, entry, target, observed == str(target)))
+    for library in libraries:
+        hou.hda.installFile(library, change_oplibraries_file=False, force_use_assets=True)
+    rebound = []
+    for parameter, entry, target, already_connected in bindings:
+        if not already_connected:
+            parameter.set(str(target), follow_parm_reference=False)
+        if parameter.evalAsString() != str(target):
+            raise RuntimeError('Input did not resolve to its verified target')
+        rebound.append({'parameterPath': parameter.path(), 'sha256': entry['sha256'], 'state': 'already-connected' if already_connected else 'rebound'})
+    for node in hou.node('/').allSubChildren():
+        key = (node.type().category().name(), node.type().name())
+        expected = definitions.get(key)
+        if not expected:
+            continue
+        definition = node.type().definition()
+        if not definition or Path(definition.libraryFilePath()).resolve() != Path(expected):
+            raise RuntimeError('HDA instance did not use the verified loaded library')
+        libraries[expected].append(node.path())
+    verify_file(str(scene), plan['sceneRoot'], plan['sceneSha256'])
+    for entry, target in resources:
+        verify_file(str(target), entry['targetRoot'], entry['sha256'])
+    return {'schemaVersion': 1, 'checkedAt': datetime.now(timezone.utc).isoformat(), 'sceneSha256': plan['sceneSha256'],
+        'sceneOpened': True, 'resourceBytesVerified': len(resources), 'reboundInputs': rebound,
+        'loadedLibraries': [{'sha256': next(entry['sha256'] for entry, target in resources if str(target) == library), 'instancePaths': instances} for library, instances in libraries.items()],
+        'warnings': warnings, 'savedScene': False, 'portabilityVerified': False}
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Verify scoped Houdini resource preparation in an isolated session.')
+    parser.add_argument('plan')
+    parser.add_argument('--output', required=True)
+    args = parser.parse_args()
+    plan = json.loads(Path(args.plan).read_text())
+    output = Path(args.output).resolve()
+    protected = {Path(args.plan).resolve(), Path(plan['scenePath']).resolve(), *(Path(entry['targetPath']).resolve() for entry in plan['resources'])}
+    if output.suffix != '.json' or output in protected:
+        raise ValueError('Preparation output must be a separate JSON file')
+    report = prepare_scene(plan)
+    output.write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps({'sceneOpened': report['sceneOpened'], 'inputCount': len(report['reboundInputs']), 'libraryCount': len(report['loadedLibraries']), 'portabilityVerified': False}))
+
+
+if __name__ == '__main__':
+    main()

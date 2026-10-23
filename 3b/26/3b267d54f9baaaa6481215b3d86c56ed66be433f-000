@@ -1,0 +1,460 @@
+#!/usr/bin/env node
+// ZenRayMedia — installateur de polices Google Fonts.
+//
+//   node scripts/zrm-fonts.mjs            # installe tout ce qui manque
+//   node scripts/zrm-fonts.mjs --force    # retélécharge tout
+//   node scripts/zrm-fonts.mjs --list     # affiche le catalogue sans rien télécharger
+//   node scripts/zrm-fonts.mjs --cjk      # ajoute les familles japonaises (~12 Mo, voir plus bas)
+//
+// POURQUOI LE JAPONAIS EST HORS DU DÉFAUT (mesuré, pas supposé) : une famille CJK arrive en
+// 121 tranches Unicode -- Noto Serif JP pèse 6,8 Mo, Noto Sans JP 5,0 Mo. Douze mégaoctets dans
+// `public/` pour une famille de thèmes dont AUCUN n'est encore construit, c'est du poids de
+// déploiement payé pour rien. Les 13 familles latines (2,1 Mo) servent 15 familles de thèmes sur
+// 16 et sont installées par défaut. Le jour où un thème japonais existe : `--cjk`, et les 12 Mo
+// se justifient. En attendant, `fontStack()` retombe sur Hiragino Mincho, présent sur tout Mac.
+//
+// POURQUOI L'API CSS ET PAS LE DÉPÔT GITHUB (décision, pas préférence) :
+// `github.com/google/fonts` sert des TTF complets — Playfair Display y pèse 300 ko. L'API CSS,
+// elle, sert des **WOFF2 déjà découpés par sous-ensemble Unicode** : le même Playfair en latin
+// tombe à 38 ko, soit 8 fois moins. Comme chaque page compilée embarque ses polices en base64
+// (sinon elle n'est pas autonome), ce facteur 8 est la différence entre un export de 200 ko et
+// un export de 1,6 Mo. Aucun outil local n'est requis : ni fontTools, ni brotli, ni woff2.
+//
+// LICENCES : toutes les familles listées ici sont sous SIL Open Font License ou Apache 2.0,
+// donc redistribuables — y compris à l'intérieur d'un fichier HTML livré à un client. C'est ce
+// que réclamait ZM-L4-11. La licence de chaque famille est écrite dans le registre généré.
+
+import { writeFile, readFile, mkdir, readdir, stat } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+
+const ROOT = path.resolve(import.meta.dirname, '..')
+const OUT_DIR = path.join(ROOT, 'public', 'zrm-fonts')
+const REGISTRY = path.join(ROOT, 'src', 'zenraymedia', 'fonts.js')
+
+// Un navigateur moderne : sans lui, Google renvoie du TTF au lieu du WOFF2.
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+
+// Sous-ensembles Unicode conservés. `latin` couvre le français courant, `latin-ext` les langues
+// d'Europe centrale. Le reste (cyrillique, vietnamien, grec) est écarté : il alourdirait chaque
+// export sans jamais servir. Les familles japonaises déclarent leur propre sous-ensemble.
+const DEFAULT_SUBSETS = ['latin', 'latin-ext']
+
+// Le catalogue, organisé par ARCHÉTYPE TYPOGRAPHIQUE (01-PLAN §11.2) et non par goût.
+// Chaque archétype couvre une famille de thèmes du catalogue des 1024.
+// AJOUTS À LA DEMANDE (`--add`). Le catalogue ci-dessous reste CURÉ : une famille par
+// sous-famille du catalogue de thèmes, choisie par affinité. Les familles ajoutées ensuite pour
+// un thème précis vivent dans `zrm-fonts-extra.json`, pas ici — mélanger les deux ferait perdre
+// la propriété qui rend le catalogue lisible (128 familles, 128 sous-familles, aucune en trop).
+//
+// Cas d'usage réel : les interfaces de JEU réclament des graisses que la presse n'utilise
+// jamais — un titre de Death Stranding est en 200 avec un interlettrage de 0,4em. Aucune des
+// 128 familles de presse n'a de hairline. On ajoute, on ne remplace pas.
+const EXTRA_FILE = path.join(import.meta.dirname, 'zrm-fonts-extra.json')
+
+export const CATALOG = [
+  // 128 familles latines + 2 japonaises. Le compte n'est pas arbitraire : le catalogue compte
+  // 16 familles de thèmes x 8 sous-familles = 128 SOUS-FAMILLES, et les 8 variantes d'une
+  // sous-famille partagent leur police (elles diffèrent par graisse, échelle et casse, pas par
+  // famille typographique). 128 polices = exactement une par sous-famille.
+  // Les axes ne sont PAS déclarés ici : `installFamily` essaie plusieurs jeux d'axes et retient
+  // le premier accepté par Google — une famille statique et une variable ne prennent pas les
+  // mêmes, et coder l'axe à la main pour 128 familles serait 128 occasions de se tromper.
+  { family: "Source Serif 4", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Spectral", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Lora", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Merriweather", archetype: "labeur", license: "OFL-1.1" },
+  { family: "PT Serif", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Noto Serif", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Crimson Text", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Cardo", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Neuton", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Bitter", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Zilla Slab", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Roboto Slab", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Arvo", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Domine", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Frank Ruhl Libre", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Libre Baskerville", archetype: "labeur", license: "OFL-1.1" },
+  { family: "EB Garamond", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Cormorant Garamond", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Literata", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Newsreader", archetype: "labeur", license: "OFL-1.1" },
+  { family: "Public Sans", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Archivo", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Manrope", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Inter", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Roboto", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Open Sans", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Lato", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Montserrat", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Source Sans 3", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Work Sans", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Nunito Sans", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Rubik", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Karla", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "DM Sans", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Plus Jakarta Sans", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Figtree", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Outfit", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Sora", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Space Grotesk", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Poppins", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Raleway", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Mulish", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Hind", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Cabin", archetype: "grotesque", license: "OFL-1.1" },
+  { family: "Archivo Narrow", archetype: "condense", license: "OFL-1.1" },
+  { family: "Archivo Black", archetype: "condense", license: "OFL-1.1" },
+  { family: "Fira Sans Extra Condensed", archetype: "condense", license: "OFL-1.1" },
+  { family: "Antonio", archetype: "condense", license: "OFL-1.1" },
+  { family: "Khand", archetype: "condense", license: "OFL-1.1" },
+  { family: "IBM Plex Sans Condensed", archetype: "condense", license: "OFL-1.1" },
+  { family: "Asap Condensed", archetype: "condense", license: "OFL-1.1" },
+  { family: "Pragati Narrow", archetype: "condense", license: "OFL-1.1" },
+  { family: "Chau Philomene One", archetype: "condense", license: "OFL-1.1" },
+  { family: "Oswald", archetype: "condense", license: "OFL-1.1" },
+  { family: "Barlow Condensed", archetype: "condense", license: "OFL-1.1" },
+  { family: "Roboto Condensed", archetype: "condense", license: "OFL-1.1" },
+  { family: "Fjalla One", archetype: "condense", license: "OFL-1.1" },
+  { family: "Anton", archetype: "condense", license: "OFL-1.1" },
+  { family: "Bebas Neue", archetype: "condense", license: "OFL-1.1" },
+  { family: "Saira Condensed", archetype: "condense", license: "OFL-1.1" },
+  { family: "Pathway Gothic One", archetype: "condense", license: "OFL-1.1" },
+  { family: "News Cycle", archetype: "condense", license: "OFL-1.1" },
+  { family: "Encode Sans Condensed", archetype: "condense", license: "OFL-1.1" },
+  { family: "Yanone Kaffeesatz", archetype: "condense", license: "OFL-1.1" },
+  { family: "Teko", archetype: "condense", license: "OFL-1.1" },
+  { family: "Big Shoulders Display", archetype: "condense", license: "OFL-1.1" },
+  { family: "Playfair Display", archetype: "didone", license: "OFL-1.1" },
+  { family: "Bodoni Moda", archetype: "didone", license: "OFL-1.1" },
+  { family: "Prata", archetype: "didone", license: "OFL-1.1" },
+  { family: "DM Serif Display", archetype: "didone", license: "OFL-1.1" },
+  { family: "Abril Fatface", archetype: "didone", license: "OFL-1.1" },
+  { family: "Cormorant", archetype: "didone", license: "OFL-1.1" },
+  { family: "Marcellus", archetype: "didone", license: "OFL-1.1" },
+  { family: "Italiana", archetype: "didone", license: "OFL-1.1" },
+  { family: "Gilda Display", archetype: "didone", license: "OFL-1.1" },
+  { family: "Tenor Sans", archetype: "didone", license: "OFL-1.1" },
+  { family: "Antic Didone", archetype: "didone", license: "OFL-1.1" },
+  { family: "Yeseva One", archetype: "didone", license: "OFL-1.1" },
+  { family: "Rozha One", archetype: "didone", license: "OFL-1.1" },
+  { family: "Bellefair", archetype: "didone", license: "OFL-1.1" },
+  { family: "Forum", archetype: "didone", license: "OFL-1.1" },
+  { family: "Cinzel", archetype: "didone", license: "OFL-1.1" },
+  { family: "JetBrains Mono", archetype: "mono", license: "OFL-1.1" },
+  { family: "IBM Plex Mono", archetype: "mono", license: "OFL-1.1" },
+  { family: "Roboto Mono", archetype: "mono", license: "OFL-1.1" },
+  { family: "Space Mono", archetype: "mono", license: "OFL-1.1" },
+  { family: "Fira Code", archetype: "mono", license: "OFL-1.1" },
+  { family: "Source Code Pro", archetype: "mono", license: "OFL-1.1" },
+  { family: "Inconsolata", archetype: "mono", license: "OFL-1.1" },
+  { family: "Courier Prime", archetype: "mono", license: "OFL-1.1" },
+  { family: "DM Mono", archetype: "mono", license: "OFL-1.1" },
+  { family: "Azeret Mono", archetype: "mono", license: "OFL-1.1" },
+  { family: "Alfa Slab One", archetype: "display", license: "OFL-1.1" },
+  { family: "Righteous", archetype: "display", license: "OFL-1.1" },
+  { family: "Bungee", archetype: "display", license: "OFL-1.1" },
+  { family: "Titan One", archetype: "display", license: "OFL-1.1" },
+  { family: "Passion One", archetype: "display", license: "OFL-1.1" },
+  { family: "Staatliches", archetype: "display", license: "OFL-1.1" },
+  { family: "Bowlby One", archetype: "display", license: "OFL-1.1" },
+  { family: "Ultra", archetype: "display", license: "OFL-1.1" },
+  { family: "Chivo", archetype: "display", license: "OFL-1.1" },
+  { family: "Syne", archetype: "display", license: "OFL-1.1" },
+  { family: "Unbounded", archetype: "display", license: "OFL-1.1" },
+  { family: "Lexend", archetype: "display", license: "OFL-1.1" },
+  { family: "Epilogue", archetype: "display", license: "OFL-1.1" },
+  { family: "Red Hat Display", archetype: "display", license: "OFL-1.1" },
+  { family: "Bricolage Grotesque", archetype: "display", license: "OFL-1.1" },
+  { family: "Familjen Grotesk", archetype: "display", license: "OFL-1.1" },
+  { family: "Instrument Sans", archetype: "display", license: "OFL-1.1" },
+  { family: "Schibsted Grotesk", archetype: "display", license: "OFL-1.1" },
+  { family: "Host Grotesk", archetype: "display", license: "OFL-1.1" },
+  { family: "Geist", archetype: "display", license: "OFL-1.1" },
+  { family: "Great Vibes", archetype: "script", license: "OFL-1.1" },
+  { family: "Dancing Script", archetype: "script", license: "OFL-1.1" },
+  { family: "Parisienne", archetype: "script", license: "OFL-1.1" },
+  { family: "Pinyon Script", archetype: "script", license: "OFL-1.1" },
+  { family: "Sacramento", archetype: "script", license: "OFL-1.1" },
+  { family: "Allura", archetype: "script", license: "OFL-1.1" },
+  { family: "Petit Formal Script", archetype: "script", license: "OFL-1.1" },
+  { family: "Cormorant Infant", archetype: "script", license: "OFL-1.1" },
+  { family: "Amatic SC", archetype: "script", license: "OFL-1.1" },
+  { family: "Caveat", archetype: "script", license: "OFL-1.1" },
+  { family: "Alegreya", archetype: "humaniste", license: "OFL-1.1" },
+  { family: "Alegreya Sans", archetype: "humaniste", license: "OFL-1.1" },
+  { family: "Vollkorn", archetype: "humaniste", license: "OFL-1.1" },
+  { family: "Faustina", archetype: "humaniste", license: "OFL-1.1" },
+  { family: "Petrona", archetype: "humaniste", license: "OFL-1.1" },
+  { family: "Fraunces", archetype: "humaniste", license: "OFL-1.1" },
+  { family: "Piazzolla", archetype: "humaniste", license: "OFL-1.1" },
+  { family: "Gelasio", archetype: "humaniste", license: "OFL-1.1" },
+  { family: "Orbitron", archetype: "technique", license: "OFL-1.1" },
+  { family: "Rajdhani", archetype: "technique", license: "OFL-1.1" },
+  { family: "Chakra Petch", archetype: "technique", license: "OFL-1.1" },
+  { family: "Michroma", archetype: "technique", license: "OFL-1.1" },
+  { family: "Audiowide", archetype: "technique", license: "OFL-1.1" },
+  { family: "Saira", archetype: "technique", license: "OFL-1.1" },
+  { family: "Noto Serif JP", archetype: "cjk", license: "OFL-1.1", heavy: true, subsets: ["cjk", "latin"] },
+  { family: "Noto Sans JP", archetype: "cjk", license: "OFL-1.1", heavy: true, subsets: ["cjk", "latin"] },
+]
+
+const slugOf = (family) => family.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+
+async function fetchRetry(url, options = {}, tries = 4) {
+  let lastError
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(url, { ...options, headers: { 'User-Agent': UA, ...(options.headers || {}) } })
+      if (res.ok) return res
+      lastError = new Error(`HTTP ${res.status}`)
+    } catch (err) { lastError = err }
+    await new Promise((r) => setTimeout(r, 400 * (i + 1)))
+  }
+  throw lastError
+}
+
+// Découpe la feuille CSS en blocs @font-face et retient ceux dont le commentaire de sous-ensemble
+// nous intéresse. Google précède chaque bloc d'un `/* latin */` : c'est la seule façon de savoir
+// à quel sous-ensemble appartient un fichier.
+function parseFaces(css, wanted) {
+  const faces = []
+  // Le commentaire de sous-ensemble est FACULTATIF. Piège réel (2026-07-25) : une police CJK
+  // renvoie ~124 blocs dont seuls 4 portent une étiquette (`latin`, `latin-ext`, `vietnamese`,
+  // `cyrillic`) ; les ~120 blocs japonais n'en ont AUCUNE. Une première version exigeait le
+  // commentaire et les sautait tous en silence -- Noto Serif JP « s'installait » en 33 ko, soit
+  // uniquement son latin, sans un seul kanji. Un bloc sans étiquette est donc conservé et
+  // identifié par son unicode-range.
+  const re = /(?:\/\*\s*([a-z0-9-]+)\s*\*\/\s*)?@font-face\s*\{([^}]+)\}/gi
+  let m
+  while ((m = re.exec(css)) !== null) {
+    const body = m[2]
+    // Détection SIMPLE et juste : dans une police CJK, Google n'étiquette QUE les sous-ensembles
+    // latins ; tout bloc sans commentaire est une tranche d'idéogrammes. Une version précédente
+    // cherchait des points de code précis (U+4E00, U+3040) et n'attrapait que 3 tranches sur 120,
+    // parce que la plupart des tranches ne contiennent aucun de ces points de code de départ.
+    const subset = m[1] || 'cjk'
+    if (!wanted.includes(subset)) continue
+    const url = /src:\s*url\(([^)]+)\)/.exec(body)?.[1]
+    if (!url) continue
+    faces.push({
+      subset,
+      url,
+      style: /font-style:\s*([a-z]+)/i.exec(body)?.[1] || 'normal',
+      weight: /font-weight:\s*([^;]+)/i.exec(body)?.[1]?.trim() || '400',
+      unicodeRange: /unicode-range:\s*([^;]+)/i.exec(body)?.[1]?.trim() || '',
+    })
+  }
+  return faces
+}
+
+async function installFamily(entry, { force }) {
+  const slug = slugOf(entry.family)
+  const dir = path.join(OUT_DIR, slug)
+  const subsets = entry.subsets || DEFAULT_SUBSETS
+  // Jeux d'axes essayés dans l'ordre, du plus riche au plus pauvre. Google refuse (400) un axe
+  // qu'une famille ne possède pas : on retient le premier accepté plutôt que de maintenir à la
+  // main la liste des axes de 128 familles.
+  // Les familles STATIQUES n'acceptent pas la syntaxe d'axe `100..900` : la requête échoue et on
+  // retombait directement sur `400;700`. Le fichier installé ne portait donc QUE du 400, mais
+  // était déclaré `font-weight:100 900` — le navigateur rendait du 400 pour toute graisse
+  // demandée, sans la moindre erreur. Un titre en 300 sortait en 400 et paraissait « trop gras »
+  // sans qu'aucun réglage de graisse n'y change rien. On tente donc la LISTE de graisses avant
+  // de se rabattre sur régulier + gras.
+  const attempts = entry.axes ? [entry.axes] : ['ital,wght@0,100..900;1,100..900', 'wght@100..900',
+    'ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,100;1,200;1,300;1,400;1,500;1,600;1,700;1,800;1,900',
+    'wght@100;200;300;400;500;600;700;800;900', 'ital,wght@0,400;0,700;1,400', 'wght@400;700', '']
+  let css = null
+  for (const axes of attempts) {
+    const url = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(entry.family).replace(/%20/g, '+')}${axes ? ':' + axes : ''}&display=block`
+    try { css = await fetchRetry(url, {}, 2).then((r) => r.text()); break } catch { /* axe refusé : on tente le suivant */ }
+  }
+  if (!css) throw new Error('aucun jeu d\'axes accepté')
+  const faces = parseFaces(css, subsets)
+  if (!faces.length) throw new Error(`aucun sous-ensemble ${subsets.join('/')} trouvé`)
+
+  await mkdir(dir, { recursive: true })
+  const files = []
+  let bytes = 0
+  for (const [i, face] of faces.entries()) {
+    const name = `${face.style}-${face.subset}-${i}.woff2`
+    const dest = path.join(dir, name)
+    if (!force && existsSync(dest)) {
+      bytes += (await stat(dest)).size
+      files.push({ ...face, file: `/zrm-fonts/${slug}/${name}` })
+      continue
+    }
+    const buf = Buffer.from(await fetchRetry(face.url).then((r) => r.arrayBuffer()))
+    await writeFile(dest, buf)
+    bytes += buf.length
+    files.push({ ...face, file: `/zrm-fonts/${slug}/${name}` })
+  }
+  return { ...entry, slug, files, bytes }
+}
+
+function renderRegistry(installed) {
+  const lines = installed.map((f) => `  {
+    family: ${JSON.stringify(f.family)},
+    slug: ${JSON.stringify(f.slug)},
+    archetype: ${JSON.stringify(f.archetype)},
+    license: ${JSON.stringify(f.license)},
+    heavy: ${f.heavy ? 'true' : 'false'},
+    bytes: ${f.bytes},
+    faces: [
+${f.files.map((x) => `      { file: ${JSON.stringify(x.file)}, style: ${JSON.stringify(x.style)}, weight: ${JSON.stringify(x.weight)}, subset: ${JSON.stringify(x.subset)}, unicodeRange: ${JSON.stringify(x.unicodeRange)} },`).join('\n')}
+    ],
+  },`).join('\n')
+
+  return `// ZenRayMedia — registre des polices (ZM-L4-11). GÉNÉRÉ, ne pas éditer à la main.
+// Regénérer : node scripts/zrm-fonts.mjs
+//
+// Toutes les familles sont sous licence libre (OFL 1.1 ou Apache 2.0) : elles peuvent être
+// EMBARQUÉES dans un fichier livré à un client, ce qui est exactement ce dont une page compilée
+// autonome a besoin. Les fichiers sont des WOFF2 découpés par sous-ensemble Unicode, servis
+// depuis /zrm-fonts/ pour l'aperçu et inlinés en base64 à l'export.
+//
+// Les trois familles Anthropic (AnthropicSerif, AnthropicSans, AnthropicMono) restent
+// disponibles en plus, via /fonts/ : elles ne sont pas dans ce registre parce qu'elles ne sont
+// pas redistribuables sous licence libre. Un thème destiné à un client utilise celles d'ici.
+
+export const FONTS = [
+${lines}
+]
+
+export const FONTS_BY_FAMILY = Object.fromEntries(FONTS.map((f) => [f.family, f]))
+
+/** Familles d'un archétype typographique (labeur · grotesque · condense · didone · mono · cjk). */
+export function fontsOfArchetype(archetype) {
+  return FONTS.filter((f) => f.archetype === archetype)
+}
+
+const FALLBACKS = {
+  labeur: 'Georgia, "Times New Roman", serif',
+  didone: 'Didot, "Bodoni MT", Georgia, serif',
+  grotesque: 'system-ui, -apple-system, sans-serif',
+  condense: '"Arial Narrow", "Helvetica Neue Condensed", system-ui, sans-serif',
+  mono: 'ui-monospace, SFMono-Regular, monospace',
+  cjk: '"Hiragino Mincho ProN", "Yu Mincho", "Noto Serif CJK JP", serif',
+}
+
+// Archétype d'une famille CONNUE mais non installée (les japonaises sont hors du défaut).
+// Sans cette table, fontStack('Noto Serif JP') retombait sur sans-serif : un texte japonais
+// se serait affiché en police latine générique au lieu d'un mincho système. Bug évité 2026-07-25.
+// (Aucun accent grave dans ce commentaire : il vit DANS un gabarit de chaîne, un backtick y
+//  terminerait le gabarit et casserait le générateur -- erreur payée le 2026-07-25.)
+const KNOWN_ARCHETYPES = { 'Noto Serif JP': 'cjk', 'Noto Sans JP': 'cjk' }
+
+/** Pile CSS d'une famille, avec ses replis. Rend la famille utilisable même non installée. */
+export function fontStack(family) {
+  const archetype = FONTS_BY_FAMILY[family]?.archetype || KNOWN_ARCHETYPES[family]
+  const fallback = FALLBACKS[archetype] || 'system-ui, sans-serif'
+  return \`'\${family}', \${fallback}\`
+}
+
+/** Familles connues du catalogue mais absentes du disque (installables par --cjk). */
+export function missingFamilies(families) {
+  return (families || []).filter((f) => !FONTS_BY_FAMILY[f])
+}
+
+/** Les @font-face d'une liste de familles, pour l'aperçu (fichiers servis depuis /zrm-fonts/). */
+export function fontFaceCss(families) {
+  const wanted = (families || []).map((f) => FONTS_BY_FAMILY[f]).filter(Boolean)
+  return wanted.flatMap((entry) => entry.faces.map((face) =>
+    \`@font-face{font-family:'\${entry.family}';font-style:\${face.style};font-weight:\${face.weight};font-display:block;src:url('\${face.file}') format('woff2');\${face.unicodeRange ? \`unicode-range:\${face.unicodeRange};\` : ''}}\`
+  )).join('\\n')
+}
+
+/** Poids total d'un jeu de familles — sert à prévenir avant un export trop lourd. */
+export function fontsWeight(families) {
+  return (families || []).reduce((n, f) => n + (FONTS_BY_FAMILY[f]?.bytes || 0), 0)
+}
+`
+}
+
+async function readExtras() {
+  if (!existsSync(EXTRA_FILE)) return []
+  return JSON.parse(await readFile(EXTRA_FILE, 'utf8'))
+}
+
+/** Ajoute une famille au fichier d'extras, puis l'installe. Idempotent. */
+async function addFamily(family, opts) {
+  const extras = await readExtras()
+  if (extras.some((e) => e.family === family) || CATALOG.some((e) => e.family === family)) {
+    console.log(`${family} est déjà au catalogue.`)
+    return extras
+  }
+  // On vérifie l'existence dans l'index Google AVANT d'écrire : sans ça, une faute de frappe
+  // s'installe silencieusement dans le fichier d'extras et échoue à chaque exécution suivante.
+  const indexPath = path.join(import.meta.dirname, '..', 'src', 'zenraymedia', 'fonts-index.json')
+  if (existsSync(indexPath)) {
+    const idx = JSON.parse(await readFile(indexPath, 'utf8'))
+    const hit = idx.families.find((f) => f.family.toLowerCase() === family.toLowerCase())
+    if (!hit) {
+      const first = family.toLowerCase().split(/\s+/)[0]
+      const near = idx.families.filter((f) => f.family.toLowerCase().includes(first)).slice(0, 6)
+      throw new Error(`« ${family} » n'existe pas chez Google Fonts.`
+        + (near.length ? ` Vouliez-vous : ${near.map((f) => f.family).join(', ')} ?` : '')
+        + ` (Google renomme des familles : Source Sans Pro est devenue Source Sans 3.)`)
+    }
+    family = hit.family // casse officielle
+    opts = { ...opts, archetype: opts.archetype || hit.archetype }
+  }
+  const entry = { family, archetype: opts.archetype || 'grotesque', license: 'OFL-1.1', addedFor: opts.addedFor || null }
+  extras.push(entry)
+  await writeFile(EXTRA_FILE, JSON.stringify(extras, null, 2) + '\n', 'utf8')
+  console.log(`Ajoutée : ${family} (${entry.archetype})`)
+  return extras
+}
+
+async function main() {
+  const args = process.argv.slice(2)
+  const force = args.includes('--force')
+  const withCjk = args.includes('--cjk')
+  const argOf = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : null }
+
+  if (args.includes('--add')) {
+    const fam = argOf('add')
+    if (!fam) throw new Error('usage : node scripts/zrm-fonts.mjs --add "Nom De Famille" [--for T-04-1-1]')
+    await addFamily(fam, { addedFor: argOf('for') })
+  }
+  const EXTRAS = await readExtras()
+
+  if (args.includes('--list')) {
+    for (const e of [...CATALOG, ...await readExtras()]) console.log(`${e.archetype.padEnd(10)} ${e.family.padEnd(20)} ${e.license}${e.heavy ? '  (lourde)' : ''}`)
+    console.log(`\n${CATALOG.length} familles`)
+    return
+  }
+
+  await mkdir(OUT_DIR, { recursive: true })
+  const installed = []
+  let failed = 0
+  for (const entry of [...CATALOG, ...EXTRAS]) {
+    if (entry.archetype === 'cjk' && !withCjk) {
+      console.log(`  skip ${entry.family.padEnd(20)} (japonais, ~6 Mo — ajouter avec --cjk)`)
+      continue
+    }
+    try {
+      const res = await installFamily(entry, { force })
+      installed.push(res)
+      console.log(`  ok  ${entry.family.padEnd(20)} ${String(res.files.length).padStart(2)} fichier(s)  ${(res.bytes / 1024).toFixed(0).padStart(5)} ko`)
+    } catch (err) {
+      // Une famille qui échoue ne doit PAS annuler les autres : le registre se régénère avec
+      // ce qui est réellement sur le disque, et l'erreur est dite.
+      failed++
+      console.error(`  ÉCHEC ${entry.family} : ${err.message}`)
+    }
+  }
+
+  const code = renderRegistry(installed)
+  // GARDE-FOU (deux pannes payées le 2026-07-25) : un accent grave égaré dans un commentaire du
+  // gabarit termine la chaîne et produit un fichier qui ne compile pas. On refuse d'écrire un
+  // registre invalide plutôt que de le découvrir à l'import, trois commandes plus tard.
+  try { new Function(code.replace(/^export /gm, '')) }
+  catch (err) { throw new Error(`registre généré invalide (${err.message}) — rien n'a été écrit`) }
+  await writeFile(REGISTRY, code, 'utf8')
+  const total = installed.reduce((n, f) => n + f.bytes, 0)
+  console.log(`\n${installed.length} familles installées (${failed} échec(s)) · ${(total / 1024).toFixed(0)} ko · registre écrit dans src/zenraymedia/fonts.js`)
+}
+
+main().catch((err) => { console.error(err); process.exit(1) })

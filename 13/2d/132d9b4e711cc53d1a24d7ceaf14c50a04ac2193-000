@@ -1,0 +1,81 @@
+import { afterEach, describe, expect, it } from 'vitest'
+import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { acquireDirectoryLock, directoryLockOptions } from './directory-lock.mjs'
+
+const cleanup = []
+const options = { waitMs: 200, staleMs: 50, pollMs: 10, label: 'test' }
+
+afterEach(async () => {
+  await Promise.all(cleanup.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+})
+
+async function fixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'zr-directory-lock-'))
+  cleanup.push(root)
+  return path.join(root, 'lock')
+}
+
+describe('directory lock', () => {
+  it('centralizes the short and long policies', () => {
+    expect(directoryLockOptions('court', 'x')).toEqual({ waitMs: 60_000, staleMs: 900_000, pollMs: 100, label: 'x' })
+    expect(directoryLockOptions('long', 'y')).toEqual({ waitMs: 3_600_000, staleMs: 900_000, pollMs: 250, label: 'y' })
+    expect(() => directoryLockOptions('absent', 'z')).toThrow('profil de verrou inconnu')
+  })
+
+  it('serializes contenders and releases only after the holder finishes', async () => {
+    const lockDir = await fixture()
+    const first = await acquireDirectoryLock(lockDir, options)
+    let secondEntered = false
+    const waiting = acquireDirectoryLock(lockDir, options).then((lock) => {
+      secondEntered = true
+      return lock
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 70))
+    expect(secondEntered).toBe(false)
+    await first.release()
+
+    const second = await waiting
+    expect(second.waitedMs).toBeGreaterThanOrEqual(60)
+    await second.release()
+  })
+
+  it('never steals an old-looking lock from a process that is still alive', async () => {
+    const lockDir = await fixture()
+    const first = await acquireDirectoryLock(lockDir, options)
+    const old = new Date(Date.now() - 10_000)
+    await utimes(path.join(lockDir, 'owner.json'), old, old)
+
+    await expect(acquireDirectoryLock(lockDir, { ...options, waitMs: 90 })).rejects.toThrow(/test verrouillé/)
+    const owner = JSON.parse(await readFile(path.join(lockDir, 'owner.json'), 'utf8'))
+    expect(owner.pid).toBe(process.pid)
+    await first.release()
+  })
+
+  it('reclaims a stale lock whose owner process is gone', async () => {
+    const lockDir = await fixture()
+    await mkdir(lockDir)
+    await writeFile(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: 2147483647, token: 'dead' }))
+    const old = new Date(Date.now() - 10_000)
+    await utimes(path.join(lockDir, 'owner.json'), old, old)
+
+    const lock = await acquireDirectoryLock(lockDir, options)
+    const owner = JSON.parse(await readFile(path.join(lockDir, 'owner.json'), 'utf8'))
+    expect(owner.pid).toBe(process.pid)
+    expect(owner.token).not.toBe('dead')
+    await lock.release()
+  })
+
+  it('reclaims a dead identified owner immediately', async () => {
+    const lockDir = await fixture()
+    await mkdir(lockDir)
+    await writeFile(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: 2147483647, token: 'dead' }))
+
+    const lock = await acquireDirectoryLock(lockDir, options)
+    const owner = JSON.parse(await readFile(path.join(lockDir, 'owner.json'), 'utf8'))
+    expect(owner.pid).toBe(process.pid)
+    await lock.release()
+  })
+})

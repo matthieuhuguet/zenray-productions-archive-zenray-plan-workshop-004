@@ -1,0 +1,176 @@
+import React from 'react'
+import Icon from './Icon.jsx'
+import SpinnerApple from './SpinnerApple.jsx'
+
+// Notifications façon macOS (haut-droite) : cartes frosted arrondies, icône SF Symbol tintée,
+// titre + sous-titre, libellé optionnel (façon "TIME SENSITIVE"). Auto-dismiss, clic pour fermer.
+// Émetteur module-level : notify() peut être appelé depuis du code React OU non-React (helpers).
+const FONTS = { sans: "var(--zr-police-sans)" }
+
+let _id = 0
+const listeners = new Set()
+let _items = []
+const emit = () => listeners.forEach((l) => l(_items))
+const MAX_NOTIFICATION_TTL = 5000
+// 2026-09-11 08:44: toast cards expire in five seconds, while active progress cards remain visible.
+const normalizeNotificationTTL = (ttl) => {
+  const value = Number(ttl)
+  return Number.isFinite(value) && value >= 0 ? Math.min(value, MAX_NOTIFICATION_TTL) : MAX_NOTIFICATION_TTL
+}
+// 2026-09-03 12:57 : les messages suivants ne chassent pas une opération encore active.
+const appendItem = (item) => {
+  const active = _items.filter((i) => i.sticky && typeof i.progress === 'number')
+  const recent = _items.filter((i) => !active.includes(i)).slice(-Math.max(0, 3 - active.length))
+  _items = [...active, ...(active.length < 3 ? recent : []), item]
+  emit()
+}
+
+const ICON_FOR = { image: 'photo', video: 'film', media: 'music.note', page: 'doc.text', drive: 'externaldrive', success: 'checkmark', info: 'doc.text' }
+const TINT_FOR = { image: '#d97757', video: '#5E5CE6', media: '#34C759', page: '#3B82F6', drive: '#d97757', success: '#34C759', info: '#3B82F6' }
+
+export function notify({ title, body, label, icon, tint, kind, ttl, actions, big, cmd } = {}) {
+  const id = ++_id
+  // `actions` = [{ label, onClick, primary }] -> boutons cliquables (ex : Undo / Open Trash).
+  // Actions remain clickable during the five-second macOS-style toast lifetime.
+  // `cmd` = chaîne affichée en monospace dans un bloc <pre> sélectionnable (commande Terminal lisible
+  // même si l'auto-copie presse-papier a échoué).
+  const acts = Array.isArray(actions) ? actions.filter((a) => a && a.label && typeof a.onClick === 'function') : []
+  const item = {
+    id,
+    title: title || '',
+    body: body || '',
+    label: label || '',
+    icon: icon || ICON_FOR[kind] || 'checkmark',
+    tint: tint || TINT_FOR[kind] || '#34C759',
+    ttl: normalizeNotificationTTL(ttl),
+    actions: acts,
+    big: !!big,
+    cmd: cmd || '',
+    sticky: acts.length > 0,
+  }
+  appendItem(item)
+  return id
+}
+// Progress card: same macOS visual language, but it remains visible while the operation is active.
+// Renvoie un HANDLE pour piloter la carte pendant un travail long (ex : transcodage ffmpeg.wasm).
+//   h.set({ progress, title, body, label })  -> met à jour (progress 0..1)
+//   h.log(ligne | [lignes])                  -> ajoute des lignes de log (mono, scroll, garde les ~120 dernières)
+//   h.done({ title, body })                  -> finishes successfully and closes after five seconds
+//   h.fail({ title, body })                  -> finishes with an error and closes after five seconds
+// While `sticky` is true, an active progress card stays visible and cannot be closed by clicking it.
+export function notifyProgress({ title, body, label, icon, tint, kind, indeterminate } = {}) {
+  const id = ++_id
+  const item = {
+    id, title: title || '', body: body || '', label: label || '',
+    icon: icon || ICON_FOR[kind] || 'film', tint: tint || TINT_FOR[kind] || '#5E5CE6',
+    progress: 0, logs: [], sticky: true, ttl: MAX_NOTIFICATION_TTL, indeterminate: !!indeterminate,
+  }
+  appendItem(item)
+  const update = (patch) => {
+    _items = _items.map((i) => {
+      if (i.id !== id) return i
+      const next = { ...i, ...patch }
+      next.ttl = normalizeNotificationTTL(next.ttl)
+      if (patch && patch.logLines) next.logs = [...(i.logs || []), ...patch.logLines].slice(-120)
+      delete next.logLines
+      return next
+    })
+    emit()
+  }
+  return {
+    id,
+    set: (patch) => update(patch || {}),
+    log: (line) => update({ logLines: Array.isArray(line) ? line.map(String) : [String(line)] }),
+    done: (patch = {}) => update({ progress: 1, indeterminate: false, sticky: false, tint: '#34C759', icon: 'checkmark', ...patch, ttl: MAX_NOTIFICATION_TTL }),
+    fail: (patch = {}) => update({ indeterminate: false, sticky: false, tint: '#FF3B30', icon: 'exclamationmark.triangle', ...patch, ttl: MAX_NOTIFICATION_TTL }),
+  }
+}
+// Dismiss en deux temps : on marque la carte 'leaving' (fade-out .3s via .zr-notif-out) puis on la retire vraiment.
+export function dismiss(id) {
+  const it = _items.find((i) => i.id === id)
+  if (!it || it.leaving) return
+  _items = _items.map((i) => i.id === id ? { ...i, leaving: true } : i); emit()
+  setTimeout(() => { _items = _items.filter((i) => i.id !== id); emit() }, 300)
+}
+
+export function NotificationHost({ t }) {
+  const [items, setItems] = React.useState(_items)
+  const timers = React.useRef(new Map())
+  React.useEffect(() => {
+    const l = (x) => setItems(x)
+    listeners.add(l); setItems(_items)
+    return () => { listeners.delete(l) }
+  }, [])
+  // Toast cards expire in five seconds; active progress cards stay until done() or fail().
+  React.useEffect(() => {
+    items.forEach((it) => {
+      const activeProgress = it.sticky && typeof it.progress === 'number'
+      if (!it.leaving && !activeProgress && !timers.current.has(it.id)) {
+        timers.current.set(it.id, setTimeout(() => dismiss(it.id), normalizeNotificationTTL(it.ttl)))
+      }
+    })
+    for (const [id, tm] of timers.current) { if (!items.find((i) => i.id === id)) { clearTimeout(tm); timers.current.delete(id) } }
+  }, [items])
+  if (!items.length) return null
+  return (
+    <div style={{ position: 'fixed', top: 16, right: 16, zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 10, pointerEvents: 'none', width: 'min(92vw, 380px)' }}>
+      {items.map((it) => (
+        <div key={it.id} className={`zr-glass zr-notif${it.leaving ? ' zr-notif-out' : ''}`} onClick={() => { if (!it.sticky) dismiss(it.id) }}
+          style={{ position: 'relative', pointerEvents: 'auto', display: 'flex', gap: 11, alignItems: 'flex-start', padding: it.big ? '17px 18px' : '13px 14px', borderRadius: 18, boxShadow: it.big ? '0 12px 44px rgba(0,0,0,0.26)' : '0 8px 30px rgba(0,0,0,0.18)', cursor: it.sticky ? 'default' : 'pointer', opacity: it.leaving ? 0 : 1, transform: it.leaving ? 'translateY(-8px) scale(0.98)' : 'translateY(0) scale(1)', transition: 'opacity 300ms ease, transform 300ms ease' }}>
+          <button aria-label="Fermer" onClick={(e) => { e.stopPropagation(); dismiss(it.id) }}
+            style={{ position: 'absolute', top: 7, right: 7, width: 20, height: 20, borderRadius: 99, border: 'none', cursor: 'pointer', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(128,128,128,0.18)', color: t.textSecondary, lineHeight: 0 }}>
+            <Icon name="xmark" size={11} color={t.textSecondary} weight={2.2} />
+          </button>
+          <div style={{ flex: '0 0 auto', width: 38, height: 38, borderRadius: 9, background: it.tint, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Icon name={it.icon} size={20} color="#fff" weight={1.9} />
+          </div>
+          <div style={{ minWidth: 0, flex: 1, paddingRight: 16 }}>
+            {it.label && <div style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-3xs)', letterSpacing: 1, textTransform: 'uppercase', color: t.textSecondary, marginBottom: 2 }}>{it.label}</div>}
+            <div style={{ fontFamily: FONTS.sans, fontSize: it.big ? 15 : 13.5, fontWeight: 400, color: t.textPrimary, ...(it.big ? {} : { whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }) }}>{it.title}</div>
+            <div role="status" style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, lineHeight: 1.35, marginTop: 1, overflowWrap: 'anywhere' }}>{it.body}</div>
+            {it.cmd && (
+              <pre onClick={(e) => e.stopPropagation()} style={{ margin: '8px 0 0', maxHeight: 110, overflowY: 'auto', userSelect: 'text', cursor: 'text', background: 'rgba(128,128,128,0.10)', borderRadius: 8, padding: '7px 9px', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)', lineHeight: 1.45, color: t.textPrimary, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                {it.cmd}
+              </pre>
+            )}
+            {typeof it.progress === 'number' && (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {/* 2026-09-03 12:52 : activité réelle, jusqu’à la fermeture du fichier ZIP. */}
+                  {it.sticky && <SpinnerApple taille={12} />}
+                  <div role="progressbar" aria-label={it.label || 'Progression'} aria-valuemin={0} aria-valuemax={100} aria-valuenow={(it.indeterminate && it.sticky) ? undefined : Math.round(Math.max(0, Math.min(1, it.progress)) * 100)} style={{ position: 'relative', flex: 1, height: 6, borderRadius: 99, background: t.border || 'rgba(128,128,128,0.25)', overflow: 'hidden' }}>
+                    {/* INDETERMINATE capsule (2 October 2026): a job whose real progress is unknown (e.g. sort link) slides a segment instead of faking a percentage. */}
+                    {(it.indeterminate && it.sticky)
+                      ? <div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: '38%', background: it.tint, borderRadius: 99, animation: 'zrIndeterminate 1.1s ease-in-out infinite' }} />
+                      : <div style={{ width: `${Math.round(Math.max(0, Math.min(1, it.progress)) * 100)}%`, height: '100%', background: it.tint, borderRadius: 99, transition: 'width .25s ease' }} />}
+                  </div>
+                  <span style={{ fontFamily: 'var(--zr-police-serif)', fontWeight: 400, fontSize: 'var(--zr-ui-2xs)', color: t.textSecondary, flex: '0 0 auto' }}>{(it.indeterminate && it.sticky) ? '…' : `${Math.round(Math.max(0, Math.min(1, it.progress)) * 100)}%`}</span>
+                </div>
+                {it.logs && it.logs.length > 0 && (
+                  <pre ref={(el) => { if (el) el.scrollTop = el.scrollHeight }} style={{ margin: '8px 0 0', maxHeight: 92, overflowY: 'auto', background: 'rgba(128,128,128,0.10)', borderRadius: 8, padding: '6px 8px', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)', lineHeight: 1.4, color: t.textSecondary, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                    {it.logs.slice(-40).join('\n')}
+                  </pre>
+                )}
+              </div>
+            )}
+            {it.actions && it.actions.length > 0 && (
+              <div style={{ marginTop: 11, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {it.actions.map((a, i) => (
+                  <button key={i}
+                    onClick={(e) => { e.stopPropagation(); try { a.onClick() } finally { dismiss(it.id) } }}
+                    style={{
+                      fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', fontWeight: 600, cursor: 'pointer',
+                      padding: '7px 14px', borderRadius: 9,
+                      border: a.primary ? 'none' : `1px solid ${t.border || 'rgba(128,128,128,0.35)'}`,
+                      background: a.primary ? it.tint : 'transparent',
+                      color: a.primary ? '#fff' : t.textPrimary,
+                    }}>{a.label}</button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}

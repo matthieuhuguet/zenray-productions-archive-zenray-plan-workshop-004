@@ -1,0 +1,72 @@
+// uploadReport.js (14 October 2026): what Create shows while something is being uploaded, from the local relay activity.
+// Priority: the per-file queue (UploadQueueStatus.json, 15 files or 1), then a running job, then the last finished timing report.
+// The banner must NOT blink: holdReport keeps the last report on screen while the relay answers nothing for a moment.
+// FR : ce que Create affiche pendant un envoi ; la file par fichier d'abord, puis un job en cours, puis le dernier rapport.
+import { activityPercent, isActivityFresh, readableFileName, readableThroughput } from '../../progress/activitySource.js'
+
+// Every tunable value in one place (HDA rule). / FR : toutes les valeurs reglables au meme endroit.
+export const UPLOAD_REPORT = {
+  freshMs: 3 * 60 * 1000, // a running job is "alive" this long after its last update
+  holdMs: 10 * 60 * 1000, // the last report stays visible this long when the relay answers nothing
+  queueRunningMs: 3 * 60 * 60 * 1000, // a running queue waiting for GitHub writes nothing for a while
+  queueFinishedMs: 30 * 60 * 1000,
+  doneHideMs: 60 * 1000, // 17 October 2026 (Matthieu): a finished upload clears its band one minute after it is seen done. FR : une bande terminee disparait apres une minute.
+  stepPrefix: /^\[\d+\/\d+\]\s*/,
+  runningPhases: /^(uploading|pushing)$/,
+  // 17 October 2026 (Matthieu: "des vrais statuts d'explication"): one plain sentence per stage; the detail line of the file follows it.
+  // FR : une phrase claire par etape, suivie de la ligne de detail du fichier.
+  stageLabels: { waiting: 'En attente de son tour', archive: "Envoi de l'archive vers GitHub", cmaf: 'Préparation du streaming', push: 'Envoi vers GitHub', proof: 'Vérification dans le cloud', unload: 'Suppression de la copie locale', done: 'Terminé', failed: 'À relancer (échec)' },
+  activeStages: ['archive', 'cmaf', 'push', 'proof', 'unload'],
+}
+
+function queueReport(queue, now) {
+  if (!queue || !Array.isArray(queue.items) || !queue.total) return null
+  const at = Date.parse(queue.updatedAt)
+  if (!Number.isFinite(at)) return null
+  if (now - at > (queue.running ? UPLOAD_REPORT.queueRunningMs : UPLOAD_REPORT.queueFinishedMs)) return null
+  const counts = queue.counts || {}
+  const working = queue.items.filter((item) => UPLOAD_REPORT.activeStages.includes(item.stage))
+  const parts = [`${queue.finished} sur ${queue.total} terminés`]
+  if (counts.failed) parts.push(`${counts.failed} à relancer`)
+  if (working.length) {
+    const doing = [...new Set(working.map((item) => UPLOAD_REPORT.stageLabels[item.stage]))].join(', ').toLowerCase()
+    parts.push(`${working.length} en cours (${doing})`)
+  }
+  return {
+    label: 'Envoi des fichiers',
+    done: !queue.running,
+    message: `Envoi : ${parts.join(', ')}`,
+    summary: { progress: queue.total ? Math.min(1, (queue.finished + working.reduce((sum, item) => sum + (Number.isFinite(item.percent) ? item.percent / 100 : 0), 0)) / queue.total) : null }, // 17 October 2026: files in progress count for their real percentage. FR : un fichier en cours compte pour son pourcentage.
+    queue: queue.items.map((item) => ({ name: readableFileName(item.name), stage: item.stage, percent: Number.isFinite(item.percent) ? item.percent : null, label: `${UPLOAD_REPORT.stageLabels[item.stage] || item.stage}${Number.isFinite(item.percent) && UPLOAD_REPORT.activeStages.includes(item.stage) ? ` ${item.percent} %` : ''}`, detail: typeof item.detail === 'string' && UPLOAD_REPORT.activeStages.includes(item.stage) ? item.detail : '' })),
+  }
+}
+
+export function reportFromActivity(live, now = Date.now()) {
+  const fromQueue = queueReport(live?.uploadQueue, now)
+  if (fromQueue) return fromQueue
+  const jobs = Array.isArray(live?.active) ? live.active : []
+  const job = jobs.find((item) => item && (item.kind === 'upload' || UPLOAD_REPORT.runningPhases.test(String(item.phase || ''))) && isActivityFresh(item, now, UPLOAD_REPORT.freshMs))
+  if (job) {
+    const percent = activityPercent(job)
+    const step = String(job.currentStep || '').replace(UPLOAD_REPORT.stepPrefix, '')
+    const speed = readableThroughput(job.bytesPerSecond)
+    const current = readableFileName(job.currentItem || '')
+    const message = [job.title || 'Envoi en cours', current, step, speed].filter(Boolean).join(' : ')
+    return { label: job.title || 'Envoi en cours', done: false, message, summary: { progress: percent === null ? null : percent / 100 } }
+  }
+  return live?.uploadTiming && typeof live.uploadTiming === 'object' ? live.uploadTiming : null
+}
+
+/** Keeps the last non-null report for holdMs so the banner never blinks; returns { report, held }.
+ *  A report that is done is shown for doneHideMs after it was first seen done, then cleared (it never comes back while the relay repeats it).
+ *  FR : un rapport termine s'affiche doneHideMs puis disparait ; il ne revient pas tant que le relais le repete. */
+export function holdReport(previous, report, now, holdMs = UPLOAD_REPORT.holdMs, doneHideMs = UPLOAD_REPORT.doneHideMs) {
+  if (report) {
+    if (!report.done) return { state: { report, seenAt: now }, report, held: false }
+    const doneAt = previous && previous.doneAt ? previous.doneAt : now
+    if (now - doneAt > doneHideMs) return { state: { report: null, seenAt: now, doneAt }, report: null, held: false }
+    return { state: { report, seenAt: now, doneAt }, report, held: false }
+  }
+  if (previous && previous.report && !previous.report.done && now - previous.seenAt <= holdMs) return { state: previous, report: previous.report, held: true }
+  return { state: null, report: null, held: false }
+}

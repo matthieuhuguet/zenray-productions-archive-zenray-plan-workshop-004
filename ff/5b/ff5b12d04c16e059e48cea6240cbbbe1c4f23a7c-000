@@ -1,0 +1,221 @@
+// 7 October 2026: the job index sites (DevQuest, Games Jobs Index, Hitmarker, GameJobs.co, Games Jobs Direct, Remote Game Jobs,
+// Work With Indies) read as one family. Each site is a few lines of configuration plus one of five strategies; a new site that
+// publishes a sitemap, category pages or a data file costs configuration, not code. Every request goes through the polite fetcher
+// (robots.txt obeyed, Crawl-delay honoured). These sites are windows over a large catalogue: an absent vacancy proves nothing,
+// so they never close a record.
+// FR : les sites d'index d'offres lus comme une famille : quelques lignes de configuration et l'une de cinq strategies. Toute
+// requete passe par le lecteur poli. Ce sont des fenetres : une annonce absente ne ferme jamais une fiche.
+import { ROLE_PATTERN, OTHER_ROLE_PATTERN, offerId } from '../lib/Offer.mjs'
+import { canonicalUrl, clean, decodeEntities, jobPosting, isoDay } from '../lib/Text.mjs'
+import { createPoliteFetcher } from '../lib/Robots.mjs'
+import { createSeenCache } from '../lib/SeenCache.mjs'
+import { laneOf } from './Aggregators.mjs'
+
+// Slugs hold a shortened title and the studio: a LOOSE prefilter decides which pages are worth fetching, the real title decides after.
+// FR : un slug porte un titre raccourci et le studio : un prefiltre LARGE choisit les pages a lire, le vrai titre decide ensuite.
+const LOOSE_SLUG = /\b(art|artist|tech|technical|vfx|fx|houdini|unreal|ue5|environment|animation|animator|3d|level|shader|procedural|tools?|lighting|material|texture|prop|rigging|pipeline|generalist|cfx|crowd|motion|concept|design(er)?)\b/i
+
+export const slugWords = (url) => {
+  try {
+    const path = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).join(' '))
+    return path.replace(/\.html?$/i, '').replace(/[-_]+/g, ' ').replace(/\b[0-9a-f]{6,}\b|\b\d{4,}\b/gi, ' ').replace(/\s+/g, ' ').trim()
+  } catch { return '' }
+}
+
+/** <loc> entries of a sitemap or sitemap index, with their <lastmod> when present. */
+export function parseSitemap(xml) {
+  return [...String(xml).matchAll(/<(?:url|sitemap)\b[^>]*>([\s\S]*?)<\/(?:url|sitemap)>/gi)].map((match) => ({
+    loc: ((match[1].match(/<loc>\s*([^<\s]+)\s*<\/loc>/i) || [])[1] || '').trim(), lastmod: ((match[1].match(/<lastmod>\s*([^<\s]+)\s*<\/lastmod>/i) || [])[1] || '').trim(),
+  })).filter((entry) => entry.loc)
+}
+
+const asList = (value) => (Array.isArray(value) ? value : value ? [value] : [])
+const placeOf = (posting) => {
+  const places = asList(posting.jobLocation).map((place) => place?.address || place || {})
+  const first = places[0] || {}
+  const country = typeof first.addressCountry === 'object' ? first.addressCountry?.name : first.addressCountry
+  const real = (value) => (value && !/^(null|undefined|none|n\/a)$/i.test(String(value).trim()) ? String(value).trim() : '')
+  return { location: places.map((a) => [real(a.addressLocality), real(a.addressRegion)].filter(Boolean).join(', ')).filter(Boolean).slice(0, 3).join(' / '), country: real(country) }
+}
+const contractOf = (posting) => asList(posting.employmentType).map((type) => String(type).replace(/_/g, ' ').toLowerCase()).join(', ')
+
+/** A page's JobPosting as a listing, or null when it is expired, empty or not a vacancy for the engine. */
+export function listingFromPosting(posting, { url, site, label, today = isoDay(), forceLane = '' }) {
+  if (!posting) return null
+  const title = clean(posting.title)
+  const org = typeof posting.hiringOrganization === 'string' ? posting.hiringOrganization : posting.hiringOrganization?.name
+  const name = clean(org)
+  const validThrough = String(posting.validThrough || '').slice(0, 10)
+  if (!title || !name || (validThrough && validThrough < today)) return null
+  const text = clean(posting.description)
+  // A game-job board lists game jobs: whatever role fits, the lane is games. Only a page he gave us is sorted by its own words.
+  // FR : un index d'offres du jeu video liste des offres du jeu video : le poste qui colle, la voie est le jeu. Seule une page qu'il a donnee se trie par ses mots.
+  const lane = forceLane || laneOf(title, text)
+  if (!lane) return null
+  const { location, country } = placeOf(posting)
+  return {
+    lane, sourceKey: `index:${site}`, sourceLabel: label, evidence: `${label}, annonce relayée avec lien d’origine`, name, title, url, applyUrl: url,
+    sourceId: `index:${site}:${canonicalUrl(url)}`, location, country, contract: contractOf(posting), workplace: /telecommut|remote/i.test(String(posting.jobLocationType)) ? 'Remote' : 'Voir conditions de la fiche',
+    published: String(posting.datePosted || ''), validThrough, text, careersUrl: '',
+  }
+}
+
+const emptyBoard = (site, label) => ({ key: `index:${site}`, label, listings: [], seenIds: [], listed: 0, matched: 0, errors: [], complete: false, partial: true })
+const finish = (board) => { board.seenIds = board.listings.map((listing) => offerId(listing.sourceId)); board.matched = board.listings.length; return board }
+
+/** Fetch the details of at most `cap` unseen pages, newest first; every page looked at is remembered, kept or not. */
+async function readDetails({ urls, cap, fetcher, seen, known, site, label, board, today, forceLane = '' }) {
+  const fresh = []
+  for (const url of urls) {
+    if (fresh.length >= cap) break
+    if (known.has(canonicalUrl(url)) || await seen.has(url)) continue
+    fresh.push(url)
+  }
+  for (const url of fresh) {
+    try {
+      const listing = listingFromPosting(jobPosting(await fetcher.text(url)), { url, site, label, today, forceLane })
+      // A kept page is remembered by the store (its link); only the pages judged irrelevant go in the cache, so a push that fails retries them.
+      // FR : une page gardee est retenue par le fichier (son lien) ; seules les pages ecartees entrent dans le cache, un push raté les reessaie.
+      if (listing && (ROLE_PATTERN.test(listing.title) || OTHER_ROLE_PATTERN.test(listing.title))) board.listings.push(listing)
+      else await seen.add(url)
+    } catch (error) {
+      // A refusal by robots.txt or a missing page is final for this URL; a network hiccup is retried at the next pass.
+      if (error.code === 'robots' || error.status === 404) await seen.add(url)
+      else board.errors.push({ source: url, error: error.message })
+    }
+  }
+  return fresh.length
+}
+
+const STRATEGIES = {
+  /** DevQuest publishes its whole catalogue as one data file, direct links to the employers' own pages included. */
+  async devquest({ site, label, settings, fetcher, now, board, today }) {
+    const text = await fetcher.text(settings.dataUrl)
+    const start = text.indexOf('{')
+    if (start < 0 || !/JOBS_DATA\s*=/.test(text.slice(0, start))) throw new Error('DevQuest data file has an unexpected shape')
+    const data = JSON.parse(text.slice(start).replace(/;\s*$/, ''))
+    if (!Array.isArray(data.jobs)) throw new Error('DevQuest data file lists no jobs')
+    const horizon = now.getTime() - settings.recencyDays * 86400000
+    board.listed = data.jobs.length
+    for (const job of data.jobs) {
+      const title = clean(job.title)
+      const seenAt = Date.parse(job.firstSeen || job.postedAt || '')
+      if (!title || !job.studio || !/^https?:\/\//.test(job.url || '') || (Number.isFinite(seenAt) && seenAt < horizon)) continue
+      const blob = `${title}. ${job.studio}. ${job.discipline || ''}. ${job.seniority || ''}. ${job.location || ''}. ${(job.tech || []).join(' ')}`
+      if (!ROLE_PATTERN.test(title) && !OTHER_ROLE_PATTERN.test(title)) continue
+      const lane = 'games'
+      board.listings.push({
+        lane, sourceKey: `index:${site}`, sourceLabel: label, evidence: `${label}, annonce relayée avec lien d’origine`, name: clean(job.studio), title, url: job.url, applyUrl: job.url,
+        sourceId: `index:${site}:${job.id || canonicalUrl(job.url)}`, location: job.location && job.location !== 'Unlisted' ? job.location : '', country: '', contract: job.workType && job.workType !== 'Unknown' ? String(job.workType) : '',
+        workplace: /remote/i.test(`${job.workType} ${job.location} ${job.region}`) ? 'Remote' : 'Voir conditions de la fiche', published: job.firstSeen || job.postedAt || '', validThrough: '', text: blob, careersUrl: '',
+      })
+    }
+  },
+
+  /** A sitemap lists every vacancy; slugs prefilter, then the JSON-LD of each unseen page is read within a cap. */
+  async sitemap({ site, label, settings, fetcher, known, seen, board, today, now }) {
+    const entries = []
+    for (const sitemapUrl of settings.sitemaps) {
+      const found = parseSitemap(await fetcher.text(sitemapUrl))
+      for (const entry of found) {
+        if (/\.xml($|\?)|sitemap/i.test(entry.loc) && !entry.loc.includes(settings.jobPath)) { for (const inner of parseSitemap(await fetcher.text(entry.loc))) entries.push(inner) } else entries.push(entry)
+      }
+    }
+    const horizon = settings.recencyDays ? now.getTime() - settings.recencyDays * 86400000 : 0
+    const jobs = entries.filter((entry) => entry.loc.includes(settings.jobPath))
+    board.listed = jobs.length
+    const candidates = jobs.filter((entry) => LOOSE_SLUG.test(slugWords(entry.loc)) && (!horizon || !entry.lastmod || Date.parse(entry.lastmod) >= horizon))
+      .sort((a, b) => String(b.lastmod).localeCompare(String(a.lastmod)))
+    await readDetails({ urls: candidates.map((entry) => entry.loc), cap: settings.maxDetails, fetcher, seen, known, site, label, board, today, forceLane: 'games' })
+  },
+
+  /** Category pages carry links whose slug holds the real title: the strict pattern applies before any detail page is read. */
+  async pages({ site, label, settings, fetcher, known, seen, board, today }) {
+    const links = new Map()
+    for (const page of settings.pages) {
+      try {
+        const html = await fetcher.text(new URL(page, settings.base).href)
+        for (const match of html.matchAll(new RegExp(`href="(${settings.linkPattern})"`, 'gi'))) links.set(new URL(match[1], settings.base).href, true)
+      } catch (error) { board.errors.push({ source: page, error: error.message }) }
+    }
+    board.listed = links.size
+    const urls = [...links.keys()].filter((url) => ROLE_PATTERN.test(slugWords(url)) || OTHER_ROLE_PATTERN.test(slugWords(url)))
+    await readDetails({ urls, cap: settings.maxDetails, fetcher, seen, known, site, label, board, today, forceLane: 'games' })
+  },
+
+  /** Cards of a server-rendered list: the title is in the card, so only matching jobs cost a detail page. */
+  async cards({ site, label, settings, fetcher, known, seen, board, today }) {
+    const urls = new Map()
+    for (const page of settings.pages) {
+      try {
+        const html = await fetcher.text(new URL(page, settings.base).href)
+        for (const match of html.matchAll(/<a\b[^>]*title="([^"]*)"[^>]*class="card"[^>]*href="([^"]+)"/gi)) {
+          const title = decodeEntities(match[1]).replace(/^.*? is hiring /i, '').replace(/\s*\(Remote Job\)\s*$/i, '')
+          if (ROLE_PATTERN.test(title) || OTHER_ROLE_PATTERN.test(title)) urls.set(match[2], true)
+        }
+      } catch (error) { board.errors.push({ source: page, error: error.message }) }
+    }
+    board.listed = urls.size
+    await readDetails({ urls: [...urls.keys()], cap: settings.maxDetails, fetcher, seen, known, site, label, board, today, forceLane: 'games' })
+  },
+}
+
+/**
+ * Any public page he gives: its own JobPosting if it has one, otherwise the links on it whose title fits a role he does, read
+ * within a small cap. Only public https addresses, one level deep, through the same polite fetcher.
+ * FR : n'importe quelle page publique qu'il donne : son JobPosting s'il en a un, sinon les liens dont le titre colle a ses metiers,
+ * dans un petit plafond. Adresses https publiques seulement, un seul niveau, par le meme lecteur poli.
+ */
+async function genericPage({ page, fetcher, known, seen, today, cap }) {
+  const host = new URL(page.url).hostname.replace(/^www\./, '')
+  const site = `custom-${host.replace(/[^a-z0-9]+/gi, '-')}`
+  const board = emptyBoard(site, page.label || host)
+  try {
+    const html = await fetcher.text(page.url)
+    const own = listingFromPosting(jobPosting(html), { url: page.url, site, label: board.label, today })
+    if (own) board.listings.push(own)
+    const links = new Map()
+    for (const match of html.matchAll(/<a\b[^>]*href="([^"#]+)"[^>]*>([\s\S]{0,200}?)<\/a>/gi)) {
+      let target
+      try { target = new URL(decodeEntities(match[1]), page.url) } catch { continue }
+      if (target.protocol !== 'https:' || target.hostname !== new URL(page.url).hostname || canonicalUrl(target.href) === canonicalUrl(page.url)) continue
+      const text = `${clean(match[2])} ${slugWords(target.href)}`
+      if (ROLE_PATTERN.test(text) || OTHER_ROLE_PATTERN.test(text)) links.set(target.href, true)
+    }
+    board.listed = links.size + (own ? 1 : 0)
+    await readDetails({ urls: [...links.keys()], cap, fetcher, seen, known, site, label: board.label, board, today })
+  } catch (error) {
+    board.partial = false
+    board.errors.push({ source: page.url, error: error.code === 'robots' ? `robots.txt refuses this address: ${error.message}` : error.message })
+  }
+  return finish(board)
+}
+
+/**
+ * One board per configured site. `known` is the set of canonical links already in the store (their pages are not read again),
+ * `seen` remembers pages judged irrelevant. A failing site yields its own incomplete board and never stops the others.
+ */
+export async function indexes({ http, config, known = new Set(), seen = createSeenCache(), now = new Date(), fetcher = null, extraPages = [] }) {
+  const family = config.sources.indexes
+  const polite = fetcher || createPoliteFetcher({ http, minGapMs: family.minGapMs, maxDelayMs: family.maxDelayMs })
+  const today = isoDay(now)
+  const names = Object.keys(family.sites).filter((site) => family.sites[site].enabled !== false)
+  // Sites run side by side (different hosts); the polite fetcher keeps each host to one request at a time with its own gap.
+  // FR : les sites tournent en parallele (hotes differents) ; le lecteur poli garde chaque hote a une requete a la fois avec son propre ecart.
+  const boards = await Promise.all(names.map(async (site) => {
+    const settings = family.sites[site]
+    const board = emptyBoard(site, settings.label)
+    const strategy = STRATEGIES[settings.strategy]
+    try {
+      if (!strategy) throw new Error(`Unknown strategy ${settings.strategy}`)
+      await strategy({ site, label: settings.label, settings, fetcher: polite, known, seen, now, board, today })
+    } catch (error) {
+      board.partial = false
+      board.errors.push({ source: site, error: error.code === 'robots' ? `robots.txt refuses this address: ${error.message}` : error.message })
+    }
+    return finish(board)
+  }))
+  for (const page of extraPages.slice(0, family.maxCustomPages)) boards.push(await genericPage({ page, fetcher: polite, known, seen, today, cap: family.customMaxDetails }))
+  await seen.save().catch(() => {})
+  return boards
+}

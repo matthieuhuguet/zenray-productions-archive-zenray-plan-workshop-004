@@ -1,0 +1,120 @@
+// 12 October 2026: quick scan of every Assets project: last real edit and thumbnail candidates.
+// Reads the light index and each project's .workspace.json from zenray-data through `gh` (keyring auth, no token typed).
+// `--apply` writes lastActivityAt into the index and the named thumbnails into pages/.zr-assets-covers.json.
+// FR : balayage rapide de tous les projets : dernière vraie modification et miniatures candidates.
+//
+//   node scripts/Assets/ScanProjectCovers.mjs            report only
+//   node scripts/Assets/ScanProjectCovers.mjs --apply    report, then write the two cloud files
+//   node scripts/Assets/ScanProjectCovers.mjs --only a,b limit to some project ids
+import { execFile, spawn } from 'node:child_process'
+import { promisify } from 'node:util'
+import { pickProjectCover, lastFileActivity, coverReference, isImageFile } from '../../src/lib/assetsProjectCover.js'
+import { downloadUrls } from '../../src/lib/archiveChunks.js'
+
+const run = promisify(execFile)
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const INDEX = 'pages/.zr-assets-workspaces-index.json'
+const COVERS = 'pages/.zr-assets-covers.json'
+const args = process.argv.slice(2)
+const apply = args.includes('--apply')
+const only = (args.find((arg) => arg.startsWith('--only='))?.slice(7) || '').split(',').filter(Boolean)
+const parallel = Number(process.env.SCAN_PARALLEL || 3)
+
+async function readRaw(path) {
+  const { stdout } = await run('gh', ['api', `repos/${REPO}/contents/${path}`, '-H', 'Accept: application/vnd.github.raw'], { maxBuffer: 400 * 1024 * 1024 })
+  return stdout
+}
+async function readSha(path) {
+  const { stdout } = await run('gh', ['api', `repos/${REPO}/contents/${path}`, '--jq', '.sha'])
+  return stdout.trim()
+}
+async function write(path, object, message, sha) {
+  const body = JSON.stringify({ message, content: Buffer.from(`${JSON.stringify(object, null, 1)}\n`).toString('base64'), ...(sha ? { sha } : {}) })
+  const child = execFile('gh', ['api', '-X', 'PUT', `repos/${REPO}/contents/${path}`, '--input', '-'], { maxBuffer: 50 * 1024 * 1024 })
+  child.stdin.end(body)
+  await new Promise((resolve, reject) => { child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`gh exit ${code}`))); child.on('error', reject) })
+}
+// 360x203 center-cropped WebP of an archived image, as a data URI: small enough to live inside the covers file.
+// FR : vignette 360x203 recadrée au centre, en data URI, assez légère pour vivre dans le fichier des miniatures.
+async function thumbnailDataUri(manifest) {
+  if (!manifest || manifest.type !== 'file' || (manifest.size || 0) > 40e6) return undefined
+  const urls = downloadUrls(manifest)
+  if (!urls?.length) return undefined
+  const parts = []
+  for (const url of urls) {
+    const response = await fetch(url, { signal: AbortSignal.timeout(90000) })
+    if (!response.ok) throw new Error(`chunk ${response.status}`)
+    parts.push(Buffer.from(await response.arrayBuffer()))
+  }
+  const input = Buffer.concat(parts)
+  const output = await new Promise((resolve, reject) => {
+    const child = spawn('magick', ['-', '-auto-orient', '-resize', '360x203^', '-gravity', 'center', '-extent', '360x203', '-quality', '72', 'webp:-'])
+    const chunks = []
+    child.stdout.on('data', (chunk) => chunks.push(chunk))
+    child.on('error', reject)
+    child.on('exit', (code) => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`magick exit ${code}`)))
+    child.stdin.on('error', () => {})
+    child.stdin.end(input)
+  })
+  return `data:image/webp;base64,${output.toString('base64')}`
+}
+const day = (ms) => ms ? new Date(ms).toISOString().slice(0, 16).replace('T', ' ') : '—'
+
+const index = JSON.parse(await readRaw(INDEX))
+const projects = index.projects.filter((project) => !only.length || only.includes(project.id))
+const results = []
+let cursor = 0
+async function worker() {
+  while (cursor < projects.length) {
+    const project = projects[cursor++]
+    try {
+      const snapshot = JSON.parse(await readRaw(`${project.folder}/.workspace.json`))
+      const files = snapshot.files || []
+      const named = pickProjectCover(files, { named: true })
+      const any = pickProjectCover(files)
+      // Effective cover: a file named like a thumbnail, else what the index already shows, else the first image.
+      const existing = project.coverFile && project.coverFile.contentPath ? { file: project.coverFile, reason: 'index' } : null
+      const effective = named || existing || any
+      let thumbnailUrl
+      if (effective?.file?.contentPath) {
+        try {
+          const manifest = JSON.parse(await readRaw(effective.file.contentPath))
+          thumbnailUrl = manifest.thumb || manifest.poster || manifest.thumbUrl || (apply ? await thumbnailDataUri(manifest) : undefined)
+        } catch { /* no manifest thumbnail: the app renders it the long way */ }
+      }
+      results.push({ id: project.id, files: files.length, images: files.filter(isImageFile).length, activity: lastFileActivity(files), named, any, effective, thumbnailUrl })
+    } catch (error) { results.push({ id: project.id, error: error.message.split('\n')[0].slice(0, 80) }) }
+  }
+}
+await Promise.all(Array.from({ length: parallel }, worker))
+results.sort((a, b) => (b.activity || 0) - (a.activity || 0))
+console.log('project'.padEnd(36), 'files'.padStart(6), 'imgs'.padStart(6), 'last edit'.padEnd(17), 'thumbnail found by name')
+for (const entry of results) {
+  if (entry.error) { console.log(entry.id.padEnd(36), `ERROR ${entry.error}`); continue }
+  console.log(entry.id.padEnd(36), String(entry.files).padStart(6), String(entry.images).padStart(6), day(entry.activity).padEnd(17), entry.named ? entry.named.file.relativePath : (entry.any ? `(none by name; first image: ${entry.any.file.relativePath})` : '(no renderable image)'))
+}
+console.log(`\n${results.filter((entry) => entry.named).length} of ${results.length} projects already hold a file named like a thumbnail.`)
+
+if (apply) {
+  const indexSha = await readSha(INDEX)
+  const fresh = JSON.parse(await readRaw(INDEX))
+  const byId = new Map(results.filter((entry) => !entry.error).map((entry) => [entry.id, entry]))
+  for (const project of fresh.projects) { const entry = byId.get(project.id); if (entry?.activity > 0) project.lastActivityAt = entry.activity }
+  fresh.updatedAt = new Date().toISOString()
+  await write(INDEX, fresh, 'assets: lastActivityAt per project (12 October 2026)', indexSha)
+  let covers = { schemaVersion: 1, covers: {} }
+  let coversSha = null
+  try { covers = JSON.parse(await readRaw(COVERS)); coversSha = await readSha(COVERS) } catch { /* first write */ }
+  covers.covers ||= {}
+  let added = 0
+  for (const entry of results) {
+    if (entry.error || !entry.effective || covers.covers[entry.id]?.choice === 'manual') continue
+    const reference = coverReference(entry.effective.file)
+    if (entry.thumbnailUrl) reference.thumbnailUrl = entry.thumbnailUrl
+    const reason = entry.effective.reason === 'named' ? 'named' : entry.effective.reason
+    covers.covers[entry.id] = { file: reference, choice: 'auto', reason, at: new Date().toISOString() }
+    added++
+  }
+  await write(COVERS, covers, `assets: ${added} project thumbnails with their direct image URL (12 October 2026)`, coversSha)
+  console.log(`written: ${INDEX} (lastActivityAt) and ${COVERS} (+${added} thumbnails, with direct URLs)`)
+}

@@ -1,0 +1,66 @@
+// @vitest-environment node
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createSignedShareToken } from './share-token.js'
+import { createHash } from 'node:crypto'
+
+const SECRET = 'test-secret-that-is-long-and-stable'
+const ROOT = 'pages/Photos/Galerie'
+
+function reponse() {
+  const r = { code: 0, body: null, headers: {} }
+  r.status = (c) => { r.code = c; return r }
+  r.setHeader = (k, v) => { r.headers[k] = v }
+  r.end = (b) => { r.body = b; return r }
+  return r
+}
+
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.resetModules() })
+
+describe('share-cover : la couverture vient de l’API Contents, jamais d’un cache raw périmé', () => {
+  it('sert la version de l’API même si raw a encore l’ancienne ou répond 404', async () => {
+    vi.stubEnv('GITHUB_TOKEN', 'faux'); vi.stubEnv('ZENRAY_SHARE_SECRET', SECRET)
+    const token = createSignedShareToken(SECRET, Buffer.alloc(24, 3))
+    const record = { v: 1, tokenHash: createHash('sha256').update(token).digest('hex'), kind: 'folder', path: ROOT, createdAt: new Date(0).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), revokedAt: null }
+    const octets = Buffer.from('RIFFxxxxWEBPfake')
+    const cover = JSON.stringify({ b64: octets.toString('base64'), mime: 'image/webp' })
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const u = String(url)
+      if (u.includes('/contents/_shares/')) return new Response(JSON.stringify({ content: Buffer.from(JSON.stringify(record)).toString('base64'), sha: 'x' }), { status: 200 })
+      if (u.includes('raw.githubusercontent.com')) return new Response(JSON.stringify({ b64: Buffer.from('ANCIENNE').toString('base64'), mime: 'image/webp' }), { status: 200 })
+      if (u.includes('api.github.com') && u.includes('.zr-share-cover.json')) return new Response(cover, { status: 200 })
+      return new Response('?', { status: 500 })
+    }))
+    const { default: handler } = await import('./share-cover.js')
+    const res = reponse()
+    await handler({ query: { d: token } }, res)
+    expect(res.code).toBe(200)
+    expect(res.headers['Content-Type']).toBe('image/webp')
+    expect(Buffer.from(res.body).toString()).toBe('RIFFxxxxWEBPfake')
+  })
+})
+
+describe('share-cover : la première vraie photo quand rien d’autre n’existe (galerie de liens)', () => {
+  it('suit le lien jusqu’à sa cible, déchiffre la vignette et la rend telle quelle', async () => {
+    const { firstPhoto } = await import('./share-cover.js')
+    const rawKey = crypto.getRandomValues(new Uint8Array(32))
+    const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt'])
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const webp = new Uint8Array([82, 73, 70, 70, 1, 2, 3, 4, 87, 69, 66, 80])
+    const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, webp))
+    const files = {
+      'pages/G/IMG_1.JPG.img.json': { type: 'zenray-eagle-link/v1', resourceId: 'zr_abc' },
+      'pages/.zr-resources/zr_abc.json': { resourceId: 'zr_abc', sourcePath: 'pages/Mois/IMG_1.JPG.img.json' },
+      'pages/Mois/IMG_1.JPG.img.json': { type: 'image', thumb: 'https://cdn.example/t.webp', thumbIv: btoa(String.fromCharCode(...iv)) },
+    }
+    const fetchImpl = async (url) => {
+      const u = String(url)
+      if (u.includes('/git/trees/')) return new Response(JSON.stringify({ tree: [{ type: 'blob', path: 'IMG_1.JPG.img.json' }] }), { status: 200 })
+      if (u === 'https://cdn.example/t.webp') return new Response(sealed, { status: 200 })
+      const path = decodeURIComponent((u.split('/main/')[1] || u.split('/contents/')[1] || '').split('?')[0])
+      return path in files ? new Response(JSON.stringify(files[path]), { status: 200 }) : new Response('nope', { status: 404 })
+    }
+    const out = await firstPhoto('faux', 'pages/G', fetchImpl, btoa(String.fromCharCode(...rawKey)))
+    expect(out.mime).toBe('image/webp')
+    expect(Array.from(out.bytes)).toEqual(Array.from(webp))
+  })
+})

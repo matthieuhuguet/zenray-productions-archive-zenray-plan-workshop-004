@@ -1,0 +1,176 @@
+// Helpers client C202 : upload chunké (Git Data API via /api/media) et réassemblage Blob.
+// Toute la progression passe par onProgress(ratio 0..1). Voir SPEC C202.
+const enc = encodeURIComponent
+
+// ── DÉPRÉCIÉ (2026-07-21, politique de découpage finale) : uploadChunked + helpers ──────────────
+// L'ancien uploader C202 (non chiffré, parts de 3 Mo STOCKÉES telles quelles via /api/media) n'a
+// PLUS AUCUN appelant : tout upload passe par universalCapture.js (chiffré AES-GCM, chunks de
+// stockage 19 MiB <=95 Mo / 95 Mo au-delà -- voir CLAUDE.md projet "POLITIQUE DE DÉCOUPAGE MÉDIA
+// FINALE"). Conservé en commentaire sur demande explicite de Matthieu (trace du choix), avec le
+// endpoint serveur /api/media qui devient orphelin côté écriture (la LECTURE des vieux manifestes
+// 3 Mo reste assurée par loadChunked/fetchPartDecrypted ci-dessous, schéma-aware).
+// const abToB64 = (ab) => {
+//   const bytes = new Uint8Array(ab)
+//   let bin = ''
+//   const CH = 0x8000 // évite le dépassement d'arguments de String.fromCharCode
+//   for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH))
+//   return btoa(bin)
+// }
+//
+// // Upload : découpe en parts de chunkSize, crée chaque blob, puis 1 commit atomique.
+// // destFolder ex "pages/films". onProgress(0..1). Retourne { path, manifest }.
+// // C211g — dimensions w/h pour vidéo (loadedmetadata) ou image (createImageBitmap), best-effort.
+// async function probeDims(file) {
+//   try {
+//     if ((file.type || '').startsWith('image/')) { const b = await createImageBitmap(file); const d = { w: b.width, h: b.height }; b.close && b.close(); return d }
+//     if ((file.type || '').startsWith('video/')) {
+//       return await new Promise((res) => { const v = document.createElement('video'); v.preload = 'metadata'; const u = URL.createObjectURL(file)
+//         v.onloadedmetadata = () => { res({ w: v.videoWidth, h: v.videoHeight, duration: v.duration }); URL.revokeObjectURL(u) }
+//         v.onerror = () => { res({}); URL.revokeObjectURL(u) }; v.src = u; setTimeout(() => res({}), 4000) })
+//     }
+//   } catch {}
+//   return {}
+// }
+// export async function uploadChunked(file, destFolder, onProgress) {
+//   const dims = await probeDims(file)
+//   const init = await fetch('/api/media', {
+//     method: 'POST', headers: { 'content-type': 'application/json' },
+//     body: JSON.stringify({ action: 'init', name: file.name, mime: file.type || 'application/octet-stream', size: file.size }),
+//   }).then((r) => r.json())
+//   if (!init || !init.ok) throw new Error('init: ' + ((init && init.error) || 'fail'))
+//
+//   const { dir, chunkSize, count } = init
+//   const blobs = []
+//   let sent = 0
+//   for (let i = 0; i < count; i++) {
+//     const slice = file.slice(i * chunkSize, Math.min((i + 1) * chunkSize, file.size))
+//     const b64 = abToB64(await slice.arrayBuffer())
+//     let sha = null
+//     // retry léger : 2 tentatives par part (robustesse réseau, sans perte car re-create = même blob)
+//     for (let attempt = 0; attempt < 2 && !sha; attempt++) {
+//       const r = await fetch('/api/media', {
+//         method: 'POST', headers: { 'content-type': 'application/json' },
+//         body: JSON.stringify({ action: 'blob', b64 }),
+//       }).then((x) => x.json()).catch(() => null)
+//       if (r && r.ok && r.sha) sha = r.sha
+//     }
+//     if (!sha) throw new Error('blob ' + i + ' failed')
+//     blobs.push({ i, sha })
+//     sent += slice.size
+//     if (onProgress) onProgress(sent / file.size)
+//   }
+//
+//   const base = file.name.replace(/[/\\]/g, '_')
+//   const manifestPath = `${destFolder.replace(/\/$/, '')}/${base}.media.json`
+//   const fin = await fetch('/api/media', {
+//     method: 'POST', headers: { 'content-type': 'application/json' },
+//     body: JSON.stringify({ action: 'commit', dir, name: file.name, mime: file.type || 'application/octet-stream', size: file.size, manifestPath, blobs, w: dims.w, h: dims.h, duration: dims.duration }),
+//   }).then((r) => r.json())
+//   if (!fin || !fin.ok) throw new Error('commit: ' + ((fin && fin.error) || 'fail'))
+//   return { path: fin.path, manifest: fin.manifest }
+// }
+
+// Lecture du manifest (.media.json est sous pages/ => via /api/page action read).
+// raw=1 (2026-07-20) : lecture d'affichage sans sha -> raw.githubusercontent, HORS quota API REST
+// (règle dure post-incident 403 -- une lecture qui n'écrira pas ne paie jamais le prix du sha).
+export async function readManifest(manifestPath) {
+  const j = await fetch(`/api/page?action=read&raw=1&path=${enc(manifestPath)}`, { cache: 'no-store' }).then((r) => r.json())
+  if (!j || j.error || j.missing) throw new Error('manifest read')
+  return JSON.parse(j.markdown)
+}
+
+// ── Récupération d'UNE part, schéma-aware (2026-07-20, LE correctif preview/download) ────────────
+// BUG RÉEL corrigé : loadChunked/downloadChunkedToDisk fetchaient TOUTES les parts via
+// `/api/img?path=media/<id>/NNN.bin` -- un chemin du repo de CONTENU qui n'existe QUE pour l'ancien
+// schéma non chiffré. Or TOUT upload UI depuis le passage public+chiffré (universalCapture) pose ses
+// parts sur le repo SHARD (cdnRepo, ex. zenrayshards-pdf-<hex12>), chiffrées AES-GCM (ivs[i]) :
+// /api/img renvoyait une erreur -> preview ET retéléchargement cassés pour chaque nouveau fichier
+// (PDF 31,5 Mo de Matthieu compris). Ici :
+//   - schéma PUBLIC CHIFFRÉ (cdnRepo + cdnCommit + ivs) : part lue par le CDN jsDelivr (vert), avec
+//     REPLI raw.githubusercontent (bleu) -- indispensable pour un commit tout frais que jsDelivr n'a
+//     pas encore propagé (404 pendant quelques minutes) -- puis déchiffrée CÔTÉ CLIENT. ZÉRO Vercel.
+//   - schéma LEGACY (pas de cdnRepo) : /api/img comme avant, inchangé (compat totale).
+async function fetchPartDecrypted(m, i) {
+  // SCHÉMA AUDIO V3 (2026-07-22, LE bug du download 0 Ko) : les manifestes audio portent `parts` = OBJETS
+  // {url: jsDelivr…, start, end, size, iv} (buildAudioManifestV3), SANS cdnRepo/cdnCommit/ivs/dir au top-level.
+  // fetchPartDecrypted ne reconnaissait que le schéma générique (cdnRepo+ivs) ou legacy (/api/img) -> il
+  // tombait sur `/api/img?path=undefined/[object Object].bin` -> 404 -> download 0 Ko. Ici : fetch direct de
+  // part.url (jsDelivr, VERT), repli raw.githubusercontent (BLEU, si commit trop frais non propagé), puis
+  // déchiffrement AES-GCM avec l'IV DE LA PART. C'est la même voie de lecture que le Service Worker.
+  const partObj = m.parts && m.parts[i]
+  if (partObj && typeof partObj === 'object' && partObj.url) {
+    let r = await fetch(partObj.url).catch(() => null)
+    if (!r || !r.ok) {
+      const raw = String(partObj.url)
+        .replace('https://cdn.jsdelivr.net/gh/', 'https://raw.githubusercontent.com/')
+        .replace(/@([^/]+)\//, '/$1/')
+      r = await fetch(raw).catch(() => null)
+    }
+    if (!r || !r.ok) throw new Error('part ' + i + ' inaccessible (CDN et raw)')
+    const cipher = await r.arrayBuffer()
+    const { decryptBytes } = await import('../media/crypto.js')
+    return new Uint8Array(await decryptBytes(cipher, partObj.iv))
+  }
+  const isEncryptedCdn = !!(m.cdnRepo && m.cdnCommit && Array.isArray(m.ivs))
+  const binPath = `${m.dir}/${m.parts[i]}.bin`
+  if (!isEncryptedCdn) {
+    const buf = await fetch(`/api/img?path=${enc(binPath)}`).then((r) => { if (!r.ok) throw new Error('part ' + i); return r.arrayBuffer() })
+    return new Uint8Array(buf)
+  }
+  // BUG RÉEL corrigé le 2026-07-21 ("déchiffrement infini" + download tronqué) : les URLs étaient
+  // construites À LA MAIN avec `m.cdnRepo` -- or les manifestes stockent le repo SANS owner
+  // ('zenray-pdf-public-01'), c'est buildJsDelivrUrl/buildRawUrl (shardNaming.js) qui préfixent
+  // 'matthieuhuguet/'. Sans owner : gh/<repo>@<commit> est une URL jsDelivr INVALIDE et le raw 404
+  // -> 100% des parts échouaient, silencieusement. TOUJOURS passer par les helpers officiels.
+  // Parts > 20 Mo (chunks 95 Mo des gros fichiers) : jsDelivr refuse -> raw directement.
+  const { buildJsDelivrUrl, buildRawUrl } = await import('../capture/shardNaming.js')
+  const { servedByRaw } = await import('../config/chunkPolicy.js')
+  const overCdnLimit = servedByRaw(m.chunkSize) // > 20 Mo (source unique chunkPolicy.js) -> raw.github
+  let r = null
+  if (!overCdnLimit) r = await fetch(buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, binPath)).catch(() => null)
+  if (!r || !r.ok) r = await fetch(buildRawUrl(m.cdnRepo, m.cdnCommit, binPath)).catch(() => null)
+  if (!r || !r.ok) throw new Error('part ' + i + ' inaccessible (CDN et raw)')
+  const cipher = await r.arrayBuffer()
+  const { decryptBytes } = await import('../media/crypto.js')
+  const clear = await decryptBytes(cipher, m.ivs[i])
+  return new Uint8Array(clear)
+}
+
+// Réassemblage côté client : télécharge chaque part (proxy /api/img), recolle en Blob ordonné.
+// concurrency bornée, ordre garanti par index. onProgress(0..1). Retourne un objectURL.
+export async function loadChunked(manifestPath, onProgress, concurrency = 4) {
+  const m = await readManifest(manifestPath)
+  const out = new Array(m.count)
+  let bytes = 0, next = 0
+  const worker = async () => {
+    while (next < m.count) {
+      const idx = next++
+      // fetchPartDecrypted : CDN jsDelivr + déchiffrement client pour le schéma public chiffré,
+      // /api/img seulement pour le legacy (voir commentaire du helper -- correctif 2026-07-20).
+      const buf = await fetchPartDecrypted(m, idx)
+      out[idx] = buf
+      bytes += buf.byteLength
+      if (onProgress) onProgress(Math.min(1, bytes / m.size))
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, m.count) }, worker))
+  const blob = new Blob(out, { type: m.mime })
+  return { url: URL.createObjectURL(blob), manifest: m, blob }
+}
+
+// DOWNLOAD STREAMÉ (anti-OOM) : récupère chaque part via /api/img et l'écrit DIRECTEMENT sur disque (File
+// System Access API) ou, à défaut, en Blob borné — au lieu de garder tout le fichier en RAM avant l'enregistrement.
+// Sur un gros média mobile, c'est ce qui évite le crash de l'onglet. Réutilise fetchAsset.streamDownloadChunks.
+export async function downloadChunkedToDisk(manifestPath, onProgress) {
+  const m = await readManifest(manifestPath)
+  const { streamDownloadChunks } = await import('../lib/fetchAsset.js')
+  await streamDownloadChunks({
+    count: m.count,
+    name: m.name || 'fichier',
+    mime: m.mime || 'application/octet-stream',
+    onProgress,
+    // Correctif 2026-07-20 (voir fetchPartDecrypted) : le download tirait /api/img sur des parts qui
+    // n'y existent pas pour le schéma public chiffré -> "impossible de retélécharger mon fichier".
+    getChunk: (i) => fetchPartDecrypted(m, i),
+  })
+}

@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+// LES 38 VARIABLES, DE VERCEL VERS CLOUDFLARE, SANS LES SAISIR À LA MAIN.
+//
+//   node scripts/secrets-vercel-vers-cloudflare.mjs            # prépare et vérifie, n'envoie rien
+//   node scripts/secrets-vercel-vers-cloudflare.mjs --envoyer  # prépare, vérifie, puis envoie
+//
+// CE QUE J'AI CRU, ET CE QUI EST VRAI (mesuré le 2026-07-30)
+// ----------------------------------------------------------
+// J'ai d'abord écrit que `vercel env pull` rendrait les 38 valeurs en clair et ferait tomber les
+// quarante minutes de saisie à deux. **C'est faux.** Vercel marque ces variables « sensibles », et
+// une variable sensible n'est jamais relue, pas même par sa propre CLI : le fichier tiré contient
+// `NOM=""`, deux octets, pour les 38. Mesuré, pas supposé.
+//
+// La répartition réelle, elle, réduit quand même beaucoup le travail :
+//   5   valeurs sont dans `.env.local` et partent automatiquement
+//   14  sont de la configuration qui a DÉJÀ un défaut dans le code, donc rien à poser
+//   19  doivent venir de Matthieu, dont ZENRAY_MEDIA_KEY qui déchiffre tous les médias
+//
+// Le script lit donc `.env.local` en premier, puis tout fichier supplémentaire passé en argument,
+// et il NOMME ce qui manque encore. Ce qui a un défaut dans le code n'est jamais réclamé.
+//
+// CE QUE CE SCRIPT NE FAIT JAMAIS
+// -------------------------------
+// Il n'affiche aucune valeur, ni en sortie, ni en cas d'erreur. Il ne nomme que des CLÉS. Le
+// fichier intermédiaire est écrit dans le dossier temporaire de la session, jamais dans le dépôt,
+// et il est effacé à la fin même si l'envoi échoue.
+
+import { execFileSync } from 'node:child_process'
+import { writeFileSync, rmSync, readFileSync, existsSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const RACINE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const PROJET_CF = 'zenray-progress'
+const SCOPE_VERCEL = 'zenrays-projects'
+const envoyer = process.argv.includes('--envoyer')
+
+// La liste attendue est RELEVÉE DANS LE CODE, pas recopiée : une liste écrite à la main dans un
+// script devient fausse au premier `process.env` ajouté, et le script dirait alors « complet »
+// en laissant une variable derrière lui.
+function clesAttendues() {
+  const sortie = execFileSync('bash', ['-c',
+    `grep -rhoE "process\\.env\\.[A-Z0-9_]+" server api src 2>/dev/null | sed 's/process\\.env\\.//' | sort -u`,
+  ], { cwd: RACINE, encoding: 'utf8' })
+  return sortie.split('\n').map((s) => s.trim()).filter(Boolean)
+}
+
+// Un .env se lit ligne à ligne : une valeur peut contenir « = », donc on coupe au PREMIER seulement.
+function lireEnv(fichier) {
+  const map = new Map()
+  for (const ligne of readFileSync(fichier, 'utf8').split('\n')) {
+    const l = ligne.trim()
+    if (!l || l.startsWith('#')) continue
+    const i = l.indexOf('=')
+    if (i < 1) continue
+    let v = l.slice(i + 1).trim()
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1)
+    map.set(l.slice(0, i).trim(), v.replace(/\\n/g, '\n'))
+  }
+  return map
+}
+
+const temp = mkdtempSync(path.join(tmpdir(), 'zr-secrets-'))
+const fEnv = path.join(temp, '.env.production')
+const fJson = path.join(temp, 'secrets.json')
+
+try {
+  const sources = [path.join(RACINE, '.env.local'), ...process.argv.slice(2).filter((a) => !a.startsWith('--'))]
+  console.log('1/4  lecture des sources locales')
+  const trouvees = new Map()
+  for (const f of sources) {
+    if (!existsSync(f)) { console.log(`     absent  : ${path.relative(RACINE, f) || f}`); continue }
+    const m = lireEnv(f)
+    // Les fichiers plus tardifs l'emportent : on peut donc compléter `.env.local` par un fichier
+    // d'appoint sans le modifier, ce qui évite de mêler les secrets de production à ceux du poste.
+    for (const [k, v] of m) if (v !== '') trouvees.set(k, v)
+    console.log(`     lu      : ${path.relative(RACINE, f) || f} (${m.size} clé(s))`)
+  }
+  const attendues = clesAttendues()
+  // Une variable qui a un défaut NON VIDE dans le code n'a pas à être posée : la réclamer ferait
+  // passer pour un manque ce qui est un choix déjà écrit, et allongerait la liste de moitié.
+  const avecDefaut = new Set(execFileSync('bash', ['-c',
+    `grep -rhoE "process\\.env\\.[A-Z0-9_]+[[:space:]]*\\|\\|[[:space:]]*'[^']+'" server api src 2>/dev/null`
+    + ` | sed -E "s/process\\.env\\.([A-Z0-9_]+).*/\\1/" | sort -u`,
+  ], { cwd: RACINE, encoding: 'utf8' }).split('\n').map((x) => x.trim()).filter(Boolean))
+  const manquantes = attendues.filter((k) => !trouvees.has(k) && !avecDefaut.has(k))
+
+  console.log(`2/4  ${trouvees.size} variable(s) lues, ${attendues.length} attendues par le code`)
+  if (manquantes.length) {
+    // On NOMME ce qui manque sans jamais rien montrer d'autre. Une variable absente n'interdit pas
+    // l'envoi — plusieurs sont optionnelles — mais elle doit être vue, et non découverte plus tard
+    // à travers un handler qui échoue sans dire pourquoi.
+    console.log(`     À FOURNIR (${manquantes.length}, sans défaut dans le code) :\n       ${manquantes.join('\n       ')}`)
+  } else {
+    console.log('     rien à fournir : tout est couvert par les sources ou par un défaut du code')
+  }
+
+  // On n'envoie que ce que le code lit vraiment : pousser les variables surnuméraires de Vercel
+  // (celles de ses propres intégrations) encombrerait le projet Cloudflare sans servir.
+  const charge = {}
+  for (const k of attendues) if (trouvees.has(k) && trouvees.get(k) !== '') charge[k] = trouvees.get(k)
+  writeFileSync(fJson, JSON.stringify(charge, null, 2), { mode: 0o600 })
+  console.log(`3/4  ${Object.keys(charge).length} secret(s) prêts`)
+
+  if (!envoyer) {
+    console.log('4/4  RIEN ENVOYÉ (relancer avec --envoyer une fois `npx wrangler login` fait)')
+  } else {
+    console.log(`4/4  envoi vers le projet Pages « ${PROJET_CF} »`)
+    execFileSync('npx', ['--yes', 'wrangler@latest', 'pages', 'secret', 'bulk', fJson, '--project-name', PROJET_CF],
+      { cwd: RACINE, stdio: 'inherit' })
+    console.log('     envoyé. Vérifier la liste : npx wrangler pages secret list --project-name ' + PROJET_CF)
+  }
+} finally {
+  // Le nettoyage vit dans un `finally` : un envoi qui échoue ne doit pas laisser les 38 valeurs
+  // en clair dans un fichier temporaire, et c'est précisément quand ça échoue qu'on oublie.
+  rmSync(temp, { recursive: true, force: true })
+  if (existsSync(temp)) console.error('ATTENTION : dossier temporaire non supprimé : ' + temp)
+}

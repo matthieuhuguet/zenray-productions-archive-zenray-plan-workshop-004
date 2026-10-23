@@ -1,0 +1,133 @@
+// ZenRayMedia — L7 : la Forge.
+//
+// DÉCISION ASSUMÉE (01-PLAN §8). Le rendu vidéo ne tourne PAS dans le navigateur ni sur Vercel :
+//   - les fonctions serverless du projet plafonnent la réponse à ~4,5 Mo (incident 2026-07-21,
+//     fichiers tronqués à 4,2 Mo) ;
+//   - une séquence RGBA 4K pèse 33,18 Mo PAR IMAGE, soit ~29,9 Go pour 30 s à 30 i/s.
+// La Forge est donc un processus LOCAL. C'est ce que veut dire « auto-hébergé ».
+//
+// Ce module ne simule rien : il produit le pipeline EXACT, reproductible, à exécuter sur le Mac.
+// Les réglages viennent du Format, jamais d'une valeur magique.
+
+import { durationOf, isTemporal } from './formats.js'
+import { checksumOf } from './contracts.js'
+
+const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+
+// Commande d'encodage, dérivée de `format.delivery`.
+export function ffmpegCommand(format, { input = 'frames (flux)', output } = {}) {
+  const d = format.delivery
+  const fps = format.time?.fps || 30
+  const out = output || `zenraymedia.${d.container}`
+  const common = `-f image2pipe -framerate ${fps} -i -`
+  if (format.kind === 'overlay') {
+    // prores_ks + yuva444p10le : couche alpha réelle. VÉRIFIÉ disponible (ffmpeg 8.1.1).
+    // prores_videotoolbox est volontairement écarté : son support alpha n'est pas mesuré.
+    return `ffmpeg -y ${common} -c:v prores_ks -profile:v 4444 -pix_fmt yuva444p10le -alpha_bits 16 -vendor apl0 ${shellQuote(out)}`
+  }
+  if (format.kind === 'video') {
+    // `-tag:v hvc1` : règle dure du projet. Sans elle, Apple refuse le fichier (bug payé 2026-07-05).
+    return `ffmpeg -y ${common} -c:v ${d.codec} -tag:v ${d.tag} -pix_fmt ${d.pixfmt} -b:v 12M -movflags +faststart ${shellQuote(out)}`
+  }
+  return `ffmpeg -y -i ${shellQuote(input)} ${shellQuote(out)}`
+}
+
+export function probeCommand(output) {
+  return `ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames,codec_name,pix_fmt,width,height -show_entries format=duration ${shellQuote(output)}`
+}
+
+/**
+ * Script de rendu déterministe, prêt à coller dans `Scripts/`.
+ * Le point dur est l'HORLOGE VIRTUELLE : chaque image est posée à `t = n/fps` en déplaçant
+ * `currentTime` de toutes les animations. Aucune capture ne dépend de l'horloge réelle, donc
+ * deux exécutions produisent le même fichier (règle d'or, 01-PLAN §6.1).
+ */
+export function renderScript({ format, durationSeconds, htmlFileName = 'page.html', output }) {
+  const fps = format.time?.fps || 30
+  const frames = Math.round(durationSeconds * fps)
+  const out = output || `zenraymedia.${format.delivery.container}`
+  const transparent = format.kind === 'overlay'
+
+  return `#!/usr/bin/env node
+// ZenRayMedia — rendu déterministe. Généré par la Forge, à exécuter localement.
+//   npm i -D playwright        (chromium déjà présent dans ~/Library/Caches/ms-playwright)
+//   node zrm-render.mjs
+//
+// GARANTIE : même page + même graine => même fichier, octet pour octet.
+// Vérification obligatoire avant d'aller plus loin (ZM-L6-05) :
+//   node zrm-render.mjs && shasum -a 256 ${out} && node zrm-render.mjs && shasum -a 256 ${out}
+//   -> les deux empreintes DOIVENT être identiques.
+
+import { chromium } from 'playwright'
+import { spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { pathToFileURL } from 'node:url'
+
+const FPS = ${fps}
+const FRAMES = ${frames}
+const WIDTH = ${format.canvas.w}
+const HEIGHT = ${format.canvas.h}
+const OUTPUT = ${JSON.stringify(out)}
+
+const ffmpeg = spawn('ffmpeg', ${JSON.stringify(ffmpegCommand(format, { output: out }).split(' ').slice(1).map((a) => a.replace(/^'|'$/g, '')))}, { stdio: ['pipe', 'inherit', 'inherit'] })
+
+const browser = await chromium.launch()
+const page = await browser.newPage({ viewport: { width: WIDTH, height: HEIGHT }, deviceScaleFactor: 1 })
+await page.setContent(readFileSync(${JSON.stringify(htmlFileName)}, 'utf8'), { waitUntil: 'load' })
+
+// Préchauffage (ZM-L6-03) : polices posées ET images décodées avant la première image.
+await page.evaluate(async () => { await document.fonts.ready; await Promise.all([...document.images].map((i) => i.decode().catch(() => {}))) })
+
+// Horloge virtuelle (ZM-L6-04/06) : on met en pause toutes les animations et on les POSITIONNE.
+await page.evaluate(() => { for (const a of document.getAnimations()) { a.pause() } })
+
+for (let n = 0; n < FRAMES; n++) {
+  const t = (n / FPS) * 1000
+  await page.evaluate((ms) => { for (const a of document.getAnimations()) { a.currentTime = ms } }, t)
+  const buffer = await page.screenshot({ type: 'png', omitBackground: ${transparent} })
+  // Flux DIRECT vers l'encodeur : aucune image n'atteint le disque (ZM-L6-11).
+  if (!ffmpeg.stdin.write(buffer)) await new Promise((r) => ffmpeg.stdin.once('drain', r))
+}
+
+ffmpeg.stdin.end()
+await new Promise((resolve, reject) => ffmpeg.on('close', (code) => (code === 0 ? resolve() : reject(new Error('ffmpeg code ' + code)))))
+await browser.close()
+console.log('OK', OUTPUT, FRAMES, 'images @', FPS, 'i/s')
+`
+}
+
+// Plan complet d'un job temporel : ce qu'il faut faire, dans l'ordre, avec les chiffres réels.
+export function forgePlan({ brief, cut, theme, format, html, seed }) {
+  const duration = isTemporal(format) ? durationOf(cut, format) : 0
+  const fps = format.time?.fps || 30
+  const frames = Math.round(duration * fps)
+  const bytesPerFrame = format.canvas.w * format.canvas.h * 4
+  return {
+    duration,
+    fps,
+    frames,
+    // Ce chiffre est la raison pour laquelle rien n'est écrit sur le disque.
+    rawBytesIfWrittenToDisk: bytesPerFrame * frames,
+    bytesPerFrame,
+    command: ffmpegCommand(format),
+    probe: probeCommand(`zenraymedia.${format.delivery.container}`),
+    script: renderScript({ format, durationSeconds: duration }),
+    htmlChecksum: checksumOf(html || ''),
+    seed,
+    steps: [
+      'Exporter la page compilée (bouton « Page HTML ») à côté du script.',
+      'Coller le script dans Scripts/zrm-render.mjs.',
+      'Lancer le rendu, puis la sonde ffprobe.',
+      `Vérifier que la sonde annonce exactement ${frames} images.`,
+      'Rejouer le rendu et comparer les empreintes sha256 : elles doivent être identiques.',
+    ],
+  }
+}
+
+export function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 o'
+  const units = ['o', 'ko', 'Mo', 'Go', 'To']
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)))
+  const value = bytes / Math.pow(1024, i)
+  return `${value >= 100 ? Math.round(value) : Math.round(value * 10) / 10} ${units[i]}`
+}

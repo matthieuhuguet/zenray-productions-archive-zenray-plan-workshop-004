@@ -1,0 +1,57 @@
+// Remplit `image` des manifestes movies + anime via TMDB (clé passée en env TMDB_KEY, JAMAIS commitée).
+// TMDB = built-for-apps (limite généreuse, ~50 req/s) -> haute concurrence OK, zéro throttle.
+//   movies (films/séries/docs) -> search/multi (puis search/movie en repli)
+//   anime                       -> search/tv (puis search/multi)
+// Les jeux NE sont PAS couverts par TMDB -> RAWG (autre script). Idempotent : ne remplit que les manquants.
+// L'URL écrite est une image PUBLIQUE TMDB (pas la clé) : https://image.tmdb.org/t/p/w500/<path>
+import { readFile, writeFile } from 'node:fs/promises'
+
+const ROOT = new URL('../public/shelf/', import.meta.url)
+const KEY = process.env.TMDB_KEY
+if (!KEY) { console.error('TMDB_KEY manquant en env'); process.exit(1) }
+const IMG = (p) => (p ? `https://image.tmdb.org/t/p/w500${p}` : null)
+const clean = (s) => String(s)
+  .replace(/\s+(S\d{1,2}|Season\s*\d+|Saison\s*\d+|Part\s*\d+|Cour\s*\d+)\b.*$/i, '')
+  .replace(/\s*\(\d{4}\)\s*$/, '')
+  .trim()
+
+async function tmdb(path, query, extra = {}) {
+  const u = new URL(`https://api.themoviedb.org/3/${path}`)
+  u.searchParams.set('api_key', KEY)
+  u.searchParams.set('query', query)
+  for (const [k, v] of Object.entries(extra)) u.searchParams.set(k, v)
+  for (let a = 0; a < 3; a++) {
+    try {
+      const r = await fetch(u)
+      if (r.status === 429) { await new Promise((z) => setTimeout(z, 700)); continue }
+      return r.ok ? await r.json() : null
+    } catch { return null }
+  }
+  return null
+}
+const firstPoster = (j) => { const h = j && j.results && j.results.find((r) => r.poster_path); return h ? IMG(h.poster_path) : null }
+const searchMulti = async (name) => (await firstPoster(await tmdb('search/multi', clean(name), { include_adult: 'false' }))) || firstPoster(await tmdb('search/movie', clean(name)))
+const searchTv = async (name) => (await firstPoster(await tmdb('search/tv', clean(name)))) || firstPoster(await tmdb('search/multi', clean(name)))
+
+async function pool(items, limit, fn) {
+  let i = 0
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) { const idx = i++; await fn(items[idx]) }
+  }))
+}
+
+const PLAN = [
+  { file: 'movies.json', fetch: searchMulti, conc: 16 },
+  { file: 'anime-manga.json', fetch: searchTv, conc: 16 },
+]
+for (const { file, fetch: fetcher, conc } of PLAN) {
+  const path = new URL(file, ROOT)
+  const data = JSON.parse(await readFile(path, 'utf8'))
+  const todo = data.items.filter((it) => !it.image)
+  let filled = 0
+  await pool(todo, conc, async (it) => { const url = await fetcher(it.name); if (url) { it.image = { kind: 'url', ref: url }; filled++ } })
+  await writeFile(path, JSON.stringify(data, null, 2))
+  const total = data.items.filter((i) => i.image).length
+  console.log(`${file}: +${filled} cette passe -> ${total}/${data.items.length}`)
+}
+console.log('DONE TMDB (movies + anime). Jeux -> RAWG.')

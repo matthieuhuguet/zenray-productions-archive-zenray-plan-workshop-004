@@ -1,0 +1,133 @@
+// GITHUB THROUGH GRAPHQL ONLY, so that guest uploads never touch the owner's REST quota (2 October 2026, demand of Matthieu:
+// « je suis limité à 5000 par heure, j'aimerais ne pas perdre ma limite »).
+//
+// WHY GRAPHQL. GitHub counts GraphQL points in a bucket SEPARATE from the REST one (`/rate_limit` lists `core` and `graphql`
+// apart, 5000 each). A guest photo costs about four GraphQL points and zero REST calls. Writing goes through the
+// `createCommitOnBranch` mutation, which takes any number of files in ONE commit; reading goes through `object(expression:)`,
+// which returns a blob's text, a tree's existence, the branch head and the repository size in ONE query.
+//
+// MEASURED ON 2 October 2026 (scratch repository): files up to 19 MiB per commit pass; a stale `expectedHeadOid` answers
+// `STALE_DATA`; an identical re-commit creates an empty commit (so callers skip what already exists); GitHub reads the request
+// body for about 5 s and answers 499 past that, which only a SLOW uplink hits (a home connection), never the Workers network.
+//
+// Every failure is typed (GhError.kind): 'stale' (branch moved: re-read and retry), 'rate' (wait `waitMs`), 'down' (GitHub or
+// the network hiccuped), 'fatal' (our own bug or a permission problem). Nothing here knows about guests: it is a thin, injectable
+// GitHub client, so the guest logic can be tested against an in-memory fake (server/testing/fakeGithub.js).
+
+export class GhError extends Error {
+  constructor(kind, message, waitMs = 0) { super(message || kind); this.name = 'GhError'; this.kind = kind; this.waitMs = waitMs }
+}
+
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const b64 = (u8) => (typeof Buffer !== 'undefined' ? Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength).toString('base64') : btoa(String.fromCharCode(...u8)))
+
+export function makeGitHub({ token, owner = 'matthieuhuguet', dataRepo = 'zenray-data', branch = 'main', fetchImpl = (...a) => fetch(...a), sleep = defaultSleep, tries = 4 } = {}) {
+  if (!token) throw new GhError('fatal', 'no-token')
+  const headers = { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress', 'Content-Type': 'application/json' }
+  const gh = { rate: null }
+
+  async function gql(query, variables) {
+    let last = null
+    for (let attempt = 0; attempt < tries; attempt++) {
+      let res
+      try { res = await fetchImpl('https://api.github.com/graphql', { method: 'POST', headers, body: JSON.stringify({ query, variables }) }) } catch (e) { last = new GhError('down', String((e && e.message) || e)); await sleep(400 * (attempt + 1)); continue }
+      const remaining = res.headers && res.headers.get && res.headers.get('x-ratelimit-remaining')
+      if (remaining != null) gh.rate = { graphqlRemaining: Number(remaining) }
+      if (res.status === 403 || res.status === 429) {
+        const retryAfter = Number(res.headers.get('retry-after'))
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 30_000
+        if (waitMs <= 4000 && attempt < tries - 1) { await sleep(waitMs + 200); continue }
+        throw new GhError('rate', 'rate-limited', waitMs)
+      }
+      if (res.status >= 500 || res.status === 499) { last = new GhError('down', `http-${res.status}`); await sleep(500 * (attempt + 1)); continue }
+      if (!res.ok) throw new GhError('fatal', `http-${res.status}`)
+      let json
+      try { json = await res.json() } catch { last = new GhError('down', 'bad-json'); await sleep(400 * (attempt + 1)); continue }
+      const err = json && Array.isArray(json.errors) && json.errors[0]
+      if (err) {
+        if (err.type === 'STALE_DATA' || /Expected branch to point/i.test(err.message || '')) throw new GhError('stale', 'stale')
+        if (err.type === 'RATE_LIMITED' || /rate limit/i.test(err.message || '')) throw new GhError('rate', 'rate-limited', 60_000)
+        if (err.type === 'NOT_FOUND') throw new GhError('fatal', 'not-found')
+        if (/timeout|timed out|something went wrong/i.test(err.message || '')) { last = new GhError('down', err.message); await sleep(500 * (attempt + 1)); continue }
+        throw new GhError('fatal', String(err.message || err.type || 'graphql-error').slice(0, 160))
+      }
+      return json.data
+    }
+    throw last || new GhError('down', 'unknown')
+  }
+
+  /** `repo` = 'owner/name' or just 'name' (then `owner` applies). */
+  const full = (repo) => (repo.includes('/') ? repo : `${owner}/${repo}`)
+
+  /**
+   * One query: branch head, repository size, and for each `exprs[i]` ({ path }) the blob text / tree existence.
+   * Returns { oid, diskUsageKb, items:[{ kind:'blob'|'tree'|null, text, size }] } (items aligned with `paths`).
+   */
+  async function read(repo, paths = []) {
+    const [o, n] = full(repo).split('/')
+    const vars = { o, n, ref: `refs/heads/${branch}` }
+    const decl = ['$o:String!', '$n:String!', '$ref:String!']
+    const sel = paths.map((p, i) => { vars[`e${i}`] = `${branch}:${p}`; decl.push(`$e${i}:String!`); return `a${i}: object(expression:$e${i}){ __typename ... on Blob { text byteSize isBinary } ... on Tree { oid } }` })
+    const q = `query(${decl.join(',')}){ repository(owner:$o,name:$n){ diskUsage ref(qualifiedName:$ref){ target{ oid } } ${sel.join(' ')} } }`
+    const data = await gql(q, vars)
+    const repoNode = data && data.repository
+    if (!repoNode) throw new GhError('fatal', 'no-repository')
+    const items = paths.map((_, i) => {
+      const it = repoNode[`a${i}`]
+      if (!it) return { kind: null, text: null, size: 0 }
+      return it.__typename === 'Blob' ? { kind: 'blob', text: it.isBinary ? null : it.text, size: it.byteSize || 0 } : { kind: 'tree', text: null, size: 0 }
+    })
+    return { oid: repoNode.ref ? repoNode.ref.target.oid : null, diskUsageKb: repoNode.diskUsage || 0, items }
+  }
+
+  /** One atomic commit of `additions` ([{ path, bytes:Uint8Array | text:string }]). Throws GhError('stale') when the head moved. */
+  async function commit(repo, { expectedHeadOid, headline, additions }) {
+    const input = {
+      branch: { repositoryNameWithOwner: full(repo), branchName: branch },
+      message: { headline },
+      expectedHeadOid,
+      fileChanges: { additions: additions.map((a) => ({ path: a.path, contents: a.text != null ? b64(new TextEncoder().encode(a.text)) : b64(a.bytes) })) },
+    }
+    const data = await gql('mutation($input:CreateCommitOnBranchInput!){ createCommitOnBranch(input:$input){ commit{ oid } } }', { input })
+    const oid = data && data.createCommitOnBranch && data.createCommitOnBranch.commit && data.createCommitOnBranch.commit.oid
+    if (!oid) throw new GhError('down', 'no-commit-oid')
+    return oid
+  }
+
+  /** Read a single file's text from any repo/branch of the account, or null. Used for freshly written manifests (raw has a CDN delay). */
+  async function readText(repo, path) {
+    const r = await read(repo, [path])
+    return r.items[0].kind === 'blob' ? r.items[0].text : null
+  }
+
+  /** New PUBLIC shard `zenrayshards-img-<hex12>` (one REST call; the owner's convention), waits until its branch has a head. */
+  async function createShard() {
+    const rnd = new Uint8Array(6); crypto.getRandomValues(rnd)
+    const name = `zenrayshards-img-${Array.from(rnd, (x) => x.toString(16).padStart(2, '0')).join('')}`
+    let res
+    try {
+      res = await fetchImpl('https://api.github.com/user/repos', { method: 'POST', headers, body: JSON.stringify({ name, private: false, auto_init: true, description: 'ZenRay shard: hashed encrypted images served by jsDelivr' }) })
+    } catch (e) { throw new GhError('down', String((e && e.message) || e)) }
+    if (res.status === 403 || res.status === 429) throw new GhError('rate', 'rate-limited', 60_000)
+    if (!res.ok) throw new GhError(res.status >= 500 ? 'down' : 'fatal', `create-shard-${res.status}`)
+    for (let i = 0; i < 20; i++) {
+      await sleep(1200)
+      try { const st = await read(name, []); if (st.oid) return name } catch (e) { if (e instanceof GhError && e.kind === 'fatal') { /* repository not visible yet */ } }
+    }
+    throw new GhError('down', 'shard-not-ready')
+  }
+
+  return Object.assign(gh, { gql, read, commit, readText, createShard, dataRepo: full(dataRepo), owner })
+}
+
+/**
+ * A file of the drive repo read through GraphQL, or null. For manifests written moments ago: raw.githubusercontent.com keeps
+ * answering 404 for them for up to five minutes (CDN cache), and the Contents API would spend the owner's REST quota.
+ * Costs one GraphQL point (a separate bucket).
+ */
+export async function readFreshText(token, path, { repo = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data', branch = process.env.CONTENT_BRANCH || 'main' } = {}) {
+  try {
+    const [owner, name] = repo.split('/')
+    return await makeGitHub({ token, owner, dataRepo: name, branch, tries: 2 }).readText(repo, path.normalize('NFC'))
+  } catch { return null }
+}

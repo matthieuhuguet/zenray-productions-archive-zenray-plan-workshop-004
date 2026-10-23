@@ -1,0 +1,129 @@
+import React from 'react'
+import { afterEach, expect, test, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import PlanAttachments from './PlanAttachments.jsx'
+import { captureAttachment } from '../capture/universalCapture.js'
+import { issueShareToken, revokeShareToken } from '../lib/shareLinks.js'
+
+vi.mock('../capture/universalCapture.js', () => ({ captureAttachment: vi.fn() }))
+vi.mock('../lib/shareLinks.js', () => ({ issueShareToken: vi.fn(), revokeShareToken: vi.fn() }))
+afterEach(() => { cleanup(); vi.resetAllMocks() })
+
+// UI checks cover success, visible failure, and link revocation. (19 October 2026, 00:33 Paris)
+test('file selection stores a Create path and a downloadable Calendar link', async () => {
+  captureAttachment.mockResolvedValue({ nodePath: 'pages/PlanAttachments/test.media.json' })
+  issueShareToken.mockResolvedValue({ token: 'signed' })
+  const onPatch = vi.fn()
+  render(<PlanAttachments task={{ id: 'task-1' }} onPatch={onPatch} />)
+  fireEvent.change(screen.getByLabelText('Choose attachments'), { target: { files: [new File(['audio'], 'audio.m4a', { type: 'audio/mp4' })] } })
+  await waitFor(() => expect(onPatch).toHaveBeenCalledOnce())
+  expect(onPatch.mock.calls[0][0].attachments[0]).toMatchObject({ name: 'audio.m4a', size: 5, path: 'pages/PlanAttachments/test.media.json', url: expect.stringContaining('/api/attachment-download?share=signed') })
+})
+test('failed upload remains visible and never saves a broken attachment', async () => {
+  captureAttachment.mockRejectedValue(new Error('offline'))
+  const onPatch = vi.fn()
+  render(<PlanAttachments task={{ id: 'task-1' }} onPatch={onPatch} />)
+  fireEvent.change(screen.getByLabelText('Choose attachments'), { target: { files: [new File(['test'], 'test.txt')] } })
+  expect(await screen.findByRole('alert')).toHaveTextContent('offline')
+  expect(onPatch).not.toHaveBeenCalled()
+})
+test('removing an attachment revokes its link before updating the task', async () => {
+  revokeShareToken.mockResolvedValue({ ok: true })
+  const onPatch = vi.fn()
+  render(<PlanAttachments task={{ id: 'task-1', attachments: [{ name: 'audio.m4a', url: 'https://site.test/download', token: 'signed' }] }} onPatch={onPatch} />)
+  fireEvent.click(screen.getByLabelText('Remove audio.m4a'))
+  await waitFor(() => expect(onPatch).toHaveBeenCalledWith({ attachments: [] }))
+  expect(revokeShareToken).toHaveBeenCalledWith('signed')
+})
+
+// Progress must not claim completion before the drive confirms saving. (19 October 2026, 00:49 Paris)
+test('keeps the Apple loader and progress bar through link creation and the confirmed Plan save', async () => {
+  let finishLink, finishSave
+  captureAttachment.mockImplementation(async (_file, options) => {
+    options.onStage('uploading')
+    options.onProgress(0.45)
+    return { nodePath: 'pages/PlanAttachments/audio.media.json' }
+  })
+  issueShareToken.mockImplementation(() => new Promise((resolve) => { finishLink = resolve }))
+  const onPatch = vi.fn(() => new Promise((resolve) => { finishSave = resolve }))
+  render(<PlanAttachments task={{ id: 'task-1' }} onPatch={onPatch} />)
+  fireEvent.change(screen.getByLabelText('Choose attachments'), { target: { files: [new File(['audio'], 'audio.m4a')] } })
+  await screen.findByText(/Creating download link/)
+  expect(screen.getByRole('progressbar')).toHaveAttribute('value', '95')
+  expect(screen.getByRole('img', { name: 'Attachment in progress' })).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Add attachments' })).toBeDisabled()
+  finishLink({ token: 'signed' })
+  await screen.findByText(/Saving attachment in Plan/)
+  expect(screen.getByRole('progressbar')).toHaveAttribute('value', '98')
+  finishSave({ ok: true })
+  await waitFor(() => expect(screen.getByRole('progressbar')).toHaveAttribute('value', '100'))
+  expect(screen.queryByRole('img', { name: 'Attachment in progress' })).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Add attachments' })).toBeEnabled()
+})
+test('rejects oversized files before creating any upload or link', async () => {
+  const huge = { name: 'large.bin', size: 95 * 1024 * 1024 + 1 }
+  render(<PlanAttachments task={{ id: 'task-1' }} onPatch={vi.fn()} />)
+  fireEvent.change(screen.getByLabelText('Choose attachments'), { target: { files: [huge] } })
+  expect(await screen.findByRole('alert')).toHaveTextContent('95 MiB')
+  expect(captureAttachment).not.toHaveBeenCalled()
+  expect(issueShareToken).not.toHaveBeenCalled()
+})
+test('a failed Plan save remains an error, not a completed upload', async () => {
+  captureAttachment.mockResolvedValue({ nodePath: 'pages/test.media.json' })
+  issueShareToken.mockResolvedValue({ token: 'signed' })
+  render(<PlanAttachments task={{ id: 'task-1' }} onPatch={async () => ({ ok: false, error: 'offline' })} />)
+  fireEvent.change(screen.getByLabelText('Choose attachments'), { target: { files: [new File(['a'], 'a.txt')] } })
+  expect(await screen.findByRole('alert')).toHaveTextContent('offline')
+  expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+})
+
+test('late fragment callbacks cannot revive progress after an upload failure', async () => {
+  let callbacks
+  captureAttachment.mockImplementation(async (_file, options) => { callbacks = options; throw new Error('offline') })
+  render(<PlanAttachments task={{ id: 'task-1' }} onPatch={vi.fn()} />)
+  fireEvent.change(screen.getByLabelText('Choose attachments'), { target: { files: [new File(['a'], 'a.txt')] } })
+  await screen.findByRole('alert')
+  act(() => { callbacks.onProgress(0.5); callbacks.onStage('uploading') })
+  expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Add attachments' })).toBeEnabled()
+})
+
+test('renders stacked image attachments with thumbnail preview and download links', () => {
+  const images = [
+    { name: 'screen1.png', url: 'https://site.test/screen1.png', mime: 'image/png' },
+    { name: 'screen2.gif', url: 'https://site.test/screen2.gif', mime: 'image/gif' },
+  ]
+  render(<PlanAttachments task={{ id: 'task-1', attachments: images }} onPatch={vi.fn()} />)
+  expect(screen.getByRole('list', { name: 'Attached images' })).toBeInTheDocument()
+  expect(screen.getAllByRole('listitem')).toHaveLength(2)
+  expect(screen.getByAltText('screen1.png')).toHaveAttribute('src', 'https://site.test/screen1.png')
+  expect(screen.getByAltText('screen2.gif')).toHaveAttribute('src', 'https://site.test/screen2.gif')
+  expect(screen.getByLabelText('Remove screen1.png')).toBeInTheDocument()
+  expect(screen.getByLabelText('Remove screen2.gif')).toBeInTheDocument()
+})
+
+test('pasting an image file into PlanAttachments uploads it quickly via /api/img', async () => {
+  const onPatch = vi.fn().mockResolvedValue({ ok: true })
+  const origFetch = global.fetch
+  global.fetch = vi.fn(async (url) => {
+    if (url === '/api/img') {
+      return { ok: true, json: async () => ({ url: '/api/img?path=uploads/pasted.png', path: 'uploads/pasted.png' }) }
+    }
+    return origFetch ? origFetch(url) : { ok: true, json: async () => ({}) }
+  })
+  try {
+    render(<PlanAttachments task={{ id: 'task-1' }} onPatch={onPatch} />)
+    const imageFile = new File(['binary-img'], 'screenshot.png', { type: 'image/png' })
+    fireEvent.paste(screen.getByLabelText('Task attachments'), {
+      clipboardData: { files: [imageFile] },
+    })
+    await waitFor(() => expect(onPatch).toHaveBeenCalled())
+    expect(onPatch.mock.calls[0][0].attachments[0]).toMatchObject({
+      name: 'screenshot.png',
+      path: 'uploads/pasted.png',
+      url: expect.stringContaining('/api/img?path=uploads/pasted.png'),
+    })
+  } finally {
+    global.fetch = origFetch
+  }
+})

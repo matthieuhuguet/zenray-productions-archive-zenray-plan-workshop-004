@@ -1,0 +1,86 @@
+// 21 October 2026: keep a working clone of zenray-data between archive passes instead of recreating it each time.
+// FR : garder un clone de travail de zenray-data entre deux passes au lieu de le recréer à chaque fois.
+//
+// Measured 21 October 2026: one tiny file took 52 s through archive-folder.mjs and 34.7 s of it was
+// `rm -rf` + `git clone --filter=blob:none --sparse --reference-if-able <38 GB cache> --dissociate`.
+// A slot is claimed with a directory lock (dead PID = reclaimable at once), refreshed with one incremental fetch
+// and a hard reset, then left in place for the next run. Anything unexpected falls back to a fresh clone, so the
+// warm path can only make a pass faster, never wrong.
+import { spawnSync } from 'node:child_process'
+import { mkdir, rm, stat } from 'node:fs/promises'
+import path from 'node:path'
+import { acquireDirectoryLock } from './directory-lock.mjs'
+
+const TRY_ONCE = { waitMs: 1, staleMs: 15 * 60_000, pollMs: 1, label: 'warm zenray-data slot' }
+
+const gitIn = (dir, args, { env, timeout = 120_000 } = {}) =>
+  spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8', env, timeout, killSignal: 'SIGKILL' })
+
+async function exists(target) {
+  try { await stat(target); return true } catch { return false }
+}
+
+// Same clone the engine always made: blobless, sparse, optionally borrowing objects from the local cache.
+function coldClone({ url, dir, env, referenceRepo, timeout }) {
+  const args = ['clone', '--quiet', '--filter=blob:none', '--sparse']
+  if (referenceRepo) args.push('--reference-if-able', referenceRepo, '--dissociate')
+  args.push(url, dir)
+  const result = spawnSync('git', args, { encoding: 'utf8', env, timeout, killSignal: 'SIGKILL' })
+  if (result.status !== 0) throw new Error('clone zenray-data: ' + (result.stderr || '').slice(-200))
+}
+
+// Bring an existing clone back to the exact state a fresh clone would have. Returns false when it cannot be trusted.
+function refreshInPlace({ url, dir, env, branch, timeout }) {
+  const remote = gitIn(dir, ['remote', 'get-url', 'origin'], { env })
+  if (remote.status !== 0 || remote.stdout.trim() !== url) return false
+  // A crashed run can leave a half-finished rebase or merge behind; neither is an error worth keeping.
+  gitIn(dir, ['rebase', '--abort'], { env })
+  gitIn(dir, ['merge', '--abort'], { env })
+  const fetched = gitIn(dir, ['fetch', '--quiet', 'origin', branch], { env, timeout })
+  if (fetched.status !== 0) return false
+  const reset = gitIn(dir, ['checkout', '--quiet', '--force', '-B', branch, `origin/${branch}`], { env, timeout })
+  if (reset.status !== 0) return false
+  // Manifests written by a run that died before its commit would otherwise be swept into the next commit.
+  return gitIn(dir, ['clean', '--quiet', '-fd'], { env, timeout }).status === 0
+}
+
+/**
+ * Claim a working clone of zenray-data limited to `destination/**`.
+ * Returns { dir, mode, release } where mode is 'warm', 'cold' (new slot) or 'fresh' (no slot was free).
+ */
+export async function claimDataClone({ slotsRoot, fallbackDir, url, destination, env, referenceRepo, branch = 'main',
+  maxSlots = 6, timeout = 180_000, enabled = true }) {
+  const place = async (dir, lock, wantWarm) => {
+    const sparse = () => gitIn(dir, ['sparse-checkout', 'set', '--no-cone', `${destination}/**`], { env, timeout })
+    let mode = 'cold'
+    if (wantWarm && await exists(path.join(dir, '.git')) && refreshInPlace({ url, dir, env, branch, timeout })) mode = 'warm'
+    else {
+      await rm(dir, { recursive: true, force: true })
+      await mkdir(path.dirname(dir), { recursive: true })
+      coldClone({ url, dir, env, referenceRepo, timeout })
+    }
+    let result = sparse()
+    if (result.status !== 0 && mode === 'warm') {
+      // A warm clone whose sparse checkout fails is not trustworthy: rebuild it rather than push from it.
+      await rm(dir, { recursive: true, force: true })
+      coldClone({ url, dir, env, referenceRepo, timeout })
+      mode = 'cold'
+      result = sparse()
+    }
+    if (result.status !== 0) throw new Error('sparse-checkout zenray-data: ' + (result.stderr || '').slice(-200))
+    return { dir, mode, release: lock ? () => lock.release() : async () => {} }
+  }
+
+  if (enabled) {
+    await mkdir(slotsRoot, { recursive: true })
+    for (let n = 1; n <= maxSlots; n++) {
+      const lock = await acquireDirectoryLock(path.join(slotsRoot, `slot-${n}.lock`), TRY_ONCE).catch(() => null)
+      if (!lock) continue
+      try { return await place(path.join(slotsRoot, `slot-${n}`), lock, true) }
+      catch (error) { await lock.release(); throw error }
+    }
+  }
+  // Every slot busy (or the warm path switched off): behave exactly as the engine did before 21 October 2026.
+  await rm(fallbackDir, { recursive: true, force: true })
+  return place(fallbackDir, null, false).then((claim) => ({ ...claim, mode: 'fresh' }))
+}

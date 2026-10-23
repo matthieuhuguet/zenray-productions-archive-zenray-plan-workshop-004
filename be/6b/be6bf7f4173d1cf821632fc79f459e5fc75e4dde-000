@@ -1,0 +1,179 @@
+// C74 — transport Spotify Web API centralise : auth, rate-limit et pagination.
+import { forceRefreshToken, getValidToken } from './spotifyAuth.js'
+
+const API_ORIGIN = 'https://api.spotify.com'
+const MAX_RATE_LIMIT_RETRIES = 2
+const MAX_RETRY_AFTER_MS = 5_000
+const DEFAULT_MAX_PAGES = 100
+const DEFAULT_MAX_ITEMS = 10_000
+
+export class SpotifyApiError extends Error {
+  constructor(code, message, details = {}) {
+    super(message)
+    this.name = 'SpotifyApiError'
+    this.code = code
+    Object.assign(this, details)
+  }
+}
+
+function apiPath(value) {
+  const url = new URL(String(value || ''), API_ORIGIN)
+  if (url.origin !== API_ORIGIN || !url.pathname.startsWith('/v1/')) {
+    throw new SpotifyApiError('invalid-api-url', 'URL Spotify API refusee')
+  }
+  return url.pathname + url.search
+}
+
+function retryAfterMs(response, attempt) {
+  const raw = response?.headers?.get?.('Retry-After')
+  if (raw != null && raw !== '') {
+    const seconds = Number(raw)
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000
+  }
+  return 250 * (attempt + 1)
+}
+
+function wait(ms, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason || new DOMException('Aborted', 'AbortError'))
+  if (ms <= 0) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const finish = () => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }
+    const abort = () => {
+      clearTimeout(timer)
+      reject(signal.reason || new DOMException('Aborted', 'AbortError'))
+    }
+    const timer = setTimeout(finish, ms)
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+async function callWithRateLimit(path, token, init) {
+  const headers = new Headers(init.headers || {})
+  headers.set('Authorization', 'Bearer ' + token)
+  if (init.body != null && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await fetch(API_ORIGIN + path, { ...init, headers })
+    if (response.status !== 429 || attempt >= MAX_RATE_LIMIT_RETRIES) return response
+
+    const delay = retryAfterMs(response, attempt)
+    // Ne jamais rappeler Spotify avant son Retry-After. Une attente trop longue est
+    // rendue a l'appelant plutot que de bloquer silencieusement l'UI.
+    if (delay > MAX_RETRY_AFTER_MS) return response
+    await wait(delay, init.signal)
+  }
+}
+
+export async function api(path, init = {}) {
+  const safePath = apiPath(path)
+  let token = await getValidToken()
+  if (!token) throw new SpotifyApiError('no-token', 'Connexion Spotify requise')
+
+  let response = await callWithRateLimit(safePath, token, init)
+  if (response.status !== 401) return response
+
+  // forceRefreshToken est single-flight : plusieurs 401 simultanes partagent le
+  // meme refresh. La requete initiale n'est rejouee qu'une seule fois.
+  // Une autre requete peut avoir termine son refresh pendant que celle-ci
+  // attendait son 401. Reutiliser ce token evite un second refresh sequentiel.
+  const latestToken = await getValidToken()
+  token = latestToken && latestToken !== token ? latestToken : await forceRefreshToken()
+  if (!token) return response
+  return callWithRateLimit(safePath, token, init)
+}
+
+async function jsonOrNull(response) {
+  return response?.ok ? response.json() : null
+}
+
+export async function collectSpotifyPages(firstPage, {
+  maxPages = DEFAULT_MAX_PAGES,
+  maxItems = DEFAULT_MAX_ITEMS,
+  signal,
+  onProgress,
+} = {}) {
+  if (!firstPage || !Array.isArray(firstPage.items)) {
+    throw new SpotifyApiError('invalid-page', 'Page Spotify invalide')
+  }
+  if (!Number.isInteger(maxPages) || maxPages < 1 || !Number.isInteger(maxItems) || maxItems < 1) {
+    throw new SpotifyApiError('invalid-pagination-bounds', 'Bornes de pagination invalides')
+  }
+
+  const items = [...firstPage.items]
+  if (items.length > maxItems) {
+    throw new SpotifyApiError('pagination-limit', 'Limite de titres Spotify depassee', { maxItems })
+  }
+
+  const seen = new Set()
+  let pages = 1
+  let next = firstPage.next || null
+  onProgress?.({ pages, items: items.length, total: Number(firstPage.total) || null })
+
+  while (next) {
+    if (pages >= maxPages) {
+      throw new SpotifyApiError('pagination-limit', 'Limite de pages Spotify depassee', { maxPages })
+    }
+    const path = apiPath(next)
+    if (seen.has(path)) throw new SpotifyApiError('pagination-cycle', 'Boucle de pagination Spotify detectee')
+    seen.add(path)
+
+    const response = await api(path, { signal })
+    if (!response.ok) {
+      throw new SpotifyApiError('page-fetch-failed', `Page Spotify indisponible (${response.status})`, { status: response.status })
+    }
+    const page = await response.json()
+    if (!page || !Array.isArray(page.items)) throw new SpotifyApiError('invalid-page', 'Page Spotify invalide')
+    if (items.length + page.items.length > maxItems) {
+      throw new SpotifyApiError('pagination-limit', 'Limite de titres Spotify depassee', { maxItems })
+    }
+
+    items.push(...page.items)
+    pages += 1
+    next = page.next || null
+    onProgress?.({ pages, items: items.length, total: Number(firstPage.total) || null })
+  }
+
+  return { ...firstPage, items, next: null }
+}
+
+async function pagedResource(path, field, options) {
+  try {
+    const resource = await api(path, { signal: options?.signal }).then(jsonOrNull)
+    if (!resource?.[field]) return resource
+    return { ...resource, [field]: await collectSpotifyPages(resource[field], options) }
+  } catch {
+    // Les appels publics historiques retournent null pour laisser l'UI afficher
+    // son etat d'erreur sans exposer token, URL ou reponse Spotify.
+    return null
+  }
+}
+
+export const me = () => api('/v1/me').then(jsonOrNull).catch(() => null)
+export const myPlaylists = () => api('/v1/me/playlists?limit=50').then(jsonOrNull).catch(() => null)
+// Bug réel corrigé le 2026-07-19 : myTracks() ne récupérait JAMAIS que la première page (limit=50) de
+// l'endpoint /v1/me/tracks -- `next` (le curseur de pagination Spotify) n'était même pas lu. Un compte
+// avec 514 titres likés (cas réel de Matthieu) n'en voyait donc que les 50 premiers, silencieusement.
+// Réutilise collectSpotifyPages (déjà éprouvé sur les albums/playlists, DEFAULT_MAX_ITEMS = 10 000) avec
+// un plafond de 4096 : mémoire-sûr (un titre liké = un petit objet JSON, quelques centaines d'octets --
+// 4096 titres restent de l'ordre du mégaoctet, sans commune mesure avec une vraie limite navigateur).
+export const myTracks = async (options) => {
+  try {
+    const firstPage = await api('/v1/me/tracks?limit=50', { signal: options?.signal }).then(jsonOrNull)
+    if (!firstPage || !Array.isArray(firstPage.items)) return firstPage
+    return await collectSpotifyPages(firstPage, { maxItems: 4096, ...options })
+  } catch { return null }
+}
+export const search = (q) => api('/v1/search?type=track&limit=24&q=' + encodeURIComponent(q)).then(jsonOrNull).catch(() => null)
+export const spotifyAlbum = (id, options) => pagedResource('/v1/albums/' + encodeURIComponent(id), 'tracks', options)
+export const spotifyPlaylist = (id, options) => pagedResource('/v1/playlists/' + encodeURIComponent(id) + '?market=from_token', 'tracks', options)
+export const spotifyTrack = (id) => api('/v1/tracks/' + encodeURIComponent(id)).then(jsonOrNull).catch(() => null)
+// Page artiste (2026-07-19, feature "cliquer sur l'artiste" du lecteur) : 3 appels distincts, comme
+// l'onglet officiel Spotify -- fiche (nom, photo, auditeurs), titres populaires, albums. Pas de pagination
+// exhaustive sur les albums (limit=20) : la page officielle elle-même n'affiche qu'une grille scrollable,
+// pas un catalogue complet -- 20 couvre largement un artiste normal sans sur-ingénierie.
+export const spotifyArtist = (id) => api('/v1/artists/' + encodeURIComponent(id)).then(jsonOrNull).catch(() => null)
+export const spotifyArtistTopTracks = (id) => api('/v1/artists/' + encodeURIComponent(id) + '/top-tracks?market=from_token').then(jsonOrNull).catch(() => null)
+export const spotifyArtistAlbums = (id) => api('/v1/artists/' + encodeURIComponent(id) + '/albums?include_groups=album,single&market=from_token&limit=20').then(jsonOrNull).catch(() => null)

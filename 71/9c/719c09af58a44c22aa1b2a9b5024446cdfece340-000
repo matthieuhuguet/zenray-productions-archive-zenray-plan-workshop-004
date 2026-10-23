@@ -1,0 +1,108 @@
+# 3 October 2026, 08:55 CEST: real HOM fixtures prove reconnection with missing origins and unchanged scene bytes.
+import copy
+import hashlib
+import shutil
+import sys
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+import hou
+sys.dont_write_bytecode = True
+from PrepareHoudiniScene import prepare_scene
+
+
+def digest(file):
+    return hashlib.sha256(file.read_bytes()).hexdigest()
+
+
+class ScenePreparationTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='assets-prepare-')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        origin, loaded = self.root / 'origin', self.root / 'loaded'
+        origin.mkdir(); loaded.mkdir()
+        hou.hipFile.clear(suppress_save_prompt=True)
+        hou.setUpdateMode(hou.updateMode.Manual)
+        input_node = hou.node('/obj').createNode('geo', 'Input', run_init_scripts=False)
+        for name, mode in [('resource', 'read'), ('output', 'write'), ('dynamic', 'read'), ('dynamic_time', 'read'), ('dynamic_braces', 'read'), ('linked', 'read')]:
+            input_node.addSpareParmTuple(hou.StringParmTemplate(name, name, 1, string_type=hou.stringParmType.FileReference, tags={'filechooser_mode': mode}))
+        texture = origin / 'Texture.dat'; texture.write_bytes(b'verified input bytes')
+        input_node.parm('resource').set(str(texture))
+        input_node.parm('output').set(str(texture))
+        input_node.parm('dynamic').set(str(origin / 'sequence.$F4.dat'))
+        input_node.parm('dynamic_time').set(str(origin / 'sequence.$T.dat'))
+        input_node.parm('dynamic_braces').set(str(origin / 'sequence.${SF}.dat'))
+        input_node.parm('linked').set(input_node.parm('resource'))
+        library = origin / 'Fixture.hdalc'
+        instance = hou.node('/obj').createNode('subnet', 'LibraryInstance')
+        instance.createDigitalAsset(name=f'zenray_assets_fixture::{uuid.uuid4().hex}::1.0', hda_file_name=str(library))
+        scene = self.root / 'Origin.hiplc'; hou.hipFile.save(str(scene))
+        restored_scene = loaded / 'Scene.hiplc'; shutil.copy2(scene, restored_scene)
+        restored_texture = loaded / texture.name; shutil.copy2(texture, restored_texture)
+        restored_library = loaded / library.name; shutil.copy2(library, restored_library)
+        self.source_scene, self.loaded_scene, self.texture = scene, restored_scene, restored_texture
+        self.scene_hash = digest(scene)
+        self.plan = {'schemaVersion': 1, 'scenePath': str(restored_scene), 'sceneRoot': str(loaded), 'sceneSha256': self.scene_hash, 'resources': [
+            {'kind': 'input', 'parameterPath': '/obj/Input/resource', 'originalPath': str(texture), 'targetPath': str(restored_texture), 'targetRoot': str(loaded), 'sha256': digest(restored_texture)},
+            {'kind': 'hda', 'targetPath': str(restored_library), 'targetRoot': str(loaded), 'sha256': digest(restored_library)},
+        ]}
+        hou.hda.uninstallFile(str(library), change_oplibraries_file=False)
+        origin.rename(self.root / 'hidden-origin')
+
+    def assert_unchanged(self):
+        self.assertEqual(digest(self.source_scene), self.scene_hash)
+        self.assertEqual(digest(self.loaded_scene), self.scene_hash)
+
+    def test_missing_origins_fail_before_preparation_then_verified_copies_resolve_in_memory(self):
+        try:
+            hou.hipFile.load(str(self.loaded_scene), suppress_save_prompt=True)
+        except hou.LoadWarning:
+            pass
+        self.assertFalse(Path(hou.parm('/obj/Input/resource').evalAsString()).exists())
+        definition = hou.node('/obj/LibraryInstance').type().definition()
+        self.assertTrue(definition is None or Path(definition.libraryFilePath()).resolve() != Path(self.plan['resources'][1]['targetPath']))
+        report = prepare_scene(self.plan)
+        self.assertEqual(hou.parm('/obj/Input/resource').evalAsString(), str(self.texture))
+        self.assertEqual(report['resourceBytesVerified'], 2)
+        self.assertEqual(report['reboundInputs'][0]['state'], 'rebound')
+        self.assertIn('/obj/LibraryInstance', report['loadedLibraries'][0]['instancePaths'])
+        self.assertEqual(Path(hou.node('/obj/LibraryInstance').type().definition().libraryFilePath()).resolve(), Path(self.plan['resources'][1]['targetPath']))
+        self.assertFalse(report['savedScene']); self.assertFalse(report['portabilityVerified'])
+        self.assert_unchanged()
+
+    def test_refuses_changed_bytes_stale_scene_and_redirected_target(self):
+        changed = copy.deepcopy(self.plan); changed['sceneSha256'] = '0' * 64
+        with self.assertRaisesRegex(ValueError, 'fingerprint'):
+            prepare_scene(changed)
+        self.texture.write_bytes(b'changed input')
+        with self.assertRaisesRegex(ValueError, 'fingerprint'):
+            prepare_scene(self.plan)
+        self.texture.write_bytes(b'verified input bytes')
+        changed = copy.deepcopy(self.plan)
+        changed['resources'][0]['targetRoot'] = str(self.root / 'hidden-origin')
+        with self.assertRaisesRegex(ValueError, 'outside'):
+            prepare_scene(changed)
+        alias = self.texture.parent / 'Alias.dat'; alias.symlink_to(self.texture)
+        changed['resources'][0]['targetRoot'] = str(self.texture.parent)
+        changed['resources'][0]['targetPath'] = str(alias)
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            prepare_scene(changed)
+        self.assert_unchanged()
+
+    def test_refuses_outputs_dynamic_channel_links_and_wrong_observed_origin(self):
+        for parameter, reason in [('output', 'readable'), ('dynamic', 'dynamic'), ('dynamic_time', 'dynamic'), ('dynamic_braces', 'dynamic'), ('linked', 'channel-linked')]:
+            with self.subTest(parameter=parameter):
+                changed = copy.deepcopy(self.plan); changed['resources'][0]['parameterPath'] = f'/obj/Input/{parameter}'
+                with self.assertRaisesRegex(ValueError, reason):
+                    prepare_scene(changed)
+                self.assert_unchanged()
+        changed = copy.deepcopy(self.plan); changed['resources'][0]['originalPath'] = str(self.root / 'unrelated.dat')
+        with self.assertRaisesRegex(ValueError, 'observed|Observed'):
+            prepare_scene(changed)
+        self.assert_unchanged()
+
+
+if __name__ == '__main__':
+    unittest.main()

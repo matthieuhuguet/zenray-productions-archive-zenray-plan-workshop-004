@@ -1,0 +1,45 @@
+// /api/shelf-poster?u=<jsDelivr URL of a Shelf poster> (15 October 2026): serves a poster's ORIGINAL bytes from our own edge.
+//
+// Measured on 15 October 2026 (games shelf, 12 posters, 86 KB to 2.1 MB): a cold jsDelivr commit answers in 14 to 88 s
+// (or 503); GitHub raw answers the same bytes in 0.4 to 2 s; a warm cache answers in under 0.1 s. The browser should
+// never wait for jsDelivr's cold start, and it must not hit GitHub raw itself for hundreds of posters either.
+// Here the Worker reads raw ONCE per poster (a public repo, no token, not the 5000/h REST quota), keeps the bytes in the
+// Cloudflare edge cache for a year (the URL is pinned to a commit, so it never changes), and the browser caches it too.
+// FR : le Worker lit raw UNE fois par poster, garde les octets un an a l'edge ; aucune baisse de qualite, memes octets.
+//
+// Not an open proxy: only https://cdn.jsdelivr.net/gh/<owner>/<shelf image repo>@<commit>/<flat file>.<image ext>.
+import { parseShelfPosterUrl as parsePure, SHELF_OWNER, SHELF_REPOS } from './shelf-poster-url.js'
+const OWNER = process.env.CONTENT_OWNER || SHELF_OWNER
+const REPOS = [...new Set([process.env.SHELF_IMG_REPO, ...SHELF_REPOS].filter(Boolean))]
+const MAX_BYTES = 12 * 1024 * 1024
+const ONE_YEAR = 31536000
+export const parseShelfPosterUrl = (input) => parsePure(input, OWNER, REPOS)
+
+export default async function handler(req, res) {
+  const method = String(req.method || 'GET').toUpperCase()
+  if (method !== 'GET' && method !== 'HEAD') { res.setHeader('Allow', 'GET, HEAD'); return res.status(405).end('') }
+  const target = parseShelfPosterUrl(req.query && req.query.u)
+  if (!target) return res.status(400).end('')
+
+  const cache = typeof caches !== 'undefined' ? caches.default : null
+  const cacheKey = new Request(`https://shelf-poster.cache.local/${encodeURIComponent(target.raw)}`)
+  const send = (bytes, source) => {
+    res.setHeader('Content-Type', target.mime)
+    res.setHeader('Cache-Control', `public, max-age=${ONE_YEAR}, immutable`)
+    res.setHeader('X-Poster-Source', source)
+    return res.status(200).end(bytes)
+  }
+  try {
+    const hit = cache && await cache.match(cacheKey)
+    if (hit) return send(Buffer.from(await hit.arrayBuffer()), 'edge-cache')
+  } catch { /* the cache is an optimisation */ }
+
+  let upstream
+  try { upstream = await fetch(target.raw, { headers: { 'User-Agent': 'zenray-progress' }, cf: { cacheEverything: true, cacheTtl: ONE_YEAR } }) } catch { return res.status(502).end('') }
+  if (upstream.status === 404) return res.status(404).end('') // absent for good: the page then falls back to the CDN url
+  if (!upstream.ok) return res.status(502).end('') // transient: never cached
+  const bytes = Buffer.from(await upstream.arrayBuffer())
+  if (!bytes.length || bytes.length > MAX_BYTES) return res.status(502).end('')
+  try { if (cache) await cache.put(cacheKey, new Response(bytes, { headers: { 'Content-Type': target.mime, 'Cache-Control': `public, max-age=${ONE_YEAR}` } })) } catch { /* idem */ }
+  return send(bytes, 'origin')
+}

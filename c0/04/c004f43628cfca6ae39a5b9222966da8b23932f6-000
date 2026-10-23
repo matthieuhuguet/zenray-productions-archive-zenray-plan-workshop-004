@@ -1,0 +1,1752 @@
+// 18 October 2026 : ZenRay Money v2 · Design A (Hub Hextech 1 250 €/sem + Dock Plan & Google Calendar) + Design C (Grand-Livre Comptable VICTORY Excel/CSV + Facture PDF)
+// 18 October 2026 : Zéro SFX, départ strict à 0,00 €, Beaufort for LoL + AnthropicSerif Medium 500 + InterVariable Medium 500 (zéro Light)
+
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+import { urlLectureAffichage } from '../lib/urlLecture.js'
+import { readCachedPlan, readPlanState, writeCachedPlan } from '../create/planCache.js'
+import { resolvePlanPath } from '../sport/sportPlan.js'
+import './money.css'
+
+const MONEY_STORAGE_KEY = 'zr:money:state:v1'
+const MONEY_CLOUD_PATH = 'pages/Money/money-state.json'
+
+const todayIso = () => new Date().toISOString().slice(0, 10)
+
+const INITIAL_MONEY_STATE = {
+  version: 2,
+  updatedAt: null,
+  settings: {
+    weeklyTargetEur: 1250,
+    monthlyTargetEur: 5000,
+    capJaponMinEur: 10000,
+    capJaponMaxEur: 20000,
+    urssafRatePct: 21.2,
+    companyName: 'MATTHIEU HUGUET · ZENRAY STUDIO',
+    companySubtitle: 'Tech Art Houdini & Unreal Engine · Aix-en-Provence / Marseille',
+    companySiret: 'Micro-entreprise BNC · Franchise en base de TVA (art. 293 B du CGI)',
+    companyEmail: 'contact@matthieuhuguet.com',
+    companyIban: 'FR76 •••• •••• ••••',
+  },
+  // 4 slots de contrats hebdomadaires : départ à 0,00 €
+  weeklySlots: [
+    { slot: 1, title: '', client: '', category: 'Freelance Tech Art', amountHt: 0, status: 'empty', date: '' },
+    { slot: 2, title: '', client: '', category: 'Freelance Tech Art', amountHt: 0, status: 'empty', date: '' },
+    { slot: 3, title: '', client: '', category: 'HDA / Copernicus', amountHt: 0, status: 'empty', date: '' },
+    { slot: 4, title: '', client: '', category: 'Unreal / Shards', amountHt: 0, status: 'empty', date: '' },
+  ],
+  // Boutique ZenRay.Studio : départ à 0,00 € (0 ventes)
+  storeItems: [
+    { id: 'store-hda', type: 'HDA HOUDINI', name: 'Pack HDA Procédural', unitPrice: 49, salesCount: 0, revenueHt: 0 },
+    { id: 'store-cop', type: 'COPERNICUS PBR', name: 'Matériaux Copernicus 4K', unitPrice: 29, salesCount: 0, revenueHt: 0 },
+    { id: 'store-ue5', type: 'UNREAL ENGINE', name: 'Shaders & Rigs UE5', unitPrice: 59, salesCount: 0, revenueHt: 0 },
+    { id: 'store-pack', type: 'BUNDLE COMPLET', name: 'All-Access Studio Pack', unitPrice: 149, salesCount: 0, revenueHt: 0 },
+  ],
+  // Grand-Livre Comptable (Design C) : départ à 0 ligne (0,00 €)
+  ledger: [],
+}
+
+function normalizeState(raw) {
+  if (!raw || typeof raw !== 'object') return INITIAL_MONEY_STATE
+  return {
+    ...INITIAL_MONEY_STATE,
+    ...raw,
+    settings: { ...INITIAL_MONEY_STATE.settings, ...(raw.settings || {}) },
+    weeklySlots: Array.isArray(raw.weeklySlots) && raw.weeklySlots.length === 4
+      ? raw.weeklySlots
+      : INITIAL_MONEY_STATE.weeklySlots,
+    storeItems: Array.isArray(raw.storeItems) && raw.storeItems.length > 0
+      ? raw.storeItems
+      : INITIAL_MONEY_STATE.storeItems,
+    ledger: Array.isArray(raw.ledger) ? raw.ledger : [],
+  }
+}
+
+function loadLocalMoneyState() {
+  try {
+    const raw = localStorage.getItem(MONEY_STORAGE_KEY)
+    if (!raw) return INITIAL_MONEY_STATE
+    return normalizeState(JSON.parse(raw))
+  } catch {
+    return INITIAL_MONEY_STATE
+  }
+}
+
+function formatEur(val) {
+  const num = Number(val) || 0
+  return new Intl.NumberFormat('fr-FR', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(num) + ' €'
+}
+
+function isDateInCurrentIsoWeek(dateStr) {
+  if (!dateStr) return false
+  const d = new Date(dateStr + 'T12:00:00')
+  if (Number.isNaN(d.getTime())) return false
+  const now = new Date()
+  const day = (now.getDay() + 6) % 7 // Lundi = 0
+  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day)
+  monday.setHours(0, 0, 0, 0)
+  const sunday = new Date(monday)
+  sunday.setDate(monday.getDate() + 7)
+  return d >= monday && d < sunday
+}
+
+function isDateInCurrentMonth(dateStr) {
+  if (!dateStr) return false
+  const ym = new Date().toISOString().slice(0, 7)
+  return String(dateStr).startsWith(ym)
+}
+
+export default function MoneyView({ onNavigateView }) {
+  const [state, setState] = useState(() => loadLocalMoneyState())
+  const [activeTab, setActiveTab] = useState('all') // 'all' | 'contracts' | 'store' | 'ledger' | 'invoices' | 'settings'
+  const [syncStatus, setSyncStatus] = useState('Prêt · Local + Cloud')
+  const [planTasks, setPlanTasks] = useState([])
+  const [planPath, setPlanPath] = useState(() => resolvePlanPath())
+  const [newPlanTaskTitle, setNewPlanTaskTitle] = useState('')
+  const [newPlanTaskTime, setNewPlanTaskTime] = useState('09:00')
+
+  // Formulaire Facture PDF (Design C)
+  const nextInvoiceNumber = useMemo(() => {
+    const year = new Date().getFullYear()
+    const count = state.ledger.length + 1
+    return `F-${year}-${String(count).padStart(3, '0')}`
+  }, [state.ledger.length])
+
+  const [invoiceForm, setInvoiceForm] = useState({
+    ref: '',
+    date: todayIso(),
+    client: '',
+    clientAddress: '',
+    description: '',
+    category: 'Freelance Tech Art',
+    daysOrQty: '1',
+    unitPriceHt: '0',
+    status: 'PAYÉ',
+  })
+
+  // Modales d'édition rapide (Slot de contrat / Produit boutique / Ligne comptable)
+  const [editingSlot, setEditingSlot] = useState(null)
+  const [editingStoreItem, setEditingStoreItem] = useState(null)
+  const [addingLedgerModal, setAddingLedgerModal] = useState(false)
+  const [ledgerDraft, setLedgerDraft] = useState({
+    date: todayIso(),
+    ref: '',
+    client: '',
+    description: '',
+    category: 'Freelance Tech Art',
+    amountHt: '',
+    status: 'PAYÉ',
+  })
+
+  const csvInputRef = useRef(null)
+
+  // Chargement initial depuis le Cloud (pages/Money/money-state.json)
+  useEffect(() => {
+    let cancelled = false
+    fetch(urlLectureAffichage(MONEY_CLOUD_PATH), { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cloudData) => {
+        if (cancelled || !cloudData || typeof cloudData !== 'object') return
+        setState((prev) => {
+          const prevTime = prev.updatedAt ? Date.parse(prev.updatedAt) : 0
+          const cloudTime = cloudData.updatedAt ? Date.parse(cloudData.updatedAt) : 0
+          if (cloudTime > prevTime) {
+            const normalized = normalizeState(cloudData)
+            try { localStorage.setItem(MONEY_STORAGE_KEY, JSON.stringify(normalized)) } catch {}
+            return normalized
+          }
+          return prev
+        })
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+
+  // Chargement du vrai ZenRay Plan (synchronisé Google Calendar)
+  useEffect(() => {
+    let cancelled = false
+    const path = resolvePlanPath()
+    setPlanPath(path)
+    const cached = readCachedPlan(path)
+    if (cached?.tasks) setPlanTasks(cached.tasks)
+
+    readPlanState(path).then(({ status, board }) => {
+      if (cancelled) return
+      if (status === 'ok' && board?.tasks) {
+        writeCachedPlan(path, board)
+        setPlanTasks(board.tasks)
+      }
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+
+  // Persistance unifiée (Local + Cloud)
+  const commitState = (updater, label = 'Sauvegardé') => {
+    setState((prev) => {
+      const nextRaw = typeof updater === 'function' ? updater(prev) : updater
+      const next = {
+        ...normalizeState(nextRaw),
+        updatedAt: new Date().toISOString(),
+      }
+      try {
+        localStorage.setItem(MONEY_STORAGE_KEY, JSON.stringify(next))
+      } catch {}
+      setSyncStatus(`${label} · Sync Cloud...`)
+      saveJsonWithRetry(MONEY_CLOUD_PATH, () => next, `money: ${label}`)
+        .then(() => setSyncStatus(`${label} · Cloud OK`))
+        .catch(() => setSyncStatus(`${label} · Local OK`))
+      return next
+    })
+  }
+
+  // Calculs financiers en temps réel (départ à 0,00 €)
+  const metrics = useMemo(() => {
+    const urssafRate = (Number(state.settings.urssafRatePct) || 21.2) / 100
+    const weeklyTarget = Number(state.settings.weeklyTargetEur) || 1250
+    const monthlyTarget = Number(state.settings.monthlyTargetEur) || 5000
+    const capMin = Number(state.settings.capJaponMinEur) || 10000
+    const capMax = Number(state.settings.capJaponMaxEur) || 20000
+
+    // Somme des slots de contrats actifs de la semaine
+    const slotsSumHt = state.weeklySlots.reduce(
+      (acc, s) => (s.status !== 'empty' ? acc + (Number(s.amountHt) || 0) : acc),
+      0
+    )
+    const signedSlotsCount = state.weeklySlots.filter((s) => s.status !== 'empty' && (Number(s.amountHt) || 0) > 0).length
+
+    // Somme de la boutique ZenRay.Studio
+    const storeSumHt = state.storeItems.reduce((acc, it) => acc + (Number(it.revenueHt) || 0), 0)
+
+    // Somme du Grand-Livre Comptable
+    const ledgerPaidHt = state.ledger
+      .filter((r) => r.status === 'PAYÉ')
+      .reduce((acc, r) => acc + (Number(r.amountHt) || 0), 0)
+    const ledgerPendingHt = state.ledger
+      .filter((r) => r.status !== 'PAYÉ')
+      .reduce((acc, r) => acc + (Number(r.amountHt) || 0), 0)
+
+    const ledgerWeekHt = state.ledger
+      .filter((r) => isDateInCurrentIsoWeek(r.date))
+      .reduce((acc, r) => acc + (Number(r.amountHt) || 0), 0)
+
+    const ledgerMonthHt = state.ledger
+      .filter((r) => isDateInCurrentMonth(r.date))
+      .reduce((acc, r) => acc + (Number(r.amountHt) || 0), 0)
+
+    // Total de la semaine = max entre les slots hebdo en cours et les entrées du Grand-Livre de la semaine + boutique
+    const weeklyTotalHt = Math.max(slotsSumHt + storeSumHt, ledgerWeekHt)
+    const weeklyPct = weeklyTarget > 0 ? Math.min(100, Math.round((weeklyTotalHt / weeklyTarget) * 100)) : 0
+
+    // Total cumulé (Grand-Livre encaissé, ou slots + boutique si le Grand-Livre est encore vide)
+    const totalGrossHt = state.ledger.length > 0 ? ledgerPaidHt : slotsSumHt + storeSumHt
+    const totalUrssaf = totalGrossHt * urssafRate
+    const totalNetPocket = totalGrossHt - totalUrssaf
+
+    const monthlyGrossHt = state.ledger.length > 0 ? ledgerMonthHt : weeklyTotalHt
+    const monthlyNet = monthlyGrossHt * (1 - urssafRate)
+
+    return {
+      urssafRate,
+      weeklyTarget,
+      monthlyTarget,
+      capMin,
+      capMax,
+      slotsSumHt,
+      signedSlotsCount,
+      storeSumHt,
+      weeklyTotalHt,
+      weeklyPct,
+      ledgerPaidHt,
+      ledgerPendingHt,
+      totalGrossHt,
+      totalUrssaf,
+      totalNetPocket,
+      monthlyGrossHt,
+      monthlyNet,
+    }
+  }, [state])
+
+  // Anneau SVG Hextech (rayon = 92, circonférence = 578)
+  const ringCircumference = 2 * Math.PI * 92
+  const ringDashOffset = ringCircumference * (1 - Math.min(1, metrics.weeklyPct / 100))
+
+  // Montant calculé du formulaire de facture PDF
+  const invoiceCalculatedHt = useMemo(() => {
+    const q = Math.max(0, Number(invoiceForm.daysOrQty) || 0)
+    const u = Math.max(0, Number(invoiceForm.unitPriceHt) || 0)
+    return q * u
+  }, [invoiceForm.daysOrQty, invoiceForm.unitPriceHt])
+
+  const invoiceUrssaf = invoiceCalculatedHt * metrics.urssafRate
+  const invoiceNet = invoiceCalculatedHt - invoiceUrssaf
+
+  // Enregistrer une facture dans le Grand-Livre Comptable
+  const handleRecordInvoiceToLedger = () => {
+    const amountHt = invoiceCalculatedHt
+    const ref = (invoiceForm.ref || nextInvoiceNumber).trim()
+    const client = (invoiceForm.client || 'Client / Studio').trim()
+    const description = (invoiceForm.description || 'Prestation Tech Art / Houdini / Unreal').trim()
+    const newEntry = {
+      id: `inv-${Date.now()}`,
+      date: invoiceForm.date || todayIso(),
+      ref,
+      client,
+      description,
+      category: invoiceForm.category || 'Freelance Tech Art',
+      amountHt,
+      status: invoiceForm.status || 'PAYÉ',
+    }
+    commitState(
+      (prev) => ({
+        ...prev,
+        ledger: [newEntry, ...prev.ledger],
+      }),
+      `Facture ${ref} enregistrée`
+    )
+    setInvoiceForm((prev) => ({
+      ...prev,
+      ref: '',
+      client: '',
+      description: '',
+      unitPriceHt: '0',
+    }))
+  }
+
+  // Générer et ouvrir une vraie Facture PDF imprimable (sans toucher au navigateur externe, via fenêtre d'impression propre)
+  const handlePrintInvoicePdf = (entryOverride = null) => {
+    const ref = entryOverride?.ref || invoiceForm.ref || nextInvoiceNumber
+    const date = entryOverride?.date || invoiceForm.date || todayIso()
+    const client = entryOverride?.client || invoiceForm.client || 'Client à renseigner'
+    const clientAddress = entryOverride?.clientAddress || invoiceForm.clientAddress || ''
+    const description = entryOverride?.description || invoiceForm.description || 'Prestation Tech Art Houdini / Unreal Engine'
+    const category = entryOverride?.category || invoiceForm.category || 'Freelance Tech Art'
+    const qty = entryOverride ? 1 : Number(invoiceForm.daysOrQty) || 1
+    const unitHt = entryOverride ? Number(entryOverride.amountHt) || 0 : Number(invoiceForm.unitPriceHt) || 0
+    const totalHt = entryOverride ? Number(entryOverride.amountHt) || 0 : invoiceCalculatedHt
+    const urssafVal = totalHt * metrics.urssafRate
+    const netVal = totalHt - urssafVal
+
+    const html = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Facture ${ref} · ${state.settings.companyName}</title>
+<style>
+  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; font-weight: 500; color: #141413; background: #FAF7F0; margin: 0; padding: 48px; }
+  .sheet { max-width: 760px; margin: 0 auto; background: #FFFFFF; border: 1px solid #D8D2C5; padding: 44px; }
+  .top { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2px solid #141413; padding-bottom: 20px; margin-bottom: 28px; }
+  h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: 0.04em; text-transform: uppercase; }
+  .muted { color: #5C5952; font-size: 13px; line-height: 1.5; }
+  .badge { font-family: monospace; font-size: 14px; background: #141413; color: #FAF7F0; padding: 6px 12px; display: inline-block; margin-bottom: 6px; }
+  .parties { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px; }
+  .box { border: 1px solid #E4DEC8; padding: 14px 16px; background: #FCFBF7; }
+  .box-lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: #7C786F; margin-bottom: 6px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 28px; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1.5px solid #141413; padding: 10px 8px; color: #5C5952; }
+  td { padding: 14px 8px; border-bottom: 1px solid #E6E1D6; font-size: 14px; }
+  .totals { margin-left: auto; width: 320px; border: 1px solid #141413; padding: 16px; background: #FAF7F0; }
+  .row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 13px; }
+  .row.grand { border-top: 1px solid #141413; padding-top: 10px; margin-top: 8px; font-size: 16px; font-weight: 700; }
+  .legal { margin-top: 36px; font-size: 11.5px; color: #5C5952; border-top: 1px solid #E6E1D6; padding-top: 14px; line-height: 1.5; }
+  @media print { body { background: #FFF; padding: 0; } .sheet { border: none; padding: 24px; } .no-print { display: none; } }
+</style>
+</head>
+<body>
+  <div class="sheet">
+    <div class="no-print" style="margin-bottom:18px; display:flex; justify-content:flex-end; gap:10px;">
+      <button onclick="window.print()" style="padding:8px 16px; background:#141413; color:#FAF7F0; border:none; cursor:pointer; font-weight:600;">Imprimer / Enregistrer en PDF</button>
+    </div>
+    <div class="top">
+      <div>
+        <h1>${state.settings.companyName}</h1>
+        <div class="muted">${state.settings.companySubtitle}</div>
+        <div class="muted">${state.settings.companyEmail}</div>
+      </div>
+      <div style="text-align:right;">
+        <div class="badge">FACTURE ${ref}</div>
+        <div class="muted">Date d'émission : ${date}</div>
+      </div>
+    </div>
+    <div class="parties">
+      <div class="box">
+        <div class="box-lbl">Émetteur</div>
+        <div><strong>${state.settings.companyName}</strong></div>
+        <div class="muted">${state.settings.companySiret}</div>
+        <div class="muted">IBAN : ${state.settings.companyIban}</div>
+      </div>
+      <div class="box">
+        <div class="box-lbl">Client destinataire</div>
+        <div><strong>${client}</strong></div>
+        <div class="muted">${clientAddress || 'Adresse / Référence client'}</div>
+      </div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Désignation</th>
+          <th>Catégorie</th>
+          <th>Qté / Jours</th>
+          <th>Prix Unitaire HT</th>
+          <th style="text-align:right;">Total HT</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>${description}</strong></td>
+          <td>${category}</td>
+          <td>${qty}</td>
+          <td>${formatEur(unitHt)}</td>
+          <td style="text-align:right;"><strong>${formatEur(totalHt)}</strong></td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="totals">
+      <div class="row"><span>Total HT</span><span>${formatEur(totalHt)}</span></div>
+      <div class="row"><span>TVA (Art. 293 B du CGI)</span><span>0,00 €</span></div>
+      <div class="row grand"><span>Net à payer (TTC)</span><span>${formatEur(totalHt)}</span></div>
+      <div class="row" style="margin-top:10px; color:#5C5952; font-size:11.5px;">
+        <span>Provision interne URSSAF (${state.settings.urssafRatePct}%)</span>
+        <span>-${formatEur(urssafVal)} (Net : ${formatEur(netVal)})</span>
+      </div>
+    </div>
+    <div class="legal">
+      ${state.settings.companySiret}. En cas de retard de paiement, indemnité forfaitaire pour frais de recouvrement de 40 € (art. L.441-10 du Code de commerce).
+    </div>
+  </div>
+</body>
+</html>`
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `Facture-${ref}.html`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+    setSyncStatus(`Facture ${ref} téléchargée`)
+  }
+
+  // Export Excel (.CSV compatible Numbers / Excel / Google Sheets)
+  const handleExportCsv = () => {
+    const urssafRate = metrics.urssafRate
+    const headers = ['Date', 'Reference_Facture', 'Client_Source', 'Designation', 'Categorie', 'Montant_HT_EUR', 'URSSAF_EUR', 'Net_Poche_EUR', 'Statut']
+    const rows = state.ledger.map((r) => {
+      const ht = Number(r.amountHt) || 0
+      const urssaf = (ht * urssafRate).toFixed(2)
+      const net = (ht - ht * urssafRate).toFixed(2)
+      const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
+      return [
+        esc(r.date),
+        esc(r.ref),
+        esc(r.client),
+        esc(r.description || ''),
+        esc(r.category),
+        ht.toFixed(2),
+        urssaf,
+        net,
+        esc(r.status),
+      ].join(';')
+    })
+    const csvContent = '\uFEFF' + [headers.join(';'), ...rows].join('\r\n')
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `ZenRayMoney-GrandLivre-${todayIso()}.csv`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 3000)
+    setSyncStatus('Export Excel .CSV terminé')
+  }
+
+  // Import Excel (.CSV)
+  const handleImportCsvFile = (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      const text = String(reader.result || '').replace(/^\uFEFF/, '')
+      const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0)
+      if (lines.length <= 1) return
+      const imported = []
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(/[;,]/).map((c) => c.replace(/^"|"$/g, '').trim())
+        if (cols.length < 6) continue
+        const [date, ref, client, description, category, amountStr, , , statusStr] = cols
+        const amountHt = parseFloat(String(amountStr).replace(',', '.')) || 0
+        imported.push({
+          id: `csv-${Date.now()}-${i}`,
+          date: date || todayIso(),
+          ref: ref || `CSV-${i}`,
+          client: client || 'Import CSV',
+          description: description || '',
+          category: category || 'Freelance Tech Art',
+          amountHt,
+          status: statusStr && statusStr.toUpperCase().includes('ATTENTE') ? 'EN ATTENTE' : 'PAYÉ',
+        })
+      }
+      if (imported.length > 0) {
+        commitState(
+          (prev) => ({
+            ...prev,
+            ledger: [...imported, ...prev.ledger],
+          }),
+          `${imported.length} ligne(s) CSV importée(s)`
+        )
+      }
+    }
+    reader.readAsText(file, 'utf-8')
+    e.target.value = ''
+  }
+
+  // Ajouter une tâche directement dans ZenRay Plan (synchronisé Google Calendar)
+  const handleAddPlanTask = async (e) => {
+    e.preventDefault()
+    const title = newPlanTaskTitle.trim()
+    if (!title) return
+    const date = todayIso()
+    const newTask = {
+      id: `money-task-${Date.now()}`,
+      title,
+      date,
+      startTime: newPlanTaskTime || '09:00',
+      durationMin: 60,
+      status: 'todo',
+      note: 'Créé depuis ZenRay Money',
+      images: [],
+      createdAt: new Date().toISOString(),
+    }
+    setPlanTasks((prev) => [...prev, newTask])
+    setNewPlanTaskTitle('')
+    try {
+      await saveJsonWithRetry(
+        planPath,
+        (current) => {
+          const base = current && Array.isArray(current.tasks) ? current : { type: 'plan', tasks: [] }
+          const nextBoard = { ...base, tasks: [...base.tasks, newTask] }
+          writeCachedPlan(planPath, nextBoard)
+          return nextBoard
+        },
+        `plan: add ${title} from Money`
+      )
+      setSyncStatus('Tâche ajoutée à ZenRay Plan & GCal')
+    } catch {
+      setSyncStatus('Tâche gardée en cache local Plan')
+    }
+  }
+
+  // Tâches du jour et à venir depuis ZenRay Plan
+  const todayStr = todayIso()
+  const todaysPlanTasks = useMemo(
+    () =>
+      planTasks
+        .filter((t) => t && t.date === todayStr)
+        .sort((a, b) => String(a.startTime || '99:99').localeCompare(String(b.startTime || '99:99'))),
+    [planTasks, todayStr]
+  )
+  const upcomingPlanTasks = useMemo(
+    () =>
+      planTasks
+        .filter((t) => t && t.date > todayStr)
+        .sort((a, b) => `${a.date} ${a.startTime || ''}`.localeCompare(`${b.date} ${b.startTime || ''}`))
+        .slice(0, 5),
+    [planTasks, todayStr]
+  )
+
+  return (
+    <div className="zrm-root">
+      {/* 1. TOPBAR HEXTECH 0.999 */}
+      <header className="zrm-topbar">
+        <div className="zrm-play-wrap">
+          <div className="zrm-play-emblem" title="ZenRay Money · Hextech Client">ZR</div>
+          <button
+            type="button"
+            className="zrm-play-btn"
+            onClick={() => setAddingLedgerModal(true)}
+          >
+            + PRODUIRE / ENCAISSER
+          </button>
+        </div>
+
+        <nav className="zrm-nav-tabs" aria-label="Sections ZenRay Money">
+          {[
+            { id: 'all', label: 'VUE GLOBALE (A+C)' },
+            { id: 'contracts', label: 'CONTRATS (4/SEM)' },
+            { id: 'store', label: 'BOUTIQUE STUDIO' },
+            { id: 'ledger', label: 'COMPTA & EXCEL' },
+            { id: 'invoices', label: 'FACTURES PDF' },
+            { id: 'settings', label: 'CAP & ENTREPRISE' },
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={`zrm-nav-tab ${activeTab === tab.id ? 'is-active' : ''}`}
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+
+        <div className="zrm-currencies">
+          <div className="zrm-curr-item" title="Chiffre d'affaires HT de la semaine">
+            <div className="zrm-curr-orb gold">€</div>
+            <div>
+              <div className="zrm-curr-val zrm-num">
+                {formatEur(metrics.weeklyTotalHt)} <span style={{ color: 'var(--lol-text-muted)', fontSize: 11 }}>/ {formatEur(metrics.weeklyTarget)}</span>
+              </div>
+              <div className="zrm-curr-sub">Semaine ({metrics.weeklyPct} %)</div>
+            </div>
+          </div>
+
+          <div className="zrm-curr-item" title="Trésorerie nette après URSSAF vers le Cap Japon 2027">
+            <div className="zrm-curr-orb cyan">◈</div>
+            <div>
+              <div className="zrm-curr-val zrm-num">{formatEur(metrics.totalNetPocket)}</div>
+              <div className="zrm-curr-sub">Net Poche · Cap {formatEur(metrics.capMax)}</div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* 2. WORKSPACE + RIGHT PLAN DOCK */}
+      <div className="zrm-workspace">
+        <div className="zrm-stage">
+          {/* DESIGN A : HUB HEXTECH 3 COLONNES */}
+          {(activeTab === 'all' || activeTab === 'contracts' || activeTab === 'store') && (
+            <div className="zrm-hub-grid">
+              {/* COLONNE GAUCHE : 4 SLOTS DE CONTRATS PAR SEMAINE */}
+              <div className="zrm-frame">
+                <div className="zrm-sec-head">
+                  <span className="zrm-sec-title">4 Contrats / Semaine</span>
+                  <span className="zrm-sec-badge zrm-num">{metrics.signedSlotsCount} / 4 actifs</span>
+                </div>
+
+                <div className="zrm-slots-list">
+                  {state.weeklySlots.map((slot) => {
+                    const isFilled = slot.status !== 'empty' && (slot.title || Number(slot.amountHt) > 0)
+                    return (
+                      <div
+                        key={slot.slot}
+                        className={`zrm-slot-card ${isFilled ? 'is-signed' : 'is-empty'}`}
+                        onClick={() => {
+                          if (!isFilled) {
+                            setEditingSlot({
+                              ...slot,
+                              title: slot.title || `Contrat #${slot.slot}`,
+                              client: slot.client || '',
+                              amountHt: slot.amountHt || 0,
+                              status: 'SIGNÉ',
+                              date: todayIso(),
+                            })
+                          }
+                        }}
+                      >
+                        <div className="zrm-slot-medallion">#{slot.slot}</div>
+                        <div>
+                          <div className="zrm-slot-name">
+                            {isFilled ? slot.title : `Slot #${slot.slot} · Vide`}
+                          </div>
+                          <div className="zrm-slot-meta">
+                            {isFilled
+                              ? `${slot.client || 'Client direct'} · ${slot.status}`
+                              : '+ Cliquer pour ajouter un contrat'}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="zrm-slot-val zrm-num">{formatEur(slot.amountHt)}</div>
+                          {isFilled && (
+                            <div className="zrm-slot-actions" onClick={(e) => e.stopPropagation()}>
+                              <button
+                                type="button"
+                                className="zrm-mini-link"
+                                onClick={() => setEditingSlot({ ...slot })}
+                              >
+                                Éditer
+                              </button>
+                              <button
+                                type="button"
+                                className="zrm-mini-link"
+                                title="Envoyer dans le Grand-Livre Comptable"
+                                onClick={() => {
+                                  const ref = nextInvoiceNumber
+                                  commitState(
+                                    (prev) => ({
+                                      ...prev,
+                                      ledger: [
+                                        {
+                                          id: `slot-${slot.slot}-${Date.now()}`,
+                                          date: slot.date || todayIso(),
+                                          ref,
+                                          client: slot.client || slot.title,
+                                          description: slot.title,
+                                          category: slot.category || 'Freelance Tech Art',
+                                          amountHt: Number(slot.amountHt) || 0,
+                                          status: 'PAYÉ',
+                                        },
+                                        ...prev.ledger,
+                                      ],
+                                    }),
+                                    `Slot #${slot.slot} versé au Grand-Livre`
+                                  )
+                                }}
+                              >
+                                → Compta
+                              </button>
+                              <button
+                                type="button"
+                                className="zrm-mini-link danger"
+                                onClick={() =>
+                                  commitState(
+                                    (prev) => ({
+                                      ...prev,
+                                      weeklySlots: prev.weeklySlots.map((s) =>
+                                        s.slot === slot.slot
+                                          ? { ...s, title: '', client: '', amountHt: 0, status: 'empty', date: '' }
+                                          : s
+                                      ),
+                                    }),
+                                    `Slot #${slot.slot} remis à 0`
+                                  )
+                                }
+                              >
+                                ×
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+
+                <div style={{ marginTop: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: 'var(--lol-text-muted)' }}>
+                  <span>Sous-total Contrats</span>
+                  <span className="zrm-num" style={{ color: 'var(--lol-gold-bright)', fontSize: 13 }}>
+                    {formatEur(metrics.slotsSumHt)}
+                  </span>
+                </div>
+              </div>
+
+              {/* COLONNE CENTRALE : CADRAN RADIAL HEXTECH 0,00 € / 1 250 € */}
+              <div className="zrm-frame zrm-center-well">
+                <div className="zrm-honor-pill">
+                  PALIER HEBDOMADAIRE · CAP JAPON 2027
+                </div>
+
+                <div className="zrm-dial-wrap">
+                  <svg className="zrm-dial-svg" viewBox="0 0 220 220">
+                    <defs>
+                      <linearGradient id="zrmGoldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" stopColor="#F0E6D2" />
+                        <stop offset="50%" stopColor="#C8AA6E" />
+                        <stop offset="100%" stopColor="#785A28" />
+                      </linearGradient>
+                      <linearGradient id="zrmCyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" stopColor="#CDF5F4" />
+                        <stop offset="50%" stopColor="#0AC8B9" />
+                        <stop offset="100%" stopColor="#005A82" />
+                      </linearGradient>
+                    </defs>
+                    {/* Anneau extérieur gravé */}
+                    <circle cx="110" cy="110" r="103" fill="none" stroke="rgba(200,170,110,0.22)" strokeWidth="1" strokeDasharray="3 5" />
+                    {/* Piste sombre */}
+                    <circle cx="110" cy="110" r="92" fill="none" stroke="rgba(9,23,38,0.95)" strokeWidth="11" />
+                    <circle cx="110" cy="110" r="92" fill="none" stroke="rgba(200,170,110,0.18)" strokeWidth="11" />
+                    {/* Jauge dynamique Or + Cyan */}
+                    <circle
+                      cx="110"
+                      cy="110"
+                      r="92"
+                      fill="none"
+                      stroke="url(#zrmGoldGrad)"
+                      strokeWidth="11"
+                      strokeLinecap="round"
+                      strokeDasharray={ringCircumference}
+                      strokeDashoffset={ringDashOffset}
+                      transform="rotate(-90 110 110)"
+                      style={{ transition: 'stroke-dashoffset 0.35s ease' }}
+                    />
+                    {/* Anneau intérieur Cyan */}
+                    <circle cx="110" cy="110" r="76" fill="none" stroke="rgba(10,200,185,0.28)" strokeWidth="1.5" />
+                  </svg>
+
+                  <div className="zrm-dial-core">
+                    <span className="zrm-dial-kicker">CETTE SEMAINE</span>
+                    <div className="zrm-dial-amount zrm-num">{formatEur(metrics.weeklyTotalHt)}</div>
+                    <div className="zrm-dial-target zrm-num">
+                      CIBLE : {formatEur(metrics.weeklyTarget)} ({metrics.weeklyPct} %)
+                    </div>
+                    <div className="zrm-dial-Split zrm-num">
+                      {metrics.signedSlotsCount}/4 Contrats · Boutique {formatEur(metrics.storeSumHt)}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="zrm-kpi-strip">
+                  <div className="zrm-kpi-box">
+                    <div className="zrm-kpi-lbl">Mois HT</div>
+                    <div className="zrm-kpi-val zrm-num">
+                      {formatEur(metrics.monthlyGrossHt)}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--lol-text-muted)' }}>
+                      Cible {formatEur(metrics.monthlyTarget)}
+                    </div>
+                  </div>
+                  <div className="zrm-kpi-box">
+                    <div className="zrm-kpi-lbl">URSSAF ({state.settings.urssafRatePct}%)</div>
+                    <div className="zrm-kpi-val zrm-num" style={{ color: 'var(--lol-gold-main)' }}>
+                      {formatEur(metrics.totalUrssaf)}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--lol-text-muted)' }}>
+                      Provision calculée
+                    </div>
+                  </div>
+                  <div className="zrm-kpi-box">
+                    <div className="zrm-kpi-lbl">Net Poche Cumulé</div>
+                    <div className="zrm-kpi-val zrm-num" style={{ color: 'var(--lol-cyan-main)' }}>
+                      {formatEur(metrics.totalNetPocket)}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--lol-text-muted)' }}>
+                      Cap {formatEur(metrics.capMin)} / {formatEur(metrics.capMax)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* COLONNE DROITE : BOUTIQUE ZENRAY.STUDIO */}
+              <div className="zrm-frame">
+                <div className="zrm-sec-head">
+                  <span className="zrm-sec-title">Boutique ZenRay.Studio</span>
+                  <span className="zrm-sec-badge zrm-num">{formatEur(metrics.storeSumHt)}</span>
+                </div>
+
+                <div className="zrm-store-grid">
+                  {state.storeItems.map((item) => (
+                    <div
+                      key={item.id}
+                      className="zrm-store-card"
+                      onClick={() => setEditingStoreItem({ ...item })}
+                      title="Cliquer pour enregistrer une vente ou modifier le prix"
+                    >
+                      <div>
+                        <div className="zrm-store-type">{item.type}</div>
+                        <div className="zrm-store-name">{item.name}</div>
+                      </div>
+                      <div className="zrm-store-foot">
+                        <span className="zrm-num" style={{ color: 'var(--lol-text-muted)', fontSize: 10.5 }}>
+                          {item.salesCount} vente{item.salesCount > 1 ? 's' : ''} ({formatEur(item.unitPrice)})
+                        </span>
+                        <span className="zrm-num" style={{ color: 'var(--lol-gold-bright)', fontSize: 12.5 }}>
+                          {formatEur(item.revenueHt)}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="zrm-btn-row" style={{ marginTop: 12, justifyContent: 'space-between' }}>
+                  <button
+                    type="button"
+                    className="zrm-btn"
+                    onClick={() =>
+                      setEditingStoreItem({
+                        id: `store-${Date.now()}`,
+                        type: 'NOUVEL ASSET',
+                        name: '',
+                        unitPrice: 39,
+                        salesCount: 0,
+                        revenueHt: 0,
+                        isNew: true,
+                      })
+                    }
+                  >
+                    + Ajouter un produit
+                  </button>
+                  <button
+                    type="button"
+                    className="zrm-btn cyan"
+                    onClick={() => setActiveTab('invoices')}
+                  >
+                    Créer Facture PDF
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* DESIGN C : GRAND-LIVRE COMPTABLE VICTORY (EXCEL / CSV) + MODALE FACTURE PDF */}
+          {(activeTab === 'all' || activeTab === 'ledger' || activeTab === 'invoices') && (
+            <>
+              <div className="zrm-victory-banner">
+                <div className="zrm-victory-crest">
+                  <div className="zrm-victory-wings">V</div>
+                  <div>
+                    <div className="zrm-victory-title">
+                      GRAND-LIVRE COMPTABLE & FACTURATION PDF
+                    </div>
+                    <div className="zrm-victory-sub">
+                      Livre des recettes micro-entreprise · Export/Import Excel (.CSV) · Factures PDF conformes · {syncStatus}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="zrm-btn-row">
+                  <button type="button" className="zrm-btn" onClick={() => setAddingLedgerModal(true)}>
+                    + Nouvelle ligne
+                  </button>
+                  <button type="button" className="zrm-btn cyan" onClick={handleExportCsv}>
+                    Exporter Excel (.CSV)
+                  </button>
+                  <button type="button" className="zrm-btn" onClick={() => csvInputRef.current?.click()}>
+                    Importer .CSV
+                  </button>
+                  <input
+                    ref={csvInputRef}
+                    type="file"
+                    accept=".csv,text/csv"
+                    style={{ display: 'none' }}
+                    onChange={handleImportCsvFile}
+                  />
+                </div>
+              </div>
+
+              <div className="zrm-ledger-grid">
+                {/* TABLEAU GRAND-LIVRE COMPTABLE */}
+                <div className="zrm-frame">
+                  <div className="zrm-sec-head">
+                    <span className="zrm-sec-title">Livre des Recettes (Excel / URSSAF)</span>
+                    <span className="zrm-sec-badge zrm-num">
+                      {state.ledger.length} écriture{state.ledger.length > 1 ? 's' : ''} · Encaissé {formatEur(metrics.ledgerPaidHt)}
+                    </span>
+                  </div>
+
+                  <div className="zrm-table-wrap">
+                    <table className="zrm-table">
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th>Réf</th>
+                          <th>Client / Source</th>
+                          <th>Catégorie</th>
+                          <th>HT</th>
+                          <th>URSSAF</th>
+                          <th>Net Poche</th>
+                          <th>Statut</th>
+                          <th>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {state.ledger.length === 0 ? (
+                          <tr>
+                            <td colSpan={9} style={{ textAlign: 'center', padding: '24px 12px', color: 'var(--lol-text-muted)' }}>
+                              Aucune écriture enregistrée (0,00 €). Utilisez le générateur de Facture PDF à droite, cliquez sur « + Nouvelle ligne » ou importez un fichier Excel .CSV.
+                            </td>
+                          </tr>
+                        ) : (
+                          state.ledger.map((row) => {
+                            const ht = Number(row.amountHt) || 0
+                            const urssaf = ht * metrics.urssafRate
+                            const net = ht - urssaf
+                            const isPaid = row.status === 'PAYÉ'
+                            return (
+                              <tr key={row.id}>
+                                <td className="zrm-num">{row.date}</td>
+                                <td style={{ fontFamily: 'var(--zr-police-mono)', color: 'var(--lol-gold-main)' }}>{row.ref}</td>
+                                <td>
+                                  <div style={{ color: 'var(--lol-gold-bright)' }}>{row.client}</div>
+                                  {row.description && (
+                                    <div style={{ fontSize: 10.5, color: 'var(--lol-text-muted)' }}>{row.description}</div>
+                                  )}
+                                </td>
+                                <td style={{ fontSize: 11, color: 'var(--lol-text-muted)' }}>{row.category}</td>
+                                <td className="zrm-num" style={{ color: 'var(--lol-gold-bright)' }}>{formatEur(ht)}</td>
+                                <td className="zrm-num" style={{ color: 'var(--lol-text-muted)' }}>-{formatEur(urssaf)}</td>
+                                <td className="zrm-num" style={{ color: 'var(--lol-cyan-main)' }}>{formatEur(net)}</td>
+                                <td>
+                                  <button
+                                    type="button"
+                                    className={`zrm-status-pill ${isPaid ? '' : 'wait'}`}
+                                    style={{ cursor: 'pointer' }}
+                                    title="Cliquer pour basculer PAYÉ / EN ATTENTE"
+                                    onClick={() =>
+                                      commitState(
+                                        (prev) => ({
+                                          ...prev,
+                                          ledger: prev.ledger.map((r) =>
+                                            r.id === row.id
+                                              ? { ...r, status: r.status === 'PAYÉ' ? 'EN ATTENTE' : 'PAYÉ' }
+                                              : r
+                                          ),
+                                        }),
+                                        `Statut ${row.ref} mis à jour`
+                                      )
+                                    }
+                                  >
+                                    {row.status}
+                                  </button>
+                                </td>
+                                <td>
+                                  <div style={{ display: 'flex', gap: 6 }}>
+                                    <button
+                                      type="button"
+                                      className="zrm-mini-link"
+                                      title="Télécharger la Facture PDF correspondante"
+                                      onClick={() => handlePrintInvoicePdf(row)}
+                                    >
+                                      PDF
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="zrm-mini-link danger"
+                                      title="Supprimer cette ligne"
+                                      onClick={() =>
+                                        commitState(
+                                          (prev) => ({
+                                            ...prev,
+                                            ledger: prev.ledger.filter((r) => r.id !== row.id),
+                                          }),
+                                          `Ligne ${row.ref} supprimée`
+                                        )
+                                      }
+                                    >
+                                      ×
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            )
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* MODALE HEXTECH : ÉMETTRE UNE FACTURE PDF */}
+                <div className="zrm-invoice-card">
+                  <div className="zrm-inv-head">
+                    <div>
+                      <div className="zrm-inv-brand">ÉMETTRE UNE FACTURE PDF</div>
+                      <div className="zrm-inv-meta">{state.settings.companyName}</div>
+                    </div>
+                    <span className="zrm-sec-badge">{invoiceForm.ref || nextInvoiceNumber}</span>
+                  </div>
+
+                  <div className="zrm-inv-form-grid">
+                    <div className="zrm-field">
+                      <label>Numéro Facture</label>
+                      <input
+                        className="zrm-input"
+                        type="text"
+                        placeholder={nextInvoiceNumber}
+                        value={invoiceForm.ref}
+                        onChange={(e) => setInvoiceForm((p) => ({ ...p, ref: e.target.value }))}
+                      />
+                    </div>
+                    <div className="zrm-field">
+                      <label>Date d'émission</label>
+                      <input
+                        className="zrm-input"
+                        type="date"
+                        value={invoiceForm.date}
+                        onChange={(e) => setInvoiceForm((p) => ({ ...p, date: e.target.value }))}
+                      />
+                    </div>
+                    <div className="zrm-field">
+                      <label>Client / Studio</label>
+                      <input
+                        className="zrm-input"
+                        type="text"
+                        placeholder="Ex. Studio / Client Freelance"
+                        value={invoiceForm.client}
+                        onChange={(e) => setInvoiceForm((p) => ({ ...p, client: e.target.value }))}
+                      />
+                    </div>
+                    <div className="zrm-field">
+                      <label>Catégorie</label>
+                      <select
+                        className="zrm-select"
+                        value={invoiceForm.category}
+                        onChange={(e) => setInvoiceForm((p) => ({ ...p, category: e.target.value }))}
+                      >
+                        <option value="Freelance Tech Art">Freelance Tech Art</option>
+                        <option value="HDA Houdini / Copernicus">HDA Houdini / Copernicus</option>
+                        <option value="Unreal Engine / Shards">Unreal Engine / Shards</option>
+                        <option value="Boutique ZenRay.Studio">Boutique ZenRay.Studio</option>
+                      </select>
+                    </div>
+                    <div className="zrm-field full">
+                      <label>Désignation de la prestation / livrable</label>
+                      <input
+                        className="zrm-input"
+                        type="text"
+                        placeholder="Ex. Développement HDA Houdini / Texture procédurale Copernicus"
+                        value={invoiceForm.description}
+                        onChange={(e) => setInvoiceForm((p) => ({ ...p, description: e.target.value }))}
+                      />
+                    </div>
+                    <div className="zrm-field">
+                      <label>Quantité / Jours</label>
+                      <input
+                        className="zrm-input zrm-num"
+                        type="number"
+                        min="0"
+                        step="0.5"
+                        value={invoiceForm.daysOrQty}
+                        onChange={(e) => setInvoiceForm((p) => ({ ...p, daysOrQty: e.target.value }))}
+                      />
+                    </div>
+                    <div className="zrm-field">
+                      <label>Prix Unitaire HT (€)</label>
+                      <input
+                        className="zrm-input zrm-num"
+                        type="number"
+                        min="0"
+                        step="10"
+                        value={invoiceForm.unitPriceHt}
+                        onChange={(e) => setInvoiceForm((p) => ({ ...p, unitPriceHt: e.target.value }))}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="zrm-inv-totals">
+                    <div className="zrm-inv-row">
+                      <span>Total HT (TVA non applicable, art. 293 B CGI)</span>
+                      <span className="zrm-num">{formatEur(invoiceCalculatedHt)}</span>
+                    </div>
+                    <div className="zrm-inv-row" style={{ color: 'var(--lol-text-muted)' }}>
+                      <span>Cotisations URSSAF ({state.settings.urssafRatePct}%)</span>
+                      <span className="zrm-num">-{formatEur(invoiceUrssaf)}</span>
+                    </div>
+                    <div className="zrm-inv-row grand">
+                      <span>Net Poche Estimé</span>
+                      <span className="zrm-num" style={{ color: 'var(--lol-cyan-main)' }}>{formatEur(invoiceNet)}</span>
+                    </div>
+                  </div>
+
+                  <div className="zrm-btn-row">
+                    <button
+                      type="button"
+                      className="zrm-btn gold-solid"
+                      onClick={handleRecordInvoiceToLedger}
+                    >
+                      + Enregistrer au Grand-Livre
+                    </button>
+                    <button
+                      type="button"
+                      className="zrm-btn cyan"
+                      onClick={() => handlePrintInvoicePdf(null)}
+                    >
+                      Télécharger Facture PDF
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* ONGLET PARAMÈTRES D'ENTREPRISE & CIBLES */}
+          {activeTab === 'settings' && (
+            <div className="zrm-frame">
+              <div className="zrm-sec-head">
+                <span className="zrm-sec-title">Paramètres de l'Entreprise & Objectifs Cap Japon 2027</span>
+                <span className="zrm-sec-badge">Éditable sans retour</span>
+              </div>
+
+              <div className="zrm-inv-form-grid">
+                <div className="zrm-field">
+                  <label>Cible Hebdomadaire HT (€)</label>
+                  <input
+                    className="zrm-input zrm-num"
+                    type="number"
+                    value={state.settings.weeklyTargetEur}
+                    onChange={(e) =>
+                      commitState(
+                        (p) => ({ ...p, settings: { ...p.settings, weeklyTargetEur: Number(e.target.value) || 0 } }),
+                        'Cible hebdo modifiée'
+                      )
+                    }
+                  />
+                </div>
+                <div className="zrm-field">
+                  <label>Cible Mensuelle HT (€)</label>
+                  <input
+                    className="zrm-input zrm-num"
+                    type="number"
+                    value={state.settings.monthlyTargetEur}
+                    onChange={(e) =>
+                      commitState(
+                        (p) => ({ ...p, settings: { ...p.settings, monthlyTargetEur: Number(e.target.value) || 0 } }),
+                        'Cible mensuelle modifiée'
+                      )
+                    }
+                  />
+                </div>
+                <div className="zrm-field">
+                  <label>Taux URSSAF (%)</label>
+                  <input
+                    className="zrm-input zrm-num"
+                    type="number"
+                    step="0.1"
+                    value={state.settings.urssafRatePct}
+                    onChange={(e) =>
+                      commitState(
+                        (p) => ({ ...p, settings: { ...p.settings, urssafRatePct: Number(e.target.value) || 0 } }),
+                        'Taux URSSAF modifié'
+                      )
+                    }
+                  />
+                </div>
+                <div className="zrm-field">
+                  <label>Cap Japon 2027 Cible Haute (€)</label>
+                  <input
+                    className="zrm-input zrm-num"
+                    type="number"
+                    value={state.settings.capJaponMaxEur}
+                    onChange={(e) =>
+                      commitState(
+                        (p) => ({ ...p, settings: { ...p.settings, capJaponMaxEur: Number(e.target.value) || 0 } }),
+                        'Cap Japon modifié'
+                      )
+                    }
+                  />
+                </div>
+                <div className="zrm-field full">
+                  <label>Nom de l'entreprise sur les factures</label>
+                  <input
+                    className="zrm-input"
+                    type="text"
+                    value={state.settings.companyName}
+                    onChange={(e) =>
+                      commitState(
+                        (p) => ({ ...p, settings: { ...p.settings, companyName: e.target.value } }),
+                        'Nom entreprise modifié'
+                      )
+                    }
+                  />
+                </div>
+                <div className="zrm-field full">
+                  <label>Mentions légales / SIRET</label>
+                  <input
+                    className="zrm-input"
+                    type="text"
+                    value={state.settings.companySiret}
+                    onChange={(e) =>
+                      commitState(
+                        (p) => ({ ...p, settings: { ...p.settings, companySiret: e.target.value } }),
+                        'Mentions modifiées'
+                      )
+                    }
+                  />
+                </div>
+                <div className="zrm-field full">
+                  <label>IBAN / Coordonnées de règlement</label>
+                  <input
+                    className="zrm-input"
+                    type="text"
+                    value={state.settings.companyIban}
+                    onChange={(e) =>
+                      commitState(
+                        (p) => ({ ...p, settings: { ...p.settings, companyIban: e.target.value } }),
+                        'IBAN modifié'
+                      )
+                    }
+                  />
+                </div>
+              </div>
+
+              <div className="zrm-btn-row" style={{ marginTop: 14 }}>
+                <button
+                  type="button"
+                  className="zrm-btn"
+                  onClick={() => {
+                    if (window.confirm('Réinitialiser tous les compteurs et le Grand-Livre à 0,00 € ?')) {
+                      commitState(INITIAL_MONEY_STATE, 'Remise à 0,00 € effectuée')
+                    }
+                  }}
+                >
+                  Tout remettre à 0,00 €
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 3. DOCK DROIT HEXTECH : ZENRAY PLAN & GOOGLE CALENDAR */}
+        <aside className="zrm-dock" aria-label="Dock ZenRay Plan & Google Calendar">
+          <div>
+            <div className="zrm-dock-head">
+              <div className="zrm-dock-title">
+                <span>PLAN & GOOGLE CAL</span>
+                <span className="zrm-dock-sync">● SYNC</span>
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--lol-text-muted)', marginTop: 3 }}>
+                 Connecté à {planPath.split('/').pop()}
+              </div>
+            </div>
+
+            <div className="zrm-dock-group">PILIERS QUOTIDIENS</div>
+            <div className="zrm-dock-item">
+              <span className="zrm-dock-dot cyan" />
+              <div>
+                <div className="zrm-dock-name">09:00 · Production & Contrats</div>
+                <div className="zrm-dock-sub">Freelance Tech Art + Boutique</div>
+              </div>
+            </div>
+            <div className="zrm-dock-item">
+              <span className="zrm-dock-dot gold" />
+              <div>
+                <div className="zrm-dock-name">14:00 · Japonais Intensif</div>
+                <div className="zrm-dock-sub">Priorité 0 · Oral & Lecture</div>
+              </div>
+            </div>
+            <div className="zrm-dock-item">
+              <span className="zrm-dock-dot green" />
+              <div>
+                <div className="zrm-dock-name">17:00 · Sport (45 min max)</div>
+                <div className="zrm-dock-sub">Régularité 5x / semaine</div>
+              </div>
+            </div>
+
+            <div className="zrm-dock-group">AUJOURD'HUI DANS PLAN ({todaysPlanTasks.length})</div>
+            {todaysPlanTasks.length === 0 ? (
+              <div style={{ padding: '6px 13px', fontSize: 11, color: 'var(--lol-text-muted)' }}>
+                Aucune tâche planifiée aujourd'hui.
+              </div>
+            ) : (
+              todaysPlanTasks.slice(0, 5).map((task) => (
+                <div key={task.id} className="zrm-dock-item">
+                  <span className={`zrm-dock-dot ${task.status === 'done' ? 'green' : 'gold'}`} />
+                  <div>
+                    <div className="zrm-dock-name">
+                      {task.startTime ? `${task.startTime} · ` : ''}{task.title}
+                    </div>
+                    <div className="zrm-dock-sub">
+                      {task.status === 'done' ? 'Terminé' : 'En cours · Sync GCal'}
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+
+            {upcomingPlanTasks.length > 0 && (
+              <>
+                <div className="zrm-dock-group">À VENIR</div>
+                {upcomingPlanTasks.map((task) => (
+                  <div key={task.id} className="zrm-dock-item">
+                    <span className="zrm-dock-dot cyan" />
+                    <div>
+                      <div className="zrm-dock-name">{task.title}</div>
+                      <div className="zrm-dock-sub zrm-num">
+                        {task.date} {task.startTime || ''}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </>
+            )}
+
+            <form onSubmit={handleAddPlanTask} style={{ padding: '10px 13px', borderTop: '1px solid rgba(200,170,110,0.2)' }}>
+              <div style={{ fontSize: 9.5, fontFamily: 'var(--lol-font-display)', letterSpacing: '0.1em', color: 'var(--lol-text-muted)', textTransform: 'uppercase', marginBottom: 5 }}>
+                + Ajouter au Plan & Google Calendar
+              </div>
+              <div style={{ display: 'flex', gap: 5, marginBottom: 6 }}>
+                <input
+                  type="time"
+                  className="zrm-input zrm-num"
+                  style={{ width: 78, padding: '4px 6px', fontSize: 11 }}
+                  value={newPlanTaskTime}
+                  onChange={(e) => setNewPlanTaskTime(e.target.value)}
+                />
+                <input
+                  type="text"
+                  className="zrm-input"
+                  style={{ flex: 1, padding: '4px 7px', fontSize: 11 }}
+                  placeholder="Ex. Facturer client..."
+                  value={newPlanTaskTitle}
+                  onChange={(e) => setNewPlanTaskTitle(e.target.value)}
+                />
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button type="submit" className="zrm-btn" style={{ flex: 1, padding: '5px 8px', fontSize: 10 }}>
+                  + Planifier
+                </button>
+                {onNavigateView && (
+                  <button
+                    type="button"
+                    className="zrm-btn cyan"
+                    style={{ padding: '5px 8px', fontSize: 10 }}
+                    onClick={() => onNavigateView('plan')}
+                  >
+                    Ouvrir Plan
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
+
+          <div className="zrm-dock-foot">
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+              <span style={{ color: 'var(--lol-text-muted)' }}>Cap Japon 2027</span>
+              <span className="zrm-num" style={{ color: 'var(--lol-gold-bright)' }}>
+                {formatEur(metrics.totalNetPocket)} / {formatEur(metrics.capMin)}
+              </span>
+            </div>
+            <div style={{ height: 5, background: '#091726', border: '1px solid var(--lol-gold-dark)' }}>
+              <div
+                style={{
+                  height: '100%',
+                  width: `${Math.min(100, Math.round((metrics.totalNetPocket / Math.max(1, metrics.capMin)) * 100))}%`,
+                  background: 'linear-gradient(90deg, #C8AA6E, #0AC8B9)',
+                }}
+              />
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      {/* MODALE : ÉDITION D'UN SLOT DE CONTRAT HEBDOMADAIRE */}
+      {editingSlot && (
+        <div className="zrm-modal-backdrop" onClick={() => setEditingSlot(null)}>
+          <div className="zrm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="zrm-sec-head">
+              <span className="zrm-sec-title">Slot Contrat #{editingSlot.slot} (Semaine)</span>
+              <span className="zrm-sec-badge">Objectif 4 / semaine</span>
+            </div>
+            <div className="zrm-inv-form-grid">
+              <div className="zrm-field full">
+                <label>Intitulé de la mission / livrable</label>
+                <input
+                  className="zrm-input"
+                  type="text"
+                  value={editingSlot.title}
+                  onChange={(e) => setEditingSlot((p) => ({ ...p, title: e.target.value }))}
+                  placeholder="Ex. HDA Bâtiment Procédural / Lookdev UE5"
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Client / Studio</label>
+                <input
+                  className="zrm-input"
+                  type="text"
+                  value={editingSlot.client}
+                  onChange={(e) => setEditingSlot((p) => ({ ...p, client: e.target.value }))}
+                  placeholder="Ex. Studio Partenaire"
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Montant HT (€)</label>
+                <input
+                  className="zrm-input zrm-num"
+                  type="number"
+                  min="0"
+                  step="10"
+                  value={editingSlot.amountHt}
+                  onChange={(e) => setEditingSlot((p) => ({ ...p, amountHt: Number(e.target.value) || 0 }))}
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Statut</label>
+                <select
+                  className="zrm-select"
+                  value={editingSlot.status === 'empty' ? 'SIGNÉ' : editingSlot.status}
+                  onChange={(e) => setEditingSlot((p) => ({ ...p, status: e.target.value }))}
+                >
+                  <option value="SIGNÉ">SIGNÉ</option>
+                  <option value="EN COURS">EN COURS</option>
+                  <option value="LIVRÉ">LIVRÉ</option>
+                  <option value="PAYÉ">PAYÉ</option>
+                </select>
+              </div>
+              <div className="zrm-field">
+                <label>Date</label>
+                <input
+                  className="zrm-input"
+                  type="date"
+                  value={editingSlot.date || todayIso()}
+                  onChange={(e) => setEditingSlot((p) => ({ ...p, date: e.target.value }))}
+                />
+              </div>
+            </div>
+            <div className="zrm-btn-row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
+              <button type="button" className="zrm-btn" onClick={() => setEditingSlot(null)}>
+                Annuler
+              </button>
+              <button
+                type="button"
+                className="zrm-btn gold-solid"
+                onClick={() => {
+                  commitState(
+                    (prev) => ({
+                      ...prev,
+                      weeklySlots: prev.weeklySlots.map((s) =>
+                        s.slot === editingSlot.slot
+                          ? {
+                              ...editingSlot,
+                              status: editingSlot.status === 'empty' ? 'SIGNÉ' : editingSlot.status,
+                            }
+                          : s
+                      ),
+                    }),
+                    `Slot #${editingSlot.slot} enregistré`
+                  )
+                  setEditingSlot(null)
+                }}
+              >
+                Enregistrer le contrat
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODALE : ÉDITION D'UN PRODUIT DE LA BOUTIQUE ZENRAY.STUDIO */}
+      {editingStoreItem && (
+        <div className="zrm-modal-backdrop" onClick={() => setEditingStoreItem(null)}>
+          <div className="zrm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="zrm-sec-head">
+              <span className="zrm-sec-title">Produit Boutique ZenRay.Studio</span>
+              <span className="zrm-sec-badge">{editingStoreItem.type}</span>
+            </div>
+            <div className="zrm-inv-form-grid">
+              <div className="zrm-field">
+                <label>Catégorie / Type</label>
+                <input
+                  className="zrm-input"
+                  type="text"
+                  value={editingStoreItem.type}
+                  onChange={(e) => setEditingStoreItem((p) => ({ ...p, type: e.target.value }))}
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Nom du produit</label>
+                <input
+                  className="zrm-input"
+                  type="text"
+                  value={editingStoreItem.name}
+                  onChange={(e) => setEditingStoreItem((p) => ({ ...p, name: e.target.value }))}
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Prix unitaire HT (€)</label>
+                <input
+                  className="zrm-input zrm-num"
+                  type="number"
+                  min="0"
+                  value={editingStoreItem.unitPrice}
+                  onChange={(e) => {
+                    const unitPrice = Number(e.target.value) || 0
+                    setEditingStoreItem((p) => ({
+                      ...p,
+                      unitPrice,
+                      revenueHt: unitPrice * (Number(p.salesCount) || 0),
+                    }))
+                  }}
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Nombre de ventes</label>
+                <input
+                  className="zrm-input zrm-num"
+                  type="number"
+                  min="0"
+                  value={editingStoreItem.salesCount}
+                  onChange={(e) => {
+                    const salesCount = Math.max(0, Number(e.target.value) || 0)
+                    setEditingStoreItem((p) => ({
+                      ...p,
+                      salesCount,
+                      revenueHt: (Number(p.unitPrice) || 0) * salesCount,
+                    }))
+                  }}
+                />
+              </div>
+              <div className="zrm-field full">
+                <label>Chiffre d'affaires généré HT (€)</label>
+                <input
+                  className="zrm-input zrm-num"
+                  type="number"
+                  min="0"
+                  value={editingStoreItem.revenueHt}
+                  onChange={(e) =>
+                    setEditingStoreItem((p) => ({ ...p, revenueHt: Math.max(0, Number(e.target.value) || 0) }))
+                  }
+                />
+              </div>
+            </div>
+            <div className="zrm-btn-row" style={{ justifyContent: 'space-between', marginTop: 12 }}>
+              <button
+                type="button"
+                className="zrm-btn cyan"
+                onClick={() =>
+                  setEditingStoreItem((p) => {
+                    const nextSales = (Number(p.salesCount) || 0) + 1
+                    const nextRev = (Number(p.revenueHt) || 0) + (Number(p.unitPrice) || 0)
+                    return { ...p, salesCount: nextSales, revenueHt: nextRev }
+                  })
+                }
+              >
+                +1 Vente ({formatEur(editingStoreItem.unitPrice)})
+              </button>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button type="button" className="zrm-btn" onClick={() => setEditingStoreItem(null)}>
+                  Annuler
+                </button>
+                <button
+                  type="button"
+                  className="zrm-btn gold-solid"
+                  onClick={() => {
+                    commitState((prev) => {
+                      const exists = prev.storeItems.some((i) => i.id === editingStoreItem.id)
+                      const clean = { ...editingStoreItem }
+                      delete clean.isNew
+                      return {
+                        ...prev,
+                        storeItems: exists
+                          ? prev.storeItems.map((i) => (i.id === clean.id ? clean : i))
+                          : [...prev.storeItems, clean],
+                      }
+                    }, `Boutique ${editingStoreItem.name} mis à jour`)
+                    setEditingStoreItem(null)
+                  }}
+                >
+                  Enregistrer
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODALE : AJOUTER UNE LIGNE AU GRAND-LIVRE COMPTABLE */}
+      {addingLedgerModal && (
+        <div className="zrm-modal-backdrop" onClick={() => setAddingLedgerModal(false)}>
+          <div className="zrm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="zrm-sec-head">
+              <span className="zrm-sec-title">Nouvelle Écriture Comptable</span>
+              <span className="zrm-sec-badge">{ledgerDraft.ref || nextInvoiceNumber}</span>
+            </div>
+            <div className="zrm-inv-form-grid">
+              <div className="zrm-field">
+                <label>Date</label>
+                <input
+                  className="zrm-input"
+                  type="date"
+                  value={ledgerDraft.date}
+                  onChange={(e) => setLedgerDraft((p) => ({ ...p, date: e.target.value }))}
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Réf Facture</label>
+                <input
+                  className="zrm-input"
+                  type="text"
+                  placeholder={nextInvoiceNumber}
+                  value={ledgerDraft.ref}
+                  onChange={(e) => setLedgerDraft((p) => ({ ...p, ref: e.target.value }))}
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Client / Source</label>
+                <input
+                  className="zrm-input"
+                  type="text"
+                  placeholder="Nom du client ou plateforme"
+                  value={ledgerDraft.client}
+                  onChange={(e) => setLedgerDraft((p) => ({ ...p, client: e.target.value }))}
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Catégorie</label>
+                <select
+                  className="zrm-select"
+                  value={ledgerDraft.category}
+                  onChange={(e) => setLedgerDraft((p) => ({ ...p, category: e.target.value }))}
+                >
+                  <option value="Freelance Tech Art">Freelance Tech Art</option>
+                  <option value="HDA Houdini / Copernicus">HDA Houdini / Copernicus</option>
+                  <option value="Unreal Engine / Shards">Unreal Engine / Shards</option>
+                  <option value="Boutique ZenRay.Studio">Boutique ZenRay.Studio</option>
+                </select>
+              </div>
+              <div className="zrm-field full">
+                <label>Désignation</label>
+                <input
+                  className="zrm-input"
+                  type="text"
+                  placeholder="Description de la mission ou de la vente"
+                  value={ledgerDraft.description}
+                  onChange={(e) => setLedgerDraft((p) => ({ ...p, description: e.target.value }))}
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Montant HT (€)</label>
+                <input
+                  className="zrm-input zrm-num"
+                  type="number"
+                  min="0"
+                  step="10"
+                  placeholder="0"
+                  value={ledgerDraft.amountHt}
+                  onChange={(e) => setLedgerDraft((p) => ({ ...p, amountHt: e.target.value }))}
+                />
+              </div>
+              <div className="zrm-field">
+                <label>Statut</label>
+                <select
+                  className="zrm-select"
+                  value={ledgerDraft.status}
+                  onChange={(e) => setLedgerDraft((p) => ({ ...p, status: e.target.value }))}
+                >
+                  <option value="PAYÉ">PAYÉ</option>
+                  <option value="EN ATTENTE">EN ATTENTE</option>
+                </select>
+              </div>
+            </div>
+            <div className="zrm-btn-row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
+              <button type="button" className="zrm-btn" onClick={() => setAddingLedgerModal(false)}>
+                Annuler
+              </button>
+              <button
+                type="button"
+                className="zrm-btn gold-solid"
+                onClick={() => {
+                  const ref = (ledgerDraft.ref || nextInvoiceNumber).trim()
+                  const entry = {
+                    id: `led-${Date.now()}`,
+                    date: ledgerDraft.date || todayIso(),
+                    ref,
+                    client: (ledgerDraft.client || 'Client Direct').trim(),
+                    description: (ledgerDraft.description || '').trim(),
+                    category: ledgerDraft.category,
+                    amountHt: Number(ledgerDraft.amountHt) || 0,
+                    status: ledgerDraft.status,
+                  }
+                  commitState((prev) => ({ ...prev, ledger: [entry, ...prev.ledger] }), `Écriture ${ref} ajoutée`)
+                  setLedgerDraft({
+                    date: todayIso(),
+                    ref: '',
+                    client: '',
+                    description: '',
+                    category: 'Freelance Tech Art',
+                    amountHt: '',
+                    status: 'PAYÉ',
+                  })
+                  setAddingLedgerModal(false)
+                }}
+              >
+                Ajouter au Grand-Livre
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

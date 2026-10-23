@@ -1,0 +1,53 @@
+// 12 October 2026: the motion bridge client and the cloud-queue fallback, both ways.
+import { describe, expect, it, vi } from 'vitest'
+import { MotionBridgeError, createMotionBridge, newRequestId, sendIterationRequest } from './motionBridge.js'
+
+const json = (status, body) => ({ ok: status < 400, status, json: async () => body })
+
+describe('motion bridge', () => {
+  it('posts to the absolute local origin with the client header', async () => {
+    const fetchImpl = vi.fn(async () => json(200, { ok: true, service: 'com.zenray.motion' }))
+    const bridge = createMotionBridge({ fetchImpl })
+    await expect(bridge.status()).resolves.toMatchObject({ service: 'com.zenray.motion' })
+    const [url, init] = fetchImpl.mock.calls[0]
+    expect(url).toBe('http://127.0.0.1:3102/api/motion')
+    expect(init.headers['x-zr-motion-client']).toBe('1')
+    expect(JSON.parse(init.body)).toEqual({ action: 'status' })
+  })
+
+  it('names an absent Mac and a refusal differently', async () => {
+    const away = createMotionBridge({ fetchImpl: vi.fn(async () => { throw new TypeError('fetch failed') }) })
+    await expect(away.status()).rejects.toMatchObject({ code: 'bridge-unavailable' })
+    const refusing = createMotionBridge({ fetchImpl: vi.fn(async () => json(400, { error: 'layers.@caption.font.size=5000 outside [24, 240]', code: 'refused' })) })
+    await expect(refusing.iterate({ mode: 'params' })).rejects.toMatchObject({ code: 'refused', status: 400 })
+  })
+
+  it('makes request ids the service accepts', () => {
+    expect(newRequestId(new Date('2026-10-12T10:15:00Z'), () => 0)).toBe('req-20261012-101500-aaaaaa')
+  })
+
+  it('falls back to the zenray-data queue only when the Mac is away', async () => {
+    const payload = { mode: 'params', motionId: 'm', overrides: { k: 1 } }
+    const up = { iterate: vi.fn(async (p) => ({ job: { id: p.id, state: 'queued' } })) }
+    const save = vi.fn()
+    const viaBridge = await sendIterationRequest(payload, { bridge: up, save, now: new Date('2026-10-12T10:15:00Z') })
+    expect(viaBridge.via).toBe('bridge')
+    expect(save).not.toHaveBeenCalled()
+
+    const down = { iterate: vi.fn(async () => { throw new MotionBridgeError('away') }) }
+    const saveOk = vi.fn(async (path, mutate) => ({ ok: true, data: mutate({}) }))
+    const viaQueue = await sendIterationRequest(payload, { bridge: down, save: saveOk, now: new Date('2026-10-12T10:15:00Z') })
+    expect(viaQueue.via).toBe('queue')
+    expect(saveOk.mock.calls[0][0]).toMatch(/^pages\/ZenRayMotionDesign\/_requests\/req-20261012-101500-[a-z0-9]{6}\.json$/)
+    expect(saveOk.mock.calls[0][1]({})).toMatchObject({ kind: 'zenray-motion-request', mode: 'params', origin: 'site' })
+    // An existing request is never overwritten (created once, never modified).
+    expect(saveOk.mock.calls[0][1]({ id: 'req-x', mode: 'old' })).toEqual({ id: 'req-x', mode: 'old' })
+
+    const refused = { iterate: vi.fn(async () => { throw new MotionBridgeError('outside', { code: 'refused', status: 400 }) }) }
+    await expect(sendIterationRequest(payload, { bridge: refused, save })).rejects.toMatchObject({ code: 'refused' })
+    expect(save).not.toHaveBeenCalled()
+
+    const saveFail = vi.fn(async () => ({ ok: false, error: 'conflict-max-retries' }))
+    await expect(sendIterationRequest(payload, { bridge: down, save: saveFail })).rejects.toMatchObject({ code: 'queue-failed' })
+  })
+})

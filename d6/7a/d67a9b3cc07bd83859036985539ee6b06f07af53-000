@@ -1,0 +1,168 @@
+#!/usr/bin/env node
+// Importeur d'export Notion (Markdown & CSV) -> drive zenray-content.
+// Hors-ligne. Pages (hiérarchie préservée) -> pages/, databases (_all.csv) -> databases/<>.json,
+// médias -> media/ (servis via /api/img), liens internes réécrits.
+//
+// Usage :
+//   node scripts/import-notion.mjs --root <dossier_export> --out <clone_drive> [--dry] [--subtree "Nom"] [--limit N]
+//   --dry      : n'écrit rien, affiche le plan + stats
+//   --subtree  : ne traite qu'un dossier de 1er niveau (pour dry-run ciblé)
+//   --limit N  : limite le nombre de pages traitées (dry-run)
+import fs from 'fs'
+import path from 'path'
+
+const args = process.argv.slice(2)
+const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? (args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : true) : d }
+const ROOT = opt('--root')
+const OUT = opt('--out')
+const DRY = !!opt('--dry', false)
+const SUBTREE = opt('--subtree', null)
+const LIMIT = opt('--limit', null) ? parseInt(opt('--limit'), 10) : Infinity
+const SKIP_MEDIA = !!opt('--skip-media', false)
+const PREFIX = opt('--prefix', '') && typeof opt('--prefix') === 'string' ? opt('--prefix') : ''
+const WEBP_ROOT = opt('--webp-root', null) && typeof opt('--webp-root') === 'string' ? opt('--webp-root') : null
+const RASTER = new Set(['png', 'jpg', 'jpeg', 'gif'])
+if (!ROOT) { console.error('--root requis'); process.exit(1) }
+
+const HASH = /^(.*?)\s+([0-9a-f]{32})(\.[A-Za-z0-9]+)?$/
+const MEDIA_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'avif', 'pdf', 'mp4', 'mov', 'wav', 'mp3', 'm4a'])
+const stripName = (n) => { const m = n.match(HASH); if (m) return { title: m[1], ext: m[3] || '' }; const e = path.extname(n); return { title: e ? n.slice(0, -e.length) : n, ext: e } }
+const clean = (s) => s.replace(/[?:*"<>|]/g, '').replace(/\s+/g, ' ').trim()
+const slug = (s) => clean(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'x'
+
+// minimal CSV parser (gère guillemets, virgules échappées, retours ligne, BOM)
+function parseCSV(text) {
+  text = text.replace(/^﻿/, '')
+  const rows = []; let row = [], cur = '', q = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++ } else q = false } else cur += c }
+    else if (c === '"') q = true
+    else if (c === ',') { row.push(cur); cur = '' }
+    else if (c === '\n') { row.push(cur); rows.push(row); row = []; cur = '' }
+    else if (c === '\r') {} else cur += c
+  }
+  if (cur.length || row.length) { row.push(cur); rows.push(row) }
+  return rows.filter((r) => r.length > 1 || (r[0] && r[0].trim()))
+}
+const guessType = (vals) => {
+  const v = vals.filter(Boolean)
+  if (v.length && v.every((x) => x === 'Yes' || x === 'No')) return 'checkbox'
+  if (v.length && v.every((x) => /^-?\d+([.,]\d+)?$/.test(x))) return 'number'
+  return 'text'
+}
+
+// ── walk
+function walk(dir, rel = '') {
+  const out = []
+  for (const name of fs.readdirSync(dir)) {
+    const fp = path.join(dir, name), r = rel ? rel + '/' + name : name
+    const st = fs.statSync(fp)
+    if (st.isDirectory()) out.push({ fp, rel: r, name, dir: true }, ...walk(fp, r))
+    else out.push({ fp, rel: r, name, dir: false })
+  }
+  return out
+}
+
+// détermine la vraie racine (dossier unique "Build"/"Media" ou ROOT lui-même)
+let base = ROOT
+const top = fs.readdirSync(ROOT).filter((n) => !n.startsWith('.'))
+if (top.length === 1 && fs.statSync(path.join(ROOT, top[0])).isDirectory()) base = path.join(ROOT, top[0])
+
+let entries = walk(base)
+if (SUBTREE) entries = entries.filter((e) => e.rel === SUBTREE || e.rel.startsWith(SUBTREE + '/'))
+
+// mappe le chemin de sortie d'une page (hiérarchie nettoyée sous pages/)
+const PX = PREFIX ? clean(PREFIX) + '/' : ''
+function outPagePath(rel) {
+  const parts = rel.split('/').map((p) => clean(stripName(p).title))
+  return 'pages/' + PX + parts.join('/').replace(/\.md$/i, '') + '.md'
+}
+function outMediaPathExt(rel, ext) {
+  const dir = rel.split('/').slice(0, -1).map((p) => clean(stripName(p).title)).join('/')
+  const f = stripName(rel.split('/').pop())
+  return 'media/' + PX + (dir ? dir + '/' : '') + slug(f.title) + '.' + ext.replace(/^\./, '')
+}
+const used = new Set()
+function uniq(p) {
+  if (!used.has(p)) { used.add(p); return p }
+  const e = path.extname(p), b = p.slice(0, -e.length || undefined)
+  let i = 2; while (used.has(b + '-' + i + e)) i++
+  const u = b + '-' + i + e; used.add(u); return u
+}
+
+// index : rel d'origine -> {type, outPath}
+const index = new Map()
+for (const e of entries) {
+  if (e.dir) continue
+  const ext = (path.extname(e.name).slice(1) || '').toLowerCase()
+  if (e.name.endsWith('_all.csv')) index.set(e.rel, { type: 'db', outPath: uniq('databases/' + slug((PREFIX ? PREFIX + '-' : '') + stripName(e.name.replace(/_all\.csv$/, '')).title) + '.json') })
+  else if (ext === 'csv') index.set(e.rel, { type: 'csv-summary' })
+  else if (ext === 'md') index.set(e.rel, { type: 'page', outPath: uniq(outPagePath(e.rel)) })
+  else if (MEDIA_EXT.has(ext)) { const webp = WEBP_ROOT && RASTER.has(ext); index.set(e.rel, { type: 'media', raster: webp, outPath: uniq(outMediaPathExt(e.rel, webp ? 'webp' : ext)) }) }
+  else index.set(e.rel, { type: 'other' })
+}
+
+function resolveLink(fromRel, href) {
+  let target = decodeURIComponent(href.split('#')[0].split('?')[0])
+  if (!target || /^https?:/.test(target) || target.startsWith('mailto:')) return null
+  const fromDir = fromRel.split('/').slice(0, -1).join('/')
+  const abs = path.posix.normalize((fromDir ? fromDir + '/' : '') + target)
+  return index.get(abs) || null
+}
+function rewriteLinks(md, fromRel) {
+  return md.replace(/(!?)\[([^\]]*)\]\(([^)]+)\)/g, (m, bang, text, href) => {
+    const hit = resolveLink(fromRel, href)
+    if (!hit) return m
+    if (hit.type === 'media') return `${bang}[${text}](/api/img?path=${encodeURI(hit.outPath)})`
+    if (hit.type === 'page') return `[${text || hit.outPath}](#page:${encodeURIComponent(hit.outPath)})`
+    if (hit.type === 'db') return `[${text}](#db:${encodeURIComponent(hit.outPath)})`
+    return m
+  })
+}
+
+const stats = { pages: 0, dbs: 0, media: 0, mediaBytes: 0, skipped: 0 }
+const write = (rel, buf) => { if (DRY) return; const fp = path.join(OUT, rel); fs.mkdirSync(path.dirname(fp), { recursive: true }); fs.writeFileSync(fp, buf) }
+const sample = []
+
+for (const e of entries) {
+  if (e.dir) continue
+  const info = index.get(e.rel)
+  if (!info) continue
+  if (info.type === 'page') {
+    if (stats.pages >= LIMIT) break
+    let md = fs.readFileSync(e.fp, 'utf8')
+    md = rewriteLinks(md, e.rel)
+    write(info.outPath, md)
+    stats.pages++
+    if (sample.length < 12) sample.push(`PAGE  ${e.rel}  ->  ${info.outPath}`)
+  } else if (info.type === 'db') {
+    const rows = parseCSV(fs.readFileSync(e.fp, 'utf8'))
+    if (!rows.length) { stats.skipped++; continue }
+    const header = rows[0].map((h) => h.replace(/^﻿/, '').trim())
+    const body = rows.slice(1)
+    const columns = header.map((name, i) => ({ id: 'c' + i, name, type: guessType(body.map((r) => r[i])) }))
+    const outRows = body.map((r, ri) => ({ id: 'r' + ri, cells: Object.fromEntries(columns.map((c, i) => [c.id, c.type === 'checkbox' ? (r[i] === 'Yes') : (r[i] || '')])) }))
+    const name = clean(stripName(e.name.replace(/_all\.csv$/, '')).title)
+    write(info.outPath, JSON.stringify({ name, columns, rows: outRows }))
+    stats.dbs++
+    if (sample.length < 12) sample.push(`DB    ${e.rel}  ->  ${info.outPath}  (${columns.length} cols, ${outRows.length} lignes)`)
+  } else if (info.type === 'media') {
+    if (SKIP_MEDIA) { stats.skipped++; continue }
+    let src = e.fp
+    if (info.raster) { const w = path.join(WEBP_ROOT, e.rel) + '.webp'; if (fs.existsSync(w)) src = w; else { stats.skipped++; continue } }
+    const buf = fs.readFileSync(src)
+    if (buf.length > 95 * 1024 * 1024) { stats.skipped++; continue } // limite GitHub 100Mo
+    write(info.outPath, buf)
+    stats.media++; stats.mediaBytes += buf.length
+  } else stats.skipped++
+}
+
+console.log(DRY ? '\n=== DRY RUN (rien écrit) ===' : '\n=== IMPORT ÉCRIT dans ' + OUT + ' ===')
+console.log('base       :', base)
+if (SUBTREE) console.log('subtree    :', SUBTREE)
+console.log('pages      :', stats.pages)
+console.log('databases  :', stats.dbs)
+console.log('media      :', stats.media, '(' + (stats.mediaBytes / 1048576).toFixed(1) + ' Mo)')
+console.log('ignorés    :', stats.skipped)
+console.log('\nÉchantillon :'); sample.forEach((s) => console.log('  ' + s))

@@ -1,0 +1,131 @@
+// upload-img-list-git.mjs — upload d'une LISTE d'images en transport 100% GIT (zéro REST par fichier).
+// Frère de upload-img-list.mjs pour les lots >=100 (règle 2026-07-13 : écritures en masse zenray-data via
+// API REST INTERDITES — deux runs API ont épuisé 2x le quota 5000/h ; voir INDEX-ERREURS-FEATURES.md).
+// Patron : fix-thumb-manifests-git.mjs (manifestes via clone sparse zenray-data local, UN commit + push)
+// + img-ingest.mjs (shard binaire déjà en transport git, réutilisé tel quel, jamais réinventé).
+// REST résiduel : UN SEUL appel — la création du repo shard neuf (control-plane, autorisé par
+// $zenray-git-bulk-safety). Skip "déjà en ligne" : existence LOCALE du manifeste dans le clone (zéro réseau).
+//
+// Usage : GITHUB_TOKEN=.. node scripts/upload-img-list-git.mjs "<dest>" <img1> <img2> ...
+//   <dest> inclut le préfixe pages/ (chemin réel dans zenray-data, ex "pages/Photos/Lot").
+//   Prérequis : clone sparse zenray-data dans ~/.zr-thumb-bulk/zdata-clone (ZR_ZDATA_CLONE pour surcharger).
+
+import { makeImgShardCtx, ingestImageBulk, resolveImgManifest } from './img-ingest.mjs'
+import { jsDelivrUrl, GIT_ENV } from './lib/img-pipeline.mjs'
+import { appendPublicDelta, thumbsForPaths } from '../server/page.js'
+import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { mkdir, writeFile, rm } from 'node:fs/promises'
+import path from 'node:path'
+
+const token = process.env.GITHUB_TOKEN
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const REPO = '/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress'
+const CLONE = process.env.ZR_ZDATA_CLONE || path.join(process.env.HOME, '.zr-thumb-bulk', 'zdata-clone')
+const dest = process.argv[2]
+const files = process.argv.slice(3)
+if (!token || !dest || !files.length) { console.error('usage: GITHUB_TOKEN=.. node upload-img-list-git.mjs "<dest(pages/...)>" <img...>'); process.exit(1) }
+if (!dest.startsWith('pages/')) { console.error('<dest> doit commencer par pages/ (chemin réel du repo zenray-data)'); process.exit(1) }
+if (!existsSync(path.join(CLONE, '.git'))) { console.error(`clone zenray-data introuvable: ${CLONE} — le (re)créer en sparse (pages) avant`); process.exit(1) }
+
+const GENV = { ...process.env, ...GIT_ENV }
+const git = (args, timeout = 300000) => execFileSync('git', ['-C', CLONE, ...args], { env: GENV, timeout, encoding: 'utf8' })
+
+// 1) clone frais + reprise d'un run tué (mêmes précautions que fix-thumb-manifests-git.mjs : des manifestes
+// valides non committés bloqueraient pull --rebase -> on les committe, ils fusionnent dans le push final).
+if (git(['status', '--porcelain']).trim()) {
+  git(['add', '-A']); git(['commit', '-q', '-m', 'add: manifests (reprise run précédent)'])
+  console.log('  (manifestes non-committés du run précédent committés)')
+}
+git(['pull', '--rebase', '-q'])
+
+// 2) skip LOCAL (zéro réseau) : manifeste déterministe <dest>/<nom>.img.json déjà dans le clone = sauté.
+const cand = files.filter((f) => {
+  const rel = path.basename(f)
+  if (existsSync(path.join(CLONE, dest, `${rel}.img.json`))) { console.log(`  ⏭  déjà en ligne: ${rel}`); return false }
+  return true
+})
+console.log(`\n=== UPLOAD GIT-ONLY ${cand.length}/${files.length} image(s) -> ${dest} ===`)
+if (!cand.length) { console.log('rien à uploader (tout déjà en ligne).'); process.exit(0) }
+
+// 3) ingestion shard (img-ingest : chiffrement AES-GCM IV déterministe, chunks <=19 Mo, vignette 1080/q60,
+// push git incrémental, rollover <4,3 Go). Séquentiel : l'état du ctx (compteurs, rollover) n'est pas
+// conçu pour des écrivains concurrents, et le coût par image est dominé par magick/cwebp (~0,2 s).
+const runWork = path.join(process.env.HOME, '.zr-archive-work-img', `run-${process.pid}-${Date.now().toString(36)}`)
+const ctx = makeImgShardCtx({ token, work: runWork, repoRoot: REPO, log: (...a) => console.log('   ', ...a) })
+let ok = 0, failed = 0
+const pendings = []
+try {
+  await ctx.openShard()
+  for (const f of cand) {
+    const rel = path.basename(f)
+    try {
+      pendings.push({ rel, p: await ingestImageBulk(f, rel, dest, ctx) })
+      if (pendings.length % 25 === 0) console.log(`  · ${pendings.length}/${cand.length} ingérées`)
+    } catch (e) { failed++; console.log(`✗ ÉCHEC ${rel} : ${(e && e.message || e).toString().slice(0, 160)}`) }
+  }
+  await ctx.flush() // push shard (git) + commit SHA -> pinne les URLs jsDelivr
+
+  // 4) manifestes -> fichiers du clone zenray-data, puis UN commit + push git (retries rebase x5).
+  for (const { rel, p } of pendings) {
+    try {
+      const sb = resolveImgManifest(p, ctx)
+      const abs = path.join(CLONE, sb.path)
+      await mkdir(path.dirname(abs), { recursive: true })
+      await writeFile(abs, sb.content)
+      ok++
+    } catch (e) { failed++; console.log(`✗ résolution ${rel} : ${(e && e.message || e).toString().slice(0, 120)}`) }
+  }
+  if (ok) {
+    git(['add', '-A'])
+    git(['commit', '-q', '-m', `add: img manifests lot (${ok})`])
+    for (let a = 0; a < 5; a++) {
+      try { git(['push', '-q', 'origin', 'HEAD:main'], 600000); console.log('push manifestes OK'); break }
+      catch (e) { console.log(`push rejeté (concurrent), pull --rebase et retry ${a + 1}/5`); git(['pull', '--rebase', '-q']); if (a === 4) throw e }
+    }
+  }
+} finally {
+  await rm(runWork, { recursive: true, force: true }).catch(() => {})
+}
+
+// 5) vérif bornée : UNE URL jsDelivr par (repo,commit) distinct — le commit étant immuable, un chemin servi
+// prouve la propagation de tout l'arbre de ce commit (même logique que upload-img-list.mjs).
+const seen = new Set()
+let cdnOk = 0, cdnTot = 0
+for (const { p } of pendings) {
+  const commit = ctx.commitOf[p.repo]
+  if (!commit || !p.cdnChunks || !p.cdnChunks.length) continue
+  const k = `${p.repo}@${commit}`
+  if (seen.has(k)) continue
+  seen.add(k); cdnTot++
+  const url = jsDelivrUrl(OWNER, p.repo, commit, p.cdnChunks[0])
+  let code = 0
+  for (let a = 0; a < 6 && code !== 200; a++) { try { code = (await fetch(url)).status } catch {}; if (code !== 200) await new Promise((r) => setTimeout(r, 2500)) }
+  if (code === 200) cdnOk++
+  else console.log(`  ⚠ jsDelivr pas encore propagé (${k.slice(0, 46)}…) — cache lag, OK au refresh`)
+}
+// 6) INDEX-ADD (2026-07-14, bug trouvé par Matthieu) : un upload CLI écrivait les manifestes en Git mais
+// n'avertissait jamais l'index de recherche public (zenray-index-public/delta.json) — invisible en recherche
+// jusqu'au prochain rebuild manuel. Même mécanisme que le drop in-app (action=index-add), réutilisé tel quel
+// (server/page.js). Best-effort : un échec ici ne fait jamais échouer l'upload (les manifestes sont déjà
+// en sécurité sur zenray-data ; un rebuild complet les rattraperait de toute façon).
+// PIÈGE CORRIGÉ (2026-07-14) : appendPublicDelta lit via raw.githubusercontent (cache ~5 min) — plusieurs
+// appels séquentiels rapprochés (un par lot de 200) s'écrasent l'un l'autre au lieu de s'accumuler (constaté :
+// un lot de 4949 chemins n'en a laissé que 518 dans le delta réel). Fix : thumbsForPaths par lots de 200
+// (son propre plafond), mais UN SEUL appendPublicDelta final avec la liste complète.
+if (ok) {
+  const addedPaths = pendings.map(({ p }) => p.path)
+  try {
+    const allThumbs = {}
+    for (let i = 0; i < addedPaths.length; i += 200) {
+      Object.assign(allThumbs, await thumbsForPaths(token, addedPaths.slice(i, i + 200)))
+    }
+    const idxOk = await appendPublicDelta(token, addedPaths, allThumbs)
+    console.log(`  index-add : ${idxOk ? addedPaths.length : 0}/${addedPaths.length} chemins ajoutés au delta public (cherchables immédiatement)`)
+  } catch (e) { console.log(`  ⚠ index-add échoué (rattrapable par scripts/index-add-paths.mjs) : ${(e && e.message || e).toString().slice(0, 120)}`) }
+}
+
+console.log(`\n✓✓ GIT-ONLY COMPLET — ${ok} manifeste(s) en 1 commit zenray-data, ${failed} échec(s), jsDelivr ${cdnOk}/${cdnTot} OK. Quota REST consommé : 1 appel (création du shard).`)
+// sortie explicite : les sockets keep-alive undici (fetch jsDelivr) empêchent Node de terminer seul
+// (bug réel 2026-07-11, cf. upload-img-list.mjs).
+process.exit(failed ? 1 : 0)

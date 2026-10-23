@@ -1,0 +1,209 @@
+import { useEffect, useRef, useState } from 'react'
+import { parseSubtitles, findActiveCue } from '../../media/subtitles/subtitleParser.js'
+import { decodeSubtitleText } from '../../lib/subtitleSidecar.js'
+import { subtitleBox, SUB_FONTS_FAMILY, SUB_PERCENT } from '../../media/subtitles/subtitleSettings.js'
+
+// Families libass may ask for. One definition, used by every player.
+export const SUB_FONTS = {
+  'liberation sans': '/jassub/default.woff2',
+  'inter variable': '/fonts/InterVariable.woff2',
+  inter: '/fonts/InterVariable.woff2',
+}
+
+// Trois tailles de sous-titres proportionnelles a la taille de l'ecran et du lecteur (cqi),
+// avec paliers 4K cales sur des multiples de 8 et de 16 :
+// Petite : clamp(14px, 1.8cqi, 40px) soit 40px sur 4K (32 + 8), echelle reduite fluide sur mobile/1080p
+// Moyenne : clamp(18px, 2.8cqi, 64px) soit 64px sur 4K (multiple de 16, 4 * 16)
+// Grande : clamp(22px, 4.2cqi, 96px) soit 96px sur 4K (multiple de 16, 6 * 16)
+export const SUB_SIZES = {
+  sm: {
+    label: 'Petite',
+    fontSize: 'clamp(14px, 1.8cqi, 40px)',
+    lineHeight: 1.35,
+    padding: 'clamp(4px, 0.5cqi, 12px) clamp(10px, 1.2cqi, 24px)',
+    borderRadius: 'clamp(6px, 0.6cqi, 14px)',
+  },
+  md: {
+    label: 'Moyenne',
+    fontSize: 'clamp(18px, 2.8cqi, 64px)',
+    lineHeight: 1.38,
+    padding: 'clamp(6px, 0.7cqi, 18px) clamp(14px, 1.6cqi, 32px)',
+    borderRadius: 'clamp(8px, 0.8cqi, 18px)',
+  },
+  lg: {
+    label: 'Grande',
+    fontSize: 'clamp(22px, 4.2cqi, 96px)',
+    lineHeight: 1.42,
+    padding: 'clamp(8px, 1cqi, 24px) clamp(18px, 2.2cqi, 44px)',
+    borderRadius: 'clamp(10px, 1cqi, 22px)',
+  },
+}
+
+// track = { format:'vtt'|'srt'|'ass'|'ssa', text, src, content } | null. videoRef = ref vers le <video>.
+// sizePct: percentage of the former small (100 = exactly the former small). size: legacy names, kept for the older callers.
+// background: the opaque rounded pill, can be switched off. font: 'sans' | 'serif'.
+// useAssRenderer: ASS files go through the same DOM overlay as SRT so every film looks alike; libass is opt-in.
+// FR : un seul rendu pour tous les formats ; libass (JASSUB) ne sert que sur demande, il ignorait la charte.
+const LEGACY_PERCENT = { sm: 100, md: 150, lg: 150 }
+
+export default function SubtitleLayer({ videoRef, track, controlsVisible = false, size = 'sm', sizePct, background = true, font = 'sans', useAssRenderer = false }) {
+  const jassubRef = useRef(null)
+  const [activeCue, setActiveCue] = useState(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    const video = videoRef.current
+    let cancelled = false
+    let removeListeners = null
+
+    if (jassubRef.current) {
+      try { jassubRef.current.destroy() } catch {}
+      jassubRef.current = null
+    }
+    setActiveCue(null)
+    setError('')
+
+    const cleanup = () => {
+      cancelled = true
+      if (typeof removeListeners === 'function') {
+        removeListeners()
+        removeListeners = null
+      }
+      if (jassubRef.current) {
+        try { jassubRef.current.destroy() } catch {}
+        jassubRef.current = null
+      }
+    }
+
+    if (!video || !track) return cleanup
+
+    ;(async () => {
+      try {
+        const rawText = await decodeSubtitleText(track)
+        if (cancelled) return
+
+        const fmt = (track.format || '').toLowerCase()
+        const isAssFormat = fmt === 'ass' || fmt === 'ssa'
+        let usedJassub = false
+
+        if (isAssFormat && useAssRenderer) {
+          try {
+            const { default: JASSUB } = await import('jassub')
+            if (cancelled) return
+            jassubRef.current = new JASSUB({
+              video,
+              subContent: rawText,
+              workerUrl: '/jassub/jassub-worker.js',
+              wasmUrl: '/jassub/jassub-worker.wasm',
+              fonts: ['/jassub/default.woff2'],
+              availableFonts: SUB_FONTS,
+            })
+            usedJassub = true
+          } catch {
+            // Fallback to DOM overlay with Inter font
+          }
+        }
+
+        if (!usedJassub && !cancelled) {
+          const cues = parseSubtitles(rawText, fmt)
+          if (cancelled) return
+
+          const updateActiveCue = () => {
+            if (cancelled || !video) return
+            const cue = findActiveCue(cues, video.currentTime)
+            setActiveCue((prev) => (prev?.id === cue?.id && prev?.text === cue?.text ? prev : cue))
+          }
+
+          video.addEventListener('timeupdate', updateActiveCue)
+          video.addEventListener('seeking', updateActiveCue)
+          video.addEventListener('seeked', updateActiveCue)
+          updateActiveCue()
+
+          removeListeners = () => {
+            video.removeEventListener('timeupdate', updateActiveCue)
+            video.removeEventListener('seeking', updateActiveCue)
+            video.removeEventListener('seeked', updateActiveCue)
+          }
+        }
+      } catch (reason) {
+        if (!cancelled) setError(`Sous-titres indisponibles${reason?.message ? ` · ${reason.message}` : ''}`)
+      }
+    })()
+
+    return cleanup
+  }, [track, videoRef, useAssRenderer])
+
+  if (error) {
+    return (
+      <div
+        role="status"
+        style={{
+          position: 'absolute',
+          left: 12,
+          bottom: controlsVisible ? 68 : 28,
+          zIndex: 35,
+          maxWidth: 'calc(100% - 24px)',
+          padding: '6px 10px',
+          borderRadius: 999,
+          background: 'rgba(20,20,22,.72)',
+          color: '#ffffff',
+          fontFamily: 'var(--zr-police-sans)',
+          fontSize: 'var(--zr-ui-xs)',
+          pointerEvents: 'none',
+        }}
+      >
+        {error}
+      </div>
+    )
+  }
+
+  if (!activeCue || !activeCue.text) return null
+
+  const sizeConfig = subtitleBox(Number.isFinite(Number(sizePct)) ? sizePct : (LEGACY_PERCENT[size] ?? SUB_PERCENT.fallback))
+
+  return (
+    <div
+      className="zr-subtitle-layer"
+      style={{
+        position: 'absolute',
+        left: '50%',
+        transform: 'translateX(-50%)',
+        bottom: controlsVisible ? 72 : 28,
+        transition: 'bottom 0.22s cubic-bezier(0.16, 1, 0.3, 1)',
+        zIndex: 25,
+        width: 'auto',
+        maxWidth: 'min(92%, 1400px)',
+        boxSizing: 'border-box',
+        textAlign: 'center',
+        pointerEvents: 'none',
+        userSelect: 'none',
+      }}
+    >
+      <span
+        className="zr-subtitle-pill"
+        style={{
+          display: 'inline-block',
+          boxSizing: 'border-box',
+          padding: sizeConfig.padding,
+          borderRadius: sizeConfig.borderRadius || 8,
+          backgroundColor: background ? 'rgba(10, 10, 12, 0.82)' : 'transparent',
+          color: '#ffffff',
+          fontFamily: SUB_FONTS_FAMILY[font] || SUB_FONTS_FAMILY.sans,
+          fontSize: sizeConfig.fontSize,
+          fontWeight: 500,
+          lineHeight: sizeConfig.lineHeight,
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+          overflowWrap: 'break-word',
+          textWrap: 'balance',
+          maxWidth: '100%',
+          boxShadow: background ? '0 2px 8px rgba(0, 0, 0, 0.45)' : 'none',
+          // without the pill, an outline keeps white text readable on any image
+          textShadow: background ? 'none' : '0 0 3px #000, 0 0 6px #000, 0 1px 2px #000, 1px 0 2px #000',
+        }}
+      >
+        {activeCue.text}
+      </span>
+    </div>
+  )
+}

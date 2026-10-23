@@ -1,0 +1,167 @@
+#!/usr/bin/env node
+// ZenRayMedia — RECENSEMENT DES COMPOSANTS, image par image.
+//
+//   node scripts/zrm-inventory.mjs <dossier de captures>            # planches de contact
+//   node scripts/zrm-inventory.mjs <dossier> --check                # couverture + comptes
+//
+// POURQUOI CE FICHIER EXISTE
+// --------------------------
+// Reproche de Matthieu, 2026-07-25, et il est fondé : « tu devais reprendre toutes les images,
+// analyser dans chaque image s'il y a un nouveau composant et le générer ». J'avais construit
+// T-04-1-1 en regardant TROIS captures sur vingt-quatre, puis écrit dix composants qui
+// ressemblaient à un article habillé en sombre. Les vingt et une autres captures n'ont jamais
+// été ouvertes — et c'est exactement pour qu'elles le soient qu'il les a collectées.
+//
+// Le défaut n'était pas le manque de soin sur un composant : c'était l'absence de RECENSEMENT.
+// Sans inventaire, « j'ai fait les composants » ne veut rien dire, parce que rien ne dit combien
+// il y en avait. On ne peut pas manquer ce qu'on n'a jamais compté.
+//
+// CE QUE CE SCRIPT FAIT, ET CE QU'IL NE FAIT PAS
+// ----------------------------------------------
+// Il ne reconnaît rien tout seul. Identifier un composant dans une capture d'interface demande
+// de comprendre ce qu'on regarde ; c'est le travail du modèle, pas d'un seuillage.
+//
+// Ce script rend ce travail EXHAUSTIF et VÉRIFIABLE :
+//   1. il produit des planches de contact numérotées — 4 captures par planche, taille utile,
+//      pour parcourir vingt-quatre images en six regards au lieu de vingt-quatre ;
+//   2. il tient `components.inventory.json`, où chaque élément relevé porte son image d'origine,
+//      son rectangle, son type et son état ;
+//   3. il REFUSE de déclarer un thème couvert tant qu'une capture n'a aucune entrée. Une image
+//      sans entrée n'est pas une image sans composant : c'est une image non regardée.
+//
+// LES QUATRE TYPES, PARCE QU'ILS NE SE TRAITENT PAS PAREIL
+//   icon       un signe : glyphe de manette, réticule, pictogramme. → <symbol> dans 00-icons
+//   component  un bloc composé : barre, carte, panneau, jauge.      → un fichier parts/
+//   effect     un VFX statique reproductible : halo, dégradé, trame, liseré lumineux.
+//   motion     une animation. Reproductible en partie seulement — on note ce qu'on ne fait pas,
+//              plutôt que de faire comme si ça n'existait pas.
+
+import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+import { chromium } from 'playwright'
+
+const TYPES = ['icon', 'component', 'effect', 'motion']
+
+async function captures(dir) {
+  // Les captures peuvent vivre dans raw/ ou raw_v2/ selon la campagne de collecte. On prend les
+  // deux : oublier un dossier est précisément le genre d'omission que ce script existe pour
+  // rendre impossible.
+  const out = []
+  for (const sub of ['raw', 'raw_v2']) {
+    const p = path.join(dir, sub)
+    if (!existsSync(p)) continue
+    for (const f of (await readdir(p)).sort()) {
+      if (/\.(jpe?g|png)$/i.test(f)) out.push({ rel: `${sub}/${f}`, abs: path.join(p, f) })
+    }
+  }
+  return out
+}
+
+async function contactSheets(dir, files, perSheet = 4) {
+  const outDir = path.join(dir, 'contact')
+  await mkdir(outDir, { recursive: true })
+  const browser = await chromium.launch()
+  const page = await browser.newPage()
+  const sheets = []
+  for (let i = 0; i < files.length; i += perSheet) {
+    const batch = files.slice(i, i + perSheet)
+    const imgs = []
+    for (const f of batch) {
+      const buf = await readFile(f.abs)
+      const ext = path.extname(f.abs).slice(1).toLowerCase().replace('jpg', 'jpeg')
+      imgs.push({ rel: f.rel, url: `data:image/${ext};base64,${buf.toString('base64')}` })
+    }
+    // 2 colonnes, chaque vignette à 960 px de large : c'est la définition minimale où un libellé
+    // d'interface reste lisible. En dessous, on croit voir et on ne voit pas.
+    const html = `<!doctype html><meta charset="utf-8"><style>
+      body{margin:0;background:#111;font:12px ui-monospace,monospace;color:#8ab}
+      .g{display:grid;grid-template-columns:1fr 1fr;gap:2px}
+      figure{margin:0;position:relative}
+      img{display:block;width:100%;height:auto}
+      figcaption{position:absolute;left:0;top:0;background:rgba(0,0,0,.78);padding:3px 8px;
+        color:#cfe6ff;letter-spacing:.04em}
+    </style><div class="g">${imgs.map((m, k) =>
+      `<figure><img src="${m.url}"><figcaption>${String(i + k + 1).padStart(2, '0')} · ${m.rel}</figcaption></figure>`).join('')}</div>`
+    await page.setContent(html)
+    await page.setViewportSize({ width: 1920, height: 1080 })
+    await page.waitForTimeout(120)
+    const out = path.join(outDir, `sheet-${String(Math.floor(i / perSheet) + 1).padStart(2, '0')}.png`)
+    await page.screenshot({ path: out, fullPage: true })
+    sheets.push(out)
+  }
+  await browser.close()
+  return sheets
+}
+
+function emptyInventory(files) {
+  return {
+    note: 'Chaque entree porte son image d\'origine. Une image sans entree est une image NON REGARDEE, '
+      + 'pas une image sans composant — c\'est la distinction que --check fait respecter.',
+    types: TYPES,
+    images: files.map((f) => ({ image: f.rel, seen: false, elements: [] })),
+  }
+}
+
+async function check(dir) {
+  const p = path.join(dir, 'components.inventory.json')
+  if (!existsSync(p)) throw new Error(`inventaire absent : ${p}`)
+  const inv = JSON.parse(await readFile(p, 'utf8'))
+  const counts = Object.fromEntries(TYPES.map((t) => [t, 0]))
+  const names = new Map()
+  let unseen = 0, empty = 0
+  for (const img of inv.images) {
+    if (!img.seen) { unseen++; continue }
+    if (!img.elements.length) empty++
+    for (const el of img.elements) {
+      counts[el.type] = (counts[el.type] || 0) + 1
+      // Un même composant apparaît sur plusieurs captures — c'est normal et c'est utile : plus il
+      // revient, plus il est structurant, donc prioritaire.
+      names.set(el.name, (names.get(el.name) || 0) + 1)
+    }
+  }
+  console.log(`Images        ${inv.images.length}  ·  regardées ${inv.images.length - unseen}  ·  NON REGARDÉES ${unseen}`)
+  console.log(`Relevés       ${TYPES.map((t) => `${t} ${counts[t]}`).join('  ·  ')}`)
+  console.log(`Distincts     ${names.size}`)
+  const todo = [...names.entries()].sort((a, b) => b[1] - a[1])
+  console.log(`\nPar fréquence d'apparition (les plus fréquents structurent le thème) :`)
+  for (const [n, c] of todo.slice(0, 30)) console.log(`  ${String(c).padStart(2)}×  ${n}`)
+  if (unseen) {
+    console.log(`\n⚠ ${unseen} capture(s) jamais ouverte(s). Le thème NE PEUT PAS être déclaré couvert.`)
+    for (const img of inv.images.filter((i) => !i.seen)) console.log(`    ${img.image}`)
+    process.exitCode = 1
+  } else if (empty) {
+    console.log(`\n${empty} capture(s) regardée(s) sans aucun élément relevé — vérifier que c'est bien voulu.`)
+  } else {
+    console.log(`\nCouverture complète : les ${inv.images.length} captures ont été regardées.`)
+  }
+}
+
+async function main() {
+  const dir = process.argv[2]
+  if (!dir) throw new Error('usage : node scripts/zrm-inventory.mjs <dossier de captures> [--check]')
+  if (process.argv.includes('--check')) return check(dir)
+
+  const files = await captures(dir)
+  const invPath = path.join(dir, 'components.inventory.json')
+  if (!existsSync(invPath)) {
+    await writeFile(invPath, JSON.stringify(emptyInventory(files), null, 2) + '\n')
+    console.log(`Inventaire créé : ${invPath} (${files.length} captures, aucune regardée)`)
+  } else {
+    // On ne réécrit jamais un inventaire existant : il contient du travail d'observation qui ne
+    // se régénère pas. On ajoute seulement les captures apparues depuis.
+    const inv = JSON.parse(await readFile(invPath, 'utf8'))
+    const known = new Set(inv.images.map((i) => i.image))
+    const added = files.filter((f) => !known.has(f.rel))
+    if (added.length) {
+      inv.images.push(...added.map((f) => ({ image: f.rel, seen: false, elements: [] })))
+      await writeFile(invPath, JSON.stringify(inv, null, 2) + '\n')
+    }
+    console.log(`Inventaire existant : ${inv.images.length} captures (${added.length} ajoutée(s))`)
+  }
+  const sheets = await contactSheets(dir, files)
+  console.log(`${sheets.length} planche(s) de contact → ${path.join(dir, 'contact')}`)
+  for (const s of sheets) console.log(`  ${s}`)
+}
+
+main().catch((e) => { console.error(e.message || e); process.exit(1) })

@@ -1,0 +1,151 @@
+// migrate-legacy-to-zenrayshards.mjs — migre les manifestes LEGACY (dash / chunked-media / ancien archive v4)
+// vers le pipeline ZenRayShards pur (video-raw / blob-raw), pour uniformité totale.
+//
+// RÈGLE D'OR (demande explicite) : ON NE SUPPRIME JAMAIS L'ANCIEN CONTENU. Avant d'écrire la nouvelle version
+// au chemin CANONIQUE, l'ancien manifeste est PRÉSERVÉ dans un sous-dossier `.old/` au même emplacement, sous
+// le MÊME nom de fichier (git blob réutilisé par SHA, coût zéro — aucune re-upload du contenu ancien).
+//
+// TROIS CAS DISTINCTS (déterminés par une reco préalable, voir /tmp/dash25.txt /tmp/cm14.txt /tmp/old9_files.txt) :
+//   A) DASH (25 vidéos)      : chemin canonique <x>.mp4.media.json (type 'dash', ré-encodé legacy). On préserve
+//                              l'ancien manifeste dans .old/, puis on ré-uploade le fichier LOCAL via ingestVideoRaw
+//                              (video-raw, 95 Mo, streaming immédiat) au même chemin canonique.
+//   B) CHUNKED-MEDIA (14 wav) : chemin ORPHELIN <x>.wav.<hash>.media.json (ancien pipeline audio, hash aléatoire
+//                              dans le nom -> PAS le chemin canonique). Le blob-raw canonique <x>.wav.file.json
+//                              existe déjà (uploadé pendant le marathon DJI, vérifié bit-exact). Donc AUCUNE
+//                              re-upload ici : simple déplacement de l'orphelin vers .old/ (même nom, même dossier).
+//   C) FILE ancien v4 (9 fichiers py/cube) : chemin canonique <x>.file.json (ancien format chunké v4). On préserve
+//                              l'ancien dans .old/, puis on ré-uploade le fichier LOCAL via ingestBlobRaw (blob-raw)
+//                              au même chemin canonique.
+//
+// Usage : GITHUB_TOKEN=.. node Scripts/migrate-legacy-to-zenrayshards.mjs --mode=test    (2 échantillons, 1 par cas)
+//         GITHUB_TOKEN=.. node Scripts/migrate-legacy-to-zenrayshards.mjs --mode=all     (tout, 48 items)
+
+import { makeVidRawShardCtx, ingestVideoRaw, ingestBlobRaw } from './video-raw-lib.mjs'
+import { pushBlobs } from './video-mse-lib.mjs'
+import { readFile, stat } from 'node:fs/promises'
+import path from 'node:path'
+
+const token = process.env.GITHUB_TOKEN
+const OWNER = 'matthieuhuguet'
+const DATA = 'zenray-data'
+const LOCAL_ROOT = '/Users/zenray/Downloads/DJI'
+const ONLINE_ROOT = 'pages/Photos/DJI'
+const MODE = (process.argv.find((a) => a.startsWith('--mode=')) || '--mode=all').split('=')[1]
+if (!token) { console.error('usage: GITHUB_TOKEN=.. node migrate-legacy-to-zenrayshards.mjs --mode=test|all'); process.exit(1) }
+
+const gh = (p, init = {}) => fetch(`https://api.github.com/repos/${OWNER}/${DATA}/${p}`, { ...init, headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zr-migrate', ...(init.headers || {}) } })
+
+// Contenu local depuis un chemin manifeste canonique <ONLINE_ROOT>/<rel>.<ext>.<media|file>.json
+function localFromManifestPath(manifestPath, stripSuffix) {
+  const rel = manifestPath.slice(ONLINE_ROOT.length + 1) // enlève "pages/Photos/DJI/"
+  const localName = rel.slice(0, rel.length - stripSuffix.length)
+  return path.join(LOCAL_ROOT, localName)
+}
+
+// Lit le sha du blob GitHub d'un chemin (Contents API — suffit pour réutiliser le blob ailleurs, gratuit).
+async function blobShaOf(manifestPath) {
+  const r = await gh(`contents/${encodeURIComponent(manifestPath).replace(/%2F/g, '/')}`)
+  if (!r.ok) return null
+  const j = await r.json()
+  return j.sha || null
+}
+
+// Préserve un manifeste existant dans .old/<basename> (même dossier), en RÉUTILISANT le blob SHA existant
+// (aucune donnée retransmise). Écrit via l'API Git Data (base_tree + 1 entrée), 1 commit par appel.
+async function preserveToOld(manifestPath) {
+  const sha = await blobShaOf(manifestPath)
+  if (!sha) throw new Error('blob sha introuvable pour ' + manifestPath)
+  const dir = path.posix.dirname(manifestPath)
+  const base = path.posix.basename(manifestPath)
+  const oldPath = `${dir}/.old/${base}`
+  // déjà préservé (reprise après coupure) ?
+  const already = await gh(`contents/${encodeURIComponent(oldPath).replace(/%2F/g, '/')}`)
+  if (already.ok) return oldPath
+  const ref = await gh('git/ref/heads/main').then((r) => r.json())
+  const headSha = ref.object.sha
+  const commitObj = await gh(`git/commits/${headSha}`).then((r) => r.json())
+  const baseTree = commitObj.tree.sha
+  const tree = await gh('git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree: [{ path: oldPath, mode: '100644', type: 'blob', sha }] }) }).then((r) => r.json())
+  const commit = await gh('git/commits', { method: 'POST', body: JSON.stringify({ message: `preserve legacy -> .old/${base}`, tree: tree.sha, parents: [headSha] }) }).then((r) => r.json())
+  const upd = await gh('git/refs/heads/main', { method: 'PATCH', body: JSON.stringify({ sha: commit.sha, force: false }) })
+  if (!upd.ok) throw new Error('push .old échoué pour ' + manifestPath)
+  return oldPath
+}
+
+// Déplace (sans re-upload) : préserve puis SUPPRIME l'original (git tree : delete entry). Pour les orphelins B.
+async function moveToOld(manifestPath) {
+  const oldPath = await preserveToOld(manifestPath)
+  const ref = await gh('git/ref/heads/main').then((r) => r.json())
+  const headSha = ref.object.sha
+  const commitObj = await gh(`git/commits/${headSha}`).then((r) => r.json())
+  const baseTree = commitObj.tree.sha
+  // suppression = entrée avec sha:null n'est pas supportée par l'API tree -> on repasse par delete contents.
+  const cur = await gh(`contents/${encodeURIComponent(manifestPath).replace(/%2F/g, '/')}`).then((r) => r.json())
+  const del = await gh(`contents/${encodeURIComponent(manifestPath).replace(/%2F/g, '/')}`, { method: 'DELETE', body: JSON.stringify({ message: `move orphan -> ${oldPath}`, sha: cur.sha }) })
+  if (!del.ok) throw new Error('delete orphelin échoué pour ' + manifestPath)
+  return oldPath
+}
+
+const vctx = makeVidRawShardCtx({ token, work: process.env.HOME + '/.zr-migrate-work', type: 'vid', vis: 'private', log: (...a) => console.log('  ', ...a) })
+let shardOpen = false
+async function ensureShard() { if (!shardOpen) { await vctx.openShard(); shardOpen = true } }
+
+let done = 0, failed = 0
+
+async function migrateA_dash(manifestPath) {
+  const local = localFromManifestPath(manifestPath, '.media.json')
+  try { await stat(local) } catch { throw new Error('source locale introuvable: ' + local) }
+  const oldPath = await preserveToOld(manifestPath)
+  await ensureShard()
+  const dest = path.posix.dirname(manifestPath)
+  const base = path.basename(local).replace(/\.[^.]+$/, '')
+  const { manifest } = await ingestVideoRaw(local, { dest, base, vctx, workDir: '/tmp/zr_migrate_vid', log: (...a) => console.log('  ', ...a) })
+  await pushBlobs(token, DATA, [{ path: manifestPath, content: JSON.stringify(manifest), encoding: 'utf-8' }], `migrate dash->video-raw ${base}`, () => {})
+  console.log(`✓ MIGRÉ [dash->video-raw] ${manifestPath} (ancien préservé: ${oldPath})`)
+}
+
+async function migrateC_oldfile(manifestPath) {
+  const local = localFromManifestPath(manifestPath, '.file.json')
+  try { await stat(local) } catch { throw new Error('source locale introuvable: ' + local) }
+  const oldPath = await preserveToOld(manifestPath)
+  await ensureShard()
+  const dest = path.posix.dirname(manifestPath)
+  const { manifestPath: mp, manifest } = await ingestBlobRaw(local, { dest, base: path.basename(local), vctx, log: (...a) => console.log('  ', ...a) })
+  await vctx.flush()
+  await pushBlobs(token, DATA, [{ path: manifestPath, content: JSON.stringify(manifest), encoding: 'utf-8' }], `migrate old-v4->blob-raw ${path.basename(local)}`, () => {})
+  console.log(`✓ MIGRÉ [v4->blob-raw] ${manifestPath} (ancien préservé: ${oldPath})`)
+}
+
+async function migrateB_orphan(manifestPath) {
+  const oldPath = await moveToOld(manifestPath)
+  console.log(`✓ DÉPLACÉ [orphelin chunked-media, canonique blob-raw déjà en ligne] ${manifestPath} -> ${oldPath}`)
+}
+
+async function run(list, fn, label) {
+  for (const p of list) {
+    try { await fn(p); done++ } catch (e) { failed++; console.log(`✗ ÉCHEC [${label}] ${p} : ${(e && e.message || e).toString().slice(0, 160)}`) }
+  }
+}
+
+const dash = (await readFile('/tmp/dash25.txt', 'utf8')).trim().split('\n').filter(Boolean)
+const cm = (await readFile('/tmp/cm14.txt', 'utf8')).trim().split('\n').filter(Boolean)
+const old9 = (await readFile('/tmp/old9_files.txt', 'utf8')).trim().split('\n').filter(Boolean)
+
+// --only=<sous-chaîne1>,<sous-chaîne2>... : ne retraite QUE les items dont le chemin contient une des sous-chaînes.
+// Sert à relancer juste les échecs (transitoires ou corrigés par un fix) sans re-uploader ce qui a déjà réussi.
+const onlyArg = process.argv.find((a) => a.startsWith('--only='))
+const only = onlyArg ? onlyArg.slice(7).split(',').filter(Boolean) : null
+const filterOnly = (list) => only ? list.filter((p) => only.some((s) => p.includes(s))) : list
+
+const listsToRun = MODE === 'test'
+  ? { dash: dash.slice(0, 1), cm: cm.slice(0, 1), old9: old9.slice(0, 1) }
+  : { dash: filterOnly(dash), cm: filterOnly(cm), old9: filterOnly(old9) }
+
+console.log(`=== MIGRATION mode=${MODE} : ${listsToRun.dash.length} dash + ${listsToRun.cm.length} chunked-media + ${listsToRun.old9.length} old-v4 ===\n`)
+
+await run(listsToRun.dash, migrateA_dash, 'dash')
+await run(listsToRun.cm, migrateB_orphan, 'orphan')
+await run(listsToRun.old9, migrateC_oldfile, 'old-v4')
+if (shardOpen) await vctx.flush()
+
+console.log(`\n✓✓ MIGRATION COMPLET — ${done} réussi(s), ${failed} échec(s).`)

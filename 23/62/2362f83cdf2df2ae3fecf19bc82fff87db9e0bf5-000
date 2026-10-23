@@ -1,0 +1,133 @@
+// Publication d'un article vers ZenRayWebsite — pipeline COMPLET et SÛR.
+// Crée une BRANCHE article/<slug> depuis master, y écrit en UN SEUL commit atomique (Git Data API,
+// jamais de clone) : public/articles/<slug>.json + public/articles/index.json + tous les assets
+// PUBLICS promus sous public/articles/<slug>/... Ne touche JAMAIS master.
+// Le JSON public ne contient AUCUNE URL privée (/api/img|shard|stream|hls). Statut réel renvoyé.
+// Actions (via body.action) : 'publish' (défaut) | 'status'.
+import { normalizeDraft, validateDraft, buildPublicArtifact, upsertIndex } from './article-contract.js'
+import { resolveAndPromote } from './article-assets.js'
+
+const REPO = process.env.WEBSITE_REPO || 'matthieuhuguet/ZenRayWebsite'
+const BASE = process.env.WEBSITE_BRANCH || 'master'
+const TOKEN = process.env.WEBSITE_GITHUB_TOKEN || process.env.GITHUB_TOKEN
+const BASE_URL = process.env.WEBSITE_PUBLIC_BASE_URL || 'https://matthieuhuguet.com'
+const ROUTE = process.env.WEBSITE_ROUTE_BASE || '/reels'
+
+import { instrument } from './cmdlog.js'
+const slugify = (s) => (s || 'article').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 60) || 'article'
+const ghRaw = (path, init = {}) => fetch(`https://api.github.com/repos/${REPO}/${path}`, { ...init, headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) } })
+const gh = instrument(ghRaw, { repoOf: () => REPO, pathOf: (args) => args[0], initOf: (args) => args[1] || {} })
+
+async function readJsonOnBranch(path, ref) {
+  const r = await gh(`contents/${encodeURI(path)}?ref=${ref}`)
+  if (!r.ok) return null
+  try { return JSON.parse(Buffer.from((await r.json()).content, 'base64').toString('utf8')) } catch { return null }
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return res.status(405).end() }
+  if (!TOKEN) return res.status(401).json({ error: 'no-token' })
+  let body = req.body; if (typeof body === 'string') { try { body = JSON.parse(body) } catch { body = {} } }
+  const action = (body && body.action) || 'publish'
+
+  if (action === 'status') {
+    const slug = slugify((body && body.slug) || '')
+    try {
+      const branch = `article/${slug}`
+      const br = await gh(`branches/${branch}`)
+      const onBranch = br.ok
+      const fileOnMaster = await readJsonOnBranch(`public/articles/${slug}.json`, BASE)
+      const pr = await gh(`pulls?head=${REPO.split('/')[0]}:${branch}&state=open`)
+      const prs = pr.ok ? await pr.json() : []
+      let status = 'draft'
+      if (fileOnMaster) status = 'live'
+      else if (prs.length) status = 'preview'
+      else if (onBranch) status = 'published_to_branch'
+      return res.status(200).json({ ok: true, slug, status, branch: onBranch ? branch : null, prUrl: prs[0] ? prs[0].html_url : null, liveUrl: fileOnMaster ? `${BASE_URL}${ROUTE}/${slug}` : null })
+    } catch { return res.status(500).json({ error: 'status-fetch' }) }
+  }
+
+  // --- PUBLISH ---
+  const draft = normalizeDraft(body && body.article)
+  const v = validateDraft(draft)
+  if (!v.ok) return res.status(400).json({ error: 'validation', errors: v.errors, warnings: v.warnings })
+  const slug = v.slug
+  const branch = `article/${slug}`
+  const runId = 'run-' + Date.now().toString(36)
+
+  try {
+    // 1. base master
+    const mr = await gh(`git/ref/heads/${BASE}`); if (!mr.ok) return res.status(404).json({ error: 'no-base' })
+    const baseSha = (await mr.json()).object.sha
+
+    // 2. promotion des médias privés -> assets publics autonomes
+    let promo
+    try { promo = await resolveAndPromote(process.env.GITHUB_TOKEN, draft, slug) }
+    catch (e) { return res.status(422).json({ error: 'assets', detail: String(e.message || e).slice(0, 160) }) }
+
+    // 3. artefact public (lève si une URL privée subsiste)
+    let artifact
+    try { artifact = buildPublicArtifact(draft, { slug, rewriteMap: promo.rewriteMap, assetMeta: promo.assetMeta }) }
+    catch (e) { return res.status(422).json({ error: 'artifact', detail: String(e.message || e).slice(0, 160) }) }
+
+    // 4. index public (lu depuis master, upsert)
+    const prevIndex = await readJsonOnBranch('public/articles/index.json', BASE)
+    const newIndex = upsertIndex(prevIndex && prevIndex.items, artifact)
+
+    // 5. branche (ignore si elle existe -> 422)
+    const cr = await gh('git/refs', { method: 'POST', body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseSha }) })
+    if (!cr.ok && cr.status !== 422) { const t = await cr.text(); return res.status(409).json({ error: 'branch', detail: t.slice(0, 160) }) }
+    // sha de la pointe de branche (master si neuve, sinon la pointe existante)
+    const tipr = await gh(`git/ref/heads/${branch}`)
+    const tipSha = tipr.ok ? (await tipr.json()).object.sha : baseSha
+
+    // 6. blobs (assets binaires en base64 + 2 JSON texte)
+    const tree = []
+    for (const f of promo.files) {
+      const bl = await gh('git/blobs', { method: 'POST', body: JSON.stringify({ content: f.base64, encoding: 'base64' }) })
+      if (!bl.ok) { const t = await bl.text(); return res.status(500).json({ error: 'blob', detail: t.slice(0, 160) }) }
+      tree.push({ path: f.path, mode: '100644', type: 'blob', sha: (await bl.json()).sha })
+    }
+    const putText = async (p, obj) => {
+      const bl = await gh('git/blobs', { method: 'POST', body: JSON.stringify({ content: Buffer.from(JSON.stringify(obj, null, 2), 'utf8').toString('base64'), encoding: 'base64' }) })
+      if (!bl.ok) throw new Error('blob-text')
+      tree.push({ path: p, mode: '100644', type: 'blob', sha: (await bl.json()).sha })
+    }
+    await putText(`public/articles/${slug}.json`, artifact)
+    await putText('public/articles/index.json', newIndex)
+
+    // 7. tree (base = pointe de branche) + commit + move ref (atomique)
+    const tr = await gh('git/trees', { method: 'POST', body: JSON.stringify({ base_tree: tipSha, tree }) })
+    if (!tr.ok) { const t = await tr.text(); return res.status(500).json({ error: 'tree', detail: t.slice(0, 160) }) }
+    const treeSha = (await tr.json()).sha
+    const co = await gh('git/commits', { method: 'POST', body: JSON.stringify({ message: `content publish ${slug}`, tree: treeSha, parents: [tipSha] }) })
+    if (!co.ok) { const t = await co.text(); return res.status(500).json({ error: 'commit', detail: t.slice(0, 160) }) }
+    const commitSha = (await co.json()).sha
+    const up = await gh(`git/refs/heads/${branch}`, { method: 'PATCH', body: JSON.stringify({ sha: commitSha, force: false }) })
+    if (!up.ok) { const t = await up.text(); return res.status(500).json({ error: 'ref', detail: t.slice(0, 160) }) }
+
+    // 8. PR best-effort (selon scope du token). Échec PR != échec publish.
+    let prUrl = null
+    try {
+      const existing = await gh(`pulls?head=${REPO.split('/')[0]}:${branch}&state=open`)
+      const arr = existing.ok ? await existing.json() : []
+      if (arr.length) prUrl = arr[0].html_url
+      else {
+        const prr = await gh('pulls', { method: 'POST', body: JSON.stringify({ title: `content publish ${slug}`, head: branch, base: BASE, body: `Publish \`${slug}\`.` }) })
+        if (prr.ok) prUrl = (await prr.json()).html_url
+      }
+    } catch { /* token sans Pull requests RW : on continue */ }
+
+    return res.status(200).json({
+      ok: true, runId, slug, branch, commitSha,
+      status: prUrl ? 'preview' : 'published_to_branch',
+      assets: promo.files.length,
+      warnings: v.warnings,
+      prUrl,
+      compareUrl: `https://github.com/${REPO}/compare/${BASE}...${branch}`,
+      liveUrl: `${BASE_URL}${ROUTE}/${slug}`,
+    })
+  } catch (e) {
+    return res.status(500).json({ error: 'fetch', detail: String(e && e.message || e).slice(0, 160) })
+  }
+}

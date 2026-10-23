@@ -1,0 +1,294 @@
+// img-ingest.mjs — SIDECAR Node d'ingestion IMAGE en masse (choix A1 : sidecar pur, PAS de navigateur headless).
+//
+// EN CLAIR : quand le script d'archive en masse (archive-folder.mjs) croise une IMAGE, il NE doit PLUS la
+// découper en morceaux binaires opaques (.file.json). Une image, on sait l'afficher tout de suite. Ce module
+// reproduit en Node EXACTEMENT le pipeline image de l'app :
+//   1. chiffre l'image (AES-256-GCM, clé maître, IV déterministe = dédup) ;
+//   2. la pousse CHIFFRÉE sur un shard PUBLIC zenray-img-public-NN (servi par jsDelivr) ;
+//   3. fabrique une VRAIE vignette .webp (ffmpeg), chiffrée elle aussi ;
+//   4. rend un manifeste .img.json IDENTIQUE au schéma in-app (buildPublicImgManifest).
+// Résultat : l'image archivée s'ouvre inline dans Create, avec sa vignette, ZÉRO réassemblage.
+//
+// POURQUOI A1 (sidecar) ET PAS A2 (navigateur headless rejouant captureImage) : zéro dépendance lourde,
+// zéro risque, diff borné. Coût assumé : garder ce fichier synchrone du schéma .img.json. Si la logique
+// image diverge un jour, réévaluer A2 (noté, pas fait). Réutilise la lib CANONIQUE Scripts/lib/img-pipeline.mjs.
+//
+// CONTRAINTE DURE (héritée du modèle projet) : push par GIT (transport hors quota REST), cap dur < 5 Go/shard
+// avec rollover, jamais de token committé, public par défaut (P0 anti-fuite : chemins = hash, aucun nom humain).
+
+import { readFile, writeFile, mkdir, rm, stat } from 'node:fs/promises'
+import { spawnSync, execFileSync } from 'node:child_process'
+import path from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import {
+  sha256Hex, ivFromHash, encryptDeterministic, loadMasterKey,
+  shardPathFor, shardChunkPathFor, splitIntoChunks, PUBLIC_SHARD_BASE, SHARD_CAP_BYTES, shardName, jsDelivrUrl,
+  buildPublicImgManifest, GIT_ENV,
+} from './lib/img-pipeline.mjs'
+
+// OUTILS IMAGE Node : cwebp (libwebp) pour la vignette .webp ; sips (natif macOS) pour les dimensions et
+// pour décoder les formats que cwebp ne lit pas (HEIC, TIFF exotiques) en PNG intermédiaire. ffprobe reste
+// un dernier recours pour les dimensions. Tous surchargeables par env pour portabilité.
+const CWEBP = process.env.ZR_CWEBP || '/opt/homebrew/bin/cwebp'
+const SIPS = process.env.ZR_SIPS || '/usr/bin/sips'
+const FFPROBE = process.env.ZR_FFPROBE || '/opt/homebrew/bin/ffprobe'
+
+// L'image est poussée TELLE QUELLE (octets d'origine chiffrés, jamais ré-encodés) : préserve la qualité,
+// garde l'idempotence par hash du clair d'origine. Seule la vignette est dérivée. Le ciphertext est ensuite
+// DÉCOUPÉ en morceaux ≤19 Mo (splitIntoChunks, lib/img-pipeline.mjs) — plus de version recompressée
+// dispPath : la reconstruction bit-exacte via jsDelivr remplace l'ancien barreau d'affichage (2026-07-07).
+
+// Mesure (w,h) : sips d'abord (natif, lit HEIC/RAW), ffprobe en repli. Best-effort : 0,0 si illisible.
+function imageDims(abs) {
+  try {
+    const out = execFileSync(SIPS, ['-g', 'pixelWidth', '-g', 'pixelHeight', abs], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 30000 }).toString()
+    const w = (out.match(/pixelWidth:\s*(\d+)/) || [])[1]
+    const h = (out.match(/pixelHeight:\s*(\d+)/) || [])[1]
+    if (w && h) return { w: parseInt(w, 10), h: parseInt(h, 10) }
+  } catch {}
+  try {
+    const out = execFileSync(FFPROBE, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x', abs], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 30000 }).toString().trim()
+    const m = out.match(/(\d+)x(\d+)/)
+    if (m) return { w: parseInt(m[1], 10), h: parseInt(m[2], 10) }
+  } catch {}
+  return { w: 0, h: 0 }
+}
+
+// SUPPRIMÉ (2026-07-13) : makeThumbWebp, l'ancienne vignette 384px/q72. Elle rendait les aperçus flous
+// sur les écrans haute densité (iPhone 15 Pro Max). La SEULE fabrique de vignette est désormais
+// makeThumbAt() plus bas : petit côté <= 1080px, WebP qualité 60, jamais d'agrandissement.
+// Les 2552 images DJI déjà en ligne ont été régénérées à ce format le 2026-07-13 (voir PROGRESS.md).
+// Si tu cherches l'ancien code : git log -S makeThumbWebp — ne le réintroduis pas.
+
+// ── CONTEXTE SHARD IMAGE PUBLIC (git push incrémental, rollover < 5 Go) ───────────────────────────────
+// Le bulk crée UN contexte partagé en début de run, le passe à chaque ingestImageBulk, puis appelle
+// flushImgShard() à la fin (push final + commit SHA pour pinner les URLs jsDelivr). Patron jumeau du shard
+// de archive-folder.mjs, mais sur la famille zenray-img-public-NN (publique, chiffrée).
+export function makeImgShardCtx({ token, owner = 'matthieuhuguet', work, repoRoot, log = console.log }) {
+  const key = loadMasterKey(repoRoot, { readFileSync })
+  if (!key) throw new Error('clé maître média introuvable (ZENRAY_MEDIA_KEY ou <repo>/.zenray-media-key) — img-ingest impossible')
+  const GENV = { ...process.env, ...GIT_ENV }
+  const cloneUrl = (repo) => `https://x-access-token:${token}@github.com/${owner}/${repo}.git`
+  const git = (dir, a, timeout = 240000) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', env: GENV, timeout, killSignal: 'SIGKILL' })
+
+  const ctx = {
+    token, owner, work, key, log,
+    repo: null, dir: null, bytes: 0, pending: 0,
+    commitOf: {},          // repo -> commit SHA (rempli au flush ; pour pinner jsDelivr)
+    // staged[] : { repo, hashedPath, kind:'img'|'thumb' } — info de debug seulement.
+  }
+
+  // MODÈLE 2026-07-05 (décision Matthieu, même contrat que makeVidRawShardCtx) : repo NEUF par lot,
+  // nom aléatoire zenrayshards-img-<hex12>, PUBLIC (jsDelivr exige public — seule famille publique de la
+  // convention). ZÉRO clone d'un shard existant, ZÉRO check de place distant. Le découpage au sein d'un
+  // lot géant reste anticipé par compteur LOCAL (writeBinary). Ne JAMAIS recréer un ancien nom de repo :
+  // les vieux manifestes reposent sur la redirection GitHub ancien->nouveau nom (vérifiée OK le 2026-07-05
+  // sur raw.githubusercontent.com ET jsDelivr, chemins non cachés).
+  async function openShard() {
+    const { randomBytes } = await import('node:crypto')
+    ctx.repo = `zenrayshards-img-${randomBytes(6).toString('hex')}`
+    ctx.dir = path.join(work, ctx.repo)
+    await rm(ctx.dir, { recursive: true, force: true })
+    await mkdir(ctx.dir, { recursive: true })
+    git(ctx.dir, ['init', '-q']); git(ctx.dir, ['branch', '-M', 'main'])
+    git(ctx.dir, ['config', 'user.email', 'bot@zenray']); git(ctx.dir, ['config', 'user.name', 'zenray-bot'])
+    git(ctx.dir, ['config', 'http.version', 'HTTP/1.1'])
+    await writeFile(path.join(ctx.dir, 'README.md'), '# zenrayshards (img, public)\n\nBinaires images chiffres AES-GCM, nommes par empreinte, servis par jsDelivr. Cle maitre hors de ce depot.\n')
+    const cr = spawnSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', '-H', `Authorization: Bearer ${token}`, 'https://api.github.com/user/repos', '-d', JSON.stringify({ name: ctx.repo, private: false })], { encoding: 'utf8' })
+    if ((cr.stdout || '').trim() !== '201') throw new Error(`création repo ${ctx.repo}: HTTP ${(cr.stdout || '?')}`)
+    git(ctx.dir, ['add', '-A']); git(ctx.dir, ['commit', '-q', '-m', 'init'])
+    git(ctx.dir, ['remote', 'add', 'origin', cloneUrl(ctx.repo)])
+    const ps = git(ctx.dir, ['push', '-q', 'origin', 'HEAD:main'], 120000)
+    if (ps.status !== 0) throw new Error('push-init img shard: ' + (ps.stderr || '').slice(-200))
+    ctx.log(`  >>> repo image neuf ${ctx.repo} (public) créé — zéro clone, zéro check`)
+    ctx.bytes = 0; ctx.pending = 0
+  }
+
+  // push incrémental (anti-hang) : commit + push, avec retries.
+  async function pushShard() {
+    const st = git(ctx.dir, ['status', '--porcelain'])
+    if (!st.stdout.trim()) return true
+    git(ctx.dir, ['add', '-A']); git(ctx.dir, ['commit', '-q', '-m', '+img'])
+    for (let a = 0; a < 20; a++) {
+      const ps = git(ctx.dir, ['push', '-q', 'origin', 'HEAD:main'], 600000)
+      if (ps.status === 0) { ctx.pending = 0; return true }
+      ctx.log(`  img push retry ${a + 1}/20 ${(ps.stderr || '').slice(-120)}`)
+      await new Promise((r) => setTimeout(r, Math.min(60000, 3000 * (a + 1))))
+    }
+    return false
+  }
+
+  // flush final : push + lit le commit SHA (pour pinner jsDelivr dans les manifestes).
+  async function flush() {
+    if (ctx.dir && existsSync(ctx.dir)) {
+      if (!await pushShard()) throw new Error('push-final img shard ' + ctx.repo)
+      ctx.commitOf[ctx.repo] = git(ctx.dir, ['rev-parse', 'HEAD']).stdout.trim()
+      ctx.log(`  ✓ ${ctx.repo} poussé (commit ${(ctx.commitOf[ctx.repo] || '').slice(0, 7)})`)
+    }
+  }
+
+  // Rollover ANTICIPÉ (compteur local, jamais de question à GitHub) si `bytes` ne tiendrait plus dans le
+  // shard courant. Exposé séparément (ctx.reserve) pour qu'une image DÉCOUPÉE EN PLUSIEURS MORCEAUX réserve
+  // la place du TOTAL avant d'écrire son premier morceau -> garantit que tous les morceaux d'UNE MÊME image
+  // atterrissent dans le MÊME repo/commit (sinon un rollover pile entre deux morceaux romprait la reconstruction,
+  // qui suppose cdnRepo/cdnCommit uniques pour toute la liste cdnChunks).
+  async function reserve(bytes) {
+    if (ctx.bytes > 0 && ctx.bytes + bytes > SHARD_CAP_BYTES) { await pushShard(); ctx.commitOf[ctx.repo] = git(ctx.dir, ['rev-parse', 'HEAD']).stdout.trim(); await openShard() }
+  }
+  // Écrit un binaire chiffré (déjà hashé) dans l'arbre du shard, à son chemin d'adresse de contenu.
+  // Rollover AVANT écriture si le shard atteint le cap. Renvoie le repo dans lequel il a atterri.
+  async function writeBinary(hashedPath, cipherBuf) {
+    await reserve(cipherBuf.length)
+    const dst = path.join(ctx.dir, hashedPath)
+    await mkdir(path.dirname(dst), { recursive: true })
+    await writeFile(dst, cipherBuf)
+    ctx.bytes += cipherBuf.length; ctx.pending += cipherBuf.length
+    // 900 Mo (2026-07-11, relevé depuis 800 Mo, demande Matthieu) : reste sous la marge <1 Go/push déjà
+    // testée (img-pipeline.mjs) — 800 comme 900 sont sûrs, seule 1900 (proposé puis écarté) l'aurait
+    // dépassée. Pour upload-img-list.mjs ce seuil est de toute façon rarement atteint : depuis le fix
+    // "média par média" du même jour, ctx.flush() est appelé explicitement après CHAQUE image (voir ce
+    // script), donc `pending` repart de 0 à chaque image — ce seuil ne sert de filet que pour les AUTRES
+    // consommateurs de makeImgShardCtx (archive-folder.mjs, upload-img-all.mjs, regen-thumbs-oriented.mjs)
+    // qui n'appellent pas flush() par image.
+    if (ctx.pending >= 900 * 1024 * 1024) { if (!await pushShard()) throw new Error('push-incr img shard') }
+    return ctx.repo
+  }
+
+  ctx.openShard = openShard
+  ctx.flush = flush
+  ctx.writeBinary = writeBinary
+  ctx.reserve = reserve
+  return ctx
+}
+
+// ── INGESTION D'UNE IMAGE (appelée par le bulk) ───────────────────────────────────────────────────────
+// Pousse l'image chiffrée + sa vignette sur le shard public courant, renvoie le blob manifeste
+// { path:'<dest>/<rel>.img.json', content } à committer sur zenray-data par le bulk (avec les autres).
+// IMPORTANT : le commit SHA jsDelivr n'est connu qu'au flush() final. On renvoie donc un manifeste avec
+// un PLACEHOLDER de commit que le bulk RÉSOUT après flush (resolveImgManifests ci-dessous).
+export async function ingestImageBulk(absPath, rel, dest, ctx) {
+  if (!ctx.dir) await ctx.openShard()
+  const clear = await readFile(absPath)
+  const hash = sha256Hex(clear)
+  const ext = (rel.match(/\.([a-z0-9]+)$/i) || [, 'bin'])[1].toLowerCase()
+  const { w, h } = imageDims(absPath)
+
+  // binaire principal chiffré (IV déterministe = dédup), puis DÉCOUPÉ en morceaux ≤19 Mo (uniforme, même
+  // pour une petite image -> 1 seul morceau). Chaque morceau est son propre fichier git ; le manifeste garde
+  // la liste ORDONNÉE des chemins (cdnChunks) pour que le client les concatène avant de déchiffrer.
+  const { cipher } = encryptDeterministic(clear, ctx.key, hash)
+  await ctx.reserve(cipher.length) // réserve la place du TOTAL -> tous les morceaux dans le MÊME repo
+  const chunkBufs = splitIntoChunks(cipher)
+  const cdnChunks = []
+  let repo = null
+  for (let i = 0; i < chunkBufs.length; i++) {
+    const cp = shardChunkPathFor(hash, i)
+    repo = await ctx.writeBinary(cp, chunkBufs[i])
+    cdnChunks.push(cp)
+  }
+
+  // Vignette WebP chiffrée (best-effort), avec son PROPRE IV (son contenu diffère de l'original) — jamais
+  // découpée en morceaux (toujours petite). Format standard : 1080px petit côté / q60 (voir makeThumbAt).
+  let thumbIv = null
+  let thumbPath = null
+  let thumbW = null
+  let thumbH = null
+  const thumb = makeThumbAt(absPath, ctx.work, 1080, 60)
+  if (thumb) {
+    const tHash = sha256Hex(thumb.buf)
+    const enc = encryptDeterministic(thumb.buf, ctx.key, tHash)
+    thumbIv = enc.iv
+    thumbPath = shardPathFor(tHash, 'webp')
+    thumbW = thumb.w; thumbH = thumb.h
+    await ctx.writeBinary(thumbPath, enc.cipher)
+  }
+
+  // manifeste : on connaît tout SAUF le commit SHA (rempli au flush). On stocke les morceaux et on laissera
+  // le bulk résoudre cdnCommit + l'URL jsDelivr de la vignette. iv = IV déterministe (= ivFromHash du clair).
+  const iv = ivFromHash(hash).toString('base64')
+  const pending = {
+    path: `${dest}/${rel}.img.json`,
+    repo, cdnChunks, iv, thumbIv, thumbPath, thumbW, thumbH,
+    base: { name: path.basename(rel), ext, w, h, clearSize: clear.length },
+  }
+  return pending // résolu en blob final par resolveImgManifest() après ctx.flush()
+}
+
+// Après flush() (commit SHA connus), transforme un `pending` en blob manifeste final { path, content }.
+// thumbUrl jsDelivr@sha (servie en clair côté CDN, déchiffrée par /api/media-key via thumbIv côté app).
+export function resolveImgManifest(pending, ctx) {
+  const commit = ctx.commitOf[pending.repo]
+  if (!commit) throw new Error('commit img shard manquant pour ' + pending.repo)
+  const m = buildPublicImgManifest({
+    name: pending.base.name, ext: pending.base.ext, w: pending.base.w, h: pending.base.h,
+    clearSize: pending.base.clearSize, addedAt: new Date().toISOString(),
+    cdnRepo: pending.repo, cdnChunks: pending.cdnChunks, cdnCommit: commit,
+    iv: pending.iv, thumbIv: pending.thumbIv, thumbW: pending.thumbW, thumbH: pending.thumbH,
+  })
+  // thumb (URL jsDelivr@sha) si une vignette a été poussée — champ lu par le Drive/Finder pour l'aperçu.
+  if (pending.thumbPath) m.thumb = jsDelivrUrl(ctx.owner, pending.repo, commit, pending.thumbPath)
+  return { path: pending.path, content: JSON.stringify(m) }
+}
+
+// SUPPRIMÉ (2026-07-13) : regenThumbOnly (le backfill 384px). Remplacé par regenThumbAt() ci-dessous,
+// même rôle (régénérer SEULEMENT la vignette d'une image déjà en ligne, original intact) mais au
+// format standard 1080px/q60. thumbUrlForRegen reste : il résout juste l'URL jsDelivr après flush.
+export const thumbUrlForRegen = (ctx, repo, thumbPath) => jsDelivrUrl(ctx.owner, repo, ctx.commitOf[repo], thumbPath)
+
+// ── LA fabrique de vignette (standard unique depuis 2026-07-13) ──────────────────────────────────────
+// Ce que ça fait, en une phrase : produit une vignette WebP dont le PETIT côté fait au plus `maxShort`
+// pixels (1080 par défaut chez tous les appelants), qualité `quality` (60), sans jamais AGRANDIR une
+// image plus petite (pas de fausse netteté inventée).
+//
+// Pourquoi 1080/q60 (décision Matthieu, chiffres réels du 2026-07-12 sur 74 images) : le 384px était
+// pixelisé sur iPhone 15 Pro Max ; 1080p coûte ~4x le poids mais reste négligeable en absolu
+// (~50-460 Ko/vignette) ; WebP bat le JPEG de 2,3-3,2x à qualité égale (mesuré), donc le format reste.
+//
+// Ordre des moteurs (le premier qui marche gagne, un échec total renvoie null sans casser l'ingestion) :
+//   1. ImageMagick — le seul qui applique l'orientation EXIF (photos iPhone portrait sinon couchées).
+//      JAMAIS de suffixe [0] : il fait planter magick 7.1.2-24/27 combiné à -resize (bug isolé le 2026-07-13).
+//   2. cwebp direct — pas d'orientation EXIF, mais lit PNG/JPEG/TIFF/WebP.
+//   3. sips -> PNG temporaire -> cwebp — pour les formats exotiques (HEIC...).
+export function makeThumbAt(abs, work, maxShort, quality) {
+  const { w, h } = imageDims(abs)
+  const short = Math.min(w, h) || 0
+  const scale = short > 0 ? Math.min(1, maxShort / short) : 1 // jamais d'upscale
+  const neww = w ? Math.max(1, Math.round(w * scale)) : maxShort
+  const newh = h ? Math.max(1, Math.round(h * scale)) : maxShort
+  const geom = `${neww}x${newh}!` // dims EXACTES déjà calculées au ratio source — pas de recalcul ambigu par magick
+  const tryCwebp = (src) => {
+    try {
+      const out = execFileSync(CWEBP, ['-quiet', '-q', String(quality), '-resize', String(neww), String(newh), src, '-o', '-'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 60000, maxBuffer: 1 << 27 })
+      return out && out.length ? out : null
+    } catch { return null }
+  }
+  try {
+    // pas de suffixe [0] : bug ImageMagick ci-dessus (makeThumbWebp) — même correctif.
+    const out = execFileSync('magick', [abs, '-auto-orient', '-resize', geom, '-quality', String(quality), '-strip', 'webp:-'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 60000, maxBuffer: 1 << 27 })
+    if (out && out.length) return { buf: out, w: neww, h: newh }
+  } catch {}
+  const direct = tryCwebp(abs)
+  if (direct) return { buf: direct, w: neww, h: newh }
+  try {
+    const tmpPng = path.join(work, `thumbsrc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}.png`)
+    execFileSync(SIPS, ['-s', 'format', 'png', abs, '--out', tmpPng], { stdio: ['ignore', 'ignore', 'ignore'], timeout: 60000 })
+    const out = tryCwebp(tmpPng)
+    try { execFileSync('rm', ['-f', tmpPng]) } catch {}
+    return out ? { buf: out, w: neww, h: newh } : null
+  } catch { return null }
+}
+
+// Régénère SEULEMENT la vignette d'une image déjà en ligne : fabrique la .webp (makeThumbAt), la chiffre,
+// la pousse sur le shard courant. L'original et le reste du manifeste ne sont jamais touchés — l'appelant
+// (regen-thumbs-oriented.mjs, regen-thumbs-bulk.mjs) met à jour thumb/thumbIv/thumbW/thumbH lui-même.
+// Renvoie { repo, thumbPath, thumbIv, thumbW, thumbH } ou null (best-effort : un échec ne casse rien).
+export async function regenThumbAt(absPath, ctx, maxShort = 1080, quality = 60) {
+  if (!ctx.dir) await ctx.openShard()
+  const t = makeThumbAt(absPath, ctx.work, maxShort, quality)
+  if (!t) return null
+  const tHash = sha256Hex(t.buf)
+  const enc = encryptDeterministic(t.buf, ctx.key, tHash)
+  const thumbPath = shardPathFor(tHash, 'webp')
+  const repo = await ctx.writeBinary(thumbPath, enc.cipher)
+  return { repo, thumbPath, thumbIv: enc.iv, thumbW: t.w, thumbH: t.h }
+}

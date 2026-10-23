@@ -1,0 +1,68 @@
+// 2026-09-23 19:10 : the journal reader pins both files to one commit and never trusts a torn pair.
+import { describe, it, expect } from 'vitest'
+import { createJournalReader, sliceSince } from './journal.js'
+
+const enc = (s) => new TextEncoder().encode(s)
+
+function fakeGithub(state) {
+  const calls = []
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, headers: init.headers })
+    if (url.includes('/commits/')) {
+      if (init.headers['If-None-Match'] === `"etag-${state.commit}"`) return new Response(null, { status: 304 })
+      return new Response(state.commit, { status: 200, headers: { etag: `"etag-${state.commit}"` } })
+    }
+    const ref = new URL(url).searchParams.get('ref')
+    const files = state.byCommit[ref]
+    if (url.includes('/contents/status.json')) return new Response(files.status, { status: 200 })
+    return new Response(files.journal, { status: 200 })
+  }
+  return { fetchImpl, calls }
+}
+
+describe('journal reader', () => {
+  it('reads the pair pinned to the head commit, then serves from memory on a 304', async () => {
+    const body = 'entry one\n'
+    const state = { commit: 'c1', byCommit: { c1: { journal: body, status: JSON.stringify({ size: enc(body).length, sha256: 'x' }) } } }
+    const { fetchImpl, calls } = fakeGithub(state)
+    const read = createJournalReader({ fetchImpl, token: 't' })
+    const a = await read()
+    expect(a.commit).toBe('c1')
+    expect(new TextDecoder().decode(a.bytes)).toBe(body)
+    expect(calls.filter((c) => c.url.includes('ref=c1'))).toHaveLength(2)
+    const b = await read()
+    expect(b).toBe(a)
+    expect(calls.at(-1).headers['If-None-Match']).toBe('"etag-c1"')
+    expect(calls.filter((c) => c.url.includes('ref=c1'))).toHaveLength(2)
+  })
+
+  it('follows a new commit', async () => {
+    const one = 'a\n', two = 'a\nb\n'
+    const state = { commit: 'c1', byCommit: {
+      c1: { journal: one, status: JSON.stringify({ size: 2 }) },
+      c2: { journal: two, status: JSON.stringify({ size: 4 }) },
+    } }
+    const { fetchImpl } = fakeGithub(state)
+    const read = createJournalReader({ fetchImpl, token: 't' })
+    await read()
+    state.commit = 'c2'
+    const b = await read()
+    expect(b.commit).toBe('c2')
+    expect(b.bytes.length).toBe(4)
+  })
+
+  it('refuses a pair whose declared size does not match the bytes', async () => {
+    const state = { commit: 'c1', byCommit: { c1: { journal: 'abc', status: JSON.stringify({ size: 99 }) } } }
+    const { fetchImpl } = fakeGithub(state)
+    const read = createJournalReader({ fetchImpl, token: 't' })
+    await expect(read()).rejects.toThrow('journal-inconsistent')
+  })
+})
+
+describe('sliceSince', () => {
+  it('returns only appended bytes, or everything when incoherent', () => {
+    const b = enc('abcdef')
+    expect(new TextDecoder().decode(sliceSince(b, '4').body)).toBe('ef')
+    for (const s of [undefined, '', '-1', '9', 'x']) expect(sliceSince(b, s).from).toBe(0)
+  })
+})

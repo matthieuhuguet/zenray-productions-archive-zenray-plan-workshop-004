@@ -1,0 +1,106 @@
+import { randomUUID } from 'node:crypto'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const PROFILES = {
+  court: { waitMs: 60_000, staleMs: 15 * 60_000, pollMs: 100 },
+  long: { waitMs: 60 * 60_000, staleMs: 15 * 60_000, pollMs: 250 },
+}
+
+export function directoryLockOptions(profile, label) {
+  const values = PROFILES[profile]
+  if (!values) throw new Error(`profil de verrou inconnu: ${profile}`)
+  return { ...values, label }
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try { process.kill(pid, 0); return true }
+  catch (error) { return error?.code === 'EPERM' }
+}
+
+async function inspectLock(lockDir, staleMs) {
+  try {
+    const ownerPath = path.join(lockDir, 'owner.json')
+    let owner = null
+    let modifiedAt = (await stat(lockDir)).mtimeMs
+    try {
+      owner = JSON.parse(await readFile(ownerPath, 'utf8'))
+      modifiedAt = (await stat(ownerPath)).mtimeMs
+    } catch {}
+    const ownerIdentifie = Number.isInteger(owner?.pid) && owner.pid > 0
+    return {
+      owner,
+      // Un PID prouvé mort ne peut plus écrire : son verrou se reprend immédiatement. Le délai ne sert qu'au
+      // bref instant où le dossier existe mais où owner.json n'est pas encore écrit, ou si ce fichier est cassé.
+      stale: ownerIdentifie ? !processIsAlive(owner.pid) : Date.now() - modifiedAt > staleMs,
+    }
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null
+    throw error
+  }
+}
+
+/**
+ * Verrou inter-processus par dossier.
+ *
+ * Le PID empêche de voler le verrou à un processus vivant dont une commande synchrone bloque la boucle
+ * JavaScript plus longtemps que `staleMs`. Le jeton empêche, inversement, un ancien détenteur de supprimer
+ * le verrou d'un successeur lorsqu'il se réveille tardivement.
+ */
+export async function acquireDirectoryLock(lockDir, { waitMs, staleMs, pollMs, label }) {
+  for (const [name, value] of Object.entries({ waitMs, staleMs, pollMs })) {
+    if (!Number.isFinite(value) || value <= 0) throw new Error(`paramètre de verrou invalide: ${name}`)
+  }
+  if (!label) throw new Error('paramètre de verrou manquant: label')
+
+  const startedAt = Date.now()
+  const token = `${process.pid}-${randomUUID()}`
+  const ownerPath = path.join(lockDir, 'owner.json')
+
+  for (;;) {
+    try {
+      await mkdir(lockDir)
+      await writeFile(ownerPath, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString(), label }))
+      let released = false
+      return {
+        waitedMs: Date.now() - startedAt,
+        async release() {
+          if (released) return
+          released = true
+          try {
+            const owner = JSON.parse(await readFile(ownerPath, 'utf8'))
+            if (owner?.token === token) await rm(lockDir, { recursive: true, force: true })
+          } catch {}
+        },
+      }
+    } catch (error) {
+      if (error?.code !== 'EEXIST') {
+        await rm(lockDir, { recursive: true, force: true }).catch(() => {})
+        throw error
+      }
+    }
+
+    const state = await inspectLock(lockDir, staleMs)
+    if (!state) continue
+    if (state.stale) {
+      const abandoned = `${lockDir}.stale-${token}`
+      try {
+        await rename(lockDir, abandoned)
+        await rm(abandoned, { recursive: true, force: true })
+        continue
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue
+        throw error
+      }
+    }
+
+    if (Date.now() - startedAt >= waitMs) {
+      const owner = state.owner ? ` (${JSON.stringify(state.owner)})` : ''
+      throw new Error(`${label} verrouillé depuis plus de ${Math.round(waitMs / 1000)}s${owner}`)
+    }
+    await sleep(pollMs)
+  }
+}

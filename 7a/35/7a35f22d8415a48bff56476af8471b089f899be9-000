@@ -1,0 +1,146 @@
+// 4 October 2026: the merge adds, updates and closes vacancies, and never touches what Matthieu wrote.
+import { describe, expect, it } from 'vitest'
+import config from './FreelanceConfig.json'
+import { buildOffer, offerId } from './lib/Offer.mjs'
+import { inferSource, isClosed, mergeStore } from './StoreMerge.mjs'
+
+const NOW = new Date('2026-10-04T10:00:00+02:00')
+const later = (days) => new Date(NOW.getTime() + days * 86400000)
+const listing = (n, extra = {}) => ({ sourceKey: 'greenhouse:epic', sourceLabel: 'Epic Games', evidence: 'Epic Games, recrutement officiel Greenhouse', name: 'Epic Games', title: `Technical Artist ${n}`, url: `https://boards.example/${n}`, applyUrl: `https://boards.example/${n}`, sourceId: `epic:${n}`, location: 'Remote', country: 'US', contract: 'Full-time', workplace: 'Remote', published: '2026-10-01', text: 'Houdini and Unreal Engine.', ...extra })
+const board = (listings, extra = {}) => ({ key: 'greenhouse:epic', label: 'Epic Games', listings, seenIds: listings.map((item) => offerId(item.sourceId)), listed: listings.length, matched: listings.length, errors: [], complete: true, ...extra })
+const store = (studios) => ({ v: 2, studios })
+
+describe('mergeStore', () => {
+  it('adds new vacancies as uncontacted and reports them, without mutating the input', () => {
+    const current = store([])
+    const frozen = JSON.stringify(current)
+    const { store: next, report } = mergeStore(current, [board([listing(1), listing(2)])], config, { now: NOW })
+    expect(next.studios).toHaveLength(2)
+    expect(next.studios.every((studio) => studio.status === 'to_contact' && studio.messages.length === 0)).toBe(true)
+    expect(report.added).toHaveLength(2)
+    expect(JSON.stringify(current)).toBe(frozen)
+  })
+
+  it('refreshes the engine block of a known vacancy and never touches his status, messages, history or notes', () => {
+    const first = mergeStore(store([]), [board([listing(1)])], config, { now: NOW }).store
+    const edited = { ...first.studios[0], status: 'contacted', contactedAt: '2026-10-05', messages: [{ at: '2026-10-05', channel: 'mail', text: 'envoyé' }], history: [{ at: '2026-10-05', from: 'to_contact', to: 'contacted', note: '' }], notes: 'ma note' }
+    const { store: second } = mergeStore(store([edited]), [board([listing(1, { title: 'Technical Artist 1' })])], config, { now: later(2) })
+    const kept = second.studios[0]
+    expect(kept).toMatchObject({ status: 'contacted', contactedAt: '2026-10-05', notes: 'ma note' })
+    expect(kept.messages).toEqual(edited.messages)
+    expect(kept.history).toEqual(edited.history)
+    expect(kept.engine.firstSeenAt).toBe('2026-10-04')
+    expect(kept.engine.lastSeenAt).toBe('2026-10-06')
+  })
+
+  it('closes a vacancy only after enough missed runs, and only when the source answered in full', () => {
+    const first = mergeStore(store([]), [board([listing(1), listing(2)])], config, { now: NOW }).store
+    const gone = [board([listing(2)])]
+    const one = mergeStore(first, gone, config, { now: later(1) })
+    expect(one.store.studios.find((s) => s.name && s.engine.externalId === 'epic:1').engine).toMatchObject({ missedRuns: 1, closedAt: '' })
+    const two = mergeStore(one.store, gone, config, { now: later(2) })
+    const closed = two.store.studios.find((s) => s.engine.externalId === 'epic:1')
+    expect(closed.engine.closedAt).toBe('2026-10-06')
+    expect(two.report.closed).toEqual([closed.id])
+    expect(isClosed(closed, '2026-10-07')).toBe(true)
+    // the same absence from a source that FAILED proves nothing
+    const failed = [board([], { complete: false, errors: [{ error: 'HTTP 500' }] })]
+    const afterFailure = mergeStore(first, failed, config, { now: later(3) }).store
+    expect(afterFailure.studios.every((s) => s.engine.missedRuns === 0 && !s.engine.closedAt)).toBe(true)
+  })
+
+  it('counts two passes a few minutes apart as one miss only', () => {
+    const first = mergeStore(store([]), [board([listing(1)])], config, { now: NOW }).store
+    const a = mergeStore(first, [board([])], config, { now: later(1) }).store
+    const minutesLater = new Date(later(1).getTime() + 5 * 60000)
+    const b = mergeStore(a, [board([])], config, { now: minutesLater }).store
+    expect(b.studios[0].engine).toMatchObject({ missedRuns: 1, closedAt: '' })
+    const c = mergeStore(b, [board([])], config, { now: new Date(later(1).getTime() + 7 * 3600000) }).store
+    expect(c.studios[0].engine.closedAt).not.toBe('')
+  })
+
+  it('reopens a vacancy that comes back', () => {
+    let current = mergeStore(store([]), [board([listing(1)])], config, { now: NOW }).store
+    current = mergeStore(current, [board([])], config, { now: later(1) }).store
+    current = mergeStore(current, [board([])], config, { now: later(2) }).store
+    expect(current.studios[0].engine.closedAt).not.toBe('')
+    const back = mergeStore(current, [board([listing(1)])], config, { now: later(3) })
+    expect(back.store.studios[0].engine.closedAt).toBe('')
+    expect(back.report.reopened).toHaveLength(1)
+  })
+
+  it('does not duplicate a posting whose variant id changed, nor a link already stored', () => {
+    const first = mergeStore(store([]), [board([listing(1, { variantIds: [offerId('epic:1'), offerId('epic:9')] })])], config, { now: NOW }).store
+    const renamed = listing(9, { url: 'https://boards.example/9', variantIds: [offerId('epic:1'), offerId('epic:9')], title: 'Technical Artist 1' })
+    const { store: next, report } = mergeStore(first, [board([renamed])], config, { now: later(1) })
+    expect(next.studios).toHaveLength(1)
+    expect(report.added).toHaveLength(0)
+    const samelink = listing(7, { url: first.studios[0].link, title: first.studios[0].role })
+    expect(mergeStore(first, [board([samelink])], config, { now: later(1) }).store.studios).toHaveLength(1)
+  })
+
+  it('adopts a vacancy written before the engine by its address, instead of adding a duplicate', () => {
+    const old = { id: 'job_old_id', name: 'Epic Games', role: 'Technical Artist 1', link: 'https://boards.example/1', status: 'contacted', messages: [{ at: 'x', channel: 'mail', text: 'sent' }], history: [], notes: 'Source : Epic Games, recrutement officiel Greenhouse.' }
+    const { store: next, report } = mergeStore(store([old]), [board([listing(1)])], config, { now: NOW })
+    expect(next.studios).toHaveLength(1)
+    expect(report.added).toHaveLength(0)
+    expect(next.studios[0]).toMatchObject({ id: 'job_old_id', status: 'contacted' })
+    expect(next.studios[0].engine.source).toBe('greenhouse:epic')
+  })
+
+  it('leaves records of other sources, spontaneous prospects and the CRM contacts exactly as they are', () => {
+    const crm = { id: 'a1785075913163', name: 'Contact', role: 'Recruiter', link: '', status: 'declined', messages: [], history: [], notes: 'x' }
+    const { store: next } = mergeStore(store([crm]), [board([listing(1)])], config, { now: NOW })
+    expect(next.studios.find((s) => s.id === crm.id)).toEqual(crm)
+  })
+
+  it('refuses a store of an unknown shape', () => {
+    expect(() => mergeStore({ foo: 1 }, [], config, { now: NOW })).toThrow(/Unexpected store shape/)
+  })
+
+  it('adopts earlier records: engine read back from notes, board inferred from the source line', () => {
+    const notes = 'Recensement vérifié le 30 September 2026. Source : Epic Games, recrutement officiel Greenhouse.\n\nOffre : Old. Contrat publié : Full-time. (30 September 2026)'
+    const legacy = { id: 'job_legacy', name: 'Epic Games', role: 'Old', link: 'https://boards.example/old', status: 'to_contact', createdAt: '2026-09-30', messages: [], history: [], notes }
+    expect(inferSource({ ...legacy, engine: undefined }, [board([])])).toBe('greenhouse:epic')
+    const one = mergeStore(store([legacy]), [board([listing(1)])], config, { now: NOW })
+    const adopted = one.store.studios.find((s) => s.id === 'job_legacy')
+    expect(adopted.engine.legacy).toBe(true)
+    expect(adopted.engine.missedRuns).toBe(1)
+  })
+
+  it('marks an uncontacted closed offer as deprecated and preserves status when already contacted', () => {
+    const uncontacted = { id: 'job_u', name: 'Studio A', role: 'TA', link: 'https://boards.example/u', status: 'to_contact', messages: [], history: [], engine: { source: 'greenhouse:epic', missedRuns: 2, lastMissAt: NOW.toISOString(), closedAt: '' } }
+    const contacted = { id: 'job_c', name: 'Studio B', role: 'TA', link: 'https://boards.example/c', status: 'contacted', messages: [], history: [], engine: { source: 'greenhouse:epic', missedRuns: 2, lastMissAt: NOW.toISOString(), closedAt: '' } }
+    const current = store([uncontacted, contacted])
+    const emptyBoard = [board([], { key: 'greenhouse:epic' })]
+    const { store: next } = mergeStore(current, emptyBoard, config, { now: later(1) })
+    const uAfter = next.studios.find((s) => s.id === 'job_u')
+    const cAfter = next.studios.find((s) => s.id === 'job_c')
+    expect(uAfter.status).toBe('deprecated')
+    expect(uAfter.history.at(-1)).toMatchObject({ from: 'to_contact', to: 'deprecated' })
+    expect(cAfter.status).toBe('contacted')
+  })
+
+  it('restores a deprecated offer to to_contact when reopened', () => {
+    const dep = { id: 'job_dep', name: 'Epic Games', role: 'Technical Artist 1', link: 'https://boards.example/1', status: 'deprecated', messages: [], history: [{ at: '2026-10-06', from: 'to_contact', to: 'deprecated', note: 'fermé' }], engine: { source: 'greenhouse:epic', externalId: 'epic:1', missedRuns: 3, closedAt: '2026-10-06' } }
+    const current = store([dep])
+    const { store: next } = mergeStore(current, [board([listing(1)])], config, { now: later(3) })
+    const restored = next.studios.find((s) => s.id === 'job_dep')
+    expect(restored.status).toBe('to_contact')
+    expect(restored.engine.closedAt).toBe('')
+    expect(restored.history.at(-1)).toMatchObject({ from: 'deprecated', to: 'to_contact' })
+  })
+})
+
+describe('score floor', () => {
+  it('does not store a new vacancy below the floor, and counts it', async () => {
+    const { mergeStore } = await import('./StoreMerge.mjs')
+    const { default: cfg } = await import('./FreelanceConfig.json')
+    const board = { key: 'x', label: 'X', complete: true, listed: 2, matched: 2, seenIds: [], listings: [
+      { sourceKey: 'x', sourceLabel: 'X', name: 'Fits', title: 'Technical Artist Houdini Unreal', url: 'https://x.test/1', sourceId: 'x:1', text: 'Houdini Unreal Engine Python', contract: 'Freelance', country: 'FR' },
+      { sourceKey: 'x', sourceLabel: 'X', name: 'Misses', title: 'Game Director', url: 'https://x.test/2', sourceId: 'x:2', text: 'lead the studio', contract: '', country: 'ZZ' },
+    ] }
+    const { store, report } = mergeStore({ studios: [] }, [board], cfg, { now: new Date('2026-10-05T10:00:00Z') })
+    expect(store.studios.map((s) => s.name)).toEqual(['Fits']); expect(report.belowFloor).toBe(1)
+  })
+})

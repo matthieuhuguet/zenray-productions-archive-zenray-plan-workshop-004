@@ -1,0 +1,77 @@
+// CACHE SWR (stale-while-revalidate) des listings de dossier du Finder.
+//
+// EN CLAIR POUR TOUS : quand on ouvre un dossier déjà visité, on affiche INSTANTANÉMENT
+// la dernière liste connue (le "stale"), puis on va discrètement revérifier auprès du drive
+// en arrière-plan ("revalidate"). Plus d'écran vide pendant l'aller-retour GitHub.
+//
+// DEUX ÉTAGES :
+//  - RAM (Map) : ultra-rapide, survit aux remontages de composant (même session, sans reload).
+//  - localStorage (2026-07-06, perf dossiers) : survit au reload ET au REDÉMARRAGE du navigateur.
+//    Avant : sessionStorage -> chaque première visite d'un dossier par session repartait de zéro
+//    (attente réseau ~0,5-1,5 s). Maintenant le "stale" est disponible dès le premier double-clic,
+//    même à froid ; la revalidation réseau continue de corriger derrière. Best-effort (quota plein
+//    = no-op silencieux) ; les très gros listings (> 2000 entrées) ne sont gardés qu'en RAM pour
+//    ne pas saturer le quota localStorage partagé avec le reste de l'app.
+//
+// L'arbre global (loadPaths, ~10 Mo) n'est volontairement PAS mis ici : trop gros pour
+// localStorage, et il sort du chemin critique via un simple debounce côté App.
+
+const RAM = new Map() // dir -> entries[] (objets déjà "buildés" par buildDirEntries)
+const SS_PREFIX = 'zr:dir:'
+const PERSIST_MAX_ENTRIES = 2000
+
+function ssKey(dir) { return SS_PREFIX + dir }
+
+// Lit le cache : RAM d'abord (rapide), puis localStorage (survit au redémarrage). Migration douce :
+// on lit AUSSI l'ancien étage sessionStorage (sessions ouvertes avant ce changement), en le promouvant.
+export function readDirCache(dir) {
+  if (RAM.has(dir)) return RAM.get(dir)
+  try {
+    const raw = localStorage.getItem(ssKey(dir)) || sessionStorage.getItem(ssKey(dir))
+    if (raw) { const v = JSON.parse(raw); if (Array.isArray(v)) { RAM.set(dir, v); return v } }
+  } catch {}
+  return null
+}
+
+// Écrit le cache (RAM + localStorage best-effort, borné en taille).
+export function writeDirCache(dir, entries) {
+  if (!Array.isArray(entries)) return
+  RAM.set(dir, entries)
+  if (entries.length > PERSIST_MAX_ENTRIES) return // trop gros pour persister : RAM seulement
+  try { localStorage.setItem(ssKey(dir), JSON.stringify(entries)) } catch {}
+}
+
+// Mutation optimiste : applique `fn(entries)` au listing en cache d'un dossier et renvoie le
+// nouveau tableau (ou null si rien en cache). Sert à refléter create/delete/move/rename tout de
+// suite, sans attendre le réseau.
+export function mutateDirCache(dir, fn) {
+  const cur = readDirCache(dir)
+  const base = Array.isArray(cur) ? cur : []
+  let next
+  try { next = fn(base.slice()) } catch { return null }
+  if (!Array.isArray(next)) return null
+  writeDirCache(dir, next)
+  return next
+}
+
+// Invalide un dossier (sur échec d'une op optimiste : on jette la copie pour forcer un refetch propre).
+// Purge les DEUX étages persistants (localStorage actuel + ancien sessionStorage de migration).
+export function dropDirCache(dir) {
+  RAM.delete(dir)
+  try { localStorage.removeItem(ssKey(dir)) } catch {}
+  try { sessionStorage.removeItem(ssKey(dir)) } catch {}
+}
+
+// Vide TOUT le cache des listings (RAM + localStorage + ancien sessionStorage). Utile après une migration
+// média (les manifests changent d'URL) pour forcer un refetch propre de tous les dossiers.
+export function clearAllDirCache() {
+  RAM.clear()
+  for (const store of [() => localStorage, () => sessionStorage]) {
+    try {
+      const s = store()
+      const ks = []
+      for (let i = 0; i < s.length; i++) { const k = s.key(i); if (k && k.startsWith(SS_PREFIX)) ks.push(k) }
+      ks.forEach((k) => s.removeItem(k))
+    } catch {}
+  }
+}

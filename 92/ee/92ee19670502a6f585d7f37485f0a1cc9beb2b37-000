@@ -1,0 +1,101 @@
+import { afterEach, describe, expect, it } from 'vitest'
+import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { loadZenrayDataInventory, normalizeGitPrefix } from './zenray-data-inventory.mjs'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const repoRoot = path.resolve(here, '../..')
+const cleanup = []
+
+const git = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], {
+  encoding: 'utf8',
+  stdio: ['ignore', 'pipe', 'pipe'],
+})
+
+async function fixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'zr-zdata-inventory-'))
+  cleanup.push(root)
+  const source = path.join(root, 'source')
+  const remote = path.join(root, 'remote.git')
+  const cacheDir = path.join(root, 'cache', 'zdata.git')
+  await mkdir(path.join(source, 'pages', 'Photos', 'Été 2026'), { recursive: true })
+  await mkdir(path.join(source, 'outside'), { recursive: true })
+  await writeFile(path.join(source, 'pages', 'Photos', 'Été 2026', 'une image.jpg.img.json'), '{}')
+  await writeFile(path.join(source, 'outside', 'ignored.json'), '{}')
+  git(source, ['init', '-q', '-b', 'main'])
+  git(source, ['config', 'user.email', 'test@zenray.local'])
+  git(source, ['config', 'user.name', 'ZenRay Test'])
+  git(source, ['add', '-A'])
+  git(source, ['commit', '-q', '-m', 'fixture'])
+  execFileSync('git', ['clone', '--bare', '-q', source, remote])
+  git(source, ['remote', 'add', 'origin', remote])
+  return { root, source, remote, cacheDir }
+}
+
+afterEach(async () => {
+  await Promise.all(cleanup.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+})
+
+describe('zenray-data Git inventory', () => {
+  it('returns exact NUL-safe paths below one prefix without downloading/reading manifests', async () => {
+    const { remote, cacheDir } = await fixture()
+    const inventory = await loadZenrayDataInventory({
+      prefix: 'pages/Photos',
+      cacheDir,
+      remoteUrl: remote,
+    })
+    expect([...inventory]).toEqual(['pages/Photos/Été 2026/une image.jpg.img.json'])
+    expect(inventory.has('outside/ignored.json')).toBe(false)
+  })
+
+  it('refreshes the same cache once and observes a later remote commit', async () => {
+    const { source, remote, cacheDir } = await fixture()
+    const before = await loadZenrayDataInventory({ prefix: 'pages', cacheDir, remoteUrl: remote })
+    expect(before.size).toBe(1)
+
+    await writeFile(path.join(source, 'pages', 'Photos', 'second.media.json'), '{}')
+    git(source, ['add', '-A'])
+    git(source, ['commit', '-q', '-m', 'second'])
+    git(source, ['push', '-q', 'origin', 'HEAD:main'])
+
+    const after = await loadZenrayDataInventory({ prefix: 'pages', cacheDir, remoteUrl: remote })
+    expect(after.has('pages/Photos/second.media.json')).toBe(true)
+    expect(after.size).toBe(2)
+  })
+
+  it('fails closed on refresh errors and releases its lock instead of trusting stale paths', async () => {
+    const { root, remote, cacheDir } = await fixture()
+    await loadZenrayDataInventory({ prefix: 'pages', cacheDir, remoteUrl: remote })
+    await expect(loadZenrayDataInventory({
+      prefix: 'pages',
+      cacheDir,
+      remoteUrl: path.join(root, 'missing-remote.git'),
+    })).rejects.toThrow(/upload annulé avant création de shard/)
+    expect(existsSync(`${cacheDir}.lock`)).toBe(false)
+  })
+
+  it('rejects ambiguous or escaping prefixes before invoking Git', () => {
+    expect(() => normalizeGitPrefix('../pages')).toThrow(/invalide/)
+    expect(() => normalizeGitPrefix('')).toThrow(/invalide/)
+    expect(normalizeGitPrefix('/pages/Music/')).toBe('pages/Music')
+  })
+
+  it('keeps all four bulk scanners free of per-file Contents API reads', async () => {
+    const scripts = [
+      'scripts/upload-img-all.mjs',
+      'scripts/upload-blob-all.mjs',
+      'scripts/upload-vidraw-all.mjs',
+      'scripts/upload-vidraw-list.mjs',
+    ]
+    for (const rel of scripts) {
+      const source = await readFile(path.join(repoRoot, rel), 'utf8')
+      expect(source).toContain('loadZenrayDataInventory')
+      expect(source).not.toMatch(/\/contents\//)
+      expect(source).not.toContain('alreadyOnline(')
+    }
+  })
+})

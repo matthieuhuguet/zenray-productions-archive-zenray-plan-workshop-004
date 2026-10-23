@@ -1,0 +1,338 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import Icon from './Icon.jsx'
+import SettingsMenu from './SettingsMenu.jsx'
+import { usePersistedState } from '../lib/usePersistedState.js'
+import { useT } from '../i18n/useT.js'
+import { getIndexPaths, loadSearchIndex } from '../search/searchIndexClient.js'
+import { POINTER_GALLERIES, getAllGalleries } from '../config/pointerGalleries.js'
+
+// Extrait de App.jsx (batch refactor structurel 2026-07-16).
+const NAV_COLLAPSE_KEY = 'zr:navCollapsed'
+const basename = (path) => String(path || '').split('/').pop().replace(/\.media\.json$/, '')
+
+// Un groupe (YouTube / Spotify / Fichiers locaux) : replié = 2 résultats + chevron bas, déplié = 6 par
+// page + chevron haut + pagination. MÊME balisage/CSS dans les deux états (retour Matthieu 2026-07-18,
+// V2 après rejet de la V1 qui avait un style différent replié/déplié) -- seuls la liste et le sens du
+// chevron changent. Design validé sur liquidglass-components.html avant intégration ici.
+function SidebarSearchGroup({ label, items, searching, getKey, getCover, getRound, getTitle, getSubtitle, onSelect }) {
+  const [expanded, setExpanded] = useState(false)
+  const [page, setPage] = useState(0)
+  const perPage = 6
+  const pageCount = Math.max(1, Math.ceil(items.length / perPage))
+  const visible = expanded ? items.slice(page * perPage, page * perPage + perPage) : items.slice(0, 2)
+  if (!searching && !items.length) return null
+  return (
+    <div className="zr-sbs-group">
+      <div className="zr-sbs-group-head">
+        <h4>{label}</h4>
+        {items.length > 2 && (
+          <button type="button" className={`zr-sbs-chevron ${expanded ? 'up' : ''}`} onClick={() => { setExpanded((v) => !v); setPage(0) }} title={expanded ? 'Réduire' : 'Afficher jusqu’à 6 résultats'}>
+            <Icon name={expanded ? 'chevron.up' : 'chevron.down'} size={11} />
+          </button>
+        )}
+      </div>
+      {searching ? <div className="zr-sbs-note">Recherche…</div> : visible.map((item) => (
+        <button key={getKey(item)} type="button" className="zr-sbs-row" onClick={() => onSelect(item)}>
+          {getCover(item) ? <img src={getCover(item)} alt="" className={`zr-sbs-thumb ${getRound(item) ? 'round' : ''}`} /> : <div className={`zr-sbs-thumb ${getRound(item) ? 'round' : ''}`} />}
+          <span><strong>{getTitle(item)}</strong><small>{getSubtitle(item)}</small></span>
+        </button>
+      ))}
+      {expanded && pageCount > 1 && (
+        <div className="zr-sbs-pagination">
+          <button type="button" className="zr-sbs-page-btn" disabled={page === 0} onClick={() => setPage((v) => Math.max(0, v - 1))}><Icon name="chevron.left" size={11} /></button>
+          <span>{page + 1}/{pageCount}</span>
+          <button type="button" className="zr-sbs-page-btn" disabled={page === pageCount - 1} onClick={() => setPage((v) => Math.min(pageCount - 1, v + 1))}><Icon name="chevron.right" size={11} /></button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Recherche multi-source dans la sidebar (retour Matthieu 2026-07-17/18) : YouTube (API Data v3, clé
+// requise), Spotify (catalogue, Client Credentials, aucun login) et fichiers locaux (index de recherche
+// déjà chargé côté client, filtré sur pages/Music). SEUL point d'entrée : pas de home, pas de feed, donc
+// aucune recommandation YouTube en amont. Clic sur un résultat -> ouvre l'onglet Create au bon endroit :
+// vidéo YouTube (lecteur IFrame sans suggestions) ou piste Spotify/locale (ZenRay Audio, même mécanisme
+// que zr:create-music déjà utilisé par le lecteur global).
+function MultiSourceSidebarSearch({ onOpenVideo, onOpenSpotifyTrack, onOpenLocalTrack }) {
+  const [query, setQuery] = useState('')
+  const [youtubeResults, setYoutubeResults] = useState([])
+  const [youtubeSearching, setYoutubeSearching] = useState(false)
+  const [youtubeError, setYoutubeError] = useState('')
+  const [spotifyResults, setSpotifyResults] = useState([])
+  const [spotifySearching, setSpotifySearching] = useState(false)
+  const [localPaths, setLocalPaths] = useState([])
+  const ytSeq = useRef(0)
+  const spSeq = useRef(0)
+
+  useEffect(() => { loadSearchIndex().then(() => setLocalPaths(getIndexPaths().filter((p) => p.startsWith('pages/Music/') && p.endsWith('.media.json')))).catch(() => {}) }, [])
+
+  useEffect(() => {
+    const needle = query.trim()
+    if (needle.length < 2) { setYoutubeResults([]); setYoutubeSearching(false); setYoutubeError(''); setSpotifyResults([]); setSpotifySearching(false); return undefined }
+    setYoutubeSearching(true); setSpotifySearching(true)
+    const ytSequence = ++ytSeq.current
+    const spSequence = ++spSeq.current
+    const timer = setTimeout(async () => {
+      fetch(`/api/youtube-search-v3?type=video&q=${encodeURIComponent(needle)}`).then((r) => r.json()).catch(() => null).then((data) => {
+        if (ytSequence !== ytSeq.current) return
+        setYoutubeSearching(false)
+        if (!data?.ok) { setYoutubeResults([]); setYoutubeError(data?.error === 'not-configured' ? 'Clé YouTube Data API manquante.' : 'Recherche indisponible.'); return }
+        setYoutubeError(''); setYoutubeResults(data.results || [])
+      })
+      fetch(`/api/spotify-search?q=${encodeURIComponent(needle)}`).then((r) => r.json()).catch(() => null).then((data) => {
+        if (spSequence !== spSeq.current) return
+        setSpotifySearching(false)
+        const items = (data?.tracks?.items || []).map((track) => ({
+          id: track.id, title: track.name, artist: (track.artists || []).map((a) => a.name).join(', '),
+          cover: track.album?.images?.[track.album.images.length - 1]?.url || track.album?.images?.[0]?.url || '',
+          url: track.external_urls?.spotify || (track.id ? `https://open.spotify.com/track/${track.id}` : ''),
+        }))
+        setSpotifyResults(items)
+      })
+    }, 350)
+    return () => clearTimeout(timer)
+  }, [query])
+
+  const localMatches = useMemo(() => {
+    const needle = query.trim().toLowerCase()
+    if (needle.length < 2) return []
+    return localPaths.filter((path) => basename(path).toLowerCase().includes(needle)).slice(0, 48).map((path) => ({ path, title: basename(path) }))
+  }, [localPaths, query])
+
+  const active = query.trim().length >= 2
+
+  return (
+    <div style={{ padding: '0 2px' }}>
+      <div className="zr-sbs-search zr-sbs-search--sidebar">
+        <Icon name="magnifyingglass" size={18} style={{ position: 'relative', zIndex: 1, opacity: .6, flexShrink: 0 }} />
+        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search" />
+      </div>
+      {active && (
+        <div className="zr-sbs-drop">
+          <SidebarSearchGroup label="YouTube" items={youtubeResults} searching={youtubeSearching}
+            getKey={(v) => v.videoId} getCover={(v) => v.thumbnail} getRound={() => false} getTitle={(v) => v.title} getSubtitle={(v) => v.channel || 'YouTube'}
+            onSelect={(v) => onOpenVideo(v.videoId)} />
+          {youtubeError && <div className="zr-sbs-note">{youtubeError}</div>}
+          <SidebarSearchGroup label="Spotify" items={spotifyResults} searching={spotifySearching}
+            getKey={(t) => t.id} getCover={(t) => t.cover} getRound={() => true} getTitle={(t) => t.title} getSubtitle={(t) => t.artist || 'Spotify'}
+            onSelect={(t) => onOpenSpotifyTrack(t.url)} />
+          <SidebarSearchGroup label="Fichiers locaux" items={localMatches} searching={false}
+            getKey={(t) => t.path} getCover={() => ''} getRound={() => true} getTitle={(t) => t.title} getSubtitle={() => 'ZenRay'}
+            onSelect={(t) => onOpenLocalTrack(t.path)} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ═══ LA LISTE DES SECTIONS, ECRITE UNE SEULE FOIS ══════════════════════════════════════════════
+//
+// Sortie du composant le 2026-08-31 pour que le TITRE DE L ONGLET puisse lire la meme liste. Une
+// seconde table clef -> libelle aurait diverge au premier ajout de section, et l onglet aurait
+// affiche un nom perime sans que rien ne le signale. Loi HDA : une definition, plusieurs instances.
+export const NAV = [
+  // 23 October 2026 (Matthieu): Plan comes first, then Create, in one single family (no Craft or QuickTools sub-titles).
+  // FR : Plan en premier, puis Create, dans une seule famille.
+  { key: 'plan', label: 'Plan', labelKey: 'nav.plan', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  { key: 'pages', label: 'Create', labelKey: 'nav.create', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // PROGRESS (2026-09-23, demande de Matthieu) : entre Create et Assets. La chronologie vivante du
+  // journal ~/.claude/PROGRESS.md, lu en direct sur le Mac par le relais, ou au commit pousse ailleurs.
+  { key: 'progress', label: 'Progress', labelKey: 'nav.progress', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // ZENRAY ASSETS (2026-09-05, demande explicite de Matthieu) : juste APRES Create. La bibliotheque
+  // de ce qui est fini et reutilisable, 3D, projets passes, systemes, gabarits. Vue a part entiere
+  // (src/components/AssetsView.jsx), pensee comme un portfolio visuel et non comme un dossier.
+  { key: 'assets', label: 'Assets', labelKey: 'nav.assets', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // 23 October 2026 : ZenRay Knowledge, entre Plan et Sport (demande de Matthieu) : toutes ses questions et sa mémoire, cherchables.
+  { key: 'knowledge', label: 'Knowledge', labelKey: 'nav.knowledge', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // Sport (16 October 2026, demande de Matthieu) : juste sous Plan, puisqu'il y écrit une carte par jour (déplacé de QuickTools le même jour).
+  { key: 'sport', label: 'Sport', labelKey: 'nav.sport', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // 18 October 2026 : ZenRay Money (Design A Hub Hextech 1 250 €/sem + Dock Plan & Google Calendar + Design C Grand-Livre Comptable VICTORY Excel/CSV + Factures PDF).
+  { key: 'money', label: 'Money', labelKey: 'nav.money', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // POSTKIT (3 October 2026, demande de Matthieu) : le tableau de bord de ce que PostKit pilote, juste apres Plan. Vue a part entiere,
+  // un seul composant paresseux (src/postkit/PostKitView.jsx) qui lit l'API de PostKit.
+  { key: 'postkit', label: 'PostKit', labelKey: 'nav.postkit', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // ZenRayMedia (2026-07-25) : sous Create et avant Skills, demande explicite de Matthieu.
+  // Vue à part entière (pas un raccourci) -- l'application vit dans src/zenraymedia/.
+  { key: 'media', label: 'Media', labelKey: 'nav.media', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // ZenRay Motion Design (12 October 2026, demande de Matthieu) : juste apres Media, son studio jumeau. Galerie des motions
+  // rendus par HyperFrames, page d'un motion et montage local (src/motion/MotionDesignView.jsx).
+  // EN: right after Media, its twin studio: gallery of HyperFrames motions, motion page and local montage.
+  { key: 'motion', label: 'Motion Design', labelKey: 'nav.motion', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // ZenRayNotes (2026-08-04, demande explicite Matthieu) : PAS une view à part entière, même
+  // patron que 'audio' juste en dessous -- le clic délègue à onOpenTodayNote (ouvre ou crée la
+  // note du jour dans Create/Calendar/<Mois> <Année>/) au lieu de faire setView(key).
+  { key: 'notes', label: 'Notes', labelKey: 'nav.notes', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // "Audio" (2026-07-20, demande Matthieu) : raccourci direct vers la vue lecteur ZenRay Audio --
+  // PAS une view à part entière : le clic délègue à onOpenAudioPlayer (même chemin que le raccourci
+  // clavier et le mini-player : setView('pages') + zr:create-music), d'où le traitement spécial dans
+  // le onClick ci-dessous.
+  { key: 'audio', label: 'Audio', labelKey: 'nav.audio', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // 18 October 2026 : ZenRay Books (Shelf C Registre Éditorial Minimaliste + Design C Double-Page Livre Ouvert, connecté à Create/Books).
+  { key: 'books', label: 'Books', labelKey: 'nav.books', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  { key: 'shelf', label: 'Shelf', labelKey: 'nav.shelf', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // REF (2026-08-30) : la BIBLIOTHÈQUE des boards, pas un board en particulier. L'entrée avait été
+  // retirée en juillet parce qu'elle ouvrait un board vide, ce qui n'avait aucun sens ; elle revient
+  // en pointant la liste de tous les .ref.json, comme Plan pointe celle des plans.
+  { key: 'ref-library', label: 'Ref', labelKey: 'nav.refLibrary', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // ZenRayHoudini (2026-09-07, demande explicite de Matthieu) : centrale du savoir procedural
+  // et pont Unreal Engine 5.7 sous Create.
+  { key: 'houdini', label: 'Houdini', labelKey: 'nav.houdini', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'Craft' },
+  // ZenRayTimer (2026-08-27, demande explicite de Matthieu) : ENTRE Create et Plan, parce que c'est
+  // là que le geste se place — on ouvre Create pour travailler, on lance un bloc, et la trace atterrit
+  // dans Plan. Une vue à part entière, d'un seul composant centré : un minuteur qui partage l'écran
+  // avec autre chose n'est plus un minuteur, c'est un widget qu'on oublie.
+  { key: 'timer', label: 'Timer', labelKey: 'nav.timer', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'QuickTools' },
+  // ZenRay Plan (2026-07-20) : juste sous "Create", demande explicite de Matthieu -- vue filtrée
+  // (tous les .plan.json existants, façon Skills) plutôt qu'un dossier figé.
+  // Goals (2026-08-11) : juste sous Plan, demande explicite de Matthieu. Vue à part entière
+  // (src/components/GoalsView.jsx) — le classement des quatre axes, et les citations envoyées
+  // depuis une sélection de texte dans un Markdown.
+  { key: 'goals', label: 'Goals', labelKey: 'nav.goals', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'QuickTools' },
+  { key: 'skills', label: 'Skills', labelKey: 'nav.skills', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'QuickTools' },
+  { key: 'board', label: 'Dashboard', labelKey: 'nav.dashboard', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'QuickTools' },
+  { key: 'projects', label: 'Projects', labelKey: 'nav.projects', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'QuickTools' },
+  { key: 'freelance', label: 'Freelance', labelKey: 'nav.freelance', zone: 'Create', zoneKey: 'nav.zoneCreate', sgroupe: 'QuickTools' },
+  // GALERIES-POINTEUR (2026-08-11) : Design, Characters, Environments, réunies dans leur PROPRE
+  // toggler « Gallery » (demande explicite de Matthieu, après un premier passage où elles vivaient
+  // à plat dans Create). Une seule vue à part entière (src/components/GalleryView.jsx) pour les
+  // trois, paramétrée par `galleryKey` — la liste elle-même vient du registre UNIQUE
+  // src/config/pointerGalleries.js, jamais dupliquée ici : ajouter une galerie = l'ajouter au
+  // registre, elle apparaît automatiquement dans ce toggler, dans l'ordre du registre.
+  
+  ...getAllGalleries().map((g) => ({ key: g.key, label: g.label, labelKey: g.labelKey || `nav.${g.key}`, zone: 'Gallery', zoneKey: 'nav.zoneGallery' })),
+  // 'ref' retiré de la sidebar (2026-07-19, retour Matthieu) : ZenRay Ref n'est plus un onglet à part —
+  // un board .ref.json se crée depuis "+ New" dans Create et s'ouvre en double-clic, comme ZenRay Audio.
+  // ZENRAYJAPANESE (2026-08-27, demande explicite de Matthieu) : sa PROPRE zone « Learn », après les
+  // galeries et avant les apps. Une zone plutôt qu'un item isolé parce que l'apprentissage n'est pas
+  // un dossier de plus — c'est la priorité zéro déclarée, et elle mérite son étage dans la maison.
+  { key: 'japanese', label: 'Japanese', labelKey: 'nav.japanese', zone: 'Learn', zoneKey: 'nav.zoneLearn' },
+  { key: 'articles', label: 'Articles', labelKey: 'nav.articles', zone: 'Apps', zoneKey: 'nav.zoneApps' },
+  { key: 'docs', label: 'Documents', labelKey: 'nav.documents', zone: 'Apps', zoneKey: 'nav.zoneApps' },
+  { key: 'features', label: 'Features', labelKey: 'nav.features', zone: 'Apps', zoneKey: 'nav.zoneApps' },
+  { key: 'archives', label: 'Archives', labelKey: 'nav.archives', zone: 'Système', zoneKey: 'nav.zoneSysteme' },
+  { key: 'drive', label: 'Drive', labelKey: 'nav.drive', zone: 'Système', zoneKey: 'nav.zoneSysteme' },
+  { key: 'index', label: 'Index', labelKey: 'nav.index', zone: 'Système', zoneKey: 'nav.zoneSysteme' },
+  { key: 'trash', label: 'Trash', labelKey: 'nav.trash', zone: 'Système', zoneKey: 'nav.zoneSysteme' },
+]
+
+// Le libelle affichable d une vue, pour le titre de l onglet. Rend null quand la cle est inconnue,
+// ce qui laisse l appelant garder le titre nu plutot que d ecrire un nom faux.
+export function libelleDeVue(cle) {
+  const normKey = (cle === 'mariage-clea-septembre-2026') ? 'marriage-clea-septembre-2026' : cle
+  const custom = getAllGalleries().find((g) => g.key === normKey)
+  if (custom) return custom.label
+  const item = NAV.find((n) => n.key === normKey)
+  return item ? item.label : null
+}
+
+export default function Sidebar({ t, view, setView, overlay, floating, onCollapse, theme, setTheme, onPick, onMouseEnter, onMouseLeave, onOpenYoutubeVideo, onOpenSpotifyTrack, onOpenLocalTrack, onOpenAudioPlayer, onOpenTodayNote }) {
+  const i18nT = useT()
+  const [collapsed, setCollapsed] = usePersistedState(NAV_COLLAPSE_KEY, {}, { json: true })
+  const toggleZone = (zone) => setCollapsed((c) => ({ ...c, [zone]: !c[zone] }))
+  // 23 October 2026: Dynamic galleries subscription to update sidebar when a gallery is created from Create.
+  const [galleriesRevision, setGalleriesRevision] = useState(0)
+  useEffect(() => {
+    const handler = () => setGalleriesRevision((r) => r + 1)
+    window.addEventListener('zr:pointer-galleries-changed', handler)
+    return () => window.removeEventListener('zr:pointer-galleries-changed', handler)
+  }, [])
+  const navItems = useMemo(() => {
+    const all = getAllGalleries()
+    const galleryItems = all.map((g) => ({ key: g.key, label: g.label, labelKey: g.labelKey || `nav.${g.key}`, zone: 'Gallery', zoneKey: 'nav.zoneGallery' }))
+    const learnIndex = NAV.findIndex((n) => n.zone === 'Learn' || n.zone === 'Apps')
+    const topItems = NAV.slice(0, learnIndex >= 0 ? learnIndex : NAV.length).filter((n) => n.zone !== 'Gallery')
+    const bottomItems = NAV.slice(learnIndex >= 0 ? learnIndex : NAV.length).filter((n) => n.zone !== 'Gallery')
+    return [...topItems, ...galleryItems, ...bottomItems]
+  }, [galleriesRevision])
+  // C215c — sidebar en 3 zones (IA OS). Routing inchangé (chaque item garde sa view) : zéro régression.
+  // labelKey/zoneKey -> i18n (src/i18n/dict.js, namespace nav.*), label/zone restent le fallback FR brut.
+  // SUBTRACTION DESIGN (2026-07-07) : plus d'icône par item — juste le texte, plus lisible, moins de bruit.
+  // UI 2026-07-19 : "Sidebar left" du design V9 (workspace-sidebar) — verre neutre V9 (classes
+  // zr-ws-* dans fonts.css), headings mono uppercase, items 36px/17px, item actif BLEU #0a84ff.
+  // zr-liquid reste sur l'aside : l'ancrage du PlayerBar global cherche aside.zr-liquid.
+  return (
+    <aside className={`${overlay ? 'zr-liquid zr-sidebar-overlay' : 'zr-liquid'}${!overlay && !floating ? ' zr-sidebar-docked' : ''} zr-ws-sidebar`} onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave}
+      style={{ width: 232, flex: floating ? undefined : '0 0 232px', padding: '17px 18px 22px', display: 'flex', flexDirection: 'column', gap: 10,
+        // overlay (mobile) : panneau plein écran à gauche. floating (reveal au survol, façon Claude Code) : widget fixe qui FLOTTE
+        // au-dessus du contenu sans le pousser. docked (desktop ancré) : widget flottant arrondi en flux, hauteur = contenu.
+        // 9 October 2026, 01:22 CEST: The anchored desktop sidebar scrolls on its own when its links exceed the viewport.
+        // FR : la barre ancrée défile seule quand ses liens dépassent la fenêtre ; l’overlay mobile garde son comportement.
+        ...(overlay
+          ? { borderRadius: '0 30px 30px 0', maxHeight: '100dvh', overflowY: 'auto' }
+          : floating
+            ? { position: 'fixed', top: 70, left: 12, zIndex: 130, borderRadius: 30 }
+            : { position: 'sticky', top: 70, alignSelf: 'flex-start', margin: '70px 0 12px 12px', borderRadius: 30 }) }}>
+      {/* Bandeau `.zr-ws-top` du gear SUPPRIMÉ le 2026-07-22 (demande Matthieu « récupérer l'espace du haut ») :
+          l'engrenage vit désormais DANS l'en-tête de la section Tools (ex-Search), à droite du libellé -- voir plus bas. */}
+      {/* Conteneur des sections : hauteur naturelle (contenu), AUCUN overflow -> pas de scrollbar (verticale NI
+          horizontale : `overflowY:auto` entraînait `overflow-x:auto` par la spec). Seul l'overlay mobile défile. */}
+      {/* 23 October 2026 (Matthieu): the « ZenRay Progress » brand is removed from the sidebar. / la marque est retirée. */}
+      <div className={overlay ? 'zr-scroll-noblur' : undefined} style={overlay ? { flex: 1, overflowY: 'auto', minHeight: 0 } : undefined}>
+      {/* La recherche est une zone cachable de plus (retour 2026-07-19 : "cachable dans un sous menu >
+          Search, pareil que Create/Apps/System") -- même mécanisme collapsed/toggleZone que les 3 autres
+          zones. DANS le conteneur défilant (pas au-dessus, retour 2026-07-19 bis : "pas autant d'espace
+          entre search et create") : au-dessus, le `gap:10` de l'aside s'ajoutait à la marge propre du
+          heading suivant, doublant l'espace visible par rapport aux transitions Create->Apps->Système
+          (qui, elles, vivent toutes dans ce même conteneur et ne subissent que la marge du heading). */}
+      {/* Section TOOLS (ex-Search, renommée le 2026-07-22 ; corrigée le 2026-07-22 bis après retour Matthieu
+          « le gear n'est PAS imbriqué avec la search »). L'en-tête = SEUL le toggle de repli (chevron + libellé).
+          Le CONTENU (déplié) = une LIGNE flex : la barre de recherche À GAUCHE qui prend le MAXIMUM d'espace
+          (flex:1) + l'engrenage de Réglages À DROITE (petit, largeur fixe). Les DEUX sont cachés au repli de
+          Tools (une seule condition !collapsed.Tools). Un <button> ne peut pas en contenir un autre -> ce n'est
+          PAS des boutons imbriqués mais une ligne flex de deux éléments frères. Popover du gear portalé (uiPrefs.Pop)
+          -> jamais rogné, même sans overflow sur le drawer. */}
+      {navItems.map((n, i) => {
+        const on = view === n.key
+        const newZone = i === 0 || navItems[i - 1].zone !== n.zone
+        const zoneShut = !!collapsed[n.zone]
+        // SOUS-GROUPES DE LA ZONE CREATE (2026-09-05). Treize entrees d'affilee forment une liste
+        // plate ou l'oeil ne trouve plus rien : trois intertitres tres legers, Travail, Bibliotheques,
+        // Pilotage, rendent la meme liste lisible sans en retirer une seule. L'ORDRE N'EST PAS TOUCHE,
+        // les trois groupes tombent sur des items deja contigus, donc aucune position ne bouge.
+        // L'intertitre suit le repli de sa zone, sinon il flotterait au-dessus du vide.
+        return (
+          <React.Fragment key={n.key}>
+            {newZone && (
+              <button onClick={() => toggleZone(n.zone)} className="zr-ws-heading" title={zoneShut ? 'Déplier' : 'Replier'}>
+                <Icon name={zoneShut ? 'chevron.right' : 'chevron.down'} size={12} style={{ flexShrink: 0 }} />
+                {i18nT(n.zoneKey)}
+              </button>
+            )}
+            {!zoneShut && (
+              <button onClick={() => { if (n.key === 'audio') { onOpenAudioPlayer && onOpenAudioPlayer() } else if (n.key === 'notes') { onOpenTodayNote && onOpenTodayNote() } else { setView(n.key) } onPick && onPick() }} className={`zr-navitem zr-ws-item${on ? ' active' : ''}`}>
+                {(() => { const txt = i18nT(n.labelKey); return txt === n.labelKey ? n.label : txt })()}
+              </button>
+            )}
+          </React.Fragment>
+        )
+      })}
+      {/* 23 October 2026 (Matthieu): Tools is the LAST section of the sidebar, after System. / Tools en dernier. */}
+      {onOpenYoutubeVideo && (
+        <button onClick={() => toggleZone('Tools')} className="zr-ws-heading" title={collapsed.Tools ? 'Déplier' : 'Replier'}>
+          <Icon name={collapsed.Tools ? 'chevron.right' : 'chevron.down'} size={12} style={{ flexShrink: 0 }} />
+          Tools
+        </button>
+      )}
+      {/* ALIGNEMENT DE LA LIGNE TOOLS (corrigé le 2026-07-31, retour Matthieu « la search bar et
+          l'engrenage ne sont pas alignés »). DEUX causes se cumulaient, et corriger l'une seule ne
+          suffisait pas. D'abord `alignItems: 'flex-start'` calait l'engrenage sur le HAUT de la barre
+          au lieu de son milieu. Ensuite l'enveloppe de la recherche portait un `padding-bottom: 8px`,
+          donc sa BOÎTE dépassait de 8 px la PILULE visible : même centrée, la pilule serait restée
+          4 px trop haute. Le rembourrage bas est donc remonté ici, sur la ligne, où il sépare Tools
+          de la section suivante sans fausser l'alignement interne. */}
+      {onOpenYoutubeVideo && !collapsed.Tools && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '0 4px 10px 10px' }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <MultiSourceSidebarSearch
+              onOpenVideo={(videoId) => { onOpenYoutubeVideo(videoId); onPick && onPick() }}
+              onOpenSpotifyTrack={(url) => { onOpenSpotifyTrack(url); onPick && onPick() }}
+              onOpenLocalTrack={(path) => { onOpenLocalTrack(path); onPick && onPick() }} />
+          </div>
+          <SettingsMenu t={t} theme={theme} setTheme={setTheme} onCollapse={onCollapse} floating={floating} />
+        </div>
+      )}
+      </div>
+    </aside>
+  )
+}

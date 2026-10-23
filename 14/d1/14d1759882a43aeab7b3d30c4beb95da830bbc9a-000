@@ -1,0 +1,54 @@
+// streaming-unload.test.mjs (14 October 2026): a streamed film is unloaded only on a valid streaming-v1 receipt, RED otherwise.
+// FR : un film streame n'est decharge que sur un recu streaming-v1 valide.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { unloadStreamedVideo } from './video-cloud-recovery.mjs'
+
+const POSTER = `https://cdn.jsdelivr.net/gh/matthieuhuguet/zenray-poster-public-01@${'b'.repeat(40)}/posters/x.jpg`
+function setup(change = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'su-root-')); const audit = fs.mkdtempSync(path.join(os.tmpdir(), 'su-audit-'))
+  const source = path.join(fs.realpathSync(root), 'film.mkv'); fs.writeFileSync(source, 'film bytes')
+  const st = fs.statSync(source)
+  const manifestPath = path.join(audit, 'film.media.json')
+  const manifestText = JSON.stringify({ name: 'film.mkv', master: 'a/master.m3u8', mpd: 'a/manifest.mpd', poster: POSTER, ...change.manifest })
+  fs.writeFileSync(manifestPath, manifestText)
+  const receipt = { kind: 'streaming-v1', completeStreamingVerified: true, source, sourceStat: { bytes: st.size, mtimeMs: st.mtimeMs, inode: st.ino, device: st.dev, mode: st.mode & 0o777 }, bytes: st.size,
+    localSha256: crypto.createHash('sha256').update('film bytes').digest('hex'), manifestPath, manifestSha256: crypto.createHash('sha256').update(manifestText).digest('hex'), ...change.receipt }
+  const receiptPath = path.join(audit, 'r.json'); fs.writeFileSync(receiptPath, JSON.stringify(receipt))
+  return { root, audit, source, manifestPath, receiptPath }
+}
+const go = (s, extra = {}) => unloadStreamedVideo({ receiptPath: s.receiptPath, manifestPath: s.manifestPath, sourceRoot: s.root, auditDir: path.join(s.audit, 'trail'), isOpen: async () => false, ...extra })
+
+test('GREEN: a valid receipt unloads the source and writes an audit trail', async () => {
+  const s = setup(); const r = await go(s)
+  assert.equal(r.status, 'unloaded'); assert.equal(fs.existsSync(s.source), false)
+  assert.ok(fs.readdirSync(path.join(s.audit, 'trail')).some((f) => f.endsWith('.unload.json')))
+})
+test('RED: the source changed after the proof', async () => {
+  const s = setup(); fs.writeFileSync(s.source, 'film bytes!')
+  await assert.rejects(go(s)); assert.equal(fs.existsSync(s.source), true)
+})
+test('RED: the manifest changed after the proof', async () => {
+  const s = setup(); fs.writeFileSync(s.manifestPath, fs.readFileSync(s.manifestPath, 'utf8').replace('film.mkv', 'other.mkv'))
+  await assert.rejects(go(s), /Manifest changed/); assert.equal(fs.existsSync(s.source), true)
+})
+test('RED: a receipt of another kind (archive) is not accepted here', async () => {
+  const s = setup({ receipt: { kind: 'identity-v1' } })
+  await assert.rejects(go(s), /incomplete or mismatched/); assert.equal(fs.existsSync(s.source), true)
+})
+test('RED: no public poster, no unload', async () => {
+  const s = setup({ manifest: { poster: '/api/raw-proxy?p=1' } })
+  await assert.rejects(go(s), /public poster/); assert.equal(fs.existsSync(s.source), true)
+})
+test('RED: the source is open in another process', async () => {
+  const s = setup()
+  await assert.rejects(go(s, { isOpen: async () => true }), /open in another process/); assert.equal(fs.existsSync(s.source), true)
+})
+test('RED: a source outside the approved root', async () => {
+  const s = setup(); const other = fs.mkdtempSync(path.join(os.tmpdir(), 'su-other-'))
+  await assert.rejects(go(s, { sourceRoot: other })); assert.equal(fs.existsSync(s.source), true)
+})

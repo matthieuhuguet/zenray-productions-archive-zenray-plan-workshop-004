@@ -1,0 +1,88 @@
+// 9 October 2026, 09:55 CEST: Prove the shared index omits bulk file lists while retaining project navigation data.
+import { describe, expect, it } from 'vitest'
+import { createWorkspaceCatalogue, isWorkspaceCatalogue, loadWorkspaceCatalogue, summarizeWorkspaceProject, WORKSPACE_CATALOGUE_PATH, LEGACY_WORKSPACE_REGISTRY_PATH } from './assetsWorkspaceCatalogue.js'
+
+describe('Assets workspace catalogue', () => {
+  it('keeps only the article reference and a safe thumbnail, never its HTML or dependencies', () => {
+    const article = {fileId:'workshop:Article/index.html',title:'UV-Match Height',sha256:'a'.repeat(64),thumbnailUrl:'data:image/webp;base64,YQ==',html:'private markup',dependencies:['private/source.png']}
+    const summary = summarizeWorkspaceProject({id:'uv-match',name:'UV-Match',folder:'pages/ZenRayAssets/uv-match',article})
+    expect(summary.article).toEqual({fileId:article.fileId,title:article.title,sha256:article.sha256,thumbnailUrl:article.thumbnailUrl})
+    expect(JSON.stringify(summary)).not.toContain('private')
+    expect(summarizeWorkspaceProject({id:'uv-match',name:'UV-Match',folder:'pages/ZenRayAssets/uv-match',article:{...article,thumbnailUrl:'https://untrusted.test/x'}}).article.thumbnailUrl).toBeUndefined()
+  })
+  it('keeps the sidebar summary small and leaves detailed file records in the workspace snapshot', () => {
+    const files = Array.from({ length: 1000 }, (_, index) => ({
+      id: `workshop:file-${index}.png`, name: `file-${index}.png`, relativePath: `textures/file-${index}.png`,
+      size: 2048, sha256: `hash-${index}`, contentPath: `pages/ZenRayAssets/tiles/file-${index}.png.file.json`,
+      localPath: `/private/source/file-${index}.png`, status: 'backed-up',
+    }))
+    const project = {
+      id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', category: '3D', files,
+      coverFileId: files[0].id, sync: { count: files.length, state: 'ready', backedUpCount: files.length, pendingCount: 0 },
+      sources: [{ id: 'workshop', namespace: 'tmp', cloudFolder: 'pages/ZenRayAssets/tiles/sources/tmp/workshop', localPath: '/private/source' }],
+      events: Array.from({ length: 500 }, (_, index) => ({ id: `event-${index}`, message: 'large event'.repeat(20) })),
+      mapping: { files },
+    }
+
+    const summary = summarizeWorkspaceProject(project)
+
+    expect(summary).toMatchObject({ id: 'tiles', name: 'Tiles', fileCount: 1000, sync: { count: 1000, state: 'ready' } })
+    expect(summary.coverFile).toMatchObject({ id: files[0].id, contentPath: files[0].contentPath })
+    expect(summary.sources[0]).not.toHaveProperty('localPath')
+    expect(summary).not.toHaveProperty('files')
+    expect(summary).not.toHaveProperty('events')
+    expect(summary).not.toHaveProperty('mapping')
+    expect(JSON.stringify(summary)).not.toContain('/private/source')
+    expect(Buffer.byteLength(JSON.stringify(summary))).toBeLessThan(Buffer.byteLength(JSON.stringify(project)) / 100)
+  })
+
+  it('sorts and replaces project identities while keeping indexed conversations', () => {
+    const conversation = { id: 'conversation-1', title: 'Planning', provider: 'codex', projectId: 'tiles' }
+    const catalogue = createWorkspaceCatalogue([
+      { id: 'zeta', name: 'Zeta', folder: 'pages/ZenRayAssets/zeta', files: [] },
+      { id: 'agent-conversations', name: 'Conversations', folder: 'pages/ZenRayAssets/agent-conversations', conversations: [conversation], files: [] },
+      { id: 'zeta', name: 'Updated Zeta', folder: 'pages/ZenRayAssets/zeta', files: [{ id: 'tmp:a' }] },
+    ], '2026-10-09T07:55:00.000Z')
+
+    expect(isWorkspaceCatalogue(catalogue)).toBe(true)
+    expect(catalogue.projectCount).toBe(2)
+    expect(catalogue.projects.map((project) => project.id)).toEqual(['agent-conversations', 'zeta'])
+    expect(catalogue.projects.find((project) => project.id === 'agent-conversations').conversations).toEqual([conversation])
+    expect(catalogue.projects.find((project) => project.id === 'zeta')).toMatchObject({ name: 'Updated Zeta', fileCount: 1 })
+    expect(isWorkspaceCatalogue({ schemaVersion: 1, projects: [{ id: 'broken' }] })).toBe(false)
+  })
+
+  it('reads only the small index when available and uses the large registry only as a migration fallback', async () => {
+    const project = { id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', files: [] }
+    const catalogue = createWorkspaceCatalogue([project], '2026-10-09T07:55:00.000Z')
+    const indexReads = []
+    const indexed = await loadWorkspaceCatalogue(async (path) => { indexReads.push(path); return path === WORKSPACE_CATALOGUE_PATH ? JSON.stringify(catalogue) : null })
+    expect(indexReads).toEqual([WORKSPACE_CATALOGUE_PATH])
+    expect(indexed).toEqual({ projects: catalogue.projects, lightweight: true })
+
+    const fallbackReads = []
+    const fallback = await loadWorkspaceCatalogue(async (path) => {
+      fallbackReads.push(path)
+      return path === LEGACY_WORKSPACE_REGISTRY_PATH ? JSON.stringify({ projects: [project] }) : null
+    })
+    expect(fallbackReads).toEqual([WORKSPACE_CATALOGUE_PATH, LEGACY_WORKSPACE_REGISTRY_PATH])
+    expect(fallback).toEqual({ projects: [project], lightweight: false })
+  })
+
+  // 9 October 2026, 10:01 CEST: A broken or unreachable index must never trigger a silent legacy download.
+  it('does not fall back to the large registry when the small index is malformed or unreachable', async () => {
+    const malformedReads = []
+    await expect(loadWorkspaceCatalogue(async (path) => {
+      malformedReads.push(path)
+      return path === WORKSPACE_CATALOGUE_PATH ? JSON.stringify({ schemaVersion: 1, projectCount: 1, projects: [{ id: 'tiles', name: 'Tiles', folder: 'pages/other/tiles' }] }) : '{}'
+    })).rejects.toThrow('unsupported or malformed')
+    expect(malformedReads).toEqual([WORKSPACE_CATALOGUE_PATH])
+
+    const failedReads = []
+    await expect(loadWorkspaceCatalogue(async (path) => {
+      failedReads.push(path)
+      throw new Error('temporary cloud error')
+    })).rejects.toThrow('temporary cloud error')
+    expect(failedReads).toEqual([WORKSPACE_CATALOGUE_PATH])
+  })
+})

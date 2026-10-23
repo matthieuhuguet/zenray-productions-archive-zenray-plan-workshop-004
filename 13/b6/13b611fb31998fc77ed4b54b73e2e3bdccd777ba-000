@@ -1,0 +1,268 @@
+// 4 October 2026: a full pass over an in-memory cloud: new vacancies, archived text, letters, and nothing of Matthieu's touched.
+import { describe, expect, it, vi } from 'vitest'
+import realConfig from './FreelanceConfig.json'
+import { createEngine, manualSearchLinks } from './Engine.mjs'
+import { offerId } from './lib/Offer.mjs'
+import { SEED_TEMPLATE } from './Letters.mjs'
+import { createHookWriter } from './Hooks.mjs'
+
+// Tests never reach the real Claude: the paragraph writer is injected where a test wants one.
+const config = { ...realConfig, prospects: { studios: [] }, letters: { ...realConfig.letters, provider: 'deterministic' } }
+const cv = (fingerprint = 'fp1') => ({ experiences: [], skills: [{ name: 'Houdini' }, { name: 'Unreal Engine 5' }, { name: 'Python' }], projects: [{ id: 1, title: 'Ceramic Tiles', url: 'https://matthieuhuguet.com/reels/ceramic', description: { en: 'c', fr: 'c' } }], pdf: { en: 'https://cdn/en.pdf', fr: 'https://cdn/fr.pdf', contentHash: 'h' }, fingerprint, updated: { en: 'October 2026', fr: 'Octobre 2026' }, source: { commit: 'cvcommit' } })
+const listing = (n, extra = {}) => ({ sourceKey: 'lever:a', sourceLabel: 'A', evidence: 'A, recrutement officiel Lever', name: 'Studio A', title: `Technical Artist ${n}`, url: `https://jobs.example/${n}`, applyUrl: `https://jobs.example/${n}/apply`, sourceId: `a:${n}`, location: 'Paris', country: 'FR', contract: 'CDI', workplace: 'Hybride', published: '2026-10-01', text: `<p>Vous rejoindrez notre équipe : Houdini, Unreal Engine et Python pour notre profil.</p>${'<p>Détail du poste et des missions confiées.</p>'.repeat(8)}`, ...extra })
+const board = (listings, extra = {}) => ({ key: 'lever:a', label: 'A', listings, seenIds: listings.map((l) => offerId(l.sourceId)), listed: listings.length, matched: listings.length, errors: [], complete: true, ...extra })
+
+function memoryCloud(initial) {
+  const files = new Map(Object.entries(initial))
+  const tree = { read: async (f) => files.get(f) ?? null, json: async (f) => (files.has(f) ? JSON.parse(files.get(f)) : null) }
+  let commits = 0
+  return { files, commits: () => commits, tree, commit: async (message, plan, { dryRun = false } = {}) => {
+    const { files: written, report } = await plan(tree)
+    if (dryRun) return { committed: false, report, files: written }
+    for (const [file, text] of Object.entries(written)) files.set(file, text)
+    commits += Object.keys(written).length ? 1 : 0
+    return { committed: Boolean(Object.keys(written).length), report, commit: `c${commits}` }
+  } }
+}
+
+const run = (cloud, boards, { cvValue = cv(), now = '2026-10-04T10:00:00+02:00' } = {}) =>
+  createEngine({ config, cloud, gh: {}, http: {}, collect: async () => boards, cvLoader: async () => cvValue, now: () => new Date(now) }).run({ trigger: 'test' })
+
+const initialStore = () => JSON.stringify({ v: 2, studios: [{ id: 'asobo', name: 'Asobo Studio', role: 'Level Designer', link: 'https://lnkd.in/x', status: 'declined', messages: [], history: [], notes: 'sent 29/05' }, { id: 'crm', name: 'A Person', role: 'Recruiter', link: '', status: 'replied', messages: [{ at: '2026-09-01', channel: 'mail', text: 'hi' }], history: [], notes: '' }] })
+
+describe('engine pass', () => {
+  it('publishes new vacancies with their archived text, a letter each, and the run summary', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    const report = await run(cloud, [board([listing(1), listing(2)])])
+    expect(report).toMatchObject({ added: 2, letters: 3, details: 2, committed: true })
+    const store = JSON.parse(cloud.files.get(config.cloud.storePath))
+    const added = store.studios.filter((s) => s.id.startsWith('job_'))
+    expect(added).toHaveLength(2)
+    for (const studio of added) {
+      expect(studio.offerDetailsPath).toBe(`freelance/offers/${studio.id}.json`)
+      expect(JSON.parse(cloud.files.get(studio.offerDetailsPath)).sections[0].text).toContain('Houdini')
+      const archive = JSON.parse(cloud.files.get(studio.engine.letterPath))
+      expect(archive.versions).toHaveLength(1)
+      expect(archive.versions[0].text).toContain('Je vous écris au sujet de votre offre « Technical Artist')
+    }
+    const asobo = JSON.parse(cloud.files.get(`${config.cloud.lettersFolder}/asobo.json`))
+    expect(asobo.versions[0].text).toContain('votre message « lance-toi »')
+    const engine = JSON.parse(cloud.files.get(config.cloud.enginePath))
+    expect(engine).toMatchObject({ v: 1, intervalHours: 6, lastRun: { added: 2, letters: 3 }, cv: { fingerprint: 'fp1', stale: false }, template: { status: 'seed', hooks: 1 } })
+    expect(engine.sources[0]).toMatchObject({ key: 'lever:a', complete: true })
+    expect(engine.manualSearches.some((link) => link.board === 'LinkedIn')).toBe(true)
+  })
+
+  it('never touches the studios Matthieu owns', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    await run(cloud, [board([listing(1)])])
+    const store = JSON.parse(cloud.files.get(config.cloud.storePath))
+    expect(store.studios.find((s) => s.id === 'crm')).toEqual(JSON.parse(initialStore()).studios[1])
+    expect(store.studios.find((s) => s.id === 'asobo')).toMatchObject({ status: 'declined', notes: 'sent 29/05', messages: [] })
+  })
+
+  it('is idempotent: a second identical pass changes no letter and no store byte, only the run log', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    await run(cloud, [board([listing(1)])])
+    const before = new Map(cloud.files)
+    const report = await run(cloud, [board([listing(1)])], { now: '2026-10-04T16:00:00+02:00' })
+    expect(report).toMatchObject({ added: 0, letters: 0 })
+    for (const [file, text] of before) if (file !== config.cloud.enginePath && !file.endsWith('applications.json')) expect(cloud.files.get(file)).toBe(text)
+    const a = JSON.parse(before.get(config.cloud.storePath)).studios, b = JSON.parse(cloud.files.get(config.cloud.storePath)).studios
+    expect(b.map((s) => s.id)).toEqual(a.map((s) => s.id))
+  })
+
+  it('appends a letter version when the CV changes, and parks a suggestion when Matthieu edited', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    await run(cloud, [board([listing(1)])])
+    const studio = JSON.parse(cloud.files.get(config.cloud.storePath)).studios.find((s) => s.id.startsWith('job_'))
+    await run(cloud, [board([listing(1)])], { cvValue: cv('fp2') })
+    let archive = JSON.parse(cloud.files.get(studio.engine.letterPath))
+    expect(archive.versions.map((v) => v.by)).toEqual(['engine', 'engine'])
+    archive.versions.push({ at: 'x', by: 'matthieu', text: 'ma version', subject: 's', fingerprint: 'mine' })
+    cloud.files.set(studio.engine.letterPath, JSON.stringify(archive))
+    await run(cloud, [board([listing(1)])], { cvValue: cv('fp3') })
+    archive = JSON.parse(cloud.files.get(studio.engine.letterPath))
+    expect(archive.versions.at(-1).text).toBe('ma version')
+    expect(archive.suggested.cvFingerprint).toBe('fp3')
+  })
+
+  it('writes no letter for a contacted, closed or low-score vacancy, and caps new letters per run', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    const many = Array.from({ length: config.letters.maxGeneratedPerRun + 5 }, (_, i) => listing(100 + i))
+    const report = await run(cloud, [board(many)])
+    const letters = [...cloud.files.keys()].filter((f) => f.startsWith(config.cloud.lettersFolder))
+    expect(letters.length).toBe(config.letters.maxGeneratedPerRun + 1)
+    expect(report.added).toBe(many.length)
+    const low = listing(900, { title: 'Principal Game Designer', text: '12 years of experience required.' })
+    const second = await run(memoryCloud({ [config.cloud.storePath]: initialStore() }), [board([low])])
+    expect(second.letters).toBe(1)
+  })
+
+  it('keeps the CV cache fallback and flags a stale CV rather than failing the pass', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    const engine = createEngine({ config, cloud, gh: {}, http: {}, collect: async () => [board([listing(1)])], cvLoader: async () => { throw new Error('github down') }, cvCache: { read: async () => cv('cached'), write: async () => {} }, now: () => new Date('2026-10-04T10:00:00+02:00') })
+    await engine.run({ trigger: 'test' })
+    expect(JSON.parse(cloud.files.get(config.cloud.enginePath)).cv).toMatchObject({ fingerprint: 'cached', stale: true, staleReason: 'github down' })
+    const nothing = createEngine({ config, cloud: memoryCloud({ [config.cloud.storePath]: initialStore() }), gh: {}, http: {}, collect: async () => [], cvLoader: async () => { throw new Error('github down') }, cvCache: { read: async () => null, write: async () => {} } })
+    await expect(nothing.run({})).rejects.toThrow(/no cached copy/)
+  })
+
+  it('refuses to create a store when the file is missing', async () => {
+    await expect(run(memoryCloud({}), [board([listing(1)])])).rejects.toThrow(/is missing/)
+  })
+
+  it('writes one letter on demand, in the language asked, and links it to the studio', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore(), [config.cloud.templatePath]: JSON.stringify(SEED_TEMPLATE) })
+    const engine = createEngine({ config, cloud, gh: {}, http: {}, collect: async () => [], cvLoader: async () => cv(), now: () => new Date('2026-10-04T10:00:00+02:00') })
+    const result = await engine.letter({ studioId: 'crm', lang: 'en' })
+    expect(result.letterPath).toBe('freelance/letters/crm.json')
+    const archive = JSON.parse(cloud.files.get(result.letterPath))
+    expect(archive.versions[0]).toMatchObject({ lang: 'en', reason: 'regenerate', kind: 'spontaneous' })
+    expect(JSON.parse(cloud.files.get(config.cloud.storePath)).studios.find((s) => s.id === 'crm').engine.letterPath).toBe(result.letterPath)
+    await expect(engine.letter({ studioId: 'nope' })).rejects.toThrow(/Unknown studio/)
+  })
+})
+
+describe('Claude paragraph', () => {
+  const hookText = 'Votre poste demande Houdini et Unreal Engine ; mes HDA procéduraux répondent à ce besoin au quotidien dans mes projets.'
+  const writerFor = (calls) => ({ available: () => true, write: async (input) => { calls.push(input); return { text: hookText, source: 'claude' } } })
+  const make = (cloud, writer) => createEngine({ config, cloud, gh: {}, http: {}, collect: async () => [board([listing(1)])], cvLoader: async () => cv(), now: () => new Date('2026-10-04T10:00:00+02:00'), hookWriter: writer })
+
+  it('writes the paragraph once for a fitting vacancy, keeps it on the next pass, and asks again only when he regenerates', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    const calls = []
+    const report = await make(cloud, writerFor(calls)).run({ trigger: 'test' })
+    expect(report.hooks).toEqual({ written: 1, skipped: {} })
+    const studio = JSON.parse(cloud.files.get(config.cloud.storePath)).studios.find((s) => s.id.startsWith('job_'))
+    let archive = JSON.parse(cloud.files.get(studio.engine.letterPath))
+    expect(archive.versions[0]).toMatchObject({ hookSource: 'claude', hookText })
+    expect(archive.versions[0].text).toContain(hookText)
+    expect(calls[0].offerSkills).toContain('Houdini')
+    expect(calls[0].offerText).toContain('Houdini')
+    await make(cloud, writerFor(calls)).run({ trigger: 'test' })
+    expect(calls).toHaveLength(1)
+    archive = JSON.parse(cloud.files.get(studio.engine.letterPath))
+    expect(archive.versions).toHaveLength(1)
+    await make(cloud, writerFor(calls)).letter({ studioId: studio.id })
+    expect(calls).toHaveLength(2)
+  })
+
+  it('falls back to the deterministic paragraph and reports why when the model is unavailable', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    const writer = { available: () => true, write: async () => ({ skipped: 'rejected: claims a taste or a play' }) }
+    const report = await make(cloud, writer).run({ trigger: 'test' })
+    expect(report.hooks).toEqual({ written: 0, skipped: { 'rejected: claims a taste or a play': 1 } })
+    const studio = JSON.parse(cloud.files.get(config.cloud.storePath)).studios.find((s) => s.id.startsWith('job_'))
+    expect(JSON.parse(cloud.files.get(studio.engine.letterPath)).versions[0].hookSource).toBe('offer')
+  })
+
+  it('never asks the model for his own saved paragraph or a spontaneous letter, and caps the calls per pass', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    const calls = []
+    const many = Array.from({ length: 30 }, (_, i) => listing(200 + i))
+    const engine = createEngine({ config: { ...config, prospects: { studios: [{ name: 'Sandfall', city: 'Montpellier', country: 'FR', careersUrl: 'https://s.example' }] } }, cloud, gh: {}, http: {}, collect: async () => [board(many)], cvLoader: async () => cv(), now: () => new Date('2026-10-04T10:00:00+02:00'), hookWriter: writerFor(calls) })
+    const report = await engine.run({ trigger: 'test' })
+    expect(report.hooks.written).toBe(config.letters.maxClaudeHooksPerRun)
+    expect(calls.every((call) => !/asobo|sandfall/i.test(call.studio.name))).toBe(true)
+  })
+})
+
+describe('settings file', () => {
+  it('is read again before every pass and every letter, so a new token needs no restart', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    const refreshEnv = vi.fn(async () => {})
+    const engine = createEngine({ config, cloud, gh: {}, http: {}, collect: async () => [], cvLoader: async () => cv(), now: () => new Date('2026-10-04T10:00:00+02:00'), refreshEnv })
+    await engine.run({ trigger: 'test' })
+    await engine.letter({ studioId: 'crm' })
+    expect(refreshEnv).toHaveBeenCalledTimes(2)
+  })
+  it('lets the Claude writer see a token that appears after the service started', async () => {
+    const env = {}
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    const calls = []
+    const exec = async (...args) => { calls.push(args); return { stdout: JSON.stringify({ is_error: false, result: 'Votre poste demande Houdini et Unreal Engine ; mes HDA procéduraux répondent à ce besoin au quotidien dans mes projets.' }) } }
+    const writer = createHookWriter({ config, exec: async (binary, args, options) => (args[0] === 'auth' ? { stdout: JSON.stringify({ loggedIn: false }) } : exec(binary, args, options)), env, find: async () => '/bin/claude', tmp: '/tmp' })
+    const engine = createEngine({ config, cloud, gh: {}, http: {}, collect: async () => [board([listing(1)])], cvLoader: async () => cv(), now: () => new Date('2026-10-04T10:00:00+02:00'), hookWriter: writer, refreshEnv: async () => { env.CLAUDE_CODE_OAUTH_TOKEN = 'later' } })
+    expect(await writer.available()).toBe(false)
+    const report = await engine.run({ trigger: 'test' })
+    expect(report.hooks.written).toBe(1)
+    expect(calls[0][2].env.CLAUDE_CODE_OAUTH_TOKEN).toBe('later')
+  })
+})
+
+describe('model answers survive a refused push', () => {
+  it('pays for each paragraph once even when the plan is recomputed', async () => {
+    const calls = []
+    const writer = { available: async () => true, write: async (input) => { calls.push(input.studio.id); return { text: 'Votre poste demande Houdini et Unreal Engine ; mes HDA procéduraux répondent à ce besoin au quotidien dans mes projets.', source: 'claude' } } }
+    const files = new Map([[config.cloud.storePath, initialStore()]])
+    const tree = { read: async (f) => files.get(f) ?? null, json: async (f) => (files.has(f) ? JSON.parse(files.get(f)) : null) }
+    let attempts = 0
+    const cloud = { tree, commit: async (message, plan) => { attempts += 1; const first = await plan(tree); const second = await plan(tree); for (const [f, text] of Object.entries(second.files)) files.set(f, text); return { committed: true, report: second.report, commit: 'c1' } } }
+    const engine = createEngine({ config, cloud, gh: {}, http: {}, collect: async () => [board([listing(1), listing(2)])], cvLoader: async () => cv(), now: () => new Date('2026-10-04T10:00:00+02:00'), hookWriter: writer })
+    const report = await engine.run({ trigger: 'test' })
+    expect(attempts).toBe(1)
+    expect(calls).toHaveLength(2)
+    expect(report.hooks.written).toBe(2)
+  })
+})
+
+describe('template seed', () => {
+  it('replaces a seed template that is out of date, never one he saved', async () => {
+    const stale = { ...SEED_TEMPLATE, seedVersion: 1, fr: { ...SEED_TEMPLATE.fr, reasons: { ...SEED_TEMPLATE.fr.reasons, spontaneous: 'ancien texte' } } }
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore(), [config.cloud.templatePath]: JSON.stringify(stale) })
+    await run(cloud, [])
+    expect(JSON.parse(cloud.files.get(config.cloud.templatePath)).fr.reasons.spontaneous).toBe(SEED_TEMPLATE.fr.reasons.spontaneous)
+    const custom = { ...stale, status: 'custom' }
+    const keep = memoryCloud({ [config.cloud.storePath]: initialStore(), [config.cloud.templatePath]: JSON.stringify(custom) })
+    await run(keep, [])
+    expect(JSON.parse(keep.files.get(config.cloud.templatePath)).fr.reasons.spontaneous).toBe('ancien texte')
+  })
+})
+
+describe('prospects', () => {
+  const withProspects = { ...realConfig, prospects: { studios: [{ name: 'Sandfall Interactive', city: 'Montpellier', country: 'FR', careersUrl: 'https://www.sandfall.co/careers' }, { name: 'Asobo', city: 'Bordeaux', country: 'FR', careersUrl: 'https://asobo.example/careers' }] } }
+  it('adds each studio once as an uncontacted record with a spontaneous letter, and never touches a studio already known', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore() })
+    const make = () => createEngine({ config: withProspects, cloud, gh: {}, http: {}, collect: async () => [], cvLoader: async () => cv(), now: () => new Date('2026-10-04T10:00:00+02:00') })
+    const first = await make().run({ trigger: 'test' })
+    expect(first.prospects ?? 0).toBeGreaterThanOrEqual(0)
+    const store = JSON.parse(cloud.files.get(config.cloud.storePath))
+    const sandfall = store.studios.find((s) => s.id === 'prospect_sandfall')
+    expect(sandfall).toMatchObject({ status: 'to_contact', link: 'https://www.sandfall.co/careers', city: 'Montpellier, FR' })
+    expect(store.studios.filter((s) => s.name.toLowerCase().includes('asobo'))).toHaveLength(1)
+    const archive = JSON.parse(cloud.files.get(sandfall.engine.letterPath))
+    expect(archive.versions[0]).toMatchObject({ kind: 'spontaneous', lang: 'fr' })
+    expect(archive.versions[0].text).toContain('Je vous écris spontanément')
+    await make().run({ trigger: 'test' })
+    expect(JSON.parse(cloud.files.get(config.cloud.storePath)).studios.filter((s) => s.id === 'prospect_sandfall')).toHaveLength(1)
+  })
+})
+
+describe('manual search links', () => {
+  it('builds recent, date sorted LinkedIn searches and plain links for the boards that forbid scraping', () => {
+    const links = manualSearchLinks(config)
+    const first = links.find((l) => l.board === 'LinkedIn')
+    expect(first.url).toContain('f_TPR=r86400')
+    expect(first.url).toContain('sortBy=DD')
+    expect(links.map((l) => l.board)).toContain('Hitmarker')
+  })
+})
+
+describe('index sources in a pass (7 October 2026)', () => {
+  it('hands the readers the links already stored and his own index pages, and reports the best new finds for the notifier', async () => {
+    const cloud = memoryCloud({ [config.cloud.storePath]: initialStore(), [config.cloud.searchesPath]: JSON.stringify({ v: 1, searches: [{ id: 's1', kind: 'link', label: 'Studio X', url: 'https://www.studio-x.com/careers' }] }) })
+    cloud.sync = async () => {}
+    let context = null
+    const engine = createEngine({ config, cloud, gh: {}, http: {}, collect: async ({ context: c }) => { context = c; return [board([listing(1), listing(2)])] }, cvLoader: async () => cv(), now: () => new Date('2026-10-07T10:00:00Z') })
+    const report = await engine.run({ trigger: 'test' })
+    expect(context.known.has('https://lnkd.in/x')).toBe(true)
+    expect(context.extraPages.map((p) => p.url)).toEqual(['https://www.studio-x.com/careers'])
+    expect(typeof context.seen.has).toBe('function')
+    expect(report.addedSummary.length).toBe(2)
+    expect(report.addedSummary[0]).toMatchObject({ lane: 'games', source: 'A' })
+    expect(report.addedSummary[0].score).toBeGreaterThanOrEqual(report.addedSummary[1].score)
+    // the summary goes to the notifier, never into the published engine file
+    expect(cloud.files.get(config.cloud.enginePath)).not.toContain('addedSummary')
+  })
+})

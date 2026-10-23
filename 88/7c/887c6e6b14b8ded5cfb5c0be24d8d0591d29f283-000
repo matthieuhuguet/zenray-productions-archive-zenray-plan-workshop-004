@@ -1,0 +1,255 @@
+// fmp4-single.mjs (14 October 2026): ONE downloadable fragmented MP4 per film, cut into parts below the CDN limit.
+// FMP4-SINGLE : search this word to find every place that depends on this experiment.
+//
+// EN: Matthieu's question was "why upload twice (encrypted archive + streaming copy) when the streaming copy already holds the
+//     same video and audio bytes?". Test result on Bleach S17E41 (14 October 2026): video and audio packets are bit-identical
+//     (md5), subtitles keep text and timestamps once empty cues fill the gaps, and joining the parts with `cat` gives a playable
+//     MP4, no ffmpeg at download time. This module builds that file, cuts it at fragment boundaries, joins and verifies it.
+//     KNOWN LIMIT: one muxed file carries every audio track, so a player cannot switch audio language from it (HLS needs one
+//     rendition per audio). The existing separate-rendition CMAF stays the streaming path until that is decided.
+// FR : UN seul MP4 fragmente telechargeable par film, coupe en parts sous la limite du CDN. Test sur Bleach S17E41 : video et
+//     audio identiques octet pour octet, sous-titres conserves avec leurs temps si on comble les trous par des repliques vides,
+//     et `cat` des parts redonne un MP4 lisible sans ffmpeg. LIMITE : un fichier unique ne permet pas de changer de langue audio
+//     dans le lecteur ; le CMAF a pistes separees reste le chemin de streaming tant que ce n'est pas tranche.
+import { spawn, spawnSync } from 'node:child_process'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+
+// ONE object holds every number (HDA rule). Defaults are the delivered behaviour. FR : un objet, defauts = comportement livre.
+export const FMP4 = Object.freeze({
+  partLimitBytes: 19 * 1024 * 1024,        // jsDelivr serves files up to 20 MB; one fragment must fit in a part
+  fillerText: ' ',                     // non-breaking space cue that fills a gap between two subtitle cues
+  videoTag: 'hvc1',                         // HEVC tag Apple players require (rule of 5 July 2026)
+  movflags: '+frag_keyframe+empty_moov+default_base_moof+cmaf',
+  readChunkBytes: 8 * 1024 * 1024,
+  subtitleCodec: 'mov_text',
+})
+
+// ---- subtitles ------------------------------------------------------------
+const toMs = (s) => { const [h, m, r] = s.split(':'); const [sec, ms] = r.split(','); return (+h) * 3600000 + (+m) * 60000 + (+sec) * 1000 + (+ms) }
+const fromMs = (t) => `${String(Math.floor(t / 3600000)).padStart(2, '0')}:${String(Math.floor(t / 60000) % 60).padStart(2, '0')}:${String(Math.floor(t / 1000) % 60).padStart(2, '0')},${String(t % 1000).padStart(3, '0')}`
+
+export function parseSrt(text) {
+  const cues = []
+  for (const block of String(text).trim().split(/\r?\n\r?\n/)) {
+    const lines = block.split(/\r?\n/)
+    if (lines.length < 3 || !lines[1].includes('-->')) continue
+    const [a, b] = lines[1].split('-->').map((x) => x.trim())
+    cues.push({ start: toMs(a), end: toMs(b), text: lines.slice(2).join('\n') })
+  }
+  return cues
+}
+
+/** Insert a filler cue in every gap so that no cue is stretched up to the next one in a fragmented MP4 (measured: 2 s became 9 s).
+ *  FR : une replique vide dans chaque trou, sinon la replique est etiree jusqu'a la suivante. */
+export function fillSubtitleGaps(srtText, config = FMP4) {
+  const cues = parseSrt(srtText)
+  const out = []
+  let previousEnd = 0
+  for (const cue of cues) {
+    if (cue.start > previousEnd) out.push({ start: previousEnd, end: cue.start, text: config.fillerText })
+    out.push(cue)
+    previousEnd = Math.max(previousEnd, cue.end)
+  }
+  return out.map((c, i) => `${i + 1}\n${fromMs(c.start)} --> ${fromMs(c.end)}\n${c.text}\n`).join('\n')
+}
+
+const stripMarkup = (t) => t.replace(/<[^>]+>/g, '').replace(/\{[^}]*\}/g, '').replace(/ /g, '').replace(/\s+/g, ' ').trim()
+
+/** Text and timestamps of the real cues (fillers and markup ignored). The `{\\an8}` position tag and the font are NOT text. */
+export function comparableCues(srtText) {
+  return parseSrt(srtText).map((c) => ({ start: c.start, end: c.end, text: stripMarkup(c.text) })).filter((c) => c.text)
+}
+
+// ---- mux --------------------------------------------------------------------
+function ffprobeJson(file) {
+  const r = spawnSync('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', file], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  if (r.status !== 0) throw new Error(`ffprobe failed: ${r.stderr}`)
+  return JSON.parse(r.stdout)
+}
+
+export function probeSource(sourcePath) {
+  const j = ffprobeJson(sourcePath)
+  const streams = j.streams
+  return {
+    duration: Number(j.format.duration) || 0,
+    video: streams.find((s) => s.codec_type === 'video'),
+    audio: streams.filter((s) => s.codec_type === 'audio'),
+    subtitles: streams.filter((s) => s.codec_type === 'subtitle'),
+  }
+}
+
+/** Extract every text subtitle track to a gap filled SRT. Returns [{index, lang, path}]. */
+export function extractSubtitles(sourcePath, probe, workDir, config = FMP4) {
+  const tracks = []
+  probe.subtitles.forEach((stream, position) => {
+    const raw = path.join(workDir, `sub-${position}.raw.srt`)
+    const r = spawnSync('ffmpeg', ['-v', 'error', '-y', '-i', sourcePath, '-map', `0:s:${position}`, '-f', 'srt', raw], { encoding: 'utf8' })
+    if (r.status !== 0) return // bitmap tracks (PGS) cannot become text: reported by the caller, never silently dropped
+    const filled = path.join(workDir, `sub-${position}.filled.srt`)
+    fs.writeFileSync(filled, fillSubtitleGaps(fs.readFileSync(raw, 'utf8'), config), 'utf8')
+    tracks.push({ position, lang: stream.tags?.language || 'und', rawPath: raw, path: filled })
+  })
+  return tracks
+}
+
+export function buildMuxArgs(sourcePath, probe, subtitleTracks, outPath, config = FMP4) {
+  const args = ['-v', 'error', '-y', '-progress', 'pipe:1', '-nostats', '-i', sourcePath]
+  for (const t of subtitleTracks) args.push('-i', t.path)
+  args.push('-map', '0:v:0', '-c:v', 'copy')
+  if (probe.video?.codec_name === 'hevc') args.push('-tag:v', config.videoTag)
+  probe.audio.forEach((_a, i) => args.push('-map', `0:a:${i}`))
+  if (probe.audio.length) args.push('-c:a', 'copy')
+  subtitleTracks.forEach((t, i) => args.push('-map', `${i + 1}:0`, `-metadata:s:s:${i}`, `language=${t.lang}`))
+  if (subtitleTracks.length) args.push('-c:s', config.subtitleCodec)
+  args.push('-f', 'mp4', '-movflags', config.movflags, outPath)
+  return args
+}
+
+export function muxSingleFmp4(sourcePath, probe, subtitleTracks, outPath, { onProgress = () => {}, config = FMP4 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('ffmpeg', buildMuxArgs(sourcePath, probe, subtitleTracks, outPath, config), { stdio: ['ignore', 'pipe', 'pipe'] })
+    let err = ''
+    child.stderr.on('data', (d) => { err += d })
+    child.stdout.on('data', (d) => {
+      const m = String(d).match(/out_time_us=(\d+)/g)
+      if (m && probe.duration) onProgress(Math.min(99, Math.round((Number(m.at(-1).split('=')[1]) / 1e6 / probe.duration) * 100)))
+    })
+    child.on('close', (code) => (code === 0 ? resolve({ bytes: fs.statSync(outPath).size }) : reject(new Error(`ffmpeg mux failed (${code}): ${err.slice(-400)}`))))
+  })
+}
+
+// ---- boxes, split, join -----------------------------------------------------
+export function readBoxes(file) {
+  const fd = fs.openSync(file, 'r')
+  try {
+    const total = fs.fstatSync(fd).size
+    const boxes = []
+    const head = Buffer.alloc(16)
+    let offset = 0
+    while (offset < total) {
+      fs.readSync(fd, head, 0, 16, offset)
+      let size = head.readUInt32BE(0)
+      const type = head.toString('latin1', 4, 8)
+      if (size === 1) size = Number(head.readBigUInt64BE(8))
+      else if (size === 0) size = total - offset
+      if (size < 8 || offset + size > total) throw new Error(`Corrupt MP4 box ${type} at ${offset}`)
+      boxes.push({ type, offset, size })
+      offset += size
+    }
+    return boxes
+  } finally { fs.closeSync(fd) }
+}
+
+/** Groups: the init (ftyp, moov) then one group per fragment (everything up to and including an mdat). */
+export function fragmentGroups(boxes) {
+  const groups = []
+  let current = null
+  for (const box of boxes) {
+    if (!current) current = { start: box.offset, end: box.offset + box.size, kinds: [] }
+    else current.end = box.offset + box.size
+    current.kinds.push(box.type)
+    if (box.type === 'moov' || box.type === 'mdat') { groups.push(current); current = null }
+  }
+  if (current) groups.push(current)
+  return groups
+}
+
+export function planParts(groups, limitBytes = FMP4.partLimitBytes) {
+  const parts = []
+  let part = null
+  for (const g of groups) {
+    const size = g.end - g.start
+    if (size > limitBytes) throw new Error(`A fragment of ${size} bytes does not fit in a ${limitBytes} byte part: lower the keyframe interval`)
+    if (!part || part.end - part.start + size > limitBytes) { part = { start: g.start, end: g.end }; parts.push(part) } else part.end = g.end
+  }
+  return parts
+}
+
+function copyRange(srcFd, start, end, dstFd, chunk = FMP4.readChunkBytes, hash = null) {
+  const buf = Buffer.alloc(Math.min(chunk, end - start))
+  let pos = start
+  while (pos < end) {
+    const n = fs.readSync(srcFd, buf, 0, Math.min(buf.length, end - pos), pos)
+    if (!n) throw new Error('Unexpected end of file while copying')
+    fs.writeSync(dstFd, buf, 0, n)
+    if (hash) hash.update(buf.subarray(0, n))
+    pos += n
+  }
+}
+
+export function splitFmp4(filePath, outDir, { limitBytes = FMP4.partLimitBytes, prefix = 'part' } = {}) {
+  fs.mkdirSync(outDir, { recursive: true })
+  const plan = planParts(fragmentGroups(readBoxes(filePath)), limitBytes)
+  const src = fs.openSync(filePath, 'r')
+  const whole = crypto.createHash('sha256')
+  const parts = []
+  try {
+    plan.forEach((p, i) => {
+      const name = `${prefix}-${String(i + 1).padStart(5, '0')}.m4s`
+      const dst = fs.openSync(path.join(outDir, name), 'w')
+      const h = crypto.createHash('sha256')
+      try { copyRange(src, p.start, p.end, dst, FMP4.readChunkBytes, h) } finally { fs.closeSync(dst) }
+      const bytes = p.end - p.start
+      parts.push({ name, bytes, sha256: h.digest('hex'), offset: p.start })
+    })
+    // whole-file hash, streamed once. FR : empreinte du fichier entier, lue une fois.
+    copyHash(src, whole)
+  } finally { fs.closeSync(src) }
+  return { parts, bytes: parts.reduce((s, p) => s + p.bytes, 0), sha256: whole.digest('hex') }
+}
+
+function copyHash(fd, hash) {
+  const buf = Buffer.alloc(FMP4.readChunkBytes)
+  let pos = 0
+  for (;;) {
+    const n = fs.readSync(fd, buf, 0, buf.length, pos)
+    if (!n) break
+    hash.update(buf.subarray(0, n)); pos += n
+  }
+}
+
+/** Concatenate the parts in order: this IS the whole download step (no ffmpeg). FR : recoller = tout le telechargement. */
+export function joinParts(partPaths, outPath) {
+  const dst = fs.openSync(outPath, 'w')
+  const hash = crypto.createHash('sha256')
+  try {
+    for (const p of partPaths) {
+      const src = fs.openSync(p, 'r')
+      try { copyRange(src, 0, fs.fstatSync(src).size, dst, FMP4.readChunkBytes, hash) } finally { fs.closeSync(src) }
+    }
+  } finally { fs.closeSync(dst) }
+  return { sha256: hash.digest('hex'), bytes: fs.statSync(outPath).size }
+}
+
+// ---- verification -------------------------------------------------------------
+function streamMd5(file, map) {
+  const r = spawnSync('ffmpeg', ['-v', 'error', '-i', file, '-map', map, '-c', 'copy', '-f', 'md5', '-'], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
+  return r.status === 0 ? r.stdout.trim() : `error:${r.stderr.trim().slice(0, 120)}`
+}
+
+function subtitleAsSrt(file, position) {
+  const r = spawnSync('ffmpeg', ['-v', 'error', '-i', file, '-map', `0:s:${position}`, '-f', 'srt', '-'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  return r.status === 0 ? r.stdout : null
+}
+
+/** What must be equal between the source and the rebuilt MP4: video and audio packets (md5) and subtitle text with timestamps.
+ *  Returns {ok, checks[]}; never throws on a mismatch, so a RED result is a value the caller (and the unload guard) can read. */
+export function verifyAgainstSource(sourcePath, rebuiltPath, probe = probeSource(sourcePath), onStep = () => {}) {
+  const checks = []
+  const add = (name, ok, detail = '') => { checks.push({ name, ok, detail }); onStep({ name, ok }) }
+  add('video md5', streamMd5(sourcePath, '0:v:0') === streamMd5(rebuiltPath, '0:v:0'))
+  probe.audio.forEach((_a, i) => add(`audio ${i} md5`, streamMd5(sourcePath, `0:a:${i}`) === streamMd5(rebuiltPath, `0:a:${i}`)))
+  probe.subtitles.forEach((_s, i) => {
+    const original = subtitleAsSrt(sourcePath, i)
+    if (original === null) return // bitmap subtitle, not representable as text
+    const rebuilt = subtitleAsSrt(rebuiltPath, i)
+    if (rebuilt === null) { add(`subtitle ${i} present`, false); return }
+    const a = comparableCues(original); const b = comparableCues(rebuilt)
+    add(`subtitle ${i} cue count`, a.length === b.length, `${a.length} / ${b.length}`)
+    add(`subtitle ${i} text`, JSON.stringify(a.map((c) => c.text)) === JSON.stringify(b.map((c) => c.text)))
+    add(`subtitle ${i} timestamps`, JSON.stringify(a.map((c) => [c.start, c.end])) === JSON.stringify(b.map((c) => [c.start, c.end])))
+  })
+  return { ok: checks.every((c) => c.ok), checks }
+}

@@ -1,0 +1,59 @@
+// upload-blob-all.mjs — uploade TOUS les fichiers « autres » (ni vidéo ni image : wav, mp3, py, cube, json, zip…)
+// d'une arbo, en parts de 95 Mo BRUTES (aucune transformation) sur des shards publics zenray-blob-public-NN.
+// Manifeste .file.json (type 'blob-raw') -> le téléchargement recolle les parts = fichier BIT À BIT identique.
+// Dest MIROIR du chemin. Saute les déjà en ligne. Démarre sur un shard NEUF (ZR_START_SHARD), zéro clone.
+//
+// Usage : GITHUB_TOKEN=.. ZR_START_SHARD=1 node Scripts/upload-blob-all.mjs "<racine>" "<préfixe dest>"
+
+import { makeVidRawShardCtx, ingestBlobRaw } from './video-raw-lib.mjs'
+import { pushBlobs } from './video-mse-lib.mjs'
+import { loadZenrayDataInventory } from './lib/zenray-data-inventory.mjs'
+import { stat, readdir } from 'node:fs/promises'
+import path from 'node:path'
+
+const token = process.env.GITHUB_TOKEN
+const OWNER = 'matthieuhuguet'
+const DATA = 'zenray-data'
+const ROOT = process.argv[2]
+const DESTPREFIX = (process.argv[3] || 'pages/Photos/DJI').replace(/\/+$/, '')
+if (!token || !ROOT) { console.error('usage: GITHUB_TOKEN=.. ZR_START_SHARD=NN node upload-blob-all.mjs <racine> [destPrefix]'); process.exit(1) }
+
+const VIDEXT = /\.(mp4|mov|m4v|avi|mkv)$/i
+const IMGEXT = /\.(jpg|jpeg|png|heic|webp|avif|gif|tif|tiff|dng|bmp)$/i
+const relOf = (f) => path.relative(ROOT, f)
+const destOf = (f) => `${DESTPREFIX}/${path.dirname(relOf(f))}`.replace(/\/\.$/, '')
+const manifestPathOf = (f) => `${destOf(f)}/${path.basename(f)}.file.json`
+
+async function walk(dir) {
+  const out = []
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (e.name.startsWith('.')) continue
+    const p = path.join(dir, e.name)
+    if (e.isDirectory()) out.push(...await walk(p))
+    else if (!VIDEXT.test(e.name) && !IMGEXT.test(e.name)) out.push(p)
+  }
+  return out
+}
+const all = (await walk(ROOT)).sort()
+console.log(`\n=== AUTRES FICHIERS sous ${ROOT} : ${all.length} trouvés ===`)
+console.log('Inventaire Git zenray-data (une synchro, puis skips locaux)…')
+const online = await loadZenrayDataInventory({ token, owner: OWNER, repo: DATA, prefix: DESTPREFIX })
+const todo = []
+for (const f of all) { if (online.has(manifestPathOf(f))) continue; todo.push({ f, size: (await stat(f)).size }) }
+todo.sort((a, b) => a.size - b.size)
+console.log(`=== À UPLOADER : ${todo.length} fichier(s) (du plus petit au plus grand) ===\n`)
+if (!todo.length) { console.log('rien à uploader (tout déjà en ligne), aucun shard créé.'); process.exit(0) }
+
+const vctx = makeVidRawShardCtx({ token, work: process.env.HOME + '/.zr-archive-work-blob', type: 'blob', vis: 'private', log: (...a) => console.log('   ', ...a) })
+
+let done = 0
+for (const { f } of todo) {
+  try {
+    const dest = destOf(f)
+    const { manifestPath, manifest } = await ingestBlobRaw(f, { dest, base: path.basename(f), vctx, log: (...a) => console.log('   ', ...a) })
+    await pushBlobs(token, DATA, [{ path: manifestPath, content: JSON.stringify(manifest), encoding: 'utf-8' }], `blob ${path.basename(f)}`, () => {})
+    done++
+    console.log(`✓ EN LIGNE [${done}/${todo.length}] ${relOf(f)} · ${manifest.parts.length} part(s)`)
+  } catch (e) { console.log(`✗ ÉCHEC ${relOf(f)} : ${(e && e.message || e).toString().slice(0, 160)}`) }
+}
+console.log(`\n✓✓ BATCH BLOB ALL COMPLET — ${done}/${todo.length} fichiers uploadés.`)

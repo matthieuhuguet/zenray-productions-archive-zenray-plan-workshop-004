@@ -1,0 +1,119 @@
+// Read-only inventory of zenray-data through Git transport.
+//
+// Bulk uploaders used to call GitHub's Contents REST API once per candidate file just to know
+// whether its deterministic manifest path already existed. This helper maintains one bare,
+// blob-less cache, refreshes it once per run, then answers every existence check from a Set.
+// No checkout and no manifest blobs are downloaded: only commits/trees required by `git ls-tree`.
+
+import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { mkdir, rename, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { acquireDirectoryLock } from './directory-lock.mjs'
+
+const LOCK_STALE_MS = 15 * 60 * 1000
+const LOCK_WAIT_MS = 2 * 60 * 1000
+
+export const DEFAULT_ZDATA_INVENTORY = path.join(os.homedir(), '.zr-git-inventory', 'zenray-data.git')
+
+export function normalizeGitPrefix(value) {
+  const normalized = String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+  if (!normalized || normalized === '.' || normalized.split('/').some((part) => part === '..')) {
+    throw new Error(`préfixe inventaire Git invalide: ${value}`)
+  }
+  return normalized
+}
+
+function gitAuthEnv(token) {
+  const env = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GCM_INTERACTIVE: 'never',
+  }
+  if (token) {
+    // Pass auth to Git without persisting the token in the cached remote URL/config.
+    env.GIT_CONFIG_COUNT = '1'
+    env.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+    env.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`
+  }
+  return env
+}
+
+function runGit(args, { token = '', timeout = 300000, encoding = 'utf8' } = {}) {
+  return execFileSync('git', args, {
+    env: gitAuthEnv(token),
+    timeout,
+    encoding,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+}
+
+function assertBareRepository(cacheDir) {
+  if (!existsSync(path.join(cacheDir, 'HEAD'))) throw new Error(`cache inventaire Git incomplet: ${cacheDir}`)
+  const bare = String(runGit(['--git-dir', cacheDir, 'rev-parse', '--is-bare-repository'])).trim()
+  if (bare !== 'true') throw new Error(`cache inventaire non-bare refusé: ${cacheDir}`)
+}
+
+async function ensureBareCache({ cacheDir, remoteUrl, token }) {
+  if (existsSync(cacheDir)) {
+    assertBareRepository(cacheDir)
+    runGit(['--git-dir', cacheDir, 'remote', 'set-url', 'origin', remoteUrl])
+    return
+  }
+
+  await mkdir(path.dirname(cacheDir), { recursive: true })
+  const temporary = `${cacheDir}.tmp-${process.pid}-${Date.now().toString(36)}`
+  await rm(temporary, { recursive: true, force: true })
+  try {
+    const args = ['clone', '--bare', '--single-branch', '--branch', 'main']
+    if (/^https?:\/\//i.test(remoteUrl)) args.push('--filter=blob:none')
+    args.push(remoteUrl, temporary)
+    runGit(args, { token, timeout: 600000 })
+    await rename(temporary, cacheDir)
+  } finally {
+    await rm(temporary, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+/**
+ * Refresh zenray-data once through Git and return every path below `prefix` as an exact Set.
+ * Fetch failures abort before any shard is created: a stale/unknown inventory is never treated as empty.
+ */
+export async function loadZenrayDataInventory({
+  token = process.env.GITHUB_TOKEN || '',
+  owner = process.env.CONTENT_OWNER || 'matthieuhuguet',
+  repo = 'zenray-data',
+  prefix = 'pages',
+  cacheDir = process.env.ZR_ZDATA_INVENTORY || DEFAULT_ZDATA_INVENTORY,
+  remoteUrl = '',
+} = {}) {
+  const safePrefix = normalizeGitPrefix(prefix)
+  const remote = remoteUrl || `https://github.com/${owner}/${repo}.git`
+  const lockDir = `${cacheDir}.lock`
+  await mkdir(path.dirname(lockDir), { recursive: true })
+  const lock = await acquireDirectoryLock(lockDir, {
+    waitMs: LOCK_WAIT_MS,
+    staleMs: LOCK_STALE_MS,
+    pollMs: 250,
+    label: 'inventaire zenray-data',
+  })
+  try {
+    await ensureBareCache({ cacheDir, remoteUrl: remote, token })
+    // An explicit refspec makes the ref name identical after initial clone and every refresh.
+    const fetchArgs = ['--git-dir', cacheDir, 'fetch', '--quiet', '--prune']
+    if (/^https?:\/\//i.test(remote)) fetchArgs.push('--filter=blob:none')
+    fetchArgs.push('origin', '+refs/heads/main:refs/remotes/origin/main')
+    runGit(fetchArgs, { token, timeout: 600000 })
+    const raw = runGit([
+      '--git-dir', cacheDir,
+      '-c', 'core.quotepath=false',
+      'ls-tree', '-rz', '--name-only', 'refs/remotes/origin/main', '--', safePrefix,
+    ], { token, encoding: null })
+    return new Set(raw.toString('utf8').split('\0').filter(Boolean))
+  } catch (error) {
+    throw new Error(`inventaire Git zenray-data impossible; upload annulé avant création de shard: ${error?.message || error}`)
+  } finally {
+    await lock.release()
+  }
+}

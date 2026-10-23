@@ -1,0 +1,100 @@
+// MIGRATION CONTINUE des vidéos Eagle -> HLS public (shards zenray-vid-NN, cap 5Go géré par le serveur).
+// Heaviest-first. VÉRIF-AVANT-STAGE : la source n'est déplacée vers la corbeille QUE si le push a réussi
+// (video-hls.mjs exit 0 = shard commit + manifeste écrits). Rien n'est supprimé (corbeille réversible).
+// Progression écrite en continu -> /Users/zenray/.zr-eagle-trash/video-migration.json (lu par le dashboard).
+import { readdir, readFile, rename, writeFile, appendFile, mkdir, symlink, rm, stat } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import path from 'node:path'
+
+const TOKEN = process.env.GITHUB_TOKEN
+const LIB = '/Users/zenray/Create/Media/References/References.library'
+const TRASH = '/Users/zenray/.zr-eagle-trash/video'
+const PROG = '/Users/zenray/.zr-eagle-trash/video-migration.json'
+const RESTORE = '/Users/zenray/.zr-eagle-trash/restore-video.tsv'
+const LINKDIR = '/tmp/eagle-vid-links'
+const API = 'http://localhost:3000'
+// PIVOT CMAF/fMP4 (docs/video-backup-canonical.md) : repackaging sans perte via video-fmp4.mjs
+// (mp4 H.264 ET webm VP9 en -c copy, fallback HW). Plus de réencodage ni d'AES .ts legacy.
+const FMP4 = path.resolve('Scripts/video-fmp4.mjs')
+const VIDEXT = ['mp4','webm','mov','mkv']
+const sanitize = s => String(s||'').replace(/[^\p{L}\p{N} ._-]/gu,'').replace(/\s+/g,' ').trim().slice(0,80)||'_'
+const slug = (s) => (s||'').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'')
+
+await mkdir(TRASH, { recursive: true }); await mkdir(LINKDIR, { recursive: true })
+let prog = { startedAt: Date.now(), updatedAt: Date.now(), running: true, current: null, done: [], failed: [], savedBytes: 0, totalVideos: 0, totalBytes: 0 }
+try { const p = JSON.parse(await readFile(PROG,'utf8')); prog = { ...prog, ...p, running:true } } catch {}
+const doneIds = new Set(prog.done.map(d=>d.id))
+const save = async () => { prog.updatedAt = Date.now(); await writeFile(PROG, JSON.stringify(prog,null,2)) }
+
+// inventaire vidéos restantes (par taille décroissante)
+// arbre des dossiers Eagle -> chemins (même mapping que les images : pages/References/<chemin>)
+const meta = JSON.parse(await readFile(path.join(LIB,'metadata.json'),'utf8'))
+const fmap = new Map(); (function walk(arr,prefix){ for (const f of arr||[]) { const p2 = prefix?`${prefix}/${sanitize(f.name)}`:sanitize(f.name); fmap.set(f.id,p2); if (f.children) walk(f.children,p2) } })(meta.folders,'')
+const dirs = (await readdir(path.join(LIB,'images'),{withFileTypes:true})).filter(d=>d.isDirectory()&&d.name.endsWith('.info')).map(d=>d.name)
+const vids = []
+for (const d of dirs) {
+  let m; try { m = JSON.parse(await readFile(path.join(LIB,'images',d,'metadata.json'),'utf8')) } catch { continue }
+  const ext = (m.ext||'').toLowerCase()
+  if (!VIDEXT.includes(ext) || doneIds.has(m.id)) continue
+  vids.push({ dir:d, id:m.id, name:m.name||m.id, ext, size:m.size||0, folders:m.folders||[] })
+}
+vids.sort((a,b)=>a.size-b.size) // PLUS PETITES D'ABORD (purge massive rapide)
+prog.totalVideos = vids.length + prog.done.length
+prog.totalBytes = vids.reduce((s,v)=>s+v.size,0) + prog.savedBytes
+await save()
+console.log(`${vids.length} vidéos à migrer (${(prog.totalBytes/1073741824).toFixed(0)} Go restants, ${(prog.savedBytes/1073741824).toFixed(1)} Go déjà fait)`)
+
+// trouve le vrai fichier vidéo dans le .info (le plus gros fichier avec une extension vidéo)
+async function findVideoFile(dirAbs) {
+  const files = await readdir(dirAbs)
+  let best = null, bestSize = -1
+  for (const f of files) { if (!VIDEXT.includes(f.split('.').pop().toLowerCase())) continue; const s = (await stat(path.join(dirAbs,f))).size; if (s>bestSize){ bestSize=s; best=f } }
+  return best ? path.join(dirAbs, best) : null
+}
+
+for (const v of vids) {
+  const dirAbs = path.join(LIB,'images',v.dir)
+  const real = await findVideoFile(dirAbs)
+  if (!real) { prog.failed.push({ id:v.id, name:v.name, reason:'no-video-file' }); await save(); continue }
+  // nom de nœud unique (anti-collision) : <slug(name)>-<idcourt>
+  const base = `${slug(v.name)||'video'}-${v.id.slice(-5).toLowerCase()}`
+  const link = path.join(LINKDIR, `${base}.${v.ext}`)
+  try { await rm(link, { force:true }) } catch {}
+  // anti-fuite : 1 seul video-fmp4 à la fois, son temp est jetable après chaque run
+  try { await rm('/tmp/zr_fmp4', { recursive:true, force:true }) } catch {}
+  await symlink(real, link)
+  prog.current = { id:v.id, name:v.name, size:v.size, startedAt: Date.now() }; await save()
+  console.log(`\n=== ${v.name} (${(v.size/1073741824).toFixed(2)} Go) -> ${base} ===`)
+  const folderPath = v.folders.length ? (fmap.get(v.folders[0]) || '_Unsorted') : '_Unsorted'
+  const dest = `pages/References/${folderPath}`
+  const r = spawnSync('node', [FMP4, link, '--dest', dest, '--base', base, '--api', API], { stdio:'inherit', env:{...process.env, GITHUB_TOKEN:TOKEN}, maxBuffer: 1<<28 })
+  try { await rm(link, { force:true }) } catch {}
+  // VÉRIF-AVANT-STAGE RENFORCÉE : exit 0 NE SUFFIT PAS (le CLI a pu avaler un échec par le passé).
+  // On confirme que le manifeste .media.json existe RÉELLEMENT dans zenray-data avant de déplacer la source.
+  let manifestOk = false
+  if (r.status === 0) {
+    const mfPath = `${dest}/${base}/${base}.mp4.media.json`
+    for (let i = 0; i < 4 && !manifestOk; i++) {
+      try {
+        const resp = await fetch(`https://api.github.com/repos/matthieuhuguet/zenray-data/contents/${mfPath}`, { headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json' } })
+        if (resp.ok) manifestOk = true; else await new Promise(s => setTimeout(s, 1500 * (i + 1)))
+      } catch { await new Promise(s => setTimeout(s, 1500 * (i + 1))) }
+    }
+  }
+  if (r.status === 0 && manifestOk) {
+    // push OK ET manifeste confirmé committé -> on déplace la source en corbeille.
+    try {
+      await rename(dirAbs, path.join(TRASH, v.dir))
+      await appendFile(RESTORE, `${v.dir}\t${v.id}\t${(v.name||'').replace(/\t/g,' ')}\t${v.size}\n`)
+      prog.done.push({ id:v.id, name:v.name, size:v.size, base, dest }); prog.savedBytes += v.size
+      console.log(`  ✓ stagé en corbeille (+${(v.size/1073741824).toFixed(2)} Go) — total économisé vidéos: ${(prog.savedBytes/1073741824).toFixed(1)} Go`)
+    } catch(e){ prog.failed.push({ id:v.id, name:v.name, reason:'move-failed:'+String(e).slice(0,60) }) }
+  } else {
+    const reason = r.status !== 0 ? `hls-exit-${r.status}` : 'manifest-absent-zenray-data'
+    prog.failed.push({ id:v.id, name:v.name, reason })
+    console.log(`  ✗ échec (${reason}) — source CONSERVÉE dans Eagle`)
+  }
+  prog.current = null; await save()
+}
+prog.running = false; await save()
+console.log(`\n=== MIGRATION VIDÉO TERMINÉE — ${prog.done.length} ok, ${prog.failed.length} échecs, ${(prog.savedBytes/1073741824).toFixed(1)} Go économisés ===`)

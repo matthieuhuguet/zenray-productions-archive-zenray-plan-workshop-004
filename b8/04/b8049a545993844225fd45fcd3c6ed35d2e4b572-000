@@ -1,0 +1,76 @@
+// GET /api/hls-download-info?path=<...media.json>
+//
+// EN CLAIR (pour tout le monde) :
+//   Le navigateur a besoin de savoir QUOI proposer dans le panneau "Télécharger". Cet endpoint lit la
+//   fiche de la vidéo (le .media.json), vérifie que c'est bien du HLS, fabrique un laissez-passer signé
+//   (token, durée limitée), puis renvoie : un joli nom de fichier de sortie, une commande ffmpeg prête à
+//   coller, une URL ouvrable dans VLC, et l'adresse pour télécharger le petit script. Il ne renvoie
+//   JAMAIS la clé de déchiffrement brute (plan §9 / §15).
+//
+//   Le serveur ne reconstruit JAMAIS la vidéo. Il ne fait que signer un token et composer du texte.
+import { signToken, DEFAULT_TTL_MS } from './hls-token.js'
+
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+// path autorisé : une fiche média sous pages/, finissant par .media.json, sans remontée de dossier.
+function safeMediaPath(p) {
+  return typeof p === 'string' && p.startsWith('pages/') && p.endsWith('.media.json') && !p.includes('..') && !p.startsWith('/')
+}
+
+// Nom de sortie "propre" : pas d'espace exotique ni de caractère interdit, jamais d'injection shell.
+export function safeName(name) {
+  const base = String(name || 'video').replace(/\.[^.]+$/, '') // retire l'extension d'origine
+  const clean = base.normalize('NFKD').replace(/[^\w.\- ]+/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^[-.]+|[-.]+$/g, '')
+  return clean.slice(0, 80) || 'video'
+}
+
+// Base absolue du site (https://host) déduite des en-têtes — pour des URLs que ffmpeg/VLC peuvent ouvrir.
+export function siteBase(req) {
+  const proto = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0] || (req.headers.host && /localhost|127\.0\.0\.1/.test(req.headers.host) ? 'http' : 'https')
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || '').toString().split(',')[0]
+  return `${proto}://${host}`
+}
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(500).json({ ok: false, error: 'no-token' })
+  if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return res.status(405).json({ ok: false, error: 'method' }) }
+  res.setHeader('Cache-Control', 'no-store')
+
+  const mediaPath = (req.query.path || '').toString()
+  if (!safeMediaPath(mediaPath)) return res.status(400).json({ ok: false, error: 'bad-path' })
+
+  let manifest
+  try {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/contents/${encodeURI(mediaPath)}?ref=${BRANCH}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zenray-progress' },
+    })
+    if (r.status === 404) return res.status(404).json({ ok: false, error: 'not-found' })
+    if (!r.ok) return res.status(502).json({ ok: false, error: 'github' })
+    manifest = JSON.parse(await r.text())
+  } catch { return res.status(502).json({ ok: false, error: 'read' }) }
+
+  if (!manifest || manifest.type !== 'hls') return res.status(400).json({ ok: false, error: 'not-hls' })
+
+  const name = safeName(manifest.name || mediaPath.split('/').pop())
+  const outputName = `${name}.mkv`
+  const { token: dlToken, exp } = signToken(mediaPath, DEFAULT_TTL_MS)
+  const base = siteBase(req)
+  const cliUrl = `${base}/api/hls-cli?token=${encodeURIComponent(dlToken)}`
+  // -map 0 -c copy = on prend toutes les pistes (vidéo + audios + sous-titres) sans réencoder, juste remux.
+  const ffmpegCommand = `ffmpeg -hide_banner -stats -i "${cliUrl}" -map 0 -c copy "${outputName}"`
+  const scriptUrl = `${base}/api/hls-download-script?path=${encodeURIComponent(mediaPath)}&format=zip`
+
+  return res.status(200).json({
+    ok: true,
+    name,
+    outputName,
+    format: 'mkv',
+    expiresAt: new Date(exp).toISOString(),
+    hlsUrl: cliUrl,
+    vlcUrl: cliUrl,
+    ffmpegCommand,
+    scriptUrl,
+  })
+}

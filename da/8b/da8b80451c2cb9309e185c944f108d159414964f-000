@@ -1,0 +1,74 @@
+// upload-timing.mjs (14 October 2026): how long an upload took, computed from the push metrics of the push batch policy.
+// Pure functions, no I/O: the CLI scripts/UploadTimingReport.mjs reads the file, the banner src/components/upload/UploadTimingBanner.jsx shows it.
+// FR : duree d'un upload, calculee depuis les metriques de la politique de push ; fonctions pures, sans lecture de fichier.
+
+// Every tunable value in one place (HDA rule). / FR : toutes les valeurs reglables au meme endroit.
+export const UPLOAD_TIMING = Object.freeze({
+  baselineMBps: 6.2, // measured median archive throughput before the policy (12 October 2026)
+  targetMBps: 9.0, // estimated throughput after the policy
+  megabyte: 1048576, // MiB, the unit of the "Mio" displayed
+  decimalMegabyte: 1e6, // MB/s of the network line
+  minutesFromSeconds: 60,
+})
+
+const needNumber = (value, name) => {
+  if (!Number.isFinite(value)) throw new Error(`upload timing: ${name} must be a number, got ${value}`)
+  return value
+}
+
+/** Totals over the attempts of the rows. / FR : totaux sur les tentatives. */
+export function summarizeUploadTiming(rows, { config = UPLOAD_TIMING, totalBytes = 0 } = {}) {
+  const attempts = (rows || []).filter((row) => row && (row.type === 'attempt' || 'ok' in row))
+  const okRows = attempts.filter((row) => row.ok === true)
+  const failedRows = attempts.filter((row) => row.ok === false)
+  const bytes = okRows.reduce((sum, row) => sum + (Number(row.bytes) || 0), 0)
+  const transferMs = okRows.reduce((sum, row) => sum + (Number(row.durationMs) || 0), 0)
+  const waitMs = attempts.reduce((sum, row) => sum + (Number(row.waitMs) || 0), 0)
+  const times = attempts.map((row) => Date.parse(row.at)).filter(Number.isFinite)
+  const lastRow = attempts[attempts.length - 1]
+  // Wall time: first push start (first record minus its own duration) to the last record. / FR : du debut du premier push au dernier.
+  const startMs = attempts.length && times.length ? Date.parse(attempts[0].at) - (Number(attempts[0].durationMs) || 0) : null
+  const endMs = times.length ? Math.max(...times) : null
+  const wallMs = startMs !== null && endMs !== null ? endMs - startMs : 0
+  const throughputMBps = transferMs > 0 ? bytes / config.decimalMegabyte / (transferMs / 1000) : 0
+  const idleMs = Math.max(0, wallMs - transferMs)
+  return {
+    pushes: okRows.length,
+    failures: failedRows.length,
+    bytes,
+    transferSeconds: transferMs / 1000,
+    waitSeconds: waitMs / 1000,
+    wallSeconds: wallMs / 1000,
+    idleSeconds: idleMs / 1000,
+    idlePercent: wallMs > 0 ? (idleMs / wallMs) * 100 : 0,
+    throughputMBps,
+    effectiveMBps: wallMs > 0 ? bytes / config.decimalMegabyte / (wallMs / 1000) : 0,
+    gainVsBaselinePercent: throughputMBps > 0 ? (throughputMBps / config.baselineMBps - 1) * 100 : 0,
+    level: lastRow && Number.isFinite(Number(lastRow.level)) ? Number(lastRow.level) : null,
+    progress: totalBytes > 0 ? Math.min(1, bytes / needNumber(totalBytes, 'totalBytes')) : null,
+    startedAt: startMs !== null ? new Date(startMs).toISOString() : null,
+    updatedAt: endMs !== null ? new Date(endMs).toISOString() : null,
+  }
+}
+
+/** "6 min 12 s" / "45 s" / "1 h 02 min". */
+export function formatDuration(seconds, config = UPLOAD_TIMING) {
+  const total = Math.max(0, Math.round(needNumber(seconds, 'seconds')))
+  const hours = Math.floor(total / (config.minutesFromSeconds ** 2))
+  const minutes = Math.floor((total % (config.minutesFromSeconds ** 2)) / config.minutesFromSeconds)
+  const rest = total % config.minutesFromSeconds
+  if (hours) return `${hours} h ${String(minutes).padStart(2, '0')} min`
+  if (minutes) return `${minutes} min ${String(rest).padStart(2, '0')} s`
+  return `${rest} s`
+}
+
+/** The comment shown under the progress bar. / FR : le commentaire sous la barre de progression. */
+export function formatUploadMessage(label, summary, { done = false, config = UPLOAD_TIMING } = {}) {
+  const mbps = summary.throughputMBps.toFixed(1).replace('.', ',')
+  const mio = Math.round(summary.bytes / config.megabyte)
+  const head = done ? `${label} envoyé en ${formatDuration(summary.wallSeconds, config)}` : `${label} : ${formatDuration(summary.wallSeconds, config)} écoulées`
+  const gain = summary.gainVsBaselinePercent
+  const gainText = Number.isFinite(gain) && summary.throughputMBps > 0 ? ` (${gain >= 0 ? '+' : ''}${Math.round(gain)} % contre ${String(config.baselineMBps).replace('.', ',')} Mo/s avant)` : ''
+  const retries = summary.failures ? `, ${summary.failures} échec${summary.failures > 1 ? 's' : ''}` : ''
+  return `${head}, ${mio} Mio à ${mbps} Mo/s${gainText}${retries}`
+}

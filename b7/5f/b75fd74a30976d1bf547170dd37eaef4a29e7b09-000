@@ -1,0 +1,76 @@
+// CREATING EAGLE LINKS FROM THE BROWSER, WITHOUT EVER LOSING THE REASON WHY IT FAILED (2 October 2026).
+//
+// THE BUG THIS FILE FIXES. `apiPost` THROWS on any `{ error }` body or non-2xx status. The caller wrote
+// `apiPost(...).catch(() => null)`, so every server refusal (preflight item error, GitHub conflict, a Worker
+// exception answered as `{ error: 'fetch' }`, an HTTP 5xx) became `null` and the screen said « aucune-reponse »:
+// the real cause was thrown away on the way. After a few sorts into tmp-img-selection1 the user only saw that
+// message and could neither understand nor fix anything.
+//
+// WHAT IT DOES NOW. It keeps the cause (`causeApi`), retries the TRANSIENT ones a few times with a growing
+// pause, and before each retry it asks `dejaCree()` whether the previous attempt actually committed (a reply
+// can be lost after the commit): if so it reports success instead of creating a second set of links.
+// FR : garde la cause de l'échec, retente les échecs passagers, et ne recrée jamais deux fois un lot déjà commité.
+
+// Causes that a new attempt can fix: network/Worker hiccups, GitHub ref contention, a raw-CDN read that lags
+// behind a fresh upload (`invalid-source` / `missing-source` right after an upload are lag, not absence).
+const TRANSIENT_ERRORS = new Set(['fetch', 'github', 'reseau', 'reponse-vide', 'commit', 'target-tree', 'invalid-source', 'missing-source'])
+
+export function causeOf(response) {
+  if (!response) return { code: 'reponse-vide', item: null }
+  const results = Array.isArray(response.results) ? response.results : []
+  const first = results.find((x) => x && x.error && x.error !== 'batch-aborted')
+  const http = typeof response.detail === 'string' && /^HTTP \d+/.test(response.detail) ? response.detail : null
+  const code = (first && first.error) || (http ? 'http' : null) || (response.detail && response.detail !== 'commit' ? response.detail : null) || response.error || 'reponse-sans-code'
+  return { code, item: first ? first.index : null, http }
+}
+
+export function isTransient(response) {
+  const { code, http } = causeOf(response)
+  if (http && /^HTTP 5\d\d/.test(http)) return true
+  return TRANSIENT_ERRORS.has(code)
+}
+
+export async function postEagleLinksBatch(body, { apiPost, causeApi, dejaCree, attente, tentatives = 4 }) {
+  const wait = attente || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  let last = null
+  for (let essai = 0; essai < tentatives; essai++) {
+    if (essai > 0) {
+      await wait(800 * 2 ** (essai - 1)) // 0.8 s, 1.6 s, 3.2 s : long enough to ride out a brief GitHub / edge outage
+      // The previous reply may have been lost AFTER the commit: never create a second set of links.
+      if (dejaCree && await dejaCree().catch(() => false)) return { ok: true, deja: true, created: body.items.length, tentatives: essai + 1 }
+    }
+    try {
+      const response = await apiPost('create-eagle-links-batch', body)
+      if (response && response.ok) return { ...response, tentatives: essai + 1 }
+      last = response || { ok: false, error: 'reponse-vide' }
+    } catch (error) {
+      last = causeApi(error)
+    }
+    if (!isTransient(last)) break
+  }
+  return { ...(last || { ok: false, error: 'reponse-vide' }), ok: false, tentatives }
+}
+
+// INDEXING THE NEW LINKS (search entry + thumbnail) is a SECOND request, run in the background, ONE AT A TIME and
+// COALESCED: pairs that arrive while a request is running ride together in the next one (twelve sorts cost two
+// index commits instead of twelve). Concurrent appends to the same public delta would fight over its git ref, and
+// the sort that triggered it must never wait for it. Resolves to true/false and never throws.
+import { apiPost as apiPostReel } from './apiPost.js'
+let enAttente = []
+let enCours = null
+export function indexerLiens(pairs, post = apiPostReel) {
+  enAttente.push(...pairs)
+  if (!enCours) {
+    enCours = (async () => {
+      let tout = true
+      while (enAttente.length) {
+        const lot = enAttente.splice(0, 200)
+        const ok = await post('index-links', { pairs: lot }).then((r) => !!(r && r.delta)).catch(() => false)
+        tout = tout && ok
+      }
+      enCours = null
+      return tout
+    })()
+  }
+  return enCours
+}

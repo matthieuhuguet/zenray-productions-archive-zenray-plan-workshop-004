@@ -1,0 +1,291 @@
+import React, { useEffect, useRef, useState } from 'react'
+import { PALETTE, RADII, SHADOWS, TRANSITIONS } from '../theme.js'
+import { loadChunked, readManifest, downloadChunkedToDisk } from '../media/chunked.js'
+import Icon from './Icon.jsx'
+import { fileKind, fmtBytes } from '../lib/fileKind.js'
+import { lazyRetry } from '../lib/lazyRetry.js'
+import { usePlayer } from '../audio/PlayerContext.jsx'
+import VideoViewerAdapter from './VideoViewerAdapter.jsx'
+import { MEDIA_VIEWER, VIDEO_ENGINE, resolveMediaViewerRoute } from '../media/mediaViewerRoute.js'
+import { notify } from './Notifications.jsx'
+const LazyGmapsViewer = lazyRetry(() => import('./GmapsViewer.jsx')) // liens Google Maps intégrés (2026-07-04)
+
+// C202 — Barre de progression alignée sur le backbone (fond t.border, remplissage PALETTE.gradient).
+function ProgressBar({ t, value }) {
+  return (
+    <div style={{ width: '100%', height: 8, borderRadius: 99, background: t.border, overflow: 'hidden' }}>
+      <div style={{ width: `${Math.round((value || 0) * 100)}%`, height: '100%', background: PALETTE.gradient, transition: (TRANSITIONS && TRANSITIONS.smooth) || 'width .25s ease' }} />
+    </div>
+  )
+}
+
+export default function MediaViewer({ t, path, title }) {
+  const player = usePlayer()
+  const [m, setM] = useState(null)
+  const [phase, setPhase] = useState('meta') // meta | ready | error
+  const [err, setErr] = useState(null)
+  // téléchargement (formats non lisibles inline : mkv, avi…) -> réassemblage Blob
+  const [dlProgress, setDlProgress] = useState(null)
+  const urlRef = useRef(null)
+  const [dlUrl, setDlUrl] = useState(null)
+  const [forceDownload, setForceDownload] = useState(false)
+  const [spotifyEmbed, setSpotifyEmbed] = useState('')
+  // VIDÉO IMMERSIVE (façon Apple TV) : par défaut on n'affiche QUE le lecteur. Titre, format et options
+  // (téléchargement ffmpeg) sont masqués et révélés par ce toggle. Réinitialisé à chaque changement de média.
+  const [optsOpen, setOptsOpen] = useState(false)
+  // AGRANDIR/CENTRER la vidéo (même feature que le markdown pageWide) : persisté, toggle icône discret.
+  // Centré = colonne lecture (980) ; élargi = 100% de l'espace (encore plus large sidebar masquée via Tab).
+  const [vidWide, setVidWide] = useState(() => { try { return localStorage.getItem('zr:create:vidwide') === '1' } catch { return false } })
+  useEffect(() => { try { localStorage.setItem('zr:create:vidwide', vidWide ? '1' : '0') } catch {} }, [vidWide])
+  useEffect(() => { setForceDownload(false); setOptsOpen(false); setSpotifyEmbed('') }, [path])
+
+  useEffect(() => {
+    let live = true
+    setPhase('meta'); setM(null); setErr(null); setDlUrl(null); setDlProgress(null)
+    readManifest(path).then((mm) => { if (live) { setM(mm); setPhase('ready') } }).catch((e) => { if (live) { setErr(String(e.message || e)); setPhase('error') } })
+    return () => { live = false }
+  }, [path])
+  useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current) }, [])
+
+  // Transcodage local en cours : le placeholder porte {transcoding:true}. On re-poll le manifest toutes
+  // les ~4 s ; dès que le worker l'a réécrit en mse-av (transcoding tombe), l'effet ci-dessus n'est pas
+  // rappelé (path inchangé) donc on rafraîchit ICI le manifest en place pour basculer sur le lecteur.
+  // Contrat unique manifest -> viewer. Aucun bloc JSX ne recalcule son propre `streamable` : un manifeste
+  // choisit exactement un moteur, ce qui interdit le double montage déjà rencontré avec YouTube.
+  const viewerRoute = resolveMediaViewerRoute(m, { phase, forceDownload })
+  const transcoding = viewerRoute.transcoding
+  useEffect(() => {
+    if (!transcoding) return
+    let live = true
+    const id = setInterval(() => {
+      readManifest(path).then((mm) => { if (live && mm) setM(mm) }).catch(() => {})
+    }, 4000)
+    return () => { live = false; clearInterval(id) }
+  }, [transcoding, path])
+
+  // URL /api/stream -- DERNIER usage restant (2026-07-21) : l'IMAGE LEGACY inline (vieux manifestes
+  // chunked-media image, < 4 Mo de fait) plus bas, rien d'autre. Le PDF est passé au blob déchiffré
+  // client (pdfUrl), les ancres de téléchargement ont été SUPPRIMÉES (réponse Vercel plafonnée
+  // ~4,5 Mo = fichiers tronqués), l'audio passe par PlayerContext (SW/jsDelivr) et la vidéo par ses
+  // lecteurs dédiés. Ne JAMAIS réutiliser cette URL pour un nouveau chemin de lecture ou de download.
+  const streamUrl = `/api/stream?path=${encodeURIComponent(path)}`
+  const inline = viewerRoute.inline
+  const isVideo = viewerRoute.mediaKind === 'video'
+  const isAudio = viewerRoute.viewer === MEDIA_VIEWER.audio
+  const isImage = viewerRoute.viewer === MEDIA_VIEWER.image
+  const isPdf = viewerRoute.viewer === MEDIA_VIEWER.pdf
+  const isPlaylist = viewerRoute.viewer === MEDIA_VIEWER.playlist
+  const audioTrack = isAudio ? { source: 'local', streamPath: path, title: m.title || m.name || title, artist: m.artist || '', album: m.album || '', cover: m.cover || m.poster || '', dur: m.duration || m.probe?.duration || 0, mime: m.mime } : null
+  const artwork = (c) => !c ? '' : (/^(https?:|data:|blob:|\/)/.test(c) ? c : `/api/img?path=${encodeURIComponent(c)}`)
+
+  // téléchargement reconstitué (pour les formats non lisibles inline)
+  // DOWNLOAD 1 CLIC : reconstitue le blob déchiffré puis déclenche l'enregistrement automatiquement
+  // (plus de 2e clic « Enregistrer »). Le fichier part directement avec son nom d'origine.
+  const download = async () => {
+    setDlProgress(0)
+    try {
+      // STREAMÉ sur disque (anti-OOM) quand l'API le permet ; repli Blob borné sinon. Évite de garder un
+      // gros média entier en RAM avant l'enregistrement (cause du crash de l'onglet sur mobile).
+      await downloadChunkedToDisk(path, (r) => setDlProgress(r))
+      setDlProgress(1)
+    } catch (e) { setDlProgress(null); setErr(String(e.message || e)) }
+  }
+
+  // PDF : blob déchiffré côté client (jsDelivr + AES-GCM via loadChunked réparé, 2026-07-20) --
+  // remplace /api/stream, plafonné ~4,5 Mo de réponse Vercel (tout PDF plus gros échouait).
+  const [pdfUrl, setPdfUrl] = useState(null)
+  const [pdfProg, setPdfProg] = useState(0)
+  const [pdfErr, setPdfErr] = useState('')
+  useEffect(() => {
+    if (!isPdf || phase !== 'ready') { setPdfUrl(null); return undefined }
+    let live = true
+    let objUrl = null
+    setPdfUrl(null); setPdfProg(0); setPdfErr('')
+    loadChunked(path, (r) => { if (live) setPdfProg(r) })
+      .then(({ url }) => { if (live) { objUrl = url; setPdfUrl(url) } else URL.revokeObjectURL(url) })
+      .catch((e) => { if (live) setPdfErr(String(e.message || e)) })
+    return () => { live = false; if (objUrl) URL.revokeObjectURL(objUrl) }
+  }, [isPdf, phase, path])
+
+  const isGmaps = viewerRoute.viewer === MEDIA_VIEWER.gmaps
+  // Sauvegarde du titre/auteur édités dans le manifeste .media.json (lecture sha + réécriture sûre).
+  const saveMeta = async ({ title: nt, author: na }) => {
+    try {
+      const r = await fetch(`/api/page?action=read&path=${encodeURIComponent(path)}`, { cache: 'no-store' }).then((x) => x.json())
+      const mm = JSON.parse(r.markdown); mm.title = nt; mm.author = na
+      await fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'save', path, markdown: JSON.stringify(mm, null, 2), sha: r.sha }) })
+      setM(mm)
+    } catch (e) {
+      // L'édition reste affichée (best-effort visuel), mais un échec réel de sauvegarde doit être visible —
+      // sinon un titre/auteur modifié semble persisté alors qu'il ne l'est pas, perdu au prochain reload.
+      notify({ title: 'Sauvegarde échouée', body: 'Le titre/auteur modifié n\'a pas pu être enregistré.', kind: 'error' })
+    }
+  }
+  // Page épurée pour les moteurs déclarés immersifs (vidéo unifiée et carte).
+  const immersiveVideo = viewerRoute.immersive
+  const card = immersiveVideo
+    ? { maxWidth: vidWide ? '100%' : 980, width: '100%', margin: '0 auto', transition: 'max-width .22s ease' }
+    : { background: t.surface, border: `1px solid ${t.border}`, borderRadius: RADII.lg, boxShadow: SHADOWS.md, padding: 22, maxWidth: 900, margin: '0 auto' }
+  const button = { padding: '8px 18px', borderRadius: RADII.md, border: `1px solid ${PALETTE.primary}`, background: PALETTE.primarySoft, color: PALETTE.primary, cursor: 'pointer', fontSize: 'var(--zr-ui-md)', fontWeight: 600, textDecoration: 'none', display: 'inline-block' }
+
+  return (
+    <div style={{ padding: immersiveVideo ? '12px 16px 24px' : 24 }}>
+      <div style={card}>
+        {/* Titre + badge : MASQUÉS en vidéo immersive (le lecteur affiche déjà le nom, façon Apple TV). */}
+        {!immersiveVideo && (
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+          <div style={{ fontFamily: "var(--zr-police-sans)", fontSize: 24, fontWeight: 700, marginBottom: 6, color: t.textPrimary }}>{title || (m && m.name)}</div>
+          {m && (() => {
+            // onCdn = binaire sur le CDN public (HLS jsDelivr OU chunks chiffrés public cdnRepo). Sinon, les
+            // octets traversent NOTRE fonction. Couleurs : source unique dans src/lib/mediaProvenance.js.
+            // Les teintes de fond en dérivent par suffixe alpha, au lieu d'être recopiées : le fond était
+            // resté au jaune #f5b21a alors que la pastille avait déjà changé de couleur.
+            const onCdn = m.type === 'hls' || !!m.cdnRepo
+            const accent = onCdn ? PROVENANCE.cdn : PROVENANCE.fonction
+            const soft = `${accent}24`
+            const mo = m.size ? `${(m.size / 1048576).toFixed(1)} Mo · ` : ''
+            return (
+              <div style={{ flexShrink: 0, fontSize: 'var(--zr-ui-sm)', fontWeight: 700, color: accent, background: soft, border: `1px solid ${accent}`, borderRadius: 99, padding: '3px 11px', whiteSpace: 'nowrap' }}>
+                {mo}{onCdn ? 'CDN public' : 'Proxy privé'}
+              </div>
+            )
+          })()}
+        </div>
+        )}
+        {!immersiveVideo && m && (() => {
+          const fmtLabel = m.type === 'hls'
+            ? (m.container === 'fmp4' ? 'HLS · fMP4 / CMAF' : 'HLS · MPEG-TS')
+            : (m.mime || 'média')
+          const codecTip = m.vcodec ? ` (${m.vcodec}${m.acodec ? '+' + m.acodec : ''})` : ''
+          return <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-sm)', marginBottom: 16 }}>{(m.size / 1048576).toFixed(1)} Mo{m.count ? ` · ${m.count} ${m.type === 'hls' ? 'segments' : 'parties'}` : ''} · {fmtLabel}{codecTip}</div>
+        })()}
+
+        {phase === 'error' && <div style={{ color: PALETTE.red, fontSize: 'var(--zr-ui-md)' }}>Erreur : {err}</div>}
+        {phase === 'ready' && viewerRoute.viewer === MEDIA_VIEWER.invalid && (
+          <div style={{ color: PALETTE.red, fontSize: 'var(--zr-ui-md)' }}>Lecture impossible : {viewerRoute.reason}</div>
+        )}
+
+        {/* Transcodage local en cours : le Mac convertit la vidéo en format lisible (MSE). On montre
+            une barre de progression et on re-poll jusqu'à ce que le manifest devienne mse-av. */}
+        {phase === 'ready' && transcoding && (
+          <div>
+            <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-md)', marginBottom: 14, lineHeight: 1.5 }}>
+              Transcodage local en cours sur le Mac{m.stage ? ` · ${m.stage}` : ''}. La vidéo deviendra lisible automatiquement dès qu'elle sera prête.
+            </div>
+            <ProgressBar t={t} value={Math.max(0.02, (m.progress || 0) / 100)} />
+            <div style={{ marginTop: 6, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, fontFamily: 'var(--zr-police-sans)' }}>{Math.round(m.progress || 0)} %</div>
+          </div>
+        )}
+
+        {/* Tous les moteurs vidéo passent par un point de montage unique. Le moteur reste spécialisé (MSE,
+            natif, fallback wasm ou lecteur unifié), mais les règles de sélection ne sont plus dupliquées. */}
+        {phase === 'ready' && !transcoding && viewerRoute.viewer === MEDIA_VIEWER.video && (
+          <div>
+            <VideoViewerAdapter engine={viewerRoute.engine} t={t} path={path} manifest={m} onSaveMeta={saveMeta} onUnsupported={() => setForceDownload(true)} />
+            {(viewerRoute.engine === VIDEO_ENGINE.native || viewerRoute.engine === VIDEO_ENGINE.mse) && (
+              <button onClick={download} disabled={dlProgress != null && dlProgress < 1} className="zr-tap" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, marginTop: 14, padding: '9px 16px', borderRadius: 12, fontSize: 'var(--zr-ui-md)', fontFamily: "var(--zr-police-sans)", color: t.textPrimary, background: 'transparent', border: `1px solid ${t.border}`, cursor: 'pointer' }}>{dlProgress != null && dlProgress < 1 ? `Téléchargement… ${Math.round(dlProgress * 100)}%` : 'Télécharger le fichier'}</button>
+            )}
+          </div>
+        )}
+
+        {/* GMAPS : carte Google Maps intégrée (2026-07-04), même famille que YouTube (référence externe,
+            aucun binaire ZenRayShards). */}
+        {phase === 'ready' && !transcoding && isGmaps && (
+          <React.Suspense fallback={<div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-md)' }}>Chargement de la carte…</div>}>
+            <LazyGmapsViewer t={t} path={path} manifest={m} onSaveMeta={saveMeta} />
+          </React.Suspense>
+        )}
+
+        {phase === 'ready' && !transcoding && isPlaylist && (
+          <div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(150px,230px) minmax(0,1fr)', gap: 24, alignItems: 'start' }}>
+              <div style={{ aspectRatio: 1, borderRadius: 22, overflow: 'hidden', display: 'grid', placeItems: 'center', background: `linear-gradient(145deg,${PALETTE.primary},#BF5AF0)`, boxShadow: '0 18px 42px -24px rgba(0,0,0,.7)' }}>
+                {m.cover ? <img src={artwork(m.cover)} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <Icon name="music.note.list" size={48} color="#fff" />}
+              </div>
+              <div>
+                <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-md)', marginBottom: 16 }}>{m.artist || `${(m.items || []).length} titres`}</div>
+                <button style={{ ...button, background: PALETTE.primary, color: '#fff', border: 0 }} onClick={() => m.contextUri ? (player.sdkReady ? player.playSpotify(null, m.contextUri) : setSpotifyEmbed(`https://open.spotify.com/embed/${m.contextUri.split(':')[1]}/${m.contextUri.split(':')[2]}?utm_source=generator&theme=0`)) : player.playMixedQueue(m.items || [], 0)}>▶ Lire</button>
+                {spotifyEmbed && <iframe title="Spotify" src={spotifyEmbed} width="100%" height="352" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" loading="lazy" style={{ border: 0, borderRadius: 16, display: 'block', marginTop: 16 }} />}
+                <div style={{ marginTop: 18 }}>
+                  {(m.items || []).map((item, i) => <button key={`${item.uri || item.streamPath || item.videoId || i}`} onClick={() => player.playMixedQueue(m.items || [], i)} style={{ width: '100%', display: 'grid', gridTemplateColumns: '30px minmax(0,1fr) auto', gap: 10, alignItems: 'center', border: 0, borderTop: `1px solid ${t.border}`, background: 'transparent', color: t.textPrimary, padding: '9px 4px', textAlign: 'left', cursor: 'pointer' }}>
+                    <span style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-sm)' }}>{i + 1}</span><span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.title || 'Sans titre'}<small style={{ display: 'block', color: t.textSecondary }}>{item.artist || item.source || ''}</small></span><span style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-xs)' }}>{item.dur ? `${Math.floor(item.dur / 60)}:${String(Math.floor(item.dur % 60)).padStart(2, '0')}` : ''}</span>
+                  </button>)}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {phase === 'ready' && !transcoding && (isAudio || isImage) && m && inline && (
+          <div>
+            {isAudio && <div style={{ display: 'flex', alignItems: 'center', gap: 18 }}>
+              <div style={{ width: 132, aspectRatio: 1, borderRadius: 20, overflow: 'hidden', display: 'grid', placeItems: 'center', background: `linear-gradient(145deg,${PALETTE.primary},#BF5AF0)`, boxShadow: '0 16px 36px -22px rgba(0,0,0,.7)' }}>{m.cover ? <img src={artwork(m.cover)} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <Icon name="music.note" size={34} color="#fff" />}</div>
+              <div><div style={{ color: t.textSecondary, marginBottom: 12 }}>{m.artist || m.album || 'Audio local'}</div><button style={{ ...button, background: PALETTE.primary, color: '#fff', border: 0 }} onClick={() => player.playTrack(audioTrack)}>▶ Lire dans ZenRay Audio</button></div>
+            </div>}
+            {isImage && <img src={streamUrl} alt={m.name} style={{ width: '100%', borderRadius: RADII.md }} />}
+            {/* Ancre /api/stream SUPPRIMÉE (2026-07-21) : la réponse d'une fonction Vercel est plafonnée
+                ~4,5 Mo -> tout téléchargement plus gros sortait TRONQUÉ (PDF 31,5 Mo -> fichier 4,2 Mo).
+                download() streame les parts depuis le CDN et déchiffre côté client, sans limite. */}
+            <button onClick={download} disabled={dlProgress != null && dlProgress < 1} style={{ display: 'inline-block', marginTop: 12, fontSize: 'var(--zr-ui-sm)', color: PALETTE.primary, background: 'transparent', border: 0, padding: 0, cursor: 'pointer' }}>{dlProgress != null && dlProgress < 1 ? `Téléchargement… ${Math.round(dlProgress * 100)}%` : 'Télécharger le fichier'}</button>
+          </div>
+        )}
+
+        {/* PDF : aperçu inline via BLOB DÉCHIFFRÉ CLIENT (loadChunked -> jsDelivr + AES-GCM, correctif
+            2026-07-20). L'ancien /api/stream échouait sur tout PDF > ~4 Mo : l'iframe fait un GET
+            plein-corps et la réponse d'une fonction Vercel est plafonnée ~4,5 Mo -> "Failed to load
+            PDF document" (PDF 31,5 Mo de Matthieu). pdfUrl=null pendant l'assemblage -> spinner. */}
+        {phase === 'ready' && !transcoding && m && isPdf && (() => {
+          const g = t.glass || {}
+          const dark = t.textPrimary === PALETTE.textPrimaryDark
+          const glass = {
+            background: `linear-gradient(150deg, ${PALETTE.primary}14, ${PALETTE.primary}07 65%), ${g.bgStrong || 'rgba(253,253,252,.84)'}`,
+            backdropFilter: g.filterThick || 'blur(44px) saturate(210%)', WebkitBackdropFilter: g.filterThick || 'blur(44px) saturate(210%)',
+            boxShadow: `inset 1.5px 1.5px 1px rgba(255,255,255,${dark ? 0.18 : 0.58}), inset 0 0 0 0.5px rgba(255,255,255,${dark ? 0.1 : 0.4}), 0 18px 50px -22px rgba(20,30,70,.45)`,
+          }
+          return (
+            <div>
+              <div style={{ ...glass, padding: 8, borderRadius: 18, overflow: 'hidden' }}>
+                {pdfUrl
+                  ? <iframe title={m.name} src={pdfUrl} style={{ width: '100%', height: '76vh', border: 'none', borderRadius: 12, background: '#fff', display: 'block' }} />
+                  : <div style={{ height: '76vh', display: 'grid', placeItems: 'center', color: t.textSecondary, fontSize: 'var(--zr-ui-md)' }}>{pdfErr ? `Aperçu indisponible : ${pdfErr}` : `Déchiffrement… ${Math.round((pdfProg || 0) * 100)}%`}</div>}
+              </div>
+              <button onClick={download} disabled={dlProgress != null && dlProgress < 1} className="zr-tap" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, marginTop: 14, padding: '9px 16px', borderRadius: 12, fontSize: 'var(--zr-ui-md)', fontFamily: "var(--zr-police-sans)", color: t.textPrimary, background: 'transparent', border: `1px solid ${t.border}`, cursor: 'pointer' }}>{dlProgress != null && dlProgress < 1 ? `Téléchargement… ${Math.round(dlProgress * 100)}%` : 'Télécharger le fichier'}</button>
+            </div>
+          )
+        })()}
+
+        {phase === 'ready' && !transcoding && viewerRoute.viewer === MEDIA_VIEWER.download && m && (() => {
+          const k = fileKind(m.name)
+          return (
+            <div>
+              {isVideo
+                ? <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-md)', marginBottom: 14, lineHeight: 1.5 }}>La lecture inline a échoué pour {m.mime}. Tu peux télécharger le fichier original.</div>
+                : (
+                  // Carte fichier sleek (Apple-ish) : glyphe + badge d'extension coloré + nom + type/taille.
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 16, padding: '4px 0 18px' }}>
+                    <div style={{ width: 72, height: 72, borderRadius: 16, flexShrink: 0, background: 'rgba(128,128,128,0.08)', border: `1px solid ${t.border}`, display: 'grid', placeItems: 'center', position: 'relative' }}>
+                      <Icon name="doc" size={34} color={t.textSecondary} weight={1.4} />
+                      <span style={{ position: 'absolute', bottom: 7, left: '50%', transform: 'translateX(-50%)', fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-3xs)', fontWeight: 700, letterSpacing: 0.4, color: '#fff', background: k.color, borderRadius: 4, padding: '1px 5px', whiteSpace: 'nowrap' }}>{k.ext ? k.ext.toUpperCase() : 'FICHIER'}</span>
+                    </div>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-2xl)', fontWeight: 600, color: t.textPrimary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{m.name}</div>
+                      <div style={{ fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, marginTop: 2 }}>{k.label}{m.size ? ` · ${fmtBytes(m.size)}` : ''} · {m.mime}</div>
+                    </div>
+                  </div>
+                )}
+              {dlProgress != null && dlProgress < 1 && (
+                <div style={{ marginBottom: 12 }}>
+                  <ProgressBar t={t} value={dlProgress} />
+                  <div style={{ marginTop: 6, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, fontFamily: 'var(--zr-police-sans)' }}>{Math.round(dlProgress * 100)} %</div>
+                </div>
+              )}
+              <button style={{ ...button, padding: '11px 22px', fontSize: 'var(--zr-ui-lg)', background: PALETTE.primary, color: '#fff', border: 'none' }} disabled={dlProgress != null && dlProgress < 1} onClick={download}>
+                {dlProgress != null && dlProgress < 1 ? 'Reconstitution…' : `↓ Télécharger${!isVideo && m.size ? ` (${fmtBytes(m.size)})` : ''}`}
+              </button>
+            </div>
+          )
+        })()}
+      </div>
+    </div>
+  )
+}

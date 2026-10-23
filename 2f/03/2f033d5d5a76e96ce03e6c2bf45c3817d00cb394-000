@@ -1,0 +1,86 @@
+import { describe, it, expect, vi } from 'vitest'
+import { postEagleLinksBatch, causeOf, isTransient, indexerLiens } from './eagleLinksRequest.js'
+import { causeApi } from './apiPost.js'
+
+// apiPost throws on any `{ error }` body: reproduce its contract with a minimal error carrying `corps`.
+const echec = (corps) => Object.assign(new Error(corps.error), { corps, statut: 200 })
+const corps = { items: [{ kind: 'leaf' }] }
+const sansPause = () => Promise.resolve()
+
+describe('postEagleLinksBatch : garder la cause et rejouer le passager', () => {
+  it('un succès rend la réponse du serveur', async () => {
+    const apiPost = vi.fn().mockResolvedValue({ ok: true, created: 1 })
+    const r = await postEagleLinksBatch(corps, { apiPost, causeApi, attente: sansPause })
+    expect(r.ok).toBe(true); expect(r.created).toBe(1); expect(apiPost).toHaveBeenCalledTimes(1)
+  })
+
+  it('une exception serveur ({error:"fetch"}) est RETENTÉE puis réussit', async () => {
+    const apiPost = vi.fn().mockRejectedValueOnce(echec({ error: 'fetch' })).mockResolvedValue({ ok: true, created: 1 })
+    const r = await postEagleLinksBatch(corps, { apiPost, causeApi, attente: sansPause })
+    expect(r.ok).toBe(true); expect(r.tentatives).toBe(2)
+  })
+
+  it('un échec de commit GitHub (results[].error = commit) est retenté', async () => {
+    const apiPost = vi.fn().mockRejectedValueOnce(echec({ error: 'github', detail: 'ref-update 409', results: [{ index: 0, ok: false, error: 'commit' }] })).mockResolvedValue({ ok: true, created: 1 })
+    const r = await postEagleLinksBatch(corps, { apiPost, causeApi, attente: sansPause })
+    expect(r.ok).toBe(true)
+  })
+
+  it('un refus DÉFINITIF (orphan-link) n’est PAS retenté et sa cause est conservée', async () => {
+    const apiPost = vi.fn().mockRejectedValue(echec({ error: 'preflight', results: [{ index: 0, ok: false, error: 'orphan-link' }] }))
+    const r = await postEagleLinksBatch(corps, { apiPost, causeApi, attente: sansPause })
+    expect(apiPost).toHaveBeenCalledTimes(1)
+    expect(r.ok).toBe(false); expect(causeOf(r).code).toBe('orphan-link')
+  })
+
+  it('une panne réseau répétée rend « http » ou la cause, jamais un null muet', async () => {
+    const apiPost = vi.fn().mockRejectedValue(Object.assign(new Error('x'), { statut: 502, corps: null }))
+    const r = await postEagleLinksBatch(corps, { apiPost, causeApi, attente: sansPause })
+    expect(apiPost).toHaveBeenCalledTimes(4)
+    expect(r.ok).toBe(false); expect(causeOf(r).code).toBe('http')
+  })
+
+  it('réponse perdue APRÈS le commit : la tentative suivante constate les liens et ne les recrée pas', async () => {
+    const apiPost = vi.fn().mockRejectedValue(echec({ error: 'fetch' }))
+    const dejaCree = vi.fn().mockResolvedValue(true)
+    const r = await postEagleLinksBatch(corps, { apiPost, causeApi, dejaCree, attente: sansPause })
+    expect(apiPost).toHaveBeenCalledTimes(1)
+    expect(r.ok).toBe(true); expect(r.deja).toBe(true)
+  })
+
+  it('lot de dossiers : une seule tentative demandée, jamais de doublon', async () => {
+    const apiPost = vi.fn().mockRejectedValue(echec({ error: 'fetch' }))
+    const r = await postEagleLinksBatch(corps, { apiPost, causeApi, attente: sansPause, tentatives: 1 })
+    expect(apiPost).toHaveBeenCalledTimes(1); expect(r.ok).toBe(false)
+  })
+})
+
+describe('isTransient', () => {
+  it('distingue le passager du définitif', () => {
+    expect(isTransient({ error: 'fetch' })).toBe(true)
+    expect(isTransient(null)).toBe(true)
+    expect(isTransient({ error: 'preflight', results: [{ index: 0, error: 'virtual-target-readonly' }] })).toBe(false)
+    expect(isTransient({ error: 'preflight', results: [{ index: 0, error: 'invalid-source' }] })).toBe(true)
+  })
+})
+
+describe('indexerLiens : une indexation à la fois, regroupée, jamais d’exception', () => {
+  it('sérialise les appels, regroupe ce qui arrive pendant un appel, et rend false sur échec', async () => {
+    const lots = []
+    let premier = true
+    const post = vi.fn(async (action, { pairs }) => { lots.push(pairs.map((p) => p[0])); await new Promise((r) => setTimeout(r, 5)); if (!premier) throw new Error('x'); premier = false; return { delta: true } })
+    const a = indexerLiens([['a', 's']], post)
+    const b = indexerLiens([['b', 's']], post)
+    const c = indexerLiens([['c', 's']], post)
+    const [ra, rb, rc] = await Promise.all([a, b, c])
+    expect(lots).toEqual([['a'], ['b', 'c']])          // b and c rode together, after a
+    expect(ra).toBe(false); expect(rb).toBe(false); expect(rc).toBe(false) // one batch failed: the shared answer says so
+    expect(post).toHaveBeenCalledTimes(2)
+  })
+
+  it('une fois vide, un nouvel appel repart proprement', async () => {
+    const post = vi.fn().mockResolvedValue({ delta: true })
+    expect(await indexerLiens([['x', 's']], post)).toBe(true)
+    expect(await indexerLiens([['y', 's']], post)).toBe(true)
+  })
+})

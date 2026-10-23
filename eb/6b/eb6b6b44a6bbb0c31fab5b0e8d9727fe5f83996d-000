@@ -1,0 +1,51 @@
+// GATE CLIENT (sécurité, audit famille A). Quand le serveur exige un secret (prod, ZENRAY_API_SECRET défini),
+// chaque appel /api/* sensible doit porter le header `x-zr-auth`. On installe UN wrapper global sur window.fetch
+// qui injecte le header pour les requêtes /api/ (même origine). En l'absence de secret stocké, on n'ajoute rien
+// (dev local = gate serveur désactivé). Sur 401, on demande le secret UNE fois (prompt), on le stocke, on rejoue.
+//
+// Les médias chargés comme src DOM (<img>/<video>/hls.js) NE passent PAS par fetch et sont EXEMPTÉS côté serveur
+// (PUBLIC_ROUTES), donc rien à faire pour eux.
+
+const KEY = 'zr:apiSecret'
+export const getApiSecret = () => { try { return localStorage.getItem(KEY) || '' } catch { return '' } }
+export const setApiSecret = (v) => { try { v ? localStorage.setItem(KEY, v) : localStorage.removeItem(KEY) } catch {} }
+
+const isApiUrl = (url) => {
+  if (typeof url !== 'string') return false
+  if (url.startsWith('/api/')) return true
+  try { return new URL(url, location.href).origin === location.origin && new URL(url, location.href).pathname.startsWith('/api/') } catch { return false }
+}
+
+// Demande le code via le pavé PIN React (PinGate -> window.__zrRequestPin). Concurrence : tous les 401 simultanés
+// partagent la MÊME demande (un seul modal). Repli sur prompt natif si le modal n'est pas encore monté.
+let pinInFlight = null
+// PAGES DE PARTAGE PUBLIC (/watch, /folder) : on ne réclame JAMAIS le code du drive à un visiteur du lien.
+// Si un appel /api y renvoie 401, on échoue silencieusement (la lecture publique des manifestes ne devrait
+// jamais 401 ; ce garde-fou évite tout window.prompt « Code du drive » chez la personne avec qui on partage).
+const isSharePage = () => { try { return location.pathname === '/watch' || location.pathname === '/folder' || location.pathname === '/view' } catch { return false } }
+async function requestPin(hadSecret) {
+  if (isSharePage()) return ''
+  if (typeof window !== 'undefined' && window.__zrRequestPin) {
+    if (!pinInFlight) pinInFlight = Promise.resolve(window.__zrRequestPin(hadSecret)).finally(() => { pinInFlight = null })
+    return pinInFlight
+  }
+  try { return window.prompt('Code du drive ZenRay :') || '' } catch { return '' }
+}
+
+export function installApiAuth() {
+  if (typeof window === 'undefined' || window.__zrApiAuth) return
+  window.__zrApiAuth = true
+  const orig = window.fetch.bind(window)
+  window.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : (input && input.url) || ''
+    const api = isApiUrl(url)
+    const withSecret = (i) => { const s = getApiSecret(); return s ? { ...i, headers: { ...((i && i.headers) || {}), 'x-zr-auth': s } } : i }
+    let res = await orig(input, api ? withSecret(init) : init)
+    // 401 sur un /api : le serveur exige le code et on ne l'a pas (ou il est faux) -> pavé PIN, puis on rejoue.
+    if (api && res && res.status === 401) {
+      const entered = await requestPin(!!getApiSecret())
+      if (entered) { setApiSecret(entered); res = await orig(input, withSecret(init)) }
+    }
+    return res
+  }
+}

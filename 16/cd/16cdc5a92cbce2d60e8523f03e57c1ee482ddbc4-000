@@ -1,0 +1,103 @@
+// Ajoute un lien Spotify (album/playlist/track) comme playlist ZenRay sous pages/Music/, SANS passer par le
+// navigateur ni l'OAuth utilisateur : utilise le grant "Client Credentials" de Spotify (app-only, lecture du
+// catalogue public uniquement, jamais un compte utilisateur) -- mêmes identifiants SPOTIFY_CLIENT_ID/SECRET
+// que api/spotify.js (serveur), PAS les VITE_SPOTIFY_* (ceux-là sont le PKCE navigateur, un secret différent).
+// Manifeste écrit identique à celui que produit CreateMusicPanel.jsx (importProvider) -- même schéma, pour
+// que la carte apparaisse et se joue pareil, que l'ajout vienne du bouton "Ajouter" ou de ce script.
+//
+// Usage : SPOTIFY_CLIENT_ID=.. SPOTIFY_CLIENT_SECRET=.. GITHUB_TOKEN=.. node scripts/spotify-add-link.mjs <url> [pages/Music/SousDossier]
+import os from 'node:os'
+
+const [, , URL_ARG, DEST_ARG] = process.argv
+const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID
+const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET
+const GH_TOKEN = process.env.GITHUB_TOKEN
+const DEST = (DEST_ARG || 'pages/Music').replace(/\/+$/, '')
+const REPO = 'matthieuhuguet/zenray-data'
+const BRANCH = 'main'
+
+if (!URL_ARG) { console.error('usage: SPOTIFY_CLIENT_ID=.. SPOTIFY_CLIENT_SECRET=.. GITHUB_TOKEN=.. node scripts/spotify-add-link.mjs <url spotify> [dossier]'); process.exit(1) }
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  console.error('SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET manquants.')
+  console.error('À récupérer sur https://developer.spotify.com/dashboard -> ton app existante (celle du VITE_SPOTIFY_CLIENT_ID) -> Settings -> "View client secret".')
+  console.error("C'est un grant app-only (aucun mot de passe Spotify saisi ici) : jamais utilisé pour lire/jouer un compte, seulement le catalogue public (albums/tracks/playlists).")
+  process.exit(1)
+}
+if (!GH_TOKEN) { console.error('GITHUB_TOKEN manquant.'); process.exit(1) }
+
+function parseProviderUrl(value) {
+  const raw = String(value || '').trim()
+  const m = raw.match(/(?:open\.spotify\.com\/|spotify:)(album|playlist|track)[/:]([A-Za-z0-9]+)/)
+  if (!m) return null
+  return { kind: m[1], id: m[2], uri: `spotify:${m[1]}:${m[2]}` }
+}
+const clean = (s) => String(s || 'Playlist').replace(/[\\/:*?"<>|]/g, '-').trim().slice(0, 100) || 'Playlist'
+
+async function getToken() {
+  const body = new URLSearchParams({ grant_type: 'client_credentials' })
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: 'Basic ' + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64') },
+    body,
+  })
+  if (!r.ok) throw new Error(`token Spotify: HTTP ${r.status} ${await r.text().then((t) => t.slice(0, 160))}`)
+  return (await r.json()).access_token
+}
+async function sp(token, path) {
+  const r = await fetch(`https://api.spotify.com${path}`, { headers: { Authorization: 'Bearer ' + token } })
+  if (!r.ok) throw new Error(`Spotify ${path}: HTTP ${r.status}`)
+  return r.json()
+}
+async function collectPages(token, first) {
+  const items = [...(first.items || [])]
+  let next = first.next
+  while (next) { const page = await fetch(next, { headers: { Authorization: 'Bearer ' + token } }).then((r) => r.json()); items.push(...(page.items || [])); next = page.next }
+  return items
+}
+
+const gh = (p, init = {}) => fetch(`https://api.github.com/repos/${REPO}/${p}`, { ...init, headers: { Authorization: `Bearer ${GH_TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zr-spotify-add', ...(init.headers || {}) } })
+const b64e = (s) => Buffer.from(s, 'utf8').toString('base64')
+async function saveManifest(path, data) {
+  let sha
+  const cur = await gh(`contents/${encodeURI(path)}?ref=${BRANCH}`)
+  if (cur.status === 200) sha = (await cur.json()).sha
+  const payload = { message: `spotify-add: ${path}`, content: b64e(JSON.stringify(data, null, 2)), branch: BRANCH, ...(sha ? { sha } : {}) }
+  const r = await gh(`contents/${encodeURI(path)}`, { method: 'PUT', body: JSON.stringify(payload) })
+  if (!r.ok) throw new Error(`save ${path}: HTTP ${r.status} ${await r.text().then((t) => t.slice(0, 160))}`)
+  return path
+}
+
+const parsed = parseProviderUrl(URL_ARG)
+if (!parsed) { console.error('Lien Spotify non reconnu (attendu : open.spotify.com/album|playlist|track/<id> ou spotify:album|playlist|track:<id>).'); process.exit(1) }
+
+const token = await getToken()
+let name, items, extra
+if (parsed.kind === 'album') {
+  const album = await sp(token, `/v1/albums/${parsed.id}`)
+  const tracks = album.tracks?.next ? await collectPages(token, album.tracks) : (album.tracks?.items || [])
+  name = album.name
+  items = tracks.map((x) => ({ source: 'spotify', uri: x.uri, title: x.name, artist: (x.artists || []).map((z) => z.name).join(', '), album: album.name, cover: album.images?.[0]?.url || '', dur: (x.duration_ms || 0) / 1000 }))
+  extra = { source: 'spotify', contextUri: album.uri, cover: album.images?.[0]?.url || '', artist: (album.artists || []).map((x) => x.name).join(', ') }
+} else if (parsed.kind === 'playlist') {
+  const playlist = await sp(token, `/v1/playlists/${parsed.id}`)
+  const raw = playlist.tracks?.next ? await collectPages(token, playlist.tracks) : (playlist.tracks?.items || [])
+  const tracks = raw.map((x) => x.track).filter(Boolean)
+  name = playlist.name
+  items = tracks.map((x) => ({ source: 'spotify', uri: x.uri, title: x.name, artist: (x.artists || []).map((z) => z.name).join(', '), album: x.album?.name || playlist.name, cover: x.album?.images?.[0]?.url || playlist.images?.[0]?.url || '', dur: (x.duration_ms || 0) / 1000 }))
+  extra = { source: 'spotify', contextUri: playlist.uri, cover: playlist.images?.[0]?.url || '', artist: playlist.owner?.display_name || 'Spotify' }
+} else {
+  const tr = await sp(token, `/v1/tracks/${parsed.id}`)
+  name = tr.name
+  items = [{ source: 'spotify', uri: tr.uri, title: tr.name, artist: (tr.artists || []).map((z) => z.name).join(', '), album: tr.album?.name || 'Spotify', cover: tr.album?.images?.[0]?.url || '', dur: (tr.duration_ms || 0) / 1000 }]
+  extra = { source: 'spotify', cover: tr.album?.images?.[0]?.url || '' }
+}
+
+const data = { type: 'playlist', v: 1, mime: 'audio/x-zenray-playlist', name, title: name, items, cover: extra.cover || (items.find((x) => x.cover) || {}).cover || '', createdAt: new Date().toISOString(), ...extra }
+const path = `${DEST}/${clean(name)}.${Date.now().toString(36)}.media.json`
+await saveManifest(path, data)
+console.log(`✓ ${items.length} titre(s) -> ${path}`)
+
+try {
+  const r = await fetch('https://zenray-progress.vercel.app/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'index-add', paths: [path] }) })
+  console.log(r.ok ? '✓ index-add' : `⏭ index-add non appliqué (HTTP ${r.status}, pas bloquant)`)
+} catch { console.log('⏭ index-add injoignable (pas bloquant)') }

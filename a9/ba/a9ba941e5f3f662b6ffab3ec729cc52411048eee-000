@@ -1,0 +1,96 @@
+// Contrat client des liens publics ZenRay.
+//
+// Nouveau format : un jeton opaque `zrs1.…` émis par /api/share-token. Le chemin réel ne voyage plus dans
+// l'URL ; le serveur vérifie signature, expiration et révocation avant de rendre le chemin au visiteur.
+// Les deux helpers legacy restent exportés pour que les liens base64 déjà envoyés continuent de fonctionner.
+import { shareViaFromUrl } from './shareVia.js'
+
+export const SHARE_KIND = Object.freeze({ video: 'video', image: 'image', folder: 'folder', file: 'file' })
+
+const kindPathOk = (kind, path) => {
+  if (typeof path !== 'string' || !path.startsWith('pages/') || path.includes('..')) return false
+  if (kind === SHARE_KIND.file) return path.endsWith('.media.json')
+  if (kind === SHARE_KIND.video) return path.endsWith('.media.json')
+  if (kind === SHARE_KIND.image) return path.endsWith('.img.json')
+  return kind === SHARE_KIND.folder && path !== 'pages' && !/\.(?:media|img)\.json$/i.test(path)
+}
+
+// UTF-8 safe et strictement rétrocompatible avec l'ancien encodeShare/decodeShare de ShareVideoPage.
+export const encodeLegacyShare = (value) => btoa(unescape(encodeURIComponent(String(value || ''))))
+  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+
+export const decodeLegacyShare = (token) => {
+  try { return decodeURIComponent(escape(atob(String(token || '').replace(/-/g, '+').replace(/_/g, '/')))) } catch { return '' }
+}
+
+// Noms historiques conservés pour les imports existants. `encodeShare` ne doit servir qu'à RELIRE/maintenir
+// l'ancien contrat ; toute nouvelle création doit passer par issueShareToken/createShareLink.
+export const encodeShare = encodeLegacyShare
+export const decodeShare = decodeLegacyShare
+
+export class ShareLinkError extends Error {
+  constructor(code, status = 0) {
+    super(code)
+    this.name = 'ShareLinkError'
+    this.code = code
+    this.status = status
+  }
+}
+
+export async function issueShareToken(kind, path, { expiresInSeconds, permanent = false, signal } = {}) {
+  if (!kindPathOk(kind, path)) throw new ShareLinkError('invalid-target')
+  const body = { action: 'issue', kind, path, ...(permanent ? { permanent: true } : {}) }
+  if (Number.isFinite(expiresInSeconds)) body.expiresInSeconds = Math.round(expiresInSeconds)
+  const response = await fetch('/api/share-token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok || !payload.token) throw new ShareLinkError(payload.error || 'share-issue-failed', response.status)
+  return payload
+}
+
+export async function revokeShareToken(token, { signal } = {}) {
+  const response = await fetch('/api/share-token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'revoke', token }),
+    signal,
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok) throw new ShareLinkError(payload.error || 'share-revoke-failed', response.status)
+  return payload
+}
+
+export async function resolveShareToken(token, expectedKind, { signal } = {}) {
+  // Résolution locale des anciens liens : indispensable pour tous les liens déjà distribués. Le serveur
+  // revalide ensuite exactement ce même jeton sur /api/page et /api/shared-media.
+  const legacyPath = decodeLegacyShare(token)
+  if (kindPathOk(expectedKind, legacyPath)) return { path: legacyPath, kind: expectedKind, legacy: true, token }
+
+  const query = new URLSearchParams({ action: 'resolve', token: String(token || ''), kind: expectedKind })
+  const response = await fetch(`/api/share-token?${query}`, { cache: 'no-store', signal })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok || !kindPathOk(expectedKind, payload.path)) {
+    throw new ShareLinkError(payload.error || 'invalid-share', response.status)
+  }
+  return { ...payload, token }
+}
+
+export const shareRoute = (kind) => kind === SHARE_KIND.folder ? ['/folder', 'd'] : [kind === SHARE_KIND.image ? '/view' : '/watch', 'v']
+
+export async function createShareLink(kind, path, options) {
+  const issued = await issueShareToken(kind, path, options)
+  const [route, key] = shareRoute(kind)
+  const origin = typeof window !== 'undefined' ? window.location.origin : ''
+  return { ...issued, url: `${origin}${route}?${key}=${encodeURIComponent(issued.token)}` }
+}
+
+export const appendShareCredential = (url, token) => {
+  const separator = String(url).includes('?') ? '&' : '?'
+  return `${url}${separator}share=${encodeURIComponent(String(token || ''))}${shareViaFromUrl(url)}`
+}
+
+export const isSharePathForKind = kindPathOk

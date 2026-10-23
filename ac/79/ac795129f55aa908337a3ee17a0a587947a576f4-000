@@ -1,0 +1,120 @@
+// 4 October 2026: the optional writer of the studio paragraph, run by Claude Sonnet 5.5 (medium effort) on Matthieu's own subscription.
+// It needs a long-lived token that only he can create (`claude setup-token`); without it the engine keeps its deterministic paragraph.
+// The model only ever writes ONE paragraph about what the role asks and what the CV already shows. It may never claim a taste, a play
+// or a study of the studio, and every answer is checked against the CV before it is used. A failure always falls back, never blocks.
+// FR : l'ecrivain optionnel du paragraphe de studio, Claude Sonnet 5.5 en effort moyen sur l'abonnement de Matthieu. Il faut un jeton
+// que lui seul peut creer ; sans lui le moteur garde son paragraphe deterministe. Le modele n'ecrit qu'UN paragraphe, sur ce que le
+// poste demande et ce que le CV montre deja, et chaque reponse est verifiee contre le CV avant usage.
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { readdir, access } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { SKILLS, skillsOf } from './lib/Offer.mjs'
+import { overlappingSkills, latestPublished } from './CvSource.mjs'
+import { clean, noLongDash } from './lib/Text.mjs'
+
+const run = promisify(execFile)
+
+/** The newest Claude Code the desktop app installed, or the one on the PATH. */
+export async function findClaude({ configured = '', home = os.homedir() } = {}) {
+  if (configured) { try { await access(configured); return configured } catch {} }
+  const root = path.join(home, 'Library/Application Support/Claude/claude-code')
+  try {
+    const versions = (await readdir(root)).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+    for (const version of versions.reverse()) {
+      for (const hash of await readdir(path.join(root, version))) {
+        const candidate = path.join(root, version, hash, 'claude.app/Contents/MacOS/claude')
+        try { await access(candidate); return candidate } catch {}
+      }
+    }
+  } catch {}
+  return null
+}
+
+const FORBIDDEN = /\b(joué|jouer|played|play(?:ing)?|fan\b|admir|j[’']adore|adore|love[sd]?\b|passionn|rêve|dream|always wanted|toujours voulu|étudié|studied your|suivi votre|follow(?:ed)? your)/i
+const WORDS = (text) => (clean(text).match(/\S+/g) || []).length
+
+/** An answer is used only if it stays inside what the CV states and what the offer says. */
+export function validateHook(text, { cv, offerSkills = [], offerText = '' }) {
+  const value = String(text || '').trim()
+  if (!value) return { ok: false, reason: 'empty' }
+  if (/[\u2014\u2013]/.test(value)) return { ok: false, reason: 'long dash' }
+  if (value.includes('\n\n')) return { ok: false, reason: 'more than one paragraph' }
+  if (WORDS(value) > 75) return { ok: false, reason: 'too long' }
+  if (WORDS(value) < 12) return { ok: false, reason: 'too short' }
+  if (FORBIDDEN.test(value)) return { ok: false, reason: 'claims a taste or a play' }
+  if (/https?:\/\/|@[a-z0-9]/i.test(value)) return { ok: false, reason: 'carries a link or address' }
+  const allowed = new Set([...overlappingSkills(cv, offerSkills), ...skillsOf(offerText).filter((skill) => overlappingSkills(cv, [skill]).length)])
+  const claimed = skillsOf(value)
+  const outside = claimed.filter((skill) => !allowed.has(skill) && overlappingSkills(cv, [skill]).length === 0)
+  if (outside.length) return { ok: false, reason: `names a skill the CV does not state: ${outside.join(', ')}` }
+  return { ok: true }
+}
+
+export function buildPrompt({ studio, offerText, cv, language }) {
+  const skills = cv.skills.map((skill) => `${skill.name} (${skill.level}/5: ${(skill.tags || []).join(', ')})`).join('; ')
+  const experience = cv.experiences.filter((entry) => !entry.divers).slice(0, 3).map((entry) => `${entry.title}, ${entry.company} (${entry.period}): ${(language === 'fr' ? entry.highlights : entry.highlightsEn || entry.highlights).slice(0, 3).join(' ')}`).join('\n')
+  const work = latestPublished(cv, 3, language).map((item) => `${item.title}: ${item.description}`).join('\n')
+  const system = [
+    `You write ONE short paragraph, in ${language === 'fr' ? 'French' : 'English'}, for the cover letter of Matthieu Huguet, a freelance Technical Artist. It has two or three sentences and at most 55 words, never more.`,
+    'It sits right after the sentence about his current work and tells the studio why this role fits what he already does.',
+    'Use only the FACTS and the OFFER below. Say in one sentence what the role asks for, then name at most two of his real skills or published projects that answer it, without describing them in detail.',
+    'Never claim that he played, loved, admired, followed or studied the studio, its games or its people. Never invent an experience, a number, a tool or a diploma.',
+    'Never name a skill that is not in FACTS. No greeting, no sign-off, no link, no dash punctuation, no list. Reply with the paragraph only.',
+  ].join(' ')
+  const user = `FACTS\nSkills: ${skills}\nExperience:\n${experience}\nPublished work:\n${work}\n\nOFFER\nStudio: ${studio.name}\nRole: ${studio.role}\n${clean(offerText).slice(0, 3500)}`
+  return { system, user }
+}
+
+export function createHookWriter({ config, exec = run, env = process.env, find = findClaude, tmp = os.tmpdir(), now = () => Date.now() }) {
+  const settings = config.letters.claude
+  const token = () => env[settings.tokenEnv] || ''
+  let login = { at: null, value: false }
+  // The CLI's own sign-in (`claude auth login`, kept and refreshed by Claude Code itself) is the primary way; the one-year token is the alternative.
+  // FR : la connexion propre a la CLI (`claude auth login`, gardee et renouvelee par Claude Code) est la voie principale ; le jeton d'un an est l'alternative.
+  async function signedIn() {
+    // A sign-in is remembered five minutes; a missing one only thirty seconds, so signing in is noticed almost at once.
+    // FR : une connexion se retient cinq minutes ; son absence trente secondes seulement, pour que la connexion soit vue presque aussitot.
+    if (login.at !== null && now() - login.at < (login.value ? 5 * 60 * 1000 : 30 * 1000)) return login.value
+    const binary = await find({ configured: settings.binary || '' })
+    let value = false
+    if (binary) {
+      try {
+        const { stdout } = await exec(binary, ['auth', 'status'], { cwd: tmp, timeout: 20000, env: { ...env, [settings.tokenEnv]: '' } })
+        value = JSON.parse(stdout).loggedIn === true
+      } catch (error) { try { value = JSON.parse(error.stdout).loggedIn === true } catch { value = false } }
+    }
+    login = { at: now(), value }
+    return value
+  }
+  return {
+    available: async () => Boolean(token()) || await signedIn(),
+    via: async () => (token() ? 'token' : (await signedIn()) ? 'login' : 'none'),
+    /** Resolves { text, source: 'claude' } or { skipped: reason }; never throws, so a pass is never blocked by the model. */
+    async write({ studio, offerText, cv, language, offerSkills = [] }) {
+      if (!(await this.available())) return { skipped: 'not-signed-in' }
+      const binary = await find({ configured: settings.binary || '' })
+      if (!binary) return { skipped: 'claude-not-found' }
+      const { system, user } = buildPrompt({ studio, offerText, cv, language })
+      const childEnv = token() ? { ...env, [settings.tokenEnv]: token() } : { ...env, [settings.tokenEnv]: '' }
+      try {
+        const { stdout } = await exec(binary, ['-p', '--no-session-persistence', '--model', settings.model, '--effort', settings.effort, '--tools', '', '--disable-slash-commands', '--output-format', 'json', '--system-prompt', system, user], {
+          cwd: tmp, timeout: settings.timeoutMs, maxBuffer: 8 * 1024 * 1024, env: childEnv,
+        })
+        const answer = JSON.parse(stdout)
+        if (answer.is_error) return { skipped: `model: ${String(answer.result).slice(0, 120)}` }
+        const text = noLongDash(String(answer.result || '').trim().replace(/^["«]\s*|\s*["»]$/g, ''))
+        const verdict = validateHook(text, { cv, offerSkills, offerText })
+        return verdict.ok ? { text, source: 'claude' } : { skipped: `rejected: ${verdict.reason}` }
+      } catch (error) {
+        // A failing `claude -p` still prints a JSON answer on stdout: its message is the real reason.
+        let reason = String(error.message).split('\n')[0]
+        try { reason = String(JSON.parse(error.stdout).result || reason) } catch {}
+        return { skipped: `error: ${reason.slice(0, 120)}` }
+      }
+    },
+  }
+}
+
+export { SKILLS }

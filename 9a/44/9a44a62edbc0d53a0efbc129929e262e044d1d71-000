@@ -1,0 +1,97 @@
+// 4 October 2026: the engine publishes by git, recomputes from the freshest remote after a refused push, and never writes outside its clone.
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { createCloudStore } from './CloudStore.mjs'
+
+const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' })
+const config = { cloud: { repo: 'x/y', branch: 'main', folder: 'freelance', pushAttempts: 3 } }
+let root, remote, clone, other
+
+beforeEach(() => {
+  root = mkdtempSync(path.join(os.tmpdir(), 'zrf-cloud-'))
+  remote = path.join(root, 'remote.git')
+  execFileSync('git', ['init', '--bare', '--quiet', '--initial-branch=main', remote])
+  const seed = path.join(root, 'seed')
+  execFileSync('git', ['clone', '--quiet', remote, seed])
+  git(seed, 'checkout', '-q', '-b', 'main')
+  mkdirSync(path.join(seed, 'freelance'))
+  writeFileSync(path.join(seed, 'freelance/applications.json'), JSON.stringify({ studios: [{ id: 'a' }] }))
+  git(seed, 'add', '-A'); git(seed, 'commit', '-q', '-m', 'seed'); git(seed, 'push', '-q', 'origin', 'main')
+  clone = path.join(root, 'engine-clone'); other = path.join(root, 'other-clone')
+  execFileSync('git', ['clone', '--quiet', remote, clone]); execFileSync('git', ['clone', '--quiet', remote, other])
+})
+afterEach(() => rmSync(root, { recursive: true, force: true }))
+
+describe('createCloudStore', () => {
+  it('commits the planned files and they reach the remote', async () => {
+    const cloud = createCloudStore({ config, directory: clone })
+    const result = await cloud.commit('test', async (tree) => ({ files: { 'freelance/engine.json': '{"ok":true}\n' }, report: { seen: (await tree.json('freelance/applications.json')).studios.length } }))
+    expect(result).toMatchObject({ committed: true, report: { seen: 1 } })
+    git(other, 'pull', '-q', 'origin', 'main')
+    expect(readFileSync(path.join(other, 'freelance/engine.json'), 'utf8')).toBe('{"ok":true}\n')
+  })
+
+  it('does nothing when the plan changes nothing, and in dry run writes nothing', async () => {
+    const cloud = createCloudStore({ config, directory: clone })
+    expect((await cloud.commit('t', async () => ({ files: {}, report: {} }))).committed).toBe(false)
+    const dry = await cloud.commit('t', async () => ({ files: { 'freelance/x.json': '1' }, report: {} }), { dryRun: true })
+    expect(dry.files['freelance/x.json']).toBe('1')
+    expect(existsSync(path.join(clone, 'freelance/x.json'))).toBe(false)
+    const same = await cloud.commit('t', async () => ({ files: { 'freelance/applications.json': readFileSync(path.join(clone, 'freelance/applications.json'), 'utf8') }, report: {} }))
+    expect(same.committed).toBe(false)
+  })
+
+  it('after a refused push recomputes from the fresh remote, so a concurrent edit by the page survives', async () => {
+    const cloud = createCloudStore({ config, directory: clone })
+    let attempts = 0
+    const result = await cloud.commit('engine', async (tree) => {
+      attempts += 1
+      const store = await tree.json('freelance/applications.json')
+      if (attempts === 1) {
+        // the page saves a studio between the engine's read and its push
+        writeFileSync(path.join(other, 'freelance/applications.json'), JSON.stringify({ studios: [{ id: 'a' }, { id: 'from-page' }] }))
+        git(other, 'add', '-A'); git(other, 'commit', '-q', '-m', 'page edit'); git(other, 'push', '-q', 'origin', 'main')
+      }
+      return { files: { 'freelance/applications.json': JSON.stringify({ studios: [...store.studios, { id: `engine-attempt-${attempts}` }] }) }, report: { attempts } }
+    })
+    expect(result.committed).toBe(true)
+    expect(attempts).toBe(2)
+    git(other, 'pull', '-q', 'origin', 'main')
+    const final = JSON.parse(readFileSync(path.join(other, 'freelance/applications.json'), 'utf8'))
+    expect(final.studios.map((s) => s.id)).toEqual(['a', 'from-page', 'engine-attempt-2'])
+  })
+
+  it('gives up loudly after the allowed attempts and publishes nothing', async () => {
+    const cloud = createCloudStore({ config: { cloud: { ...config.cloud, pushAttempts: 2 } }, directory: clone, sleep: async () => {} })
+    let n = 0
+    await expect(cloud.commit('engine', async () => {
+      n += 1
+      writeFileSync(path.join(other, `freelance/race-${n}.json`), '1'); git(other, 'add', '-A'); git(other, 'commit', '-q', '-m', `race ${n}`); git(other, 'push', '-q', 'origin', 'main')
+      return { files: { 'freelance/mine.json': '1' }, report: {} }
+    })).rejects.toThrow(/Push refused 2 times/)
+    git(other, 'pull', '-q', 'origin', 'main')
+    expect(existsSync(path.join(other, 'freelance/mine.json'))).toBe(false)
+  })
+
+  it('waits longer after each refusal before trying again', async () => {
+    const waits = []
+    const cloud = createCloudStore({ config: { cloud: { ...config.cloud, pushAttempts: 3 } }, directory: clone, sleep: async (ms) => { waits.push(ms) } })
+    let n = 0
+    await expect(cloud.commit('engine', async () => {
+      n += 1
+      writeFileSync(path.join(other, `freelance/wait-${n}.json`), '1'); git(other, 'add', '-A'); git(other, 'commit', '-q', '-m', `wait ${n}`); git(other, 'push', '-q', 'origin', 'main')
+      return { files: { 'freelance/mine.json': '1' }, report: {} }
+    })).rejects.toThrow(/Push refused 3 times/)
+    expect(waits).toHaveLength(3)
+    expect(waits[0]).toBeGreaterThanOrEqual(1500)
+    expect(waits[2]).toBeGreaterThan(waits[0])
+  })
+
+  it('refuses to write outside the clone', async () => {
+    const cloud = createCloudStore({ config, directory: clone })
+    await expect(cloud.commit('t', async () => ({ files: { '../escape.json': '1' }, report: {} }))).rejects.toThrow(/outside the clone/)
+  })
+})

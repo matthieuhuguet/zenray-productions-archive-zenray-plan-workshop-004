@@ -1,0 +1,89 @@
+import { describe, it, expect } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { loadRepoCreatePolicy, claimRepoPoolSlot, canReuse, creationWaitMs, backoffAfterBlock, createRepoGate } from './repo-create-policy.mjs'
+
+const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'zr-repo-policy-'))
+const policy = (extra = {}) => loadRepoCreatePolicy({}, { directory: temp(), ...extra })
+
+describe('repo pool lanes', () => {
+  it('gives each concurrent process its own lane, then none, and a dead owner is replaced (red controls)', () => {
+    const p = policy({ slots: 2 })
+    const a = claimRepoPoolSlot({ type: 'vid', vis: 'private', policy: p })
+    const b = claimRepoPoolSlot({ type: 'vid', vis: 'private', policy: p })
+    expect([a.slot, b.slot]).toEqual([0, 1])
+    expect(claimRepoPoolSlot({ type: 'vid', vis: 'private', policy: p })).toBeNull()
+    a.write({ repo: 'zenrayshards-vid-aaa', bytes: 100, full: false })
+    expect(a.read().repo).toBe('zenrayshards-vid-aaa')
+    a.release()
+    expect(claimRepoPoolSlot({ type: 'vid', vis: 'private', policy: p }).slot).toBe(0)
+    // a lane whose owner pid is dead (pid 2^22 does not exist) is taken over
+    fs.writeFileSync(path.join(p.directory, 'vid-private-lane1.lock', 'owner'), JSON.stringify({ pid: 4194301, at: Date.now() }))
+    b.release = () => {}
+    expect(claimRepoPoolSlot({ type: 'vid', vis: 'private', policy: p }).slot).toBe(1)
+  })
+  it('reuses a repository only while it has room and is not marked full', () => {
+    const cap = 4096 * 1048576
+    expect(canReuse({ repo: 'r', bytes: 1000 * 1048576 }, 500 * 1048576, cap)).toBe(true)
+    expect(canReuse({ repo: 'r', bytes: 3900 * 1048576 }, 500 * 1048576, cap)).toBe(false)
+    expect(canReuse({ repo: 'r', bytes: 10, full: true }, 1, cap)).toBe(false)
+    expect(canReuse(null, 1, cap)).toBe(false)
+  })
+})
+
+describe('creation gate', () => {
+  it('spaces creations, applies the hourly budget and shares a block (red controls)', () => {
+    const p = policy({ minCreateIntervalMs: 120000, maxCreatesPerHour: 3 })
+    const t = 1_000_000_000
+    expect(creationWaitMs({ creates: [] }, t, p)).toBe(0)
+    expect(creationWaitMs({ lastCreateAt: t - 30000, creates: [t - 30000] }, t, p)).toBe(90000)
+    expect(creationWaitMs({ lastCreateAt: t - 200000, creates: [t - 3000000, t - 2000000, t - 200000] }, t, p)).toBe(600000)
+    expect(creationWaitMs({ blockedUntil: t + 300000, creates: [] }, t, p)).toBe(300000)
+    expect(backoffAfterBlock(1, p)).toBe(300000)
+    expect(backoffAfterBlock(9, p)).toBe(1800000)
+  })
+  it('a block recorded by one process makes the next process wait, and a creation clears it', async () => {
+    let clock = 5_000_000_000
+    const p = policy()
+    const waits = []
+    const gate = createRepoGate({ policy: p, now: () => clock, sleep: async (ms) => { waits.push(ms); clock += ms } })
+    await gate.blocked()
+    await gate.wait()
+    expect(waits.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(300000)
+    await gate.created()
+    waits.length = 0
+    await gate.wait()
+    expect(waits.length).toBeGreaterThan(0) // spacing after the creation
+    expect(waits.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(p.minCreateIntervalMs)
+  })
+})
+
+describe('creation limits follow the work (14 October 2026)', () => {
+  const GiB = 1073741824
+  it('raises the hourly budget when the line needs more repositories, and never above the ceiling', async () => {
+    const { creationLimits } = await import('./repo-create-policy.mjs')
+    const p = policy()
+    const cap = 4 * GiB
+    expect(creationLimits({}, p, { throughputBps: 2e6, capBytes: cap }).perHour).toBe(12) // 2 MB/s needs 2 an hour: the baseline stays
+    expect(creationLimits({}, p, { throughputBps: 25e6, capBytes: cap }).perHour).toBeGreaterThan(12) // 25 MB/s needs 21 an hour
+    expect(creationLimits({}, p, { throughputBps: 400e6, capBytes: cap }).perHour).toBe(24) // the ceiling
+    expect(creationLimits({}, p, { throughputBps: 25e6, capBytes: cap }).intervalMs).toBeLessThanOrEqual(120000)
+  })
+  it('a block halves the budget (floor 0.25) and a quiet period gives it back step by step', async () => {
+    let clock = 9_000_000_000
+    const p = policy()
+    const gate = createRepoGate({ policy: p, now: () => clock, sleep: async (ms) => { clock += ms } })
+    const read = () => JSON.parse(fs.readFileSync(gate.file, 'utf8'))
+    await gate.blocked()
+    expect(read().scale).toBe(0.5)
+    await gate.blocked() // probing again while blocked does not halve twice
+    expect(read().scale).toBe(0.5)
+    clock += 24 * 3600000
+    await gate.created()
+    expect(read().scale).toBe(0.75)
+    clock += 7 * 3600000
+    await gate.created()
+    expect(read().scale).toBe(1)
+  })
+})

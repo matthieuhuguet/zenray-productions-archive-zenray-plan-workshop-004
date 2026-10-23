@@ -1,0 +1,77 @@
+// video-hls.mjs — CLI de transcodage HLS hors worker (debug / test manuel). Jumeau de video-mse.mjs.
+//
+// Usage : GITHUB_TOKEN=$(gh auth token) node scripts/video-hls.mjs <fichier|dossier> \
+//           [--dest pages/Videos] [--push] [--crf 21] [--t 90] [--api http://localhost:3000]
+//   --t N  : échantillon de N secondes (validation rapide). Omis = vidéo complète.
+//   --push : pousse les binaires (shard privé) + playlists/manifest (zenray-data). Sinon sortie locale.
+//
+// Sans --push : produit master.m3u8 + media playlists + init + segments + VTT dans /tmp/zr_hls/out/<id>,
+// utile pour inspecter (ffprobe sur un .m4s, cat des m3u8) sans rien envoyer.
+import { stat, readdir, rm } from 'node:fs/promises'
+import path from 'node:path'
+import { transcodeHls, pushHls, loadResult } from './video-hls-lib.mjs'
+
+const TOKEN = process.env.GITHUB_TOKEN
+const args = process.argv.slice(2)
+const input = args.find((a) => !a.startsWith('--'))
+const getArg = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d }
+const DEST = (getArg('--dest', 'pages/Videos')).replace(/\/$/, '')
+const PUSH = args.includes('--push')
+const CRF = getArg('--crf', '21')
+const SAMPLE = getArg('--t', null)
+const API = (getArg('--api', 'http://localhost:3000')).replace(/\/$/, '')
+const log = (...a) => console.log(...a)
+
+// REPRISE : --resume <outDir> re-pousse un transcodage DÉJÀ produit (ex. après un échec réseau au push),
+// SANS retranscoder. --base "Nom" pour nommer le nœud (sinon nom du dossier temp). --dest pour le dossier cible.
+const RESUME = getArg('--resume', null)
+if (RESUME) {
+  if (!TOKEN) { console.error('--resume nécessite GITHUB_TOKEN'); process.exit(1) }
+  const result = await loadResult(RESUME, { base: getArg('--base', null), dest: DEST })
+  console.log(`reprise du push depuis ${RESUME}`)
+  console.log(`  ${result.segments.length} segments, base="${result.base}", ${result.subsRaw.length} sous-titres, ${Math.round(result.outDuration)}s — AUCUN retranscodage`)
+  const r = await pushHls(TOKEN, result, { apiBase: API, log })
+  console.log(`  poussé: master ${r.masterPath}, shard ${r.publicRepo}`)
+  try { await rm(result.outDir, { recursive: true, force: true }); console.log(`  cache temp nettoyé: ${result.outDir}`) } catch {}
+  process.exit(0)
+}
+
+if (!input) { console.error('usage: node video-hls.mjs <fichier|dossier> [--dest ...] [--push] [--crf 21] [--t 90]  |  --resume <outDir> --push [--base "Nom"]'); process.exit(1) }
+
+const st = await stat(input)
+const files = st.isDirectory()
+  ? (await readdir(input)).filter((f) => /\.(mkv|mp4|webm|avi|mov|m4v|ts)$/i.test(f)).map((f) => path.join(input, f))
+  : [input]
+console.log(`${files.length} vidéo(s) à traiter (HLS)`)
+
+// --emit-progress : imprime des lignes machine `@@P <pct 0-100> <stage>` (transcode 0-60, push 60-100) et
+// `@@DONE <nodePath>` à la fin. Lues par local-server.mjs pour la progression LIVE de la tuile (SSE). Inoffensif sinon.
+const EMIT = args.includes('--emit-progress')
+const emit = (s) => { if (EMIT) { process.stdout.write('@@' + s + '\n') } }
+const onTranscode = (_stage, pct) => emit(`P ${Math.round(Math.min(1, pct || 0) * 60)} transcodage`)
+const onUpload = (_stage, pct) => emit(`P ${60 + Math.round(Math.min(100, pct || 0) / 100 * 40)} envoi`)
+
+let hadFailure = false
+for (const f of files) {
+  try {
+    emit('P 1 transcodage')
+    const result = await transcodeHls(f, { crf: CRF, sampleSec: SAMPLE, log, dest: DEST, onProgress: onTranscode })
+    console.log(`\n=== ${result.base} ===`)
+    console.log(`  sortie locale: ${result.outDir}`)
+    console.log(`  ${result.segments.length} segments, ${result.inits.length} init, ${result.mediaPlaylists.length} media playlists, ${result.subsRaw.length} sous-titres`)
+    if (PUSH && TOKEN) {
+      const r = await pushHls(TOKEN, result, { apiBase: API, log, onProgress: onUpload })
+      emit(`DONE ${r.manifestPath}`)
+      console.log(`  poussé: master ${r.masterPath}, manifest ${r.manifestPath}, shard ${r.publicRepo}`)
+      // NETTOYAGE CACHE : une fois les segments poussés sur le serveur, on supprime le dossier temporaire
+      // /tmp/zr_hls/out/<id> (segments chiffrés + playlists + init + clé). Le FICHIER SOURCE (~/Downloads)
+      // n'est JAMAIS touché — c'est l'entrée, pas le temp. Évite que le Mac accumule des Go de morceaux HLS.
+      try { await rm(result.outDir, { recursive: true, force: true }); console.log(`  cache temp nettoyé: ${result.outDir}`) } catch (e) { console.log(`  (nettoyage temp ignoré: ${String(e.message || e).slice(0, 80)})`) }
+    } else {
+      console.log(`  (ajoute --push pour envoyer ; inspecte avec: cat ${path.join(result.outDir, 'master.m3u8')})`)
+    }
+  } catch (e) { hadFailure = true; console.error('échec', f, String(e.message || e).slice(0, 200)) }
+}
+// EXIT CODE FIABLE : le runner de migration s'appuie dessus pour décider de stager (ou non) la source.
+// Un échec de push (manifeste non commité) DOIT remonter exit 1, sinon la source serait déplacée à tort.
+if (hadFailure) process.exit(1)

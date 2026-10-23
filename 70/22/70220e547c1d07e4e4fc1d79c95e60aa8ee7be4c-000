@@ -1,0 +1,73 @@
+// ZenRay Eagle Links: a placement keeps its normal `.img.json` / `.media.json`
+// / `.file.json` suffix, but its JSON body can point at one canonical resource.
+// This resolver is deliberately the only client-side place which understands the
+// indirection: Finder, Quick Look and every viewer receive the real manifest path.
+
+import { readPageCached } from './manifestReadCache.js'
+
+const cache = new Map()
+
+export const isEagleLink = (value) => !!(value && value.type === 'zenray-eagle-link/v1' && typeof value.resourceId === 'string')
+
+export async function resolveEaglePath(path) {
+  if (!path) return { path, linked: false }
+  if (cache.has(path)) return cache.get(path)
+  const pending = readPageCached(`/api/page?action=resolve-link&path=${encodeURIComponent(path)}`)
+    .then((result) => {
+      if (!result || !result.ok || !result.path) return { path, linked: false, abouti: false, error: result?.error || null }
+      return { path: result.path, linked: !!result.linked, abouti: true, resourceId: result.resourceId || null, sourcePath: path }
+    })
+    .catch(() => ({ path, linked: false, abouti: false, error: 'network' }))
+
+  // ═══ UN ÉCHEC PASSAGER NE SE MET PAS EN CACHE (2026-08-31) ═══════════════════════════════════
+  //
+  // LE SYMPTÔME, décrit par Matthieu : « Lien média indisponible » sur des images qui existent bel
+  // et bien, puis l'image qui apparaît quelques secondes plus tard, et des pastilles orange.
+  //
+  // LA CAUSE. Le cache gardait la promesse AVANT de savoir ce qu'elle contenait. Une résolution
+  // tombée pendant que le quota GitHub était épuisé était donc mémorisée telle quelle, pour toute la
+  // durée de la session : l'image restait indisponible même une fois le quota rétabli, et seul un
+  // rechargement complet de la page la faisait revenir. L'échec durait infiniment plus longtemps que
+  // sa cause.
+  //
+  // CE QU'ON CACHE DÉSORMAIS : une résolution qui a ABOUTI, y compris « ce n'est pas un lien », qui
+  // est une réponse légitime et stable. Un échec réseau, un quota épuisé ou une erreur serveur sont
+  // des états passagers : on les oublie, si bien que le prochain regard réessaie.
+  //
+  // CE QUI L'EMPÊCHE DE BOUCLER : `readPageCached` mémoïse déjà la requête en vol, donc plusieurs
+  // vignettes affichées ensemble ne produisent qu'un seul appel, même en cas d'échec.
+  cache.set(path, pending)
+  // `abouti` et non `error` : un quota epuise fait rendre une reponse NULLE au serveur, donc `error`
+  // valait `null` et l'echec passait pour une resolution legitime. C'est le piege exact qui gardait
+  // l'image indisponible toute la session.
+  pending.then((v) => { if (!v || !v.abouti) cache.delete(path) }).catch(() => { cache.delete(path) })
+  // On mémorise la valeur RÉSOLUE à part, pour que `eaglePathConnu` puisse répondre sans attendre.
+  pending.then((v) => { resolus.set(path, v) }).catch(() => {})
+  return pending
+}
+
+// ═══ LA RÉPONSE DÉJÀ CONNUE, SANS ATTENDRE ══════════════════════════════════════════════════════
+//
+// `resolveEaglePath` rend une PROMESSE, même quand la réponse est déjà en cache : tout appelant paie
+// donc au moins un tour de boucle d'événements, et surtout un rendu vide en attendant.
+//
+// Mesuré le 2026-08-31 : un aller-retour vers l'API coûte 150 à 250 ms. Le Quick Look en payait un
+// AVANT d'afficher le moindre pixel, alors que la grille venait d'afficher la même image — donc que
+// la réponse était déjà là. Sur un parcours à la flèche, c'est un quart de seconde par image, pour
+// rien.
+//
+// Rend le résultat s'il est connu ET déjà résolu, `undefined` sinon. Jamais de promesse, jamais
+// d'attente : l'appelant décide quoi faire du « je ne sais pas encore ».
+const resolus = new Map()
+export function eaglePathConnu(path) {
+  return path ? resolus.get(path) : undefined
+}
+
+export function invalidateEaglePath(path) {
+  if (path) { cache.delete(path); resolus.delete(path) }
+}
+
+
+// Remise a zero des deux caches. Sert aux tests : sans elle, un cas contamine le suivant et l on
+// mesure alors la memoire d'un autre test plutot que le comportement qu'on croit verifier.
+export function __resetEagleLinkCache() { cache.clear(); resolus.clear() }

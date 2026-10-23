@@ -1,0 +1,59 @@
+// ═══ REESSAYER UNE ECRITURE GITHUB QUI A ECHOUE POUR UNE RAISON PASSAGERE ════════════════════
+//
+// LE SYMPTOME, signale par Matthieu le 2026-08-28 : coller une image dans une page markdown rend
+// parfois « L'upload GitHub a echoue », et « si je persevere ca marche ». Cette derniere phrase EST
+// le diagnostic : une erreur qui disparait a l'identique au second essai n'est pas une erreur de
+// contenu, c'est une erreur de MOMENT.
+//
+// LA CAUSE. `PUT /repos/:repo/contents/:path` ecrit un commit. Deux ecritures rapprochees sur la
+// meme branche entrent en course sur la reference, et GitHub repond 409 ; il repond aussi 502 ou
+// 503 quand un noeud bascule, et 429 quand la limite secondaire se declenche. Aucun de ces trois
+// cas ne dit que l'image est mauvaise : ils disent d'attendre et de recommencer.
+//
+// POURQUOI COTE SERVEUR ET PAS COTE CLIENT. C'est ici que l'erreur nait, donc c'est ici qu'elle se
+// rattrape, et tous les appelants de la route en profitent d'un coup : l'editeur markdown, les
+// galeries, l'audio. Un filet pose seulement dans l'editeur aurait laisse les autres chemins
+// casser exactement de la meme facon.
+//
+// CE QU'ON NE REESSAIE JAMAIS, et c'est la moitie de la valeur du fichier. Un 401 ou un 403 dit que
+// le jeton ne convient pas, un 404 que le depot n'existe pas, un 422 que le contenu est refuse, un
+// 413 qu'il est trop lourd. Recommencer ne change rien a ces quatre cas : cela ne fait qu'ajouter
+// des secondes d'attente avant le meme echec, et masquer un vrai probleme de configuration derriere
+// une lenteur. Une erreur definitive doit sortir tout de suite.
+//
+// Le motif « 4 tentatives avec backoff » existait deja en dur dans `upload-vid.js` et
+// `upload-shard.js`. Il est ecrit ici une fois ; ces deux fichiers fonctionnent et ne sont pas
+// touches, mais ils pourront l'adopter le jour ou on y revient pour une autre raison.
+
+export const STATUTS_PASSAGERS = Object.freeze([409, 429, 500, 502, 503, 504])
+export const TENTATIVES_PAR_DEFAUT = 4
+
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// `appel` doit rendre une Response (ou lever). Rend la derniere Response obtenue, reussie ou non,
+// pour que l'appelant garde son traitement d'erreur existant.
+export async function fetchGithubResilient(appel, options = {}) {
+  const tentatives = options.tentatives || TENTATIVES_PAR_DEFAUT
+  const attente = options.attente || ((i) => 400 * (i + 1))
+  const passagers = new Set(options.passagers || STATUTS_PASSAGERS)
+  const journal = typeof options.journal === 'function' ? options.journal : null
+  let derniere = null
+  let derniereErreur = null
+
+  for (let i = 0; i < tentatives; i++) {
+    try {
+      derniere = await appel(i)
+      derniereErreur = null
+      if (derniere.ok || !passagers.has(derniere.status)) return derniere
+      if (journal) journal({ tentative: i + 1, status: derniere.status })
+    } catch (e) {
+      // Une coupure reseau leve au lieu de rendre une Response. Elle est passagere par nature.
+      derniereErreur = e
+      derniere = null
+      if (journal) journal({ tentative: i + 1, erreur: (e && e.message) || 'fetch' })
+    }
+    if (i < tentatives - 1) await dormir(attente(i))
+  }
+  if (derniere) return derniere
+  throw derniereErreur || new Error('github-injoignable')
+}

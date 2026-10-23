@@ -1,0 +1,156 @@
+// shard-repo.mjs — the ONE shard-repo writer (2026-07-11 refactor).
+//
+// Before this file, img-ingest.mjs (makeImgShardCtx) and video-raw-lib.mjs (makeVidRawShardCtx)
+// each carried a near-identical ~80-line "shard context": open a FRESH random GitHub repo, write
+// binaries with an anticipated LOCAL rollover, push incrementally, flush and pin the commit SHA.
+// Twin code = twin bugs. This factory is the single implementation; each family passes its own
+// numbers (cap, push threshold, retries) and keeps its exact historical behavior.
+//
+// ── THE v2 MODEL (2026-07-05, Matthieu's explicit decision) — NEW REPO PER BATCH, ZERO CHECKS ──
+//   1. Every upload BATCH creates a FRESH GitHub repo, random workflow-style name:
+//      zenrayshards-<type>-<hex12>.
+//   2. NEVER ask GitHub "is there room left?" — not before, not during. GitHub allows 100k repos;
+//      we have ~300: checking space is counter-productive (the old model recloned multi-GB shards,
+//      the "infinite re-download bug", and burned bandwidth on checks).
+//   3. Splitting a giant batch across several repos is ANTICIPATED locally: a byte counter, BEFORE
+//      writing a piece that would exceed the cap -> open ANOTHER fresh repo (new hex). Never a
+//      clone, never a pull, never a remote read.
+//   4. Visibility is ENCODED IN THE NAME (hard convention, read by the player/SW/downloader):
+//      zenrayshards-img-* = PUBLIC (jsDelivr requires public); every other type (vid/blob/pdf/doc)
+//      = PRIVATE, read via api.github.com (Accept: raw + token) — CORS verified OK 2026-07-05.
+//   5. NEVER recreate a repo under an OLD name: old manifests rely on GitHub's old-name -> new-name
+//      redirect (verified OK on raw.github AND jsDelivr, 2026-07-05); recreating the old name
+//      would kill that redirect. (313 repos renamed on 2026-07-06.)
+//
+// ── WHY GIT PUSH, NOT THE REST API, FOR THE BINARIES ───────────────────────────────────────────
+//   The GitHub REST API caps at 5000 req/h: pushing thousands of files blob-by-blob burns the
+//   quota AND hangs (secondary rate limit). GIT TRANSPORT (push) is NOT subject to that limit.
+//   RULE: push by INCREMENTS — a single multi-GB pack HANGS (git waits at 0% CPU). Always
+//   GIT_TERMINAL_PROMPT=0 (an auth prompt is a guaranteed hang) + hard timeout + retries.
+
+import { mkdir, writeFile, rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import path from 'node:path'
+import { GIT_ENV } from './img-pipeline.mjs'
+
+const SHARD_PREFIX = 'zenrayshards'
+export const newShardName = (type) => `${SHARD_PREFIX}-${type}-${randomBytes(6).toString('hex')}`
+// Name convention -> visibility. Read by the player / Service Worker / downloader.
+export const isPrivateShardName = (repo) => repo.startsWith(SHARD_PREFIX + '-') && !repo.startsWith(SHARD_PREFIX + '-img-')
+
+// Creates a shard-repo context. Family-specific knobs (historical values preserved exactly):
+//   type            'img' | 'vid' | 'blob' | 'pdf' | ...   (goes into the repo name)
+//   vis             'public' | 'private'                    (img MUST be public — jsDelivr)
+//   capBytes        hard per-repo cap; a write that would exceed it opens a fresh repo FIRST
+//   pushEveryBytes  incremental push threshold (anti-RAM, anti-giant-packfile)
+//   pushRetries     attempts for one push before giving up
+//   pushTimeoutMs   hard timeout of one push attempt
+//   gitTimeoutMs    default timeout of ordinary git ops (add/commit/status/rev-parse)
+//   commitMessage   incremental commit message ('+img', '+vidraw')
+//   readme          README.md content of a fresh shard
+//   rebasePullOnRetry  git pull --rebase between push retries (video family historical behavior)
+//   gitPostBuffer   set http.postBuffer 500 MB (video family, large packs)
+//
+// Returned ctx: { repo, dir, bytes, pending, commitOf, type, vis,
+//                 openShard(), reserve(bytes), writeBinary(hashedPath, buf) -> repo,
+//                 pushShard(), flush(), headSha() }
+export function makeShardRepo({
+  token, owner = 'matthieuhuguet', work, log = console.log,
+  type, vis,
+  capBytes, pushEveryBytes, pushRetries, pushTimeoutMs,
+  gitTimeoutMs = 240000, commitMessage = '+shard', readme = '',
+  rebasePullOnRetry = false, gitPostBuffer = false,
+}) {
+  const GENV = { ...process.env, ...GIT_ENV }
+  const cloneUrl = (repo) => `https://x-access-token:${token}@github.com/${owner}/${repo}.git`
+  const git = (dir, a, timeout = gitTimeoutMs) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', env: GENV, timeout, killSignal: 'SIGKILL' })
+
+  const ctx = {
+    token, owner, work, log, type, vis,
+    repo: null, dir: null, bytes: 0, pending: 0,
+    commitOf: {}, // repo -> commit SHA (filled at flush/rollover; pins CDN/raw URLs)
+  }
+
+  async function openShard() {
+    ctx.repo = newShardName(type)
+    ctx.dir = path.join(work, ctx.repo)
+    await rm(ctx.dir, { recursive: true, force: true })
+    await mkdir(ctx.dir, { recursive: true })
+    git(ctx.dir, ['init', '-q']); git(ctx.dir, ['branch', '-M', 'main'])
+    git(ctx.dir, ['config', 'user.email', 'bot@zenray']); git(ctx.dir, ['config', 'user.name', 'zenray-bot'])
+    git(ctx.dir, ['config', 'http.version', 'HTTP/1.1'])
+    if (gitPostBuffer) git(ctx.dir, ['config', 'http.postBuffer', '524288000'])
+    await writeFile(path.join(ctx.dir, 'README.md'), readme)
+    // Direct API creation (random name -> collision practically impossible, no existence pre-check).
+    const cr = spawnSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', '-H', `Authorization: Bearer ${token}`, 'https://api.github.com/user/repos', '-d', JSON.stringify({ name: ctx.repo, private: vis === 'private' })], { encoding: 'utf8' })
+    if ((cr.stdout || '').trim() !== '201') throw new Error(`création repo ${ctx.repo}: HTTP ${(cr.stdout || '?')}`)
+    git(ctx.dir, ['add', '-A']); git(ctx.dir, ['commit', '-q', '-m', 'init'])
+    git(ctx.dir, ['remote', 'add', 'origin', cloneUrl(ctx.repo)])
+    const ps = git(ctx.dir, ['push', '-q', 'origin', 'HEAD:main'], 120000)
+    if (ps.status !== 0) throw new Error(`push-init ${type} shard: ` + (ps.stderr || '').slice(-200))
+    log(`  >>> repo neuf ${ctx.repo} (${vis}) créé — zéro clone, zéro check`)
+    ctx.bytes = 0; ctx.pending = 0
+  }
+
+  // Incremental push (anti-hang): commit + push with retries and hard timeouts.
+  async function pushShard() {
+    const st = git(ctx.dir, ['status', '--porcelain'])
+    if (!st.stdout || !st.stdout.trim()) return true
+    git(ctx.dir, ['add', '-A']); git(ctx.dir, ['commit', '-q', '-m', commitMessage])
+    for (let a = 0; a < pushRetries; a++) {
+      const ps = git(ctx.dir, ['push', '-q', 'origin', 'HEAD:main'], pushTimeoutMs)
+      if (ps.status === 0) { ctx.pending = 0; return true }
+      log(`  ${type} push retry ${a + 1}/${pushRetries} ${(ps.stderr || '').slice(-120)}`)
+      if (rebasePullOnRetry) git(ctx.dir, ['pull', '--rebase', '-q', 'origin', 'main'], 600000)
+      await new Promise((r) => setTimeout(r, Math.min(60000, 3000 * (a + 1))))
+    }
+    return false
+  }
+
+  // ANTICIPATED rollover (local counter, never a question to GitHub) when `bytes` would no longer
+  // fit in the current shard. Exposed separately (ctx.reserve) so a file SPLIT INTO SEVERAL PIECES
+  // reserves room for its TOTAL before writing the first piece -> guarantees that all pieces of
+  // ONE file land in the SAME repo/commit (a rollover right between two pieces would break
+  // reconstruction, which assumes a single cdnRepo/cdnCommit for the whole chunk list).
+  async function reserve(bytes) {
+    if (ctx.bytes > 0 && ctx.bytes + bytes > capBytes) {
+      if (!await pushShard()) throw new Error(`push-incr ${type} shard`)
+      ctx.commitOf[ctx.repo] = git(ctx.dir, ['rev-parse', 'HEAD']).stdout.trim()
+      await openShard()
+    }
+  }
+
+  // Writes an addressed binary (hashed path) into the shard tree. Rollover BEFORE writing if the
+  // shard would exceed the cap. Returns the repo it landed in.
+  async function writeBinary(hashedPath, buf) {
+    await reserve(buf.length)
+    const dst = path.join(ctx.dir, hashedPath)
+    await mkdir(path.dirname(dst), { recursive: true })
+    await writeFile(dst, buf)
+    ctx.bytes += buf.length; ctx.pending += buf.length
+    if (ctx.pending >= pushEveryBytes) { if (!await pushShard()) throw new Error(`push-incr ${type} shard`) }
+    return ctx.repo
+  }
+
+  // Final flush: push + record the commit SHA (to pin jsDelivr / raw.github URLs in manifests).
+  async function flush() {
+    if (ctx.dir && existsSync(ctx.dir)) {
+      if (!await pushShard()) throw new Error(`push-final ${type} shard ` + ctx.repo)
+      ctx.commitOf[ctx.repo] = git(ctx.dir, ['rev-parse', 'HEAD']).stdout.trim()
+      log(`  ✓ ${ctx.repo} poussé (commit ${(ctx.commitOf[ctx.repo] || '').slice(0, 7)})`)
+    }
+  }
+
+  // Current HEAD of the shard (to pin URLs right after flushing ONE file of a longer batch).
+  function headSha() { return ctx.dir ? git(ctx.dir, ['rev-parse', 'HEAD']).stdout.trim() : null }
+
+  ctx.openShard = openShard
+  ctx.reserve = reserve
+  ctx.writeBinary = writeBinary
+  ctx.pushShard = pushShard
+  ctx.flush = flush
+  ctx.headSha = headSha
+  return ctx
+}

@@ -1,0 +1,154 @@
+// 12 October 2026, 12:30 CEST: "request an iteration" (R06 section 9.5). Three modes: Settings (sliders prefilled with
+// the version's values, at most 8 per category, bounds from the exposed parameters), Format (16:9, 9:16, 1:1) and a
+// free Instruction (kept for an agent, never executed automatically). The request goes to the local bridge, or to the
+// zenray-data queue when the Mac does not answer; a bridge job is followed every 1.5 s while the tab is visible, and
+// each step and failure is shown with its cause. Sliders change the motion's JSON parameters, never the site's CSS.
+// FR : la demande d'iteration ; pont local d'abord, file du cloud sinon ; chaque etape et chaque echec sont montres.
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { MOTION } from '../config/motion.js'
+import { buildIterationPayload, changedOverrides, parameterCategories } from './motionCatalogue.js'
+import { sendIterationRequest } from '../lib/motionBridge.js'
+
+const FINAL = new Set(['done', 'error', 'refused', 'cancelled', 'interrupted', 'waiting-agent'])
+
+function ParamInput({ item, value, onChange }) {
+  if (item.kind === 'color') {
+    return (
+      <>
+        <input type="color" value={value} onChange={(e) => onChange(e.target.value)} aria-label={item.label} />
+        <span className="zrm-mono">{value}</span>
+      </>
+    )
+  }
+  if (item.kind === 'text') {
+    return <input type="text" value={value} maxLength={item.maxLength || 80} onChange={(e) => onChange(e.target.value)} aria-label={item.label} style={{ gridColumn: 'span 2' }} />
+  }
+  return (
+    <>
+      <input type="range" min={item.min} max={item.max} step={item.step} value={value} onChange={(e) => onChange(Number(e.target.value))} aria-label={item.label} />
+      <input type="number" min={item.min} max={item.max} step={item.step} value={value} onChange={(e) => onChange(Number(e.target.value))} className="zrm-num" aria-label={`${item.label} (valeur)`} />
+    </>
+  )
+}
+
+export default function MotionIterationPanel({ motionId, baseVersion, parameters, bridge, tr, onVersion, send = sendIterationRequest }) {
+  const categories = useMemo(() => parameterCategories(parameters), [parameters])
+  const initial = useMemo(() => Object.fromEntries(Object.values(categories).flat().map((i) => [i.key, i.value])), [categories])
+  const [mode, setMode] = useState('params')
+  const [values, setValues] = useState(initial)
+  const [formats, setFormats] = useState(['9x16'])
+  const [fit, setFit] = useState(MOTION.fits[0])
+  const [instructions, setInstructions] = useState('')
+  const [state, setState] = useState({ phase: 'idle' })
+  const alive = useRef(true)
+  useEffect(() => { setValues(initial) }, [initial])
+  useEffect(() => () => { alive.current = false }, [])
+
+  // Follow a bridge job while the tab is visible (never poll a hidden tab).
+  useEffect(() => {
+    if (state.phase !== 'running' || !state.job?.id || !bridge) return undefined
+    let timer = null
+    const tick = async () => {
+      if (document.visibilityState === 'hidden') { timer = setTimeout(tick, MOTION.pollJobMs); return }
+      try {
+        const { job } = await bridge.job(state.job.id)
+        if (!alive.current) return
+        if (FINAL.has(job.state)) {
+          setState({ phase: job.state === 'done' ? 'done' : job.state === 'waiting-agent' ? 'waiting' : 'failed', job })
+          if (job.state === 'done' && job.result?.version) onVersion?.(job.result.version)
+          return
+        }
+        setState((s) => ({ ...s, job }))
+      } catch (error) { if (alive.current) setState({ phase: 'failed', error: error.message }) ; return }
+      timer = setTimeout(tick, MOTION.pollJobMs)
+    }
+    timer = setTimeout(tick, MOTION.pollJobMs)
+    return () => clearTimeout(timer)
+  }, [state.phase, state.job?.id, bridge, onVersion])
+
+  async function submit() {
+    let payload
+    try {
+      payload = buildIterationPayload({ mode, motionId, baseVersion, overrides: changedOverrides(categories, values), formats, fit, instructions })
+    } catch (error) { setState({ phase: 'invalid', error: error.message }); return }
+    setState({ phase: 'sending' })
+    try {
+      const res = await send(payload, bridge ? { bridge } : undefined)
+      if (!alive.current) return
+      if (res.via === 'queue') setState({ phase: 'queued', id: res.id })
+      else if (res.job.state === 'waiting-agent') setState({ phase: 'waiting', job: res.job })
+      else if (FINAL.has(res.job.state)) setState({ phase: res.job.state === 'done' ? 'done' : 'failed', job: res.job })
+      else setState({ phase: 'running', job: res.job })
+    } catch (error) { if (alive.current) setState({ phase: 'failed', error: error.message }) }
+  }
+
+  const busy = state.phase === 'sending' || state.phase === 'running'
+  const hasParams = Object.keys(categories).length > 0
+  return (
+    <div className="zrm-panel" data-testid="motion-iteration">
+      <div className="zrm-tabs" role="tablist">
+        {MOTION.modes.map((m) => (
+          <button key={m} type="button" role="tab" className={`zrm-chip${mode === m ? ' is-on' : ''}`} onClick={() => setMode(m)} data-testid={`motion-mode-${m}`}>
+            {tr(`motion.iter.mode.${m}`)}
+          </button>
+        ))}
+      </div>
+
+      {mode === 'params' && (hasParams ? (
+        <div className="zrm-params">
+          {Object.entries(categories).map(([cat, items]) => (
+            <div key={cat} className="zrm-params">
+              <div className="zrm-param-cat">{cat}</div>
+              {items.map((item) => (
+                <label key={item.key} className="zrm-param">
+                  <span>{item.label}{item.unit ? ` (${item.unit})` : ''}</span>
+                  <ParamInput item={item} value={values[item.key] ?? item.value} onChange={(v) => setValues((s) => ({ ...s, [item.key]: v }))} />
+                </label>
+              ))}
+            </div>
+          ))}
+          <div><button type="button" className="zrm-btn" onClick={() => setValues(initial)}>{tr('motion.iter.reset')}</button></div>
+        </div>
+      ) : <p>{tr('motion.page.noParams')}</p>)}
+
+      {mode === 'format' && (
+        <div className="zrm-params">
+          <div className="zrm-actions">
+            {MOTION.formats.map((f) => (
+              <button key={f} type="button" className={`zrm-chip${formats.includes(f) ? ' is-on' : ''}`} data-testid={`motion-format-${f}`}
+                onClick={() => setFormats((s) => (s.includes(f) ? s.filter((x) => x !== f) : [...s, f]))}>{f.replace('x', ':')}</button>
+            ))}
+          </div>
+          <div className="zrm-actions">
+            {MOTION.fits.map((f) => (
+              <button key={f} type="button" className={`zrm-chip${fit === f ? ' is-on' : ''}`} onClick={() => setFit(f)}>{tr(`motion.iter.fit.${f}`)}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {mode === 'instruction' && (
+        <div className="zrm-params">
+          <textarea className="zrm-field" rows={4} maxLength={MOTION.maxInstructionChars} value={instructions} onChange={(e) => setInstructions(e.target.value)} placeholder={tr('motion.iter.instructionHint')} data-testid="motion-instruction" />
+        </div>
+      )}
+
+      <div className="zrm-actions">
+        <button type="button" className="zrm-btn is-primary" disabled={busy} onClick={submit} data-testid="motion-send">
+          {busy ? tr('motion.iter.sending') : tr('motion.iter.send')}
+        </button>
+      </div>
+
+      <div aria-live="polite" data-testid="motion-iteration-state">
+        {state.phase === 'invalid' && <p>{state.error}</p>}
+        {state.phase === 'queued' && <p>{tr('motion.iter.viaQueue')} <span className="zrm-mono">{state.id}</span></p>}
+        {state.phase === 'waiting' && <p>{tr('motion.iter.waitingAgent')}</p>}
+        {state.phase === 'done' && <p>{tr('motion.iter.done')} : <span className="zrm-mono">{state.job?.result?.version || ''}</span></p>}
+        {state.phase === 'failed' && <p>{tr('motion.iter.failed')} : {state.job?.error || state.error}</p>}
+        {state.job?.steps?.length > 0 && (
+          <ol className="zrm-steps">{state.job.steps.map((s, i) => <li key={`${s.name}-${i}`}>{s.name}</li>)}</ol>
+        )}
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,144 @@
+// @vitest-environment node
+// 12 October 2026: releasing a managed LOAD copy rests on the identity proof (decision D3), with the full restore probe kept for
+// 1 file in N and for every file the proof cannot positively establish. Both directions: green on a good archive, the probe on every
+// failure, and the release still refused when the probe fails too.
+// FR : la liberation d'une copie LOAD repose sur la preuve par identite ; la sonde integrale reste pour 1 fichier sur N et pour tout
+// fichier que la preuve ne peut pas etablir positivement ; la liberation reste refusee si la sonde echoue aussi.
+import { afterEach, describe, expect, it } from 'vitest'
+import { mkdtemp, mkdir, writeFile, readFile, rm, realpath } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createAssetsService, hashLocalFile } from './AssetsService.mjs'
+import { normalizeWorkspaceProject } from '../src/lib/projectWorkspace.js'
+import { createArchiveIdentityProver } from './lib/archive-identity-proof.mjs'
+import { gitBlobId, resolveIdentityProofConfig } from './lib/video-identity-proof.mjs'
+
+const cleanup = []
+afterEach(async () => { while (cleanup.length) await cleanup.pop()() })
+const CONTENT = Buffer.from('original bytes')
+const CHUNK = 5
+const REPO = 'zenray-productions-archive-test'
+const COMMIT = 'c'.repeat(40)
+
+async function fixture({ identity = {}, manifestOverrides = {}, corruptRemote = false } = {}) {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'zr-assets-identity-')))
+  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  const config = JSON.parse(await readFile(new URL('./AssetsConfig.json', import.meta.url), 'utf8'))
+  config.storage.preventIdleSleepDuringTransfers = false
+  config.roots = Object.fromEntries(['tmp', 'memory', 'houdini', 'unreal'].map((kind) => [kind, path.join(root, kind)]))
+  config.additionalRoots = {}
+  config.sceneAudit.enabled = false
+  config.storage.stateDir = path.join(root, 'state'); config.storage.workspaceDir = path.join(root, 'loads'); config.projects = []
+  for (const folder of Object.values(config.roots)) await mkdir(folder, { recursive: true })
+  const folderPath = path.join(config.roots.tmp, 'test-project')
+  await mkdir(folderPath); await writeFile(path.join(folderPath, 'scene.hiplc'), CONTENT)
+  const project = normalizeWorkspaceProject({ id: 'test-project', name: 'Test project', sources: [{ id: 'workshop', namespace: 'tmp', localPath: folderPath }] })
+  const engineCalls = []
+  const service = await createAssetsService({ config, getToken: async () => 'test', runProcess: async (script, args) => {
+    engineCalls.push(path.basename(script))
+    if (script.endsWith('restaurer.mjs')) {
+      const target = path.join(args[2], args[1])
+      await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, CONTENT)
+      return { lastEvent: { ev: 'restaure', cible: target } }
+    }
+    throw new Error('Unexpected engine call')
+  } })
+  cleanup.push(() => service.close())
+
+  // the cloud as the archive engine left it: plain chunks of CHUNK bytes at a pinned commit, and the manifest of the version
+  const chunks = []
+  const tree = new Map()
+  const blobs = new Map()
+  for (let offset = 0, index = 0; offset < CONTENT.length; offset += CHUNK, index++) {
+    const name = `ab/cd/fid-${String(index).padStart(3, '0')}`
+    const bytes = CONTENT.subarray(offset, offset + CHUNK)
+    chunks.push(name); blobs.set(name, Buffer.from(bytes)); tree.set(name, gitBlobId(bytes))
+  }
+  if (corruptRemote) { const first = chunks[0]; const bad = Buffer.from(blobs.get(first)); bad[0] ^= 1; blobs.set(first, bad); tree.set(first, gitBlobId(bad)) }
+  const sha256 = await hashLocalFile(path.join(folderPath, 'scene.hiplc'))
+  const manifest = { mode: 'chunked', size: CONTENT.length, sha256, chunkSize: CHUNK, repo: REPO, commit: COMMIT, chunks,
+    parts: [{ repo: REPO, commit: COMMIT, chunks }], ...manifestOverrides }
+  const fakeRemote = { async treeIds() { return tree }, async readBlob(_repo, _commit, blobPath) { return Buffer.from(blobs.get(blobPath)) }, async close() {} }
+  service.identityProver = identity === null ? null : createArchiveIdentityProver({
+    config: { fullReadBackEvery: 8, realPartRereadCount: 1, ...identity }, getToken: async () => 'test', scratchParent: root,
+    createRemote: () => fakeRemote, readManifestBytes: async () => Buffer.from(JSON.stringify(manifest)),
+  })
+  await service.register(project)
+  const local = service.state(project.id).inventory.localFiles[0]
+  service.state(project.id).backups[local.id] = { ...local, sha256, manifestPath: 'pages/test/scene.hiplc.file.json', sourceFolder: 'pages/test', relativeManifest: 'scene.hiplc.file.json' }
+  const signal = new AbortController().signal
+  await service.restoreNow(project.id, null, { id: 'load-1' }, signal)
+  engineCalls.length = 0
+  return { service, project, config, root, signal, engineCalls, activePath: service.state(project.id).workspacePath, statsPath: path.join(config.storage.stateDir, 'VerificationStats.json') }
+}
+
+// each case runs the real unload (lsof on the workspace, hashing, renames): a generous timeout, not a performance claim
+describe('unload by identity proof', { timeout: 60000 }, () => {
+  it('releases the copy WITHOUT restoring it from the cloud, and counts the proof separately', async () => {
+    const { service, project, signal, engineCalls, statsPath } = await fixture()
+    const job = { id: 'identity-release' }
+    await service.unloadNow(project.id, null, job, signal)
+    expect(engineCalls).toEqual([])                                   // no restaurer.mjs: nothing was downloaded to prove the copy
+    expect(job.verification).toEqual({ identityProofCount: 1, fullReadBackCount: 0 })
+    expect(service.snapshot(project.id).workspace).toMatchObject({ state: 'unloaded', verification: { identityProofCount: 1, fullReadBackCount: 0, lastMode: 'identity-v1' } })
+    expect(JSON.parse(await readFile(statsPath, 'utf8'))).toMatchObject({ identityVerified: 1, filmsSinceFullReadBack: 1 })
+  })
+
+  it('keeps the full restore probe for the sampled file (1 in N)', async () => {
+    const { service, project, signal, engineCalls, statsPath } = await fixture({ identity: { fullReadBackEvery: 8 } })
+    await writeFile(statsPath, JSON.stringify({ schemaVersion: 1, identityVerified: 7, filmsSinceFullReadBack: 7 }))
+    const job = { id: 'sampled-release' }
+    await service.unloadNow(project.id, null, job, signal)
+    expect(engineCalls).toEqual(['restaurer.mjs'])
+    expect(job.verification).toEqual({ identityProofCount: 0, fullReadBackCount: 1 })
+    expect(JSON.parse(await readFile(statsPath, 'utf8'))).toMatchObject({ sampledFullReadBacks: 1, filmsSinceFullReadBack: 0 })
+  })
+
+  it('falls back to the full restore probe when the cloud object differs (never trusts a failed proof)', async () => {
+    const { service, project, signal, engineCalls } = await fixture({ corruptRemote: true })
+    const job = { id: 'fallback-release' }
+    await service.unloadNow(project.id, null, job, signal)
+    expect(engineCalls).toEqual(['restaurer.mjs'])
+    expect(job.verification).toEqual({ identityProofCount: 0, fullReadBackCount: 1 })
+    expect(service.events.some((event) => event.type === 'identity-proof-fallback')).toBe(true)
+  })
+
+  it('refuses the release when the proof fails AND the restore probe fails', async () => {
+    const { service, project, signal, activePath } = await fixture({ corruptRemote: true })
+    service.runProcess = async () => { throw new Error('Cloud unavailable') }
+    await expect(service.unloadNow(project.id, null, { id: 'both-fail' }, signal)).rejects.toThrow('Cloud unavailable')
+    expect(await readFile(path.join(activePath, 'sources/tmp/workshop/scene.hiplc'), 'utf8')).toBe(CONTENT.toString())
+    expect(service.snapshot(project.id).workspace.state).toBe('loaded')
+  })
+
+  it('uses the full probe for a format the proof does not plan (streamable manifests)', async () => {
+    const { service, project, signal, engineCalls } = await fixture({ manifestOverrides: { type: 'chunked-media' } })
+    await service.unloadNow(project.id, null, { id: 'unsupported-release' }, signal)
+    expect(engineCalls).toEqual(['restaurer.mjs'])
+  })
+
+  it('13 October 2026: an unsupported file read back in full does not restart the 1 in N cycle', async () => {
+    const { service, project, signal, statsPath } = await fixture({ manifestOverrides: { type: 'chunked-media' } })
+    await writeFile(statsPath, JSON.stringify({ schemaVersion: 1, filmsSinceFullReadBack: 3 }))
+    await service.unloadNow(project.id, null, { id: 'unsupported-keeps-cycle' }, signal)
+    expect(JSON.parse(await readFile(statsPath, 'utf8'))).toMatchObject({ fullReadBackVerified: 1, filmsSinceFullReadBack: 3, sampledFullReadBacks: 0 })
+  })
+
+  it('uses the full probe when the manifest online has no version with the archived SHA-256', async () => {
+    const { service, project, signal, engineCalls } = await fixture({ manifestOverrides: { sha256: 'e'.repeat(64) } })
+    await service.unloadNow(project.id, null, { id: 'stale-version' }, signal)
+    expect(engineCalls).toEqual(['restaurer.mjs'])
+  })
+
+  it('without an identity prover the behaviour is the previous one: the full probe, counted as such', async () => {
+    const { service, project, signal, engineCalls } = await fixture({ identity: null })
+    const job = { id: 'probe-only' }
+    await service.unloadNow(project.id, null, job, signal)
+    expect(engineCalls).toEqual(['restaurer.mjs'])
+    expect(job.verification).toEqual({ identityProofCount: 0, fullReadBackCount: 1 })
+  })
+
+  it('takes every number from the one parameter object', () => {
+    expect(resolveIdentityProofConfig({}, {})).toMatchObject({ fullReadBackEvery: 0, realPartRereadCount: 1 })
+  })
+})

@@ -1,0 +1,2230 @@
+// @vitest-environment node
+// 2 October 2026, 13:25 CEST: backup evidence must turn red on changed bytes and scoped path violations.
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mkdtemp, mkdir, writeFile, readFile, rm, realpath, rename, symlink, chmod, utimes, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { Writable } from 'node:stream'
+import { writeFileSync } from 'node:fs'
+import { createAssetsService, createIdleSleepInhibitor, scanSource, snapshotSourceFile, hashLocalFile, runAssetProcess } from './AssetsService.mjs'
+import { normalizeWorkspaceProject, combineWorkspaceFiles, buildWorkspacePlan } from '../src/lib/projectWorkspace.js'
+import { matchFeedbackProject, transcriptEntry } from './AssetsFeedbackCapture.mjs'
+import { feedbackEvents, progressEvents } from './AssetsHistory.mjs'
+import { createAssetsCloudPublisher } from './AssetsCloudPublisher.mjs'
+import { WORKSPACE_CATALOGUE_PATH } from '../src/lib/assetsWorkspaceCatalogue.js'
+
+// 9 October 2026, 22:05 CEST: a timed-out index child must leave its cloud paths queued for the next automatic pass.
+it('bounds cloud index attempts and retains paths when the child times out', async () => {
+  const { service, project, root, config } = await fixture()
+  await service.register(project)
+  const filePath = 'pages/ZenRayAssets/test-project/sources/tmp/workshop/example.file.json'
+  service.state(project.id).pendingIndex = [filePath]
+  service.runProcess = vi.fn(async () => { throw new Error('Asset engine timed out after 120000 ms') })
+  await expect(service.indexPending(project.id, {}, undefined, path.join(root, 'stage'))).rejects.toThrow('timed out')
+  expect(service.runProcess).toHaveBeenCalledWith(expect.stringContaining('index-add-paths.mjs'), expect.any(Array), expect.objectContaining({
+    timeoutMs: config.storage.indexProcessTimeoutMs,
+    killGraceMs: config.storage.processKillGraceMs,
+  }))
+  expect(service.state(project.id).pendingIndex).toEqual([filePath])
+})
+
+// 9 October 2026, 22:30 CEST: confirm that a child which never responds is terminated and reported as a timeout.
+it('terminates an unresponsive background process at its configured deadline', async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'assets-process-timeout-')))
+  const script = path.join(root, 'stalled.mjs')
+  try {
+    await writeFile(script, 'setInterval(() => {}, 1000)\n')
+    await expect(runAssetProcess(script, [], { cwd: root, timeoutMs: 250, killGraceMs: 100 })).rejects.toThrow('timed out after 250 ms')
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+// 9 October 2026, 22:30 CEST: timeout cleanup must stop nested workers before the retry starts.
+it('kills child workers with the timed-out asset process group', async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'assets-process-tree-')))
+  const script = path.join(root, 'stalled-parent.mjs')
+  const marker = path.join(root, 'orphan-wrote-after-timeout.txt')
+  try {
+    const childCode = `process.on('SIGTERM', () => {}); setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'orphan'), 500)`
+    await writeFile(script, `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', ${JSON.stringify(childCode)}], { stdio: 'ignore' })\nsetInterval(() => {}, 1000)\n`)
+    await expect(runAssetProcess(script, [], { cwd: root, timeoutMs: 100, killGraceMs: 100 })).rejects.toThrow('timed out after 100 ms')
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+// 9 October 2026, 22:30 CEST: user cancellation must clean up the same child group and preserve AbortError semantics.
+it('kills child workers when an asset process is cancelled', async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'assets-process-abort-')))
+  const script = path.join(root, 'stalled-parent.mjs')
+  const marker = path.join(root, 'orphan-wrote-after-abort.txt')
+  const controller = new AbortController()
+  try {
+    const childCode = `process.on('SIGTERM', () => {}); setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'orphan'), 500)`
+    await writeFile(script, `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', ${JSON.stringify(childCode)}], { stdio: 'ignore' })\nsetInterval(() => {}, 1000)\n`)
+    const result = runAssetProcess(script, [], { cwd: root, signal: controller.signal, killGraceMs: 100 })
+    setTimeout(() => controller.abort(), 100)
+    await expect(result).rejects.toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' })
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+// 9 October 2026, 23:11 CEST: cloud jobs alone hold an idle-sleep assertion, which releases after success or failure.
+it('holds idle sleep only during active cloud transfers and releases it after completion', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  const sleepInhibitor = { start: vi.fn(), stop: vi.fn() }
+  service.sleepInhibitor = sleepInhibitor
+  let signalStarted, releaseTask
+  const started = new Promise((resolve) => { signalStarted = resolve })
+  const gate = new Promise((resolve) => { releaseTask = resolve })
+
+  service.enqueue(project.id, 'archive', async () => { signalStarted(); await gate })
+  await started
+  expect(sleepInhibitor.start).toHaveBeenCalledOnce()
+  expect(sleepInhibitor.stop).not.toHaveBeenCalled()
+  releaseTask()
+  await service.queue
+  expect(sleepInhibitor.stop).toHaveBeenCalledOnce()
+
+  service.enqueue(project.id, 'archive', async () => { throw new Error('Temporary cloud failure') })
+  await service.queue
+  expect(sleepInhibitor.start).toHaveBeenCalledTimes(2)
+  expect(sleepInhibitor.stop).toHaveBeenCalledTimes(2)
+
+  service.enqueue(project.id, 'check', async () => {})
+  await service.queue
+  expect(sleepInhibitor.start).toHaveBeenCalledTimes(2)
+  expect(sleepInhibitor.stop).toHaveBeenCalledTimes(2)
+})
+
+// 9 October 2026, 23:11 CEST: the macOS helper uses caffeinate only for idle sleep and stops its child on release.
+it('starts and stops the macOS idle-sleep helper without preventing display sleep', () => {
+  const child = { once: vi.fn(), kill: vi.fn() }
+  const spawnProcess = vi.fn(() => child)
+  const inhibitor = createIdleSleepInhibitor({ platform: 'darwin', spawnProcess })
+
+  inhibitor.start()
+  expect(spawnProcess).toHaveBeenCalledWith('/usr/bin/caffeinate', ['-i', '-w', String(process.pid)], { stdio: 'ignore' })
+  inhibitor.stop()
+  expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+  expect(spawnProcess).toHaveBeenCalledOnce()
+})
+
+// 9 October 2026, 23:14 CEST: a failed idle-sleep helper retries while a transfer remains active.
+it('retries the macOS idle-sleep helper after an unexpected exit', async () => {
+  vi.useFakeTimers()
+  const makeChild = () => {
+    const handlers = new Map()
+    return { once: vi.fn((event, handler) => handlers.set(event, handler)), kill: vi.fn(), emit: (event, ...args) => handlers.get(event)?.(...args) }
+  }
+  const first = makeChild(), second = makeChild()
+  const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second)
+  const onFailure = vi.fn()
+  const inhibitor = createIdleSleepInhibitor({ platform: 'darwin', spawnProcess, retryMs: 10 })
+  try {
+    inhibitor.start(onFailure)
+    first.emit('exit', 1, null)
+    expect(onFailure).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(spawnProcess).toHaveBeenCalledTimes(2)
+    inhibitor.stop()
+    expect(second.kill).toHaveBeenCalledWith('SIGTERM')
+  } finally { vi.useRealTimers() }
+})
+
+// 9 October 2026, 22:12 CEST: a failed automatic archive must retry on its timer without a user request.
+it('retries a failed automatic archive without manual input', async () => {
+  const { service, project, config } = await fixture()
+  await service.register(project)
+  service.state(project.id).watched = true
+  config.storage.retryMs = 10
+  const jobIds = []
+  service.archiveNow = async (_id, _fileIds, job) => {
+    jobIds.push(job.id)
+    if (jobIds.length === 1) throw new Error('Temporary cloud failure')
+    job.count = 0
+    job.remainingCount = 0
+  }
+  service.scheduleBackup(project.id)
+  for (let pass = 0; pass < 30 && jobIds.length < 2; pass++) await new Promise((resolve) => setTimeout(resolve, 10))
+  await service.queue
+  expect(jobIds).toHaveLength(2)
+  expect(jobIds.map((id) => service.jobs.get(id).state)).toEqual(['error', 'done'])
+})
+
+// 7 October 2026, audit finding 1: simultaneous index refreshes share one rebuild, a later refresh rebuilds again, and unchanged context files are not rewritten.
+it('coalesces simultaneous context index rebuilds and skips unchanged context files', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  const spy = vi.spyOn(service, 'snapshot')
+  spy.mockClear()
+  const runs = await Promise.all(Array.from({ length: 6 }, () => service.refreshContextIndex()))
+  expect(new Set(runs).size).toBe(1)
+  const afterBurst = spy.mock.calls.length
+  expect(afterBurst).toBe(service.projects.size)
+  await service.refreshContextIndex()
+  expect(spy.mock.calls.length).toBe(afterBurst * 2)
+  const file = path.join(service.config.storage.stateDir, 'contexts', `${project.id}.md`)
+  const before = (await import('node:fs/promises')).stat
+  const first = (await before(file)).mtimeMs
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await service.refreshContextIndex()
+  expect((await before(file)).mtimeMs).toBe(first)
+})
+
+// 2 October 2026: a newly created file must appear before its stable cloud backup is triggered.
+it('indexes a new local file while a cloud upload is blocked', async () => {
+  const { service, project, folder } = await fixture()
+  await service.register(project)
+  service.config.watch.inventoryDebounceMs = 5
+  let onChange, release
+  service.watchFactory = class {
+    constructor(_backup, _settle, _reconnect, _report, _watch, changed) { onChange = changed }
+    suivre() {}
+    oublier() {}
+    toutOublier() {}
+  }
+  service.state(project.id).watched = true
+  await service.createWatcher()
+  const gate = new Promise((resolve) => { release = resolve })
+  service.enqueue(project.id, 'archive', () => gate, { background: true })
+  try {
+    await writeFile(path.join(folder, 'new-note.md'), 'new project file')
+    onChange(`${project.id}:workshop`)
+    // 3 October 2026, 09:14 CEST: wait for the watcher to finish both derived files, without manually rebuilding their index.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const index = JSON.parse(await readFile(path.join(service.config.storage.stateDir, 'GlobalProjectIndex.json'), 'utf8'))
+      const context = await readFile(path.join(service.config.storage.stateDir, 'contexts', `${project.id}.md`), 'utf8')
+      if (index.projects[project.id].coverage.fileCount === 2 && context.includes('Mapped files: 2')) break
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    const file = service.snapshot(project.id).files.find((entry) => entry.id === 'workshop:new-note.md')
+    expect(file).toBeDefined()
+    const index = JSON.parse(await readFile(path.join(service.config.storage.stateDir, 'GlobalProjectIndex.json'), 'utf8'))
+    expect(index.projects[project.id].coverage.fileCount).toBe(2)
+    expect(await readFile(path.join(service.config.storage.stateDir, 'contexts', `${project.id}.md`), 'utf8')).toContain('Mapped files: 2')
+    expect(service.state(project.id).backups[file.id]).toBeUndefined()
+    expect([...service.jobs.values()].some((job) => job.state === 'running')).toBe(true)
+  } finally { release(); await service.queue }
+})
+
+const cleanup = []
+
+// 3 October 2026, 04:18 CEST: scene resource context stays live across shared-library changes and becomes stale on scene edits.
+it('verifies a scene audit, maps shared resources and refreshes their status without exporting local paths', async () => {
+  const { service, project, folder, config } = await fixture()
+  const library = path.join(config.roots.houdini, 'shared-library')
+  await mkdir(library); await writeFile(path.join(library, 'Roof.hda'), 'shared definition')
+  await writeFile(path.join(folder, 'color.png'), 'texture bytes')
+  await service.register({ id: 'shared-houdini', name: 'Shared Houdini', sources: [{ id: 'library', namespace: 'houdini', localPath: library }] })
+  await service.register({ ...project, dependencies: ['shared-houdini'] })
+  const fileId = 'workshop:scene.hiplc'
+  const audit = { sceneSha256: await hashLocalFile(path.join(folder, 'scene.hiplc')), checkedAt: '2026-10-03T02:18:00Z', references: [
+    { parameterPath: '/obj/mesh/file', rawPath: '/untrusted/raw/path', canonicalPath: path.join(folder, 'color.png'), pathKind: 'absolute', mode: 'input', existsAtCurrentFrame: true },
+    { parameterPath: null, canonicalPath: path.join(library, 'Roof.hda'), pathKind: 'absolute', mode: 'unknown', existsAtCurrentFrame: true },
+  ] }
+  const result = await service.request('scene-context', { projectId: project.id, fileId, audit })
+  expect(result.scene.state).toBe('current')
+  expect(result.scene.references[0].targets[0].fileId).toBe('workshop:color.png')
+  expect(result.scene.references[1].targets[0].projectId).toBe('shared-houdini')
+  expect(result.scene.references[1].targets[0].status).toBe('local-only')
+  const entry = service.state('shared-houdini').inventory.localFiles[0]
+  service.state('shared-houdini').backups[entry.id] = { ...entry, sha256: await hashLocalFile(entry.localPath), manifestPath: 'pages/library/Roof.hda.file.json' }
+  await service.inventory('shared-houdini')
+  expect(service.snapshot(project.id).sceneReferences[0].references[1].targets[0].status).toBe('backed-up')
+  const cloud = JSON.stringify(service.snapshot(project.id, { cloud: true }).sceneReferences)
+  expect(cloud).not.toContain(folder)
+  expect(cloud).not.toContain(library)
+  expect(cloud).not.toContain('/untrusted/raw/path')
+  const index = JSON.parse(await readFile(path.join(config.storage.stateDir, 'GlobalProjectIndex.json'), 'utf8'))
+  expect(index.projects[project.id].context.sceneReferences[0].references[1].targets[0].status).toBe('backed-up')
+  await writeFile(path.join(library, 'Roof.hda'), 'changed shared definition')
+  await service.inventory('shared-houdini')
+  expect(service.snapshot(project.id).sceneReferences[0].references[1].targets[0].status).toBe('pending')
+  await writeFile(path.join(folder, 'scene.hiplc'), 'changed scene bytes')
+  await service.inventory(project.id)
+  expect(service.snapshot(project.id).sceneReferences[0]).toMatchObject({ state: 'stale', references: [], portabilityVerified: false })
+  expect(service.state(project.id).sceneAudits[fileId].audit.sceneSha256).toBe(audit.sceneSha256)
+})
+
+it('refuses an audit with an old scene hash or an unknown scene file before saving its context', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  await expect(service.request('scene-context', { projectId: project.id, fileId: 'workshop:scene.hiplc', audit: { sceneSha256: 'old-hash', references: [] } })).rejects.toThrow('Stale scene audit')
+  await expect(service.request('scene-context', { projectId: project.id, fileId: 'workshop:missing.hiplc', audit: { sceneSha256: 'old-hash', references: [] } })).rejects.toThrow('Inventoried Houdini scene required')
+  expect(service.state(project.id).sceneAudits).toBeUndefined()
+})
+
+// 3 October 2026, 04:26 CEST: a blocked scene audit neither blocks inventory nor duplicates the same scene analysis.
+it('refreshes a known changed scene automatically while indexing other files during its analysis', async () => {
+  const { service, project, folder } = await fixture()
+  await service.register(project)
+  const fileId = 'workshop:scene.hiplc', scenePath = path.join(folder, 'scene.hiplc')
+  await service.request('scene-context', { projectId: project.id, fileId, audit: { sceneSha256: await hashLocalFile(scenePath), references: [] } })
+  service.scheduleBackup = () => {}
+  service.state(project.id).watched = true
+  service.config.watch.settleSeconds = 0.005
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  service.runSceneAudit = vi.fn(async () => { await gate; return { sceneSha256: await hashLocalFile(scenePath), references: [] } })
+  await writeFile(scenePath, 'changed scene')
+  await service.inventory(project.id)
+  await vi.waitFor(() => expect(service.runSceneAudit).toHaveBeenCalledTimes(1))
+  expect(service.snapshot(project.id).sync.sceneAuditPendingCount).toBe(1)
+  expect(service.snapshot(project.id, { cloud: true }).sync.sceneAuditPendingCount).toBeUndefined()
+  try {
+    await writeFile(path.join(folder, 'new-note.md'), 'new file during analysis')
+    await service.inventory(project.id)
+    expect(service.snapshot(project.id).files.some((file) => file.id === 'workshop:new-note.md')).toBe(true)
+    expect(service.snapshot(project.id).sceneReferences[0].state).toBe('stale')
+    expect(service.runSceneAudit).toHaveBeenCalledTimes(1)
+  } finally { release() }
+  await vi.waitFor(() => expect(service.snapshot(project.id).sceneReferences[0].state).toBe('current'))
+  expect(service.state(project.id).sceneAudits[fileId].audit.sceneSha256).toBe(await hashLocalFile(scenePath))
+  expect(service.runSceneAudit).toHaveBeenCalledTimes(1)
+  await vi.waitFor(() => expect(service.snapshot(project.id).sync.sceneAuditPendingCount).toBe(0))
+})
+
+// 3 October 2026, 04:26 CEST: outdated analysis turns red, retries independently and clears its live error after fresh proof.
+it('refuses an analysis overtaken by a save and retries without keeping an obsolete cloud error', async () => {
+  const { service, project, folder } = await fixture()
+  await service.register(project)
+  const fileId = 'workshop:scene.hiplc', scenePath = path.join(folder, 'scene.hiplc')
+  const original = { sceneSha256: await hashLocalFile(scenePath), references: [] }
+  await service.request('scene-context', { projectId: project.id, fileId, audit: original })
+  service.scheduleBackup = () => {}
+  service.state(project.id).watched = true
+  service.config.watch.settleSeconds = 0.005
+  service.config.storage.retryMs = 100
+  let first = true
+  service.runSceneAudit = vi.fn(async () => {
+    const audit = { sceneSha256: await hashLocalFile(scenePath), references: [] }
+    if (first) { first = false; await writeFile(scenePath, 'newer save during analysis') }
+    return audit
+  })
+  await writeFile(scenePath, 'first saved modification')
+  await service.inventory(project.id)
+  await vi.waitFor(() => expect(service.snapshot(project.id).sync.sceneAuditError).toContain('Stale scene audit'))
+  expect(service.state(project.id).sceneAudits[fileId].audit).toEqual(original)
+  expect(service.snapshot(project.id, { cloud: true }).sync.sceneAuditError).toBeUndefined()
+  // 16 October 2026 14:30 Europe/Paris: await both published reference state and the later diagnostic cleanup.
+  await vi.waitFor(() => {
+    expect(service.snapshot(project.id).sceneReferences[0].state).toBe('current')
+    expect(service.snapshot(project.id).sync.sceneAuditError).toBeNull()
+  })
+  expect(service.runSceneAudit).toHaveBeenCalledTimes(2)
+})
+
+// 3 October 2026, 04:37 CEST: a new scene is discovered automatically while old snapshots keep archive coverage without launching HOM.
+it('discovers new working scenes automatically while still inventorying excluded historical scenes', async () => {
+  const { service, project, folder } = await fixture()
+  await mkdir(path.join(folder, 'backup'))
+  await mkdir(path.join(folder, 'nested'))
+  await mkdir(path.join(folder, service.config.storage.versionDirectory))
+  await writeFile(path.join(folder, service.config.storage.versionDirectory, 'Prior.hiplc'), 'preserved original scene')
+  await writeFile(path.join(folder, 'backup', 'Old.hiplc'), 'historical scene')
+  await writeFile(path.join(folder, 'nested', 'New.hiplc'), 'new nested scene')
+  await service.register(project)
+  service.scheduleBackup = () => {}
+  service.state(project.id).watched = true
+  service.config.watch.settleSeconds = 0.005
+  service.runSceneAudit = vi.fn(async (scenePath) => ({ sceneSha256: await hashLocalFile(scenePath), references: [] }))
+  await service.inventory(project.id)
+  await vi.waitFor(() => expect(Object.keys(service.state(project.id).sceneAudits || {})).toHaveLength(2))
+  expect(service.runSceneAudit.mock.calls.map(([scene]) => path.relative(folder, scene)).sort()).toEqual(['nested/New.hiplc', 'scene.hiplc'])
+  expect(service.snapshot(project.id).files.some((file) => file.id === 'workshop:backup/Old.hiplc')).toBe(true)
+  expect(service.state(project.id).sceneAudits['workshop:backup/Old.hiplc']).toBeUndefined()
+  expect(service.snapshot(project.id).files.some((file) => file.id === 'workshop:versions/Prior.hiplc')).toBe(true)
+  expect(service.state(project.id).sceneAudits['workshop:versions/Prior.hiplc']).toBeUndefined()
+  await service.inventory(project.id)
+  expect(service.sceneAuditTimers.size).toBe(0)
+})
+
+// 3 October 2026, 04:37 CEST: deleting an unknown scene clears a failed discovery instead of leaving a permanent local warning.
+it('clears an automatic discovery failure when its unknown scene is removed', async () => {
+  const { service, project, folder } = await fixture()
+  await service.register(project)
+  service.scheduleBackup = () => {}
+  service.state(project.id).watched = true
+  service.config.watch.settleSeconds = 0.005
+  service.config.storage.retryMs = 10000
+  service.runSceneAudit = async () => { throw new Error('Temporary analysis failure') }
+  await service.inventory(project.id)
+  await vi.waitFor(() => expect(service.snapshot(project.id).sync.sceneAuditError).toContain('Temporary analysis failure'))
+  await rm(path.join(folder, 'scene.hiplc'))
+  await service.inventory(project.id)
+  expect(service.snapshot(project.id).sync.sceneAuditError).toBeNull()
+  expect(service.sceneAuditTimers.size).toBe(0)
+})
+
+// 9 October 2026, 10:01 CEST: publishing a shared library refreshes consumer snapshots and the light catalogue.
+it('republishes audited consumers with current shared resource proof after a library archive', async () => {
+  const { service, project, folder, config } = await fixture()
+  const library = path.join(config.roots.houdini, 'library')
+  await mkdir(library); await writeFile(path.join(library, 'Roof.hda'), 'shared definition')
+  await service.register({ id: 'shared-library', name: 'Library', sources: [{ id: 'library', namespace: 'houdini', localPath: library }] })
+  await service.register({ ...project, dependencies: ['shared-library'] })
+  await service.register({ id: 'unrelated-project', name: 'Unrelated', sources: [] })
+  await service.request('scene-context', { projectId: project.id, fileId: 'workshop:scene.hiplc', audit: { sceneSha256: await hashLocalFile(path.join(folder, 'scene.hiplc')), references: [{ canonicalPath: path.join(library, 'Roof.hda'), pathKind: 'absolute', existsAtCurrentFrame: true }] } })
+  const cloud = new Map(), writes = []
+  // 9 October 2026, 10:01 CEST: model the immutable legacy registry read and normal project metadata writes.
+  service.cloudPublisher = createAssetsCloudPublisher({ baseUrl: 'http://fixture', token: 'test-token', fetchImpl: async (url, options) => {
+    const parsed = new URL(url)
+    if (parsed.hostname === 'api.github.com') {
+      const file = decodeURIComponent(parsed.pathname.split('/contents/')[1] || '')
+      if (!cloud.has(file)) return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 })
+      const markdown = cloud.get(file)
+      return new Response(JSON.stringify({ sha: 'legacy-registry', size: Buffer.byteLength(markdown), encoding: 'base64', content: Buffer.from(markdown).toString('base64') }))
+    }
+    if (options.method !== 'POST') {
+      const file = parsed.searchParams.get('path')
+      return new Response(JSON.stringify(cloud.has(file) ? { sha: 'old', markdown: cloud.get(file) } : { missing: true }), { status: cloud.has(file) ? 200 : 404 })
+    }
+    const body = JSON.parse(options.body); cloud.set(body.path, body.markdown); writes.push(body.path)
+    return new Response(JSON.stringify({ ok: true }))
+  } })
+  await service.publishProject(project.id)
+  expect(JSON.parse(cloud.get(`${service.project(project.id).folder}/.workspace.json`)).sceneReferences[0].references[0].targets[0].status).toBe('local-only')
+  const resource = service.state('shared-library').inventory.localFiles[0]
+  service.state('shared-library').backups[resource.id] = { ...resource, sha256: await hashLocalFile(resource.localPath), manifestPath: 'pages/library/Roof.hda.file.json' }
+  await service.inventory('shared-library')
+  writes.length = 0
+  await service.publishProject('shared-library')
+  const snapshot = JSON.parse(cloud.get(`${service.project(project.id).folder}/.workspace.json`))
+  expect(snapshot.sceneReferences[0].references[0].targets[0]).toMatchObject({ projectId: 'shared-library', fileId: resource.id, status: 'backed-up', sha256: service.state('shared-library').backups[resource.id].sha256 })
+  const catalogue = JSON.parse(cloud.get(WORKSPACE_CATALOGUE_PATH))
+  expect(catalogue.projects.map((entry) => entry.id)).toEqual(['shared-library', project.id].sort())
+  expect(catalogue.projects.find((entry) => entry.id === project.id)).not.toHaveProperty('files')
+  expect(cloud.has('pages/.zr-assets-workspaces.json')).toBe(false)
+  expect(cloud.get(`${service.project(project.id).folder}/.context.md`)).toContain('mapped: 1')
+  expect(writes.filter((file) => file.endsWith('/.workspace.json'))).toEqual([`${service.project('shared-library').folder}/.workspace.json`, `${service.project(project.id).folder}/.workspace.json`])
+  expect(writes.some((file) => file.includes('unrelated-project'))).toBe(false)
+})
+
+// 3 October 2026, 04:47 CEST: export diagnostic source identities while preserving local detail and the user's authored words.
+it('exports useful machine diagnostics without local paths and preserves authored feedback exactly', async () => {
+  const { service, project, folder } = await fixture()
+  await service.register(project)
+  const message = `ENOENT: cannot read '${folder}/missing.png'`
+  service.state(project.id).error = message
+  service.state(project.id).inventory.issues.push({ sourceId: 'workshop', relativePath: 'missing.png', code: 'ENOENT', message })
+  service.event(project.id, 'watch', message)
+  const local = service.snapshot(project.id), cloud = service.snapshot(project.id, { cloud: true })
+  expect(local.sync.error).toBe(message)
+  expect(local.inventory.issues[0].message).toBe(message)
+  expect(cloud.sync.error).toBe("ENOENT: cannot read '[source:workshop]/missing.png'")
+  expect(cloud.inventory.issues[0]).toMatchObject({ sourceId: 'workshop', relativePath: 'missing.png', code: 'ENOENT', message: cloud.sync.error })
+  expect(cloud.events.find((event) => event.type === 'watch').detail).toBe(cloud.sync.error)
+  expect(JSON.stringify(cloud)).not.toContain(folder)
+  const feedback = { type: 'prompt', body: `Work from ${folder}/reference.png`, sourcePath: '/local/feedback.md' }
+  expect(service.cloudEvent(project.id, feedback)).toEqual({ type: 'prompt', body: feedback.body })
+  expect(service.cloudDiagnostic(project.id, `${folder}-sibling/other.png`)).not.toContain('[source:workshop]')
+  expect(service.cloudDiagnostic(project.id, 'Process failed at /Applications/Houdini/bin/hython')).toBe('Process failed at [applications]/Houdini/bin/hython')
+})
+
+// 3 October 2026, 05:02 CEST: verified LOAD preserves resource identity separately from unchanged absolute parameters in the scene.
+it('keeps origin-to-copy scene resource identity after verified LOAD without declaring runtime portability', async () => {
+  const { service, project, folder } = await fixture()
+  await writeFile(path.join(folder, 'color.png'), 'texture bytes')
+  await service.register(project)
+  const fileId = 'workshop:scene.hiplc'
+  const audit = { sceneSha256: await hashLocalFile(path.join(folder, 'scene.hiplc')), references: [{ parameterPath: '/obj/geo/file', resolvedPath: path.join(folder, 'color.png'), canonicalPath: path.join(folder, 'color.png'), pathKind: 'absolute', mode: 'input', existsAtCurrentFrame: true }] }
+  await service.request('scene-context', { projectId: project.id, fileId, audit })
+  const originalOnly = await service.request('scene-preparation-plan', { projectId: project.id, fileId })
+  expect(JSON.parse(JSON.stringify(originalOnly)).plan).toMatchObject({ ready: false, resources: [], loadRequirements: [{ fileId: 'workshop:scene.hiplc' }, { fileId: 'workshop:color.png' }] })
+  for (const file of service.state(project.id).inventory.localFiles) service.state(project.id).backups[file.id] = { ...file,
+    sha256: await hashLocalFile(file.localPath), sourceFolder: `${service.project(project.id).folder}/sources/tmp/workshop`, relativeManifest: `${file.relativePath}.file.json`, manifestPath: `${file.expectedCloudPath || file.relativePath}.file.json` }
+  service.runProcess = async (_script, [_source, relativePath, destination]) => {
+    await mkdir(destination, { recursive: true })
+    const target = path.join(destination, relativePath)
+    await writeFile(target, await readFile(path.join(folder, relativePath)))
+    return { lastEvent: { ev: 'restaure', cible: target } }
+  }
+  await service.restoreNow(project.id, null, { id: 'load-scene-proof' }, new AbortController().signal)
+  expect(service.snapshot(project.id).sceneReferences[0].state).toBe('stale')
+  const result = await service.request('scene-context', { projectId: project.id, fileId, audit })
+  expect(result.scene.references[0]).toMatchObject({ type: 'relocation-required', targets: [{ projectId: project.id, fileId: 'workshop:color.png', status: 'verified' }] })
+  expect(result.scene.portabilityVerified).toBe(false)
+  expect(await hashLocalFile(path.join(folder, 'scene.hiplc'))).toBe(audit.sceneSha256)
+  await rm(path.join(folder, 'color.png'))
+  const absentOrigin = await service.request('scene-context', { projectId: project.id, fileId, audit: { ...audit, references: [{ ...audit.references[0], existsAtCurrentFrame: false }] } })
+  expect(absentOrigin.scene.references[0]).toMatchObject({ type: 'relocation-required', existsAtCurrentFrame: false, targets: [{ fileId: 'workshop:color.png', status: 'verified' }] })
+  expect(JSON.stringify(service.snapshot(project.id, { cloud: true }).sceneReferences)).not.toContain(folder)
+  // 3 October 2026, 09:01 CEST: the agent receives a server-derived plan even when the admitted origin no longer exists.
+  const preparation = await service.request('scene-preparation-plan', { projectId: project.id, fileId, targetPath: '/untrusted/override' })
+  expect(preparation.plan).toMatchObject({ ready: true, loadRequirements: [], resources: [{ kind: 'input', fileId: 'workshop:color.png', originalPath: path.join(folder, 'color.png') }] })
+  expect(preparation.plan.resources[0].targetPath).toBe(path.join(service.state(project.id).workspacePath, 'sources/tmp/workshop/color.png'))
+  expect(JSON.stringify(preparation.plan)).not.toContain('/untrusted/override')
+  service.runScenePreparation = vi.fn(async (plan) => ({ schemaVersion: 1, sceneSha256: plan.sceneSha256, checkedAt: new Date().toISOString(), sceneOpened: true,
+    resourceBytesVerified: plan.resources.length, reboundInputs: [{ parameterPath: '/obj/geo/file', state: 'rebound' }], loadedLibraries: [], savedScene: false, portabilityVerified: false, warnings: [], processDiagnostics: `Handle warning from ${folder}/scene.hiplc` }))
+  const queued = await service.request('prepare-scene', { projectId: project.id, fileId })
+  await service.queue
+  expect(service.jobs.get(queued.jobId).state).toBe('done')
+  expect(service.runScenePreparation).toHaveBeenCalledOnce()
+  expect(service.snapshot(project.id).sceneReferences[0].preparation).toMatchObject({ state: 'verified', inputCount: 1, libraryCount: 0, diagnosticCount: 1, savedScene: false, portabilityVerified: false })
+  const archivedEvidence = service.snapshot(project.id, { cloud: true }).sceneReferences[0].preparation
+  expect(archivedEvidence).toMatchObject({ state: 'historical', resourceVersions: [{ projectId: project.id, fileId: 'workshop:color.png' }] })
+  expect(JSON.stringify(archivedEvidence)).not.toContain(folder)
+  expect(JSON.stringify(archivedEvidence)).not.toContain(service.state(project.id).workspacePath)
+  await writeFile(preparation.plan.resources[0].targetPath, 'edited working texture')
+  const edited = await service.request('scene-preparation-plan', { projectId: project.id, fileId })
+  expect(edited.plan).toMatchObject({ ready: false, resources: [], loadRequirements: [{ projectId: project.id, fileId: 'workshop:color.png' }] })
+  expect(service.snapshot(project.id).sceneReferences[0].preparation.state).toBe('stale')
+  const refused = await service.request('prepare-scene', { projectId: project.id, fileId })
+  await service.queue
+  expect(service.jobs.get(refused.jobId)).toMatchObject({ state: 'error' })
+  expect(service.runScenePreparation).toHaveBeenCalledOnce()
+})
+
+// 3 October 2026, 03:50 CEST: capture health describes the current Mac and never survives as a cloud failure.
+it('reports current capture errors locally and clears them on recovery', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  service.feedbackError = 'A transcript needs verification'
+  expect(service.snapshot(project.id).sync.feedbackError).toBe(service.feedbackError)
+  expect(service.snapshot(project.id, { cloud: true }).sync.feedbackError).toBeUndefined()
+  service.feedbackError = null
+  expect(service.snapshot(project.id).sync.feedbackError).toBeNull()
+})
+
+// 2 October 2026, 16:22 CEST: first use creates a watched workshop, durable memory and append-only feedback.
+it('creates the complete local setup for a new project', async () => {
+  const { service, config } = await fixture()
+  service.watchFactory = class { suivre() {} oublier() {} toutOublier() {} }
+  const result = await service.request('start', { id: 'new-project', name: 'New project' })
+  await service.queue
+  expect(result.setup.workshopPath).toBe(path.join(config.roots.tmp, 'tmp-new-project'))
+  // 7 October 2026, 23:01 CEST: generated startup instructions must resolve the installed canonical feedback skill.
+  const instructions = await readFile(path.join(result.setup.workshopPath, 'CLAUDE.md'), 'utf8')
+  expect(instructions).toContain(result.setup.feedbackPath)
+  expect(instructions).toContain('use the zenray-assets skill')
+  expect(instructions).toContain('Append through zenray-feedback')
+  expect(instructions).not.toContain('feedback-stack')
+  expect(await readFile(path.join(result.setup.workshopPath, 'AGENTS.md'), 'utf8')).toContain('new-project')
+  expect(await readFile(result.setup.memoryFile, 'utf8')).toContain('new-project')
+  expect(await readFile(result.setup.feedbackPath, 'utf8')).toContain('Project initialized')
+  expect(result.setup.sessionBound).toBe(false)
+  expect(service.state('new-project').watched).toBe(true)
+})
+
+// 2 October 2026, 16:22 CEST: separate agents can bind sessions without overwriting shared registry entries.
+it('retains simultaneous session bindings', async () => {
+  const { service, project, config } = await fixture()
+  await service.register(project)
+  await Promise.all(['actual-session-11111111', 'actual-session-22222222'].map((sessionId) => service.request('bind-session', { projectId: project.id, sessionId })))
+  const bindings = JSON.parse(await readFile(path.join(config.storage.stateDir, 'SessionBindings.json'), 'utf8'))
+  expect(Object.keys(bindings).sort()).toEqual(['actual-session-11111111', 'actual-session-22222222'])
+})
+
+// 3 October 2026, 21:53 CEST: direct bridge calls cannot redirect an existing transcript into another project.
+it('preserves existing session bindings and skips replay when a conflicting project is requested', async () => {
+  const { service, project, config } = await fixture()
+  await service.register(project)
+  await service.register({ ...project, id: 'second-project', folder: undefined })
+  const sessionId = 'actual-session-12345678'
+  const replay = vi.fn()
+  service.feedbackCapture = { replay }
+  await service.request('bind-session', { projectId: project.id, sessionId })
+  const file = path.join(config.storage.stateDir, 'SessionBindings.json')
+  const before = await readFile(file, 'utf8')
+  await expect(service.request('bind-session', { projectId: 'second-project', sessionId })).rejects.toThrow('already bound to a different project')
+  expect(await readFile(file, 'utf8')).toBe(before)
+  expect(replay).toHaveBeenCalledTimes(1)
+  await service.request('bind-session', { projectId: project.id, sessionId })
+  expect(JSON.parse(await readFile(file, 'utf8'))[sessionId]).toBe(project.id)
+  service.feedbackCapture = null
+})
+
+// 2 October 2026: beginning a project twice must retain production mappings, prompts and human instructions.
+it('prepares a project idempotently with canonical feedback and actual session binding', async () => {
+  const { service, project, folder, config } = await fixture()
+  service.watchFactory = class { suivre() {} oublier() {} toutOublier() {} }
+  await mkdir(path.join(config.roots.houdini, 'scene'))
+  const original = { ...project, dependencies: ['zenray-shards-core'], sources: [...project.sources, { id: 'scene', namespace: 'houdini', localPath: path.join(config.roots.houdini, 'scene') }] }
+  await service.register(original)
+  await writeFile(path.join(folder, 'AGENTS.md'), 'Existing instructions')
+  const payload = { id: project.id, name: project.name, sessionId: 'actual-session-12345678' }
+  const first = await service.request('start', payload)
+  await service.queue
+  const feedbackBefore = await readFile(first.setup.feedbackPath, 'utf8')
+  const second = await service.request('start', payload)
+  await service.queue
+  expect(second.project.sources.map((source) => source.id)).toEqual(['workshop', 'scene', 'project-notes'])
+  expect(service.project(project.id).dependencies).toEqual(['zenray-shards-core'])
+  expect(second.setup.workshopPath).toBe(folder)
+  expect(second.setup.sessionBound).toBe(true)
+  expect(second.setup.watched).toBe(true)
+  expect(second.setup.createdAt).toBe(first.setup.createdAt)
+  expect(await readFile(second.setup.memoryFile, 'utf8')).toContain('project knowledge')
+  expect(await readFile(second.setup.feedbackPath, 'utf8')).toBe(feedbackBefore)
+  expect(await readFile(path.join(folder, 'AGENTS.md'), 'utf8')).toBe('Existing instructions')
+  expect(JSON.parse(await readFile(path.join(config.storage.stateDir, 'SessionBindings.json'), 'utf8'))[payload.sessionId]).toBe(project.id)
+  expect(JSON.parse(await readFile(path.join(second.setup.memoryPath, 'Project.json'), 'utf8')).projectId).toBe(project.id)
+})
+
+// 8 October 2026, 22:39 CEST: project startup succeeds as soon as the session replay is queued.
+it('starts a new project without waiting for transcript replay', async () => {
+  const { service } = await fixture()
+  service.watchFactory = class { suivre() {} oublier() {} toutOublier() {} }
+  service.scheduleBackup = () => {}
+  service.feedbackCapture = { replay: async () => ({ queued: true }), close() {} }
+  const result = await service.request('start', { id: 'capture-busy-project', name: 'Capture Busy Project', sessionId: 'actual-session-87654321' })
+  expect(result.setup).toMatchObject({ sessionBound: true, transcriptCapture: 'queued', watched: true })
+  expect(result.project.id).toBe('capture-busy-project')
+  expect(await readFile(result.setup.feedbackPath, 'utf8')).toContain('Project initialized')
+})
+
+// 8 October 2026, 23:35 CEST: transcript replay failures must not undo a project or session binding.
+it.each([
+  ['active replay', new Error('Transcript capture is active'), 'queued'],
+  ['unexpected replay failure', new Error('capture worker unavailable'), 'queued'],
+])('keeps a new project ready after %s', async (_label, replayError, expectedCapture) => {
+  const { service, config } = await fixture()
+  service.watchFactory = class { suivre() {} oublier() {} toutOublier() {} }
+  service.scheduleBackup = () => {}
+  service.feedbackCapture = { replay: async () => { throw replayError }, close() {} }
+  const projectId = expectedCapture === 'queued' ? 'transcript-active-project' : 'transcript-error-project'
+  const sessionId = expectedCapture === 'queued' ? 'actual-session-12345671' : 'actual-session-12345672'
+
+  const result = await service.request('start', { id: projectId, name: 'Transcript Start Probe', sessionId })
+  const bindings = JSON.parse(await readFile(path.join(config.storage.stateDir, 'SessionBindings.json'), 'utf8'))
+
+  expect(result.setup).toMatchObject({ sessionBound: true, transcriptCapture: expectedCapture, watched: true })
+  expect(bindings[sessionId]).toBe(projectId)
+  expect(service.state(projectId).watched).toBe(true)
+  expect(await readFile(result.setup.feedbackPath, 'utf8')).toContain('Project initialized')
+  const deferred = service.events.find((event) => event.projectId === projectId && event.type === 'feedback-capture-deferred')
+  expect(deferred?.detail).toBe('Project and session are ready; automatic transcript scanning will retry capture')
+})
+
+// 8 October 2026, 23:35 CEST: project startup never waits on a stalled transcript worker.
+it('finishes project startup when transcript replay never settles', async () => {
+  const { service, config } = await fixture()
+  service.watchFactory = class { suivre() {} oublier() {} toutOublier() {} }
+  service.scheduleBackup = () => {}
+  service.feedbackCapture = { replay: () => new Promise(() => {}), close() {} }
+  const sessionId = 'actual-session-12345673'
+  const timeout = Symbol('startup timed out')
+  const result = await Promise.race([
+    service.request('start', { id: 'transcript-stalled-project', name: 'Transcript Stalled Probe', sessionId }),
+    new Promise((resolve) => setTimeout(() => resolve(timeout), 12000)),
+  ])
+
+  expect(result).not.toBe(timeout)
+  expect(result.setup).toMatchObject({ sessionBound: true, transcriptCapture: 'queued', watched: true })
+  expect(JSON.parse(await readFile(path.join(config.storage.stateDir, 'SessionBindings.json'), 'utf8'))[sessionId]).toBe('transcript-stalled-project')
+}, 15000)
+
+// 2 October 2026: failed initialization must never write through a symlink or accept an invented session id.
+it('refuses unsafe project initialization before touching another directory', async () => {
+  const { service, config, root } = await fixture()
+  await mkdir(path.join(root, 'outside'))
+  await symlink(path.join(root, 'outside'), path.join(config.roots.tmp, 'tmp-unsafe-project'))
+  await expect(service.request('start', { id: 'unsafe-project', name: 'Unsafe' })).rejects.toThrow('symlink')
+  await expect(service.request('start', { id: 'valid-project', name: 'Valid', sessionId: 'bad' })).rejects.toThrow('session')
+  await expect(readFile(path.join(root, 'outside', 'AGENTS.md'))).rejects.toThrow()
+  expect(service.projects.has('unsafe-project')).toBe(false)
+})
+// 16 October 2026 14:30 Europe/Paris: stop background writers before removing their temporary directories.
+afterEach(async () => { for (const entry of cleanup.splice(0).reverse()) await entry() })
+
+// 9 October 2026, 00:34 CEST: compact menu stats include Mac and cloud counts without exposing file paths.
+it('returns a compact dashboard snapshot independent of project inventory size', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  const state = service.state(project.id)
+  state.inventory.localFiles = Array.from({ length: 10000 }, (_, index) => ({
+    id: `workshop:file-${index}.bin`, sourceId: 'workshop', relativePath: `file-${index}.bin`, size: 100, present: true, status: 'backed-up',
+  }))
+  state.inventory.localFiles[0].sha256 = 'same-fingerprint'
+  state.backups['workshop:file-0.bin'] = { size: 100, sha256: 'same-fingerprint' }
+  state.backups['workshop:cloud-only.bin'] = { size: 40, sha256: 'cloud-fingerprint' }
+  state.jobs = ['dashboard-job']
+  service.jobs.set('dashboard-job', { id: 'dashboard-job', projectId: project.id, type: 'restore', state: 'running', createdAt: 'now',
+    progress: { ev: 'download', recus: 23, scopeId: 'workshop:file-0.bin', privatePath: '/private/source.bin' } })
+  service.dashboardTransferSamples.set('dashboard-job:download', { bytes: 3, scope: 'workshop:file-0.bin', at: Date.now() - 2000 })
+  state.error = 'Project issue'
+  service.watchErrors.set(`${project.id}:workshop`, 'Watch issue')
+  service.feedbackError = 'Feedback issue'
+
+  const result = await service.request('dashboard')
+  const payload = result.projects[0]
+  expect(payload).toMatchObject({ id: project.id, name: project.name, workspace: { state: 'unloaded' },
+    errors: expect.arrayContaining(['Project issue', 'Watch issue', 'Feedback issue']),
+    stats: { fileCount: 10001, macFileCount: 10000, cloudFileCount: 2, pendingUploadCount: 9999, localBytes: 1000000, cloudBytes: 140 },
+    jobs: [{ id: 'dashboard-job', type: 'restore', state: 'running', progress: { ev: 'download', recus: 23 } }] })
+  expect(result.transferRates.uploadBytesPerSecond).toBe(0)
+  expect(result.transferRates.downloadBytesPerSecond).toBeGreaterThanOrEqual(9)
+  expect(result.transferRates.downloadBytesPerSecond).toBeLessThanOrEqual(11)
+  expect(payload.jobs[0].progress).not.toHaveProperty('privatePath')
+  expect(payload.jobs[0].progress).not.toHaveProperty('scopeId')
+  expect(payload).not.toHaveProperty('files')
+  expect(payload).not.toHaveProperty('sources')
+  expect(payload).not.toHaveProperty('events')
+  expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(5000)
+})
+
+// 9 October 2026, 00:41 CEST: upload and download speeds use confirmed byte deltas and ignore counter resets.
+it('measures both transfer directions and resets at source boundaries', async () => {
+  const { service, project } = await fixture()
+  const at = Date.now() - 1000
+  service.jobs.set('upload', { id: 'upload', projectId: project.id, type: 'archive', state: 'running', progress: { ev: 'chunk', envoyes: 1000100, sourceId: 'source-a' } })
+  service.jobs.set('download', { id: 'download', projectId: project.id, type: 'restore', state: 'running', progress: { ev: 'download', recus: 800100, scopeId: 'file-a' } })
+  service.jobs.set('reset', { id: 'reset', projectId: project.id, type: 'archive', state: 'running', progress: { ev: 'chunk', envoyes: 5, sourceId: 'source-b' } })
+  service.dashboardTransferSamples.set('upload:upload', { bytes: 100, scope: 'source-a', at })
+  service.dashboardTransferSamples.set('download:download', { bytes: 100, scope: 'file-a', at })
+  service.dashboardTransferSamples.set('reset:upload', { bytes: 200, scope: 'source-b', at })
+  const rates = service.dashboardTransferRates()
+  expect(rates.uploadBytesPerSecond).toBeGreaterThanOrEqual(990000)
+  expect(rates.uploadBytesPerSecond).toBeLessThanOrEqual(1000000)
+  expect(rates.downloadBytesPerSecond).toBeGreaterThanOrEqual(790000)
+  expect(rates.downloadBytesPerSecond).toBeLessThanOrEqual(800000)
+})
+
+async function fixture() {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'zr-assets-test-')))
+  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  const config = JSON.parse(await readFile(new URL('./AssetsConfig.json', import.meta.url), 'utf8'))
+  config.storage.preventIdleSleepDuringTransfers = false
+  // 14 October 2026: tests pin the scheduling baseline; coalescing, batch limits and concurrency have their own explicit tests.
+  config.storage.autoBatchLimit = 1
+  config.watch.backupMinIntervalSeconds = 0
+  config.roots = Object.fromEntries(['tmp','memory','houdini','unreal'].map((kind) => [kind, path.join(root, kind)]))
+  config.additionalRoots = {}
+  config.sceneAudit.enabled = false
+  config.storage.stateDir = path.join(root, 'state'); config.storage.workspaceDir = path.join(root, 'loads'); config.projects = []
+  for (const folder of Object.values(config.roots)) await mkdir(folder, { recursive: true })
+  const folder = path.join(config.roots.tmp, 'test-project')
+  await mkdir(folder); await writeFile(path.join(folder, 'scene.hiplc'), 'original bytes')
+  const project = normalizeWorkspaceProject({ id:'test-project', name:'Test project', sources:[{ id:'workshop', namespace:'tmp', localPath:folder }] })
+  const service = await createAssetsService({ config, getToken:async () => 'test', runProcess:async () => { throw new Error('Unexpected engine call') } })
+  cleanup.push(() => service.close())
+  return { root, config, folder, project, service }
+}
+
+// 9 October 2026, 20:28 CEST: persisted project watchers resume and queue discovery after service restart.
+it('resumes a persisted project watcher and queues an automatic backup after restart', async () => {
+  const { service, project, config, folder } = await fixture()
+  await service.register(project)
+  await writeFile(path.join(folder, 'arrived-while-service-stopped.md'), 'new local file')
+  service.state(project.id).watched = true
+  await service.save(project.id)
+
+  const followed = []
+  const restarted = await createAssetsService({
+    config,
+    getToken: async () => 'test',
+    runProcess: async () => { throw new Error('Unexpected engine call') },
+  })
+  restarted.watchFactory = class {
+    suivre(key, localPath) { followed.push({ key, localPath }) }
+    oublier() {}
+    toutOublier() {}
+  }
+  cleanup.push(() => restarted.close())
+  const scheduleBackup = vi.spyOn(restarted, 'scheduleBackup').mockImplementation(() => {})
+
+  await restarted.startWatching()
+
+  expect(followed).toContainEqual({ key: `${project.id}:workshop`, localPath: project.sources[0].localPath })
+  expect(scheduleBackup).toHaveBeenCalledWith(project.id)
+  expect(restarted.state(project.id).watched).toBe(true)
+})
+
+// 9 October 2026, 22:38 CEST: one failed watcher must not block other projects and must retry without a manual restart.
+it('continues watcher startup and retries an isolated project setup failure', async () => {
+  const { service, project, config } = await fixture()
+  await service.register(project)
+  const secondFolder = path.join(config.roots.tmp, 'second-project')
+  await mkdir(secondFolder)
+  await writeFile(path.join(secondFolder, 'scene.hiplc'), 'second bytes')
+  const secondProject = normalizeWorkspaceProject({ id: 'second-project', name: 'Second project', sources: [{ id: 'workshop', namespace: 'tmp', localPath: secondFolder }] })
+  await service.register(secondProject)
+  for (const id of [project.id, secondProject.id]) {
+    service.state(id).watched = true
+    await service.save(id)
+  }
+  config.storage.retryMs = 10
+  const score = (state) => (state.inventory?.localFiles || []).reduce((sum, file) => sum + file.size, 0)
+  const startupOrder = [...service.states].sort((left, right) => score(left[1]) - score(right[1])).map(([id]) => id)
+  const failedId = startupOrder[0], continuedId = startupOrder[1]
+  const followed = []
+  let factoryCalls = 0
+  service.watchFactory = class {
+    constructor() { if (factoryCalls++ === 0) throw new Error('temporary watcher setup failure') }
+    suivre(key, localPath) { followed.push({ key, localPath }) }
+    oublier() {}
+    toutOublier() {}
+  }
+  service.scheduleBackup = vi.fn()
+
+  await service.startWatching()
+
+  expect(followed.some(({ key }) => key.startsWith(`${continuedId}:`))).toBe(true)
+  expect(service.snapshot(failedId).sync.watchError).toContain('temporary watcher setup failure')
+  for (let pass = 0; pass < 30 && service.snapshot(failedId).sync.watchError; pass++) await new Promise((resolve) => setTimeout(resolve, 5))
+  expect(followed.some(({ key }) => key.startsWith(`${failedId}:`))).toBe(true)
+  expect(service.snapshot(failedId).sync.watchError).toBeNull()
+  expect(service.scheduleBackup).toHaveBeenCalledWith(failedId)
+})
+
+async function backedUpFixture() {
+  const context = await fixture()
+  const { service, project, folder } = context
+  const sourcePath = path.join(folder, 'scene.hiplc')
+  const initialStat = await stat(sourcePath)
+  await utimes(sourcePath, initialStat.atime, new Date(Math.floor(initialStat.mtimeMs)))
+  await service.register(project)
+  const file = service.state(project.id).inventory.localFiles[0]
+  const backup = { id: file.id, sourceId: file.sourceId, relativePath: file.relativePath, size: file.size,
+    sha256: await hashLocalFile(file.localPath, file.changeToken), changeToken: file.changeToken,
+    manifestPath: 'pages/ZenRayAssets/test-project/scene.hiplc.file.json' }
+  service.state(project.id).backups[file.id] = backup
+  await service.save(project.id)
+  return { ...context, file, backup }
+}
+
+// 9 October 2026, 11:04 CEST: The browser receives project links from the verified index, not only explicit session bindings.
+it('serves a compact workspace catalogue and the complete evidence-linked project conversation index', async () => {
+  const { root, project, service } = await fixture()
+  const memoryPath = path.join(root, 'memory', project.id)
+  await mkdir(memoryPath, { recursive: true })
+  await writeFile(path.join(memoryPath, 'ConversationIndex.json'), JSON.stringify({ schemaVersion: 1, projectId: project.id, scannedAt: '2026-10-09T08:00:00.000Z', conversations: [
+    { projectId: project.id, conversationId: 'codex:primary', sessionId: 'primary', provider: 'codex', strength: 'bound', boundProject: project.id, title: 'Primary', updatedAt: '2026-10-09T08:00:00.000Z' },
+    { projectId: project.id, conversationId: 'gemini:evidence', sessionId: 'evidence', provider: 'gemini', strength: 'strong', boundProject: null, title: 'Evidence', updatedAt: '2026-10-08T08:00:00.000Z' },
+  ] }))
+  const linkedProject = normalizeWorkspaceProject({ ...project, sources: [...project.sources, { id: 'project-memory', namespace: 'memory', localPath: memoryPath, keep: true }] })
+  await service.register(linkedProject)
+
+  const catalogue = await service.request('workspace-catalogue')
+  expect(catalogue.bridge).toEqual({ connected: true, state: 'connected' })
+  expect(catalogue.projects[0]).toMatchObject({ id: project.id, fileCount: 2 })
+  expect(catalogue.projects[0]).not.toHaveProperty('files')
+  expect(Buffer.byteLength(JSON.stringify(catalogue))).toBeLessThan(20_000)
+
+  const index = await service.request('project-conversations', { projectId: project.id })
+  expect(index).toMatchObject({ projectId: project.id, state: 'ready', conversations: [{ conversationId: 'codex:primary' }, { conversationId: 'gemini:evidence' }] })
+  expect(index.conversations[1]).toMatchObject({ strength: 'strong', boundProject: null })
+})
+
+// 8 October 2026, 14:42 CEST: ctime-only metadata changes must not hide a matching cloud hash.
+it('keeps a matching cloud file backed up after a ctime-only metadata change', async () => {
+  const { service, project, file, backup } = await backedUpFixture()
+  const before = await stat(file.localPath)
+  await chmod(file.localPath, (before.mode & 0o777) ^ 0o100)
+  await utimes(file.localPath, before.atime, before.mtime)
+  const after = await stat(file.localPath)
+  expect(after.size).toBe(before.size)
+  expect(after.mtimeMs).toBe(before.mtimeMs)
+  expect(after.ctimeMs).not.toBe(before.ctimeMs)
+
+  const result = await service.inventory(project.id)
+  expect(result.sync.pendingCount).toBe(0)
+  expect(result.files.find((entry) => entry.id === file.id)).toMatchObject({ sha256: backup.sha256, status: 'backed-up' })
+})
+
+// 8 October 2026, 14:42 CEST: same-size files with restored mtimes still require a fresh cloud archive when their bytes change.
+it('keeps changed bytes pending when size and mtime match the previous cloud file', async () => {
+  const { service, project, file, backup } = await backedUpFixture()
+  const before = await stat(file.localPath)
+  await writeFile(file.localPath, 'changed value!')
+  await utimes(file.localPath, before.atime, before.mtime)
+  const after = await stat(file.localPath)
+  expect(after.size).toBe(before.size)
+  expect(after.mtimeMs).toBe(before.mtimeMs)
+  expect(after.ctimeMs).not.toBe(before.ctimeMs)
+
+  const result = await service.inventory(project.id)
+  expect(result.sync.pendingCount).toBe(1)
+  expect(result.files.find((entry) => entry.id === file.id)).toMatchObject({ sha256: null, status: 'pending' })
+  expect(service.state(project.id).backups[file.id].changeToken).toBe(backup.changeToken)
+})
+
+// 8 October 2026, 16:08 CEST: completed archive status uses the final SHA when ctime changes after inventory.
+it('reports no remaining files when ctime changes between archive inventory and snapshot', async () => {
+  const { service, project, folder } = await fixture()
+  const sourcePath = path.join(folder, 'scene.hiplc'), initial = await stat(sourcePath)
+  await utimes(sourcePath, initial.atime, new Date(Math.floor(initial.mtimeMs)))
+  await service.register(project)
+  const inventory = service.inventory.bind(service)
+  let touched = false
+  service.inventory = async (id) => {
+    const result = await inventory(id)
+    if (id === project.id && !touched) {
+      touched = true
+      const before = await stat(sourcePath)
+      await chmod(sourcePath, (before.mode & 0o777) ^ 0o100)
+      await utimes(sourcePath, before.atime, before.mtime)
+    }
+    return result
+  }
+  service.runProcess = async (script, args) => {
+    if (script.endsWith('index-add-paths.mjs')) return { lastEvent: null }
+    const staged = path.join(args[0], 'scene.hiplc'), sha = await hashLocalFile(staged), size = (await stat(staged)).size
+    const index = args.find((argument) => argument.startsWith('--index=')).slice(8)
+    await writeFile(index, JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches: [{ rel: 'scene.hiplc', taille: size, sha, manifeste: 'scene.hiplc.file.json' }] }))
+    return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+  }
+
+  const job = { id: 'ctime-during-archive' }
+  await service.archiveNow(project.id, null, job, new AbortController().signal, { preserveVersions: false })
+
+  expect(job).toMatchObject({ count: 1, remainingCount: 0 })
+  expect(service.snapshot(project.id).sync.pendingCount).toBe(0)
+})
+
+// 9 October 2026, 02:19 CEST: the generated file map must carry its post-write fingerprint into the same inventory.
+it('refreshes the generated file-map fingerprint before an archive snapshot', async () => {
+  const { service, project, folder, root } = await fixture()
+  const fileMap = path.join(folder, 'FileMap.md')
+  await writeFile(fileMap, 'old generated map')
+  service.writeFileMap = async () => {
+    await writeFile(fileMap, 'new generated map')
+    return { file: fileMap, changed: true }
+  }
+
+  await service.register(project)
+
+  const entry = service.state(project.id).inventory.localFiles.find((file) => file.id === 'workshop:FileMap.md')
+  const metadata = await stat(fileMap)
+  expect(entry).toMatchObject({ size: metadata.size, mtimeMs: metadata.mtimeMs, ctimeMs: metadata.ctimeMs, sha256: null })
+  expect(service.state(project.id).inventory.sources.find((source) => source.id === 'workshop').bytes).toBe(metadata.size + Buffer.byteLength('original bytes'))
+  const staged = path.join(root, 'snapshot', 'FileMap.md')
+  const snapshot = await snapshotSourceFile(entry, staged, folder)
+  expect(snapshot.size).toBe(metadata.size)
+  expect(await readFile(staged, 'utf8')).toBe('new generated map')
+})
+
+// 8 October 2026, 20:41 CEST: reproduce the wrapped permanent rejection returned by the real service.
+it('retries a permanently rejected archive on a persisted repository suffix', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  const routes = []
+  let archiveAttempts = 0
+  let archiveOptions
+  service.runProcess = async (script, args, options = {}) => {
+    if (script.endsWith('index-add-paths.mjs')) return { lastEvent: null }
+    archiveOptions = options
+    routes.push(options.env.ZR_ARCHIVE_REPO_SUFFIX)
+    const indexPath = args.find((argument) => argument.startsWith('--index=')).slice(8)
+    const stagedPath = path.join(args[0], 'scene.hiplc')
+    if (archiveAttempts++ === 0) {
+      options.onEvent({ ev: 'rollover', depot: 'zenray-productions-archive-test-project-workshop-001', raison: 'refus définitif' })
+      throw new Error('Asset engine failed (1): permanent push rejection\n\nError: push-refus-definitif zenray-productions-archive-test-project-workshop-001')
+    }
+    const size = (await stat(stagedPath)).size
+    await writeFile(indexPath, JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches: [
+      { rel: 'scene.hiplc', taille: size, sha: await hashLocalFile(stagedPath), manifeste: 'scene.hiplc.file.json' },
+    ] }))
+    return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+  }
+
+  const failedJob = { id: 'definitive-rejection' }
+  await expect(service.archiveNow(project.id, null, failedJob, new AbortController().signal, { preserveVersions: false }))
+    .rejects.toThrow('push-refus-definitif')
+  const saved = JSON.parse(await readFile(service.statePath(project.id), 'utf8'))
+  expect(saved.archiveRouteSuffixes.workshop).toBe('-r02')
+
+  const retryJob = { id: 'retry-new-repository' }
+  await service.archiveNow(project.id, null, retryJob, new AbortController().signal, { preserveVersions: false })
+  expect(routes).toEqual(['', '-r02'])
+  expect(archiveOptions).toMatchObject({ timeoutMs: service.config.storage.archiveProcessTimeoutMs, killGraceMs: service.config.storage.processKillGraceMs })
+  expect(retryJob).toMatchObject({ count: 1, remainingCount: 0 })
+  expect(service.state(project.id).backups['workshop:scene.hiplc'].sha256).toBe(await hashLocalFile(path.join(project.sources[0].localPath, 'scene.hiplc')))
+})
+
+// 8 October 2026, 20:30 CEST: transient network failures must not rotate an archive repository route.
+it('keeps the archive repository route after a transient network failure', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  service.runProcess = async (script) => {
+    if (script.endsWith('index-add-paths.mjs')) return { lastEvent: null }
+    throw new Error('Could not resolve host: github.com')
+  }
+
+  await expect(service.archiveNow(project.id, null, { id: 'transient-network-failure' }, new AbortController().signal,
+    { preserveVersions: false })).rejects.toThrow('Could not resolve host')
+
+  const saved = JSON.parse(await readFile(service.statePath(project.id), 'utf8'))
+  expect(saved.archiveRouteSuffixes).toBeUndefined()
+})
+
+// 8 October 2026, 17:13 CEST: bounded retries must rotate sources when a frequently updated index stays pending.
+it('rotates bounded archive batches across sources while the first source changes', async () => {
+  const { service, project, folder, config } = await fixture()
+  const notesPath = path.join(config.roots.memory, 'test-project-notes')
+  await mkdir(notesPath)
+  await writeFile(path.join(notesPath, 'note.md'), 'second source bytes')
+  const multiSourceProject = normalizeWorkspaceProject({ ...project, sources: [...project.sources,
+    { id: 'notes', namespace: 'memory', localPath: notesPath }] })
+  const firstSource = multiSourceProject.sources[0], secondSource = multiSourceProject.sources[1]
+  const changingIndex = path.join(firstSource.localPath, 'ConversationIndex.json')
+  await writeFile(changingIndex, 'index version one')
+  await service.register(multiSourceProject)
+
+  const archivedSources = []
+  service.runProcess = async (script, args) => {
+    if (script.endsWith('index-add-paths.mjs')) return { lastEvent: null }
+    const source = multiSourceProject.sources.find((entry) => args[1].endsWith(`/sources/${entry.namespace}/${entry.id}`))
+    expect(source).toBeDefined()
+    archivedSources.push(source.id)
+    const fiches = []
+    for (const file of service.state(project.id).inventory.localFiles.filter((entry) => entry.sourceId === source.id)) {
+      const staged = path.join(args[0], file.relativePath)
+      let size
+      try { size = (await stat(staged)).size }
+      catch (error) { if (error.code === 'ENOENT') continue; throw error }
+      fiches.push({ rel: file.relativePath, taille: size, sha: await hashLocalFile(staged), manifeste: `${file.relativePath}.file.json` })
+    }
+    const index = args.find((argument) => argument.startsWith('--index=')).slice(8)
+    await writeFile(index, JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches }))
+    return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+  }
+
+  await service.archiveNow(project.id, null, { id: 'bounded-first-source' }, new AbortController().signal,
+    { maxBatches: 1, preserveVersions: false })
+  await writeFile(changingIndex, 'index version two')
+  const secondJob = { id: 'bounded-second-source' }
+  await service.archiveNow(project.id, null, secondJob, new AbortController().signal,
+    { maxBatches: 1, preserveVersions: false })
+
+  expect(archivedSources).toEqual([firstSource.id, secondSource.id])
+  expect(secondJob.count).toBeGreaterThan(0)
+  expect(service.state(project.id).backups['notes:note.md']?.sha256).toBe(await hashLocalFile(path.join(notesPath, 'note.md')))
+})
+
+describe('project workspace evidence', () => {
+  it('inventories original bytes while excluding secrets and generated directories', async () => {
+    const { folder, project, config } = await fixture()
+    await mkdir(path.join(folder, 'node_modules')); await writeFile(path.join(folder, 'node_modules/cache'), 'ignored')
+    await writeFile(path.join(folder, '.env'), 'secret')
+    const scan = await scanSource(project.sources[0], config)
+    expect(scan.files.map((file) => file.relativePath)).toEqual(['scene.hiplc'])
+    expect(scan.source.bytes).toBe(14)
+  })
+  it('refuses source escape and unsafe project IDs', async () => {
+    const { project, config } = await fixture()
+    await expect(scanSource({ ...project.sources[0], localPath: '/outside' }, config)).rejects.toThrow('outside')
+    expect(() => normalizeWorkspaceProject({ ...project, id: '../escape' })).toThrow('Invalid')
+  })
+
+  // 3 October 2026, 04:03 CEST: registered HDA libraries stay scoped to explicit roots and selected files.
+  it('scans an explicitly allowed library without permitting its parent or a whole unscoped root', async () => {
+    const { config, root } = await fixture()
+    const library = path.join(root, 'skill-library', 'otls')
+    await mkdir(library, { recursive: true })
+    await writeFile(path.join(library, 'Church.hda'), 'shared definition')
+    await writeFile(path.join(library, 'Other.hda'), 'unselected definition')
+    const source = { id: 'skill-library', namespace: 'houdini', localPath: library, include: ['Church.hda'] }
+    await expect(scanSource(source, config)).rejects.toThrow('outside configured')
+    config.additionalRoots = { houdini: [library] }
+    const scan = await scanSource(source, config)
+    expect(scan.files.map((file) => file.relativePath)).toEqual(['Church.hda'])
+    await expect(scanSource({ ...source, include: null }, config)).rejects.toThrow('explicit include list')
+    await expect(scanSource({ ...source, localPath: path.dirname(library) }, config)).rejects.toThrow('outside configured')
+    const redirected = path.join(library, 'redirected')
+    await symlink(config.roots.tmp, redirected)
+    const unsafe = await scanSource({ ...source, localPath: redirected, include: ['scene.hiplc'] }, config)
+    expect(unsafe.source.status).toBe('error')
+    expect(unsafe.files).toEqual([])
+  })
+  it('copies a stable source and independently hashes the snapshot', async () => {
+    const { folder, project, config, root } = await fixture()
+    const { files } = await scanSource(project.sources[0], config)
+    const destination = path.join(root, 'snapshot/scene.hiplc')
+    const result = await snapshotSourceFile(files[0], destination, folder)
+    expect(result.sha256).toBe(await hashLocalFile(destination))
+    expect(await readFile(destination, 'utf8')).toBe('original bytes')
+    await writeFile(path.join(folder, 'scene.hiplc'), 'changed bytes')
+    await expect(snapshotSourceFile(files[0], path.join(root, 'second/scene.hiplc'), folder)).rejects.toThrow()
+  })
+  // 8 October 2026, 15:45 CEST: ctime-only touches are re-fingerprinted while the exact copied bytes stay protected.
+  it('snapshots a file after a ctime-only touch since inventory', async () => {
+    const { folder, project, config, root } = await fixture()
+    const sourcePath = path.join(folder, 'scene.hiplc'), initial = await stat(sourcePath)
+    await utimes(sourcePath, initial.atime, new Date(Math.floor(initial.mtimeMs)))
+    const { files } = await scanSource(project.sources[0], config)
+    const before = await stat(files[0].localPath)
+    await chmod(files[0].localPath, (before.mode & 0o777) ^ 0o100)
+    await utimes(files[0].localPath, before.atime, before.mtime)
+    const destination = path.join(root, 'snapshot-after-ctime-touch/scene.hiplc')
+
+    const result = await snapshotSourceFile(files[0], destination, folder)
+
+    expect(result.changeToken).not.toBe(files[0].changeToken)
+    expect(result.sha256).toBe(await hashLocalFile(destination))
+    expect(await readFile(destination, 'utf8')).toBe('original bytes')
+  })
+  it('requires cloud fingerprints for loading and independent restore proof for unloading', async () => {
+    const { service, project } = await fixture()
+    await service.register(project)
+    const local = service.state(project.id).inventory.localFiles
+    const unknown = combineWorkspaceFiles(project, local)
+    expect(buildWorkspacePlan(project, unknown).executable).toBe(false)
+    const backup = { ...local[0], sha256:'proof', manifestPath:'pages/ZenRayAssets/test-project/scene.hiplc.file.json' }
+    const archived = combineWorkspaceFiles(project, [{ ...local[0], sha256:'proof' }], { [backup.id]:backup })
+    expect(buildWorkspacePlan(project, archived).executable).toBe(true)
+    expect(buildWorkspacePlan(project, archived, { action:'unload' }).blockers).toHaveLength(1)
+    const restored = combineWorkspaceFiles(project, [{ ...local[0], sha256:'proof' }], { [backup.id]:backup }, { [backup.id]:{ sha256:'proof', verifiedAt:'2026-10-02T11:00:00Z' } })
+    expect(buildWorkspacePlan(project, restored, { action:'unload' }).blockers).toHaveLength(0)
+    expect(buildWorkspacePlan(project, restored, { action:'unload' }).dryRun).toBe(true)
+  })
+  it('persists chronological events across service restarts', async () => {
+    const { config, service, project } = await fixture()
+    await service.register(project)
+    service.event(project.id, 'decision', 'Scoped Unreal host')
+    const restarted = await createAssetsService({ config })
+    cleanup.push(() => restarted.close())
+    expect(restarted.events.some((event) => event.detail === 'Scoped Unreal host')).toBe(true)
+  })
+  it('never assigns a shared Unreal working folder to one project by guessing', () => {
+    const projects = ['tiles','church'].map((id) => ({ id, sources:[{localPath:'/game',include:[`Content/${id}`]}] }))
+    expect(matchFeedbackProject('/game', projects)).toBe(null)
+    expect(matchFeedbackProject('/game/Content/tiles', projects)).toBe('tiles')
+  })
+  it('captures human prompts and final replies while excluding tool output and injected context', () => {
+    const record = (role, text, phase) => ({type:'response_item',timestamp:'2026-10-02T11:00:00Z',payload:{type:'message',role,phase,content:[{type:role==='user'?'input_text':'output_text',text}]}})
+    expect(transcriptEntry(record('user','Chaque projet garde ses prompts.')).kind).toBe('prompt')
+    expect(transcriptEntry(record('user','# AGENTS.md instructions for /project'))).toBe(null)
+    expect(transcriptEntry(record('user','<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>'))).toBe(null)
+    expect(transcriptEntry(record('user','<in-app-browser-context source="ambient-ui-state">Current URL is internal.</in-app-browser-context>\n\n## My request:\nShow the project conversations.')).text).toBe('## My request:\nShow the project conversations.')
+    expect(transcriptEntry(record('assistant','Result','final_answer')).kind).toBe('iteration')
+    expect(transcriptEntry({type:'response_item',payload:{type:'function_call_output',output:'secret'}})).toBe(null)
+  })
+  it('derives project history from the original dated sources', () => {
+    const feedback = '## 2 October 2026, 13:00:00 +0200 : Prompt\n- Project: tiles; kind: prompt.\n> Keep every prompt.'
+    expect(feedbackEvents(feedback,{projectId:'tiles'})[0].type).toBe('prompt')
+    const progress = '2026-10-02 13:00\n- Fait : Ceramic Tiles render verified.\n\n2026-10-02 14:00\n- Fait : Other project.'
+    expect(progressEvents(progress,{id:'tiles',name:'Ceramic Tiles',sources:[]})).toHaveLength(1)
+  })
+  // 9 October 2026, 14:13 CEST: repeated Codex wrappers collapse in the derived history, while separate seconds remain visible.
+  it('suppresses duplicate Codex final wrappers in project history without deleting source blocks', () => {
+    const source = '/Users/zenray/.codex/sessions/2026/10/09/rollout-session.jsonl'
+    const firstDate = '9 October 2026, 14:12:00 +0200', nextDate = '9 October 2026, 14:13:00 +0200'
+    const event = (hash, date) => `## ${date} : Iteration\n\n<!-- feedback-event:${hash} (${date}) -->\n- Project: tiles; kind: iteration. (${date})\n- Source: ${source}. (${date})\n\n> Same final reply. (${date})\n`
+    const markdown = event('a'.repeat(64), firstDate) + event('b'.repeat(64), firstDate) + event('c'.repeat(64), nextDate)
+    const visible = feedbackEvents(markdown, { projectId: 'tiles' })
+    expect(visible).toHaveLength(2)
+    expect(visible[0].duplicateCount).toBe(2)
+    expect(visible.map(entry => entry.body)).toEqual(['Same final reply.', 'Same final reply.'])
+    expect(markdown.match(/<!-- feedback-event:/g)).toHaveLength(3)
+  })
+})
+
+it('captures successful final iterations and excludes failed turns', () => {
+  const record = { type: 'event_msg', timestamp: '2026-10-02T11:40:00Z', payload: { type: 'task_complete', last_agent_message: 'Verified result', error: null } }
+  expect(transcriptEntry(record)?.kind).toBe('iteration')
+  expect(transcriptEntry({ ...record, payload: { ...record.payload, error: { message: 'failure' } } })).toBeNull()
+})
+
+// 2 October 2026, 14:25 CEST: a new nested file must reach its project manifest and search index automatically.
+it('routes new TMP files through watching, hashing, archive verification and indexing', async () => {
+  const { service, project, folder, root } = await fixture()
+  await service.register(project)
+  let notify, engineCalls = 0, indexed = [], indexFailures = 0
+  service.watchFactory = class {
+    constructor(callback) { notify = callback }
+    suivre() {}
+    oublier() {}
+    toutOublier() {}
+  }
+  service.runProcess = async (script, args) => {
+    if (script.endsWith('index-add-paths.mjs')) {
+      if (indexFailures > 0) { indexFailures--; throw new Error('Temporary index failure') }
+      indexed = (await readFile(args[0], 'utf8')).trim().split('\n')
+      return { lastEvent: null }
+    }
+    engineCalls++
+    const snapshot = service.state(project.id).inventory.localFiles
+    const fiches = (await Promise.all(snapshot.map(async (file) => { try { return { rel: file.relativePath,
+      taille: file.size, sha: await hashLocalFile(path.join(args[0], file.relativePath)), manifeste: `${file.relativePath}.file.json` } } catch (error) { if (error.code === 'ENOENT') return null; throw error } }))).filter(Boolean)
+    const index = args.find((arg) => arg.startsWith('--index=')).slice(8)
+    await writeFile(index, JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches }))
+    return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+  }
+  await service.setWatch(project.id, true)
+  await service.queue
+  engineCalls = 0
+  await mkdir(path.join(folder, 'unsorted'), { recursive: true })
+  await writeFile(path.join(folder, 'unsorted/new-texture.png'), 'new original bytes')
+  await writeFile(path.join(root, 'outside.png'), 'unregistered bytes')
+  indexFailures = 1
+  notify(`${project.id}:workshop`)
+  await service.queue
+  expect(service.state(project.id).pendingIndex).toHaveLength(1)
+  // 8 October 2026, 16:06 CEST: a completed job reports pending work from its refreshed byte fingerprints.
+  const archive = await service.request('archive', { projectId: project.id })
+  await service.queue
+  expect(service.state(project.id).pendingIndex).toEqual([])
+  expect(service.jobs.get(archive.jobId).remainingCount).toBe(0)
+  const backup = service.state(project.id).backups['workshop:unsorted/new-texture.png']
+  expect(backup.sha256).toBe(await hashLocalFile(path.join(folder, 'unsorted/new-texture.png')))
+  expect(indexed).toContain('pages/ZenRayAssets/test-project/sources/tmp/workshop/unsorted/new-texture.png.file.json')
+  expect(indexed.some((entry) => entry.includes('outside.png'))).toBe(false)
+  notify(`${project.id}:workshop`)
+  await service.queue
+  expect(engineCalls).toBe(1)
+})
+
+// 2 October 2026, 15:20 CEST: real filesystem removal must refuse changed, untracked or unrecoverable copies.
+// 3 October 2026, 05:13 CEST: partial cloud loads prepare a writable TMP without loading its original files.
+it('prepares and recovers the active workshop when only a Houdini file is loaded', async () => {
+  const { service, project, folder, config } = await fixture()
+  const library = path.join(config.roots.houdini, 'library')
+  await mkdir(library); await writeFile(path.join(library, 'Roof.hda'), 'definition bytes')
+  await service.register({ ...project, sources: [...project.sources, { id: 'library', namespace: 'houdini', localPath: library }] })
+  const local = service.state(project.id).inventory.localFiles.find((file) => file.id === 'library:Roof.hda')
+  const sha256 = await hashLocalFile(local.localPath)
+  service.state(project.id).backups[local.id] = { ...local, sha256, manifestPath: 'pages/test/Roof.hda.file.json', sourceFolder: 'pages/test', relativeManifest: 'Roof.hda.file.json' }
+  service.runProcess = async (_script, args) => {
+    const target = path.join(args[2], args[1])
+    await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, 'definition bytes')
+    return { lastEvent: { ev: 'restaure', cible: target } }
+  }
+  const signal = new AbortController().signal
+  await service.restoreNow(project.id, [local.id], { id: 'partial-hda' }, signal)
+  const workshop = service.snapshot(project.id).mapping.context.workshopPath
+  expect(await realpath(workshop)).toBe(workshop)
+  await expect(readFile(path.join(workshop, 'scene.hiplc'))).rejects.toThrow()
+  expect(await readFile(path.join(folder, 'scene.hiplc'), 'utf8')).toBe('original bytes')
+  await service.unloadNow(project.id, null, { id: 'release-hda' }, signal)
+  await service.recoverNow(project.id, { id: 'recover-hda' }, signal)
+  const recoveredWorkshop = service.snapshot(project.id).mapping.context.workshopPath
+  expect(recoveredWorkshop).not.toBe(workshop)
+  expect(await realpath(recoveredWorkshop)).toBe(recoveredWorkshop)
+  await writeFile(path.join(recoveredWorkshop, 'new-note.md'), 'new working note')
+  await service.inventory(project.id)
+  expect(service.snapshot(project.id).files.find((file) => file.id === 'workshop:new-note.md')).toMatchObject({ loadedCopy: true, localPath: path.join(recoveredWorkshop, 'new-note.md') })
+  expect(await hashLocalFile(local.localPath)).toBe(sha256)
+})
+
+it('refuses a redirected workshop before creating directories outside the loaded copy', async () => {
+  const { service, project, root, config } = await fixture()
+  await service.register(project)
+  const attempt = path.join(config.storage.workspaceDir, project.id, 'loads', 'redirected')
+  const outside = path.join(root, 'outside')
+  await mkdir(attempt, { recursive: true }); await mkdir(outside)
+  await symlink(outside, path.join(attempt, 'sources'))
+  await expect(service.prepareWorkspaceWorkshop(project.id, attempt)).rejects.toThrow('symlink')
+  await expect(realpath(path.join(outside, 'tmp'))).rejects.toThrow()
+})
+
+it('refuses an empty LOAD before activating a workspace or calling the cloud engine', async () => {
+  const { service, project, config } = await fixture()
+  await service.register(project)
+  service.runProcess = vi.fn()
+  await expect(service.restoreNow(project.id, [], { id: 'empty' }, new AbortController().signal)).rejects.toThrow('Select at least one')
+  expect(service.runProcess).not.toHaveBeenCalled()
+  expect(service.state(project.id).workspacePath).toBeFalsy()
+  await expect(readFile(path.join(config.storage.workspaceDir, project.id, 'Current.json'))).rejects.toThrow()
+})
+
+describe('managed workspace release and recovery', () => {
+  async function loadedFixture(relativePath = null) {
+    const context = await fixture()
+    const { service, project, config } = context
+    if (relativePath) {
+      await mkdir(path.dirname(path.join(context.folder, relativePath)), { recursive: true })
+      await rename(path.join(context.folder, 'scene.hiplc'), path.join(context.folder, relativePath))
+    }
+    await service.register(project)
+    const local = service.state(project.id).inventory.localFiles[0]
+    const sha256 = await hashLocalFile(local.localPath)
+    service.state(project.id).backups[local.id] = { ...local, sha256, manifestPath: 'pages/test/scene.hiplc.file.json', sourceFolder: 'pages/test', relativeManifest: 'scene.hiplc.file.json' }
+    service.runProcess = async (_script, args) => {
+      const target = path.join(args[2], args[1])
+      await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, 'original bytes')
+      return { lastEvent: { ev: 'restaure', cible: target } }
+    }
+    await service.restoreNow(project.id, null, { id: 'load-1' }, new AbortController().signal)
+    return { ...context, local, activePath: service.state(project.id).workspacePath, signal: new AbortController().signal }
+  }
+  // 3 October 2026, 10:09 CEST: an edited origin cannot disappear behind an unchanged or independently edited copy.
+  it('reports divergent original bytes in the local and cloud context and retains both versions', async () => {
+    const { service, project, activePath, local, signal, config } = await loadedFixture()
+    const workingPath = path.join(activePath, 'sources/tmp/workshop/scene.hiplc')
+    await writeFile(local.localPath, 'new production work')
+    await service.inventory(project.id)
+    const snapshot = service.snapshot(project.id)
+    expect(snapshot.sync.sourceConflictCount).toBe(1)
+    expect(snapshot.files[0].localPath).toBe(workingPath)
+    expect(snapshot.files[0].sourceConflict).toMatchObject({ originalPath: local.localPath, originalSha256: await hashLocalFile(local.localPath), copySha256: await hashLocalFile(workingPath) })
+    const detectedAt = snapshot.files[0].sourceConflict.detectedAt
+    await service.inventory(project.id)
+    expect(service.snapshot(project.id).files[0].sourceConflict.detectedAt).toBe(detectedAt)
+    const cloud = service.snapshot(project.id, { cloud: true })
+    expect(cloud.files[0].sourceConflict.originalSha256).toBe(snapshot.files[0].sourceConflict.originalSha256)
+    expect(JSON.stringify(cloud)).not.toContain(local.localPath)
+    expect(JSON.stringify(cloud)).not.toContain(activePath)
+    expect(await readFile(path.join(config.storage.stateDir, 'contexts', `${project.id}.md`), 'utf8')).toContain('original changed after LOAD')
+    const runProcess = vi.fn(); service.runProcess = runProcess
+    await expect(service.archiveNow(project.id, [local.id], { id: 'explicit-conflict' }, signal, { preserveVersions: false })).rejects.toThrow('diverged')
+    const automatic = { id: 'automatic-conflict' }
+    await service.archiveNow(project.id, null, automatic, signal, { preserveVersions: false })
+    expect(automatic).toMatchObject({ count: 0, sourceConflictCount: 1 })
+    expect(runProcess).not.toHaveBeenCalled()
+    await expect(service.unloadNow(project.id, null, { id: 'unload-conflict' }, signal)).rejects.toThrow('diverged')
+    expect(await readFile(workingPath, 'utf8')).toBe('original bytes')
+    expect(await readFile(local.localPath, 'utf8')).toBe('new production work')
+    await writeFile(workingPath, 'new production work')
+    await service.inventory(project.id)
+    expect(service.snapshot(project.id).sync.sourceConflictCount).toBe(0)
+    expect(service.snapshot(project.id).files[0].sourceConflict).toBeNull()
+  })
+
+  it('does not report identical original bytes rewritten after LOAD as a version conflict', async () => {
+    const { service, project, local } = await loadedFixture()
+    await writeFile(local.localPath, 'original bytes')
+    await service.inventory(project.id)
+    expect(service.snapshot(project.id).sync.sourceConflictCount).toBe(0)
+    expect(service.snapshot(project.id).files[0].sourceConflict).toBeNull()
+  })
+
+  it('archives other new files while a diverged identity is retained', async () => {
+    const { service, project, activePath, local, signal } = await loadedFixture()
+    await writeFile(local.localPath, 'new production work')
+    const note = path.join(activePath, 'sources/tmp/workshop/New.md')
+    await writeFile(note, 'independent new work')
+    service.runProcess = async (script, args) => {
+      if (script.endsWith('index-add-paths.mjs')) return {}
+      expect(await readFile(path.join(args[0], 'New.md'), 'utf8')).toBe('independent new work')
+      await expect(readFile(path.join(args[0], 'scene.hiplc'))).rejects.toThrow()
+      const index = args.find((argument) => argument.startsWith('--index=')).slice(8)
+      await writeFile(index, JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches: [{ rel: 'New.md', taille: 20, sha: await hashLocalFile(note), manifeste: 'New.md.file.json' }] }))
+      return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+    }
+    const job = { id: 'other-file-archive' }
+    await service.archiveNow(project.id, null, job, signal, { preserveVersions: false })
+    expect(job).toMatchObject({ count: 1, sourceConflictCount: 1 })
+    expect(service.state(project.id).backups['workshop:New.md'].sha256).toBe(await hashLocalFile(note))
+    expect(await readFile(local.localPath, 'utf8')).toBe('new production work')
+  })
+
+  // 3 October 2026, 10:20 CEST: preserve the exact divergent origin in its own archive before updating the active identity.
+  it('automatically archives both versions without overwriting production or the loaded copy', async () => {
+    const { service, project, activePath, local, signal } = await loadedFixture()
+    const workingPath = path.join(activePath, 'sources/tmp/workshop/scene.hiplc')
+    await writeFile(local.localPath, 'new production work')
+    await writeFile(workingPath, 'new active work')
+    const archived = new Map()
+    service.runProcess = async (script, args) => {
+      if (script.endsWith('index-add-paths.mjs')) return {}
+      if (script.endsWith('restaurer.mjs')) {
+        const relative = args[1].replace(/\.file\.json$/, ''), target = path.join(args[2], relative)
+        await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, archived.get(relative))
+        return { lastEvent: { ev: 'restaure', cible: target } }
+      }
+      const fiches = []
+      for (const file of service.state(project.id).inventory.localFiles) {
+        try {
+          const bytes = await readFile(path.join(args[0], file.relativePath))
+          const sha = await hashLocalFile(path.join(args[0], file.relativePath))
+          archived.set(file.relativePath, bytes.toString())
+          fiches.push({ rel: file.relativePath, taille: bytes.length, sha, manifeste: `${file.relativePath}.file.json` })
+        } catch (error) { if (error.code !== 'ENOENT') throw error }
+      }
+      await writeFile(args.find((argument) => argument.startsWith('--index=')).slice(8), JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches }))
+      return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+    }
+    const job = { id: 'preserve-both' }
+    await service.archiveNow(project.id, null, job, signal)
+    const version = job.preservedVersions[0]
+    expect(version.fileId).toBe(local.id)
+    expect(version.sha256).toBe(await hashLocalFile(local.localPath))
+    expect([...archived.values()]).toContain('new production work')
+    expect(archived.get('scene.hiplc')).toBe('new active work')
+    expect(service.snapshot(project.id).sync.sourceConflictCount).toBe(0)
+    expect(service.snapshot(project.id).files.find((file) => file.id === local.id).preservedOriginalVersion.versionId).toBe(version.versionId)
+    expect(await readFile(local.localPath, 'utf8')).toBe('new production work')
+    expect(await readFile(workingPath, 'utf8')).toBe('new active work')
+    const repeated = { id: 'repeat-preservation' }
+    await service.archiveNow(project.id, null, repeated, signal)
+    expect(repeated.preservedVersions).toBeUndefined()
+    expect(repeated.count).toBe(0)
+    const released = { id: 'release-two-versions' }
+    await service.unloadNow(project.id, null, released, signal)
+    expect(released.count).toBe(2)
+    expect(await readFile(local.localPath, 'utf8')).toBe('new production work')
+  })
+
+  it('does not clear a conflict when the original changes again during version archival', async () => {
+    const { service, project, local, signal } = await loadedFixture()
+    await writeFile(local.localPath, 'first production revision')
+    service.runProcess = async (script, args) => {
+      if (script.endsWith('index-add-paths.mjs')) return {}
+      const fiches = []
+      for (const file of service.state(project.id).inventory.localFiles) {
+        try {
+          const target = path.join(args[0], file.relativePath), bytes = await readFile(target)
+          fiches.push({ rel: file.relativePath, taille: bytes.length, sha: await hashLocalFile(target), manifeste: `${file.relativePath}.file.json` })
+        } catch (error) { if (error.code !== 'ENOENT') throw error }
+      }
+      await writeFile(args.find((argument) => argument.startsWith('--index=')).slice(8), JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches }))
+      await writeFile(local.localPath, 'second production revision')
+      return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+    }
+    await expect(service.archiveNow(project.id, null, { id: 'origin-changed-again' }, signal)).rejects.toThrow('Original changed while')
+    expect(service.snapshot(project.id).sync.sourceConflictCount).toBe(1)
+    expect(service.state(project.id).preservedOriginalVersions).toBeUndefined()
+    expect(await readFile(local.localPath, 'utf8')).toBe('second production revision')
+  })
+
+  it('refuses an edited preserved-version destination without overwriting it or clearing the conflict', async () => {
+    const { service, project, activePath, local, signal } = await loadedFixture()
+    await writeFile(local.localPath, 'new production work')
+    const hash = await hashLocalFile(local.localPath)
+    const target = path.join(activePath, 'sources/tmp/workshop/versions/workshop', hash, 'scene.hiplc')
+    await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, 'edited historical branch')
+    const runProcess = vi.fn(); service.runProcess = runProcess
+    await expect(service.archiveNow(project.id, null, { id: 'edited-history' }, signal)).rejects.toThrow('destination changed')
+    expect(runProcess).not.toHaveBeenCalled()
+    expect(await readFile(target, 'utf8')).toBe('edited historical branch')
+    expect(service.snapshot(project.id).sync.sourceConflictCount).toBe(1)
+  })
+
+  it('reports absent legacy LOAD baselines without claiming which version changed first', async () => {
+    const { service, project, local } = await loadedFixture()
+    delete service.state(project.id).productionBaselines[local.id]
+    await writeFile(local.localPath, 'different legacy original')
+    await service.inventory(project.id)
+    expect(service.snapshot(project.id).files.find((file) => file.id === local.id).sourceConflict.reason).toBe('baseline-missing')
+  })
+
+  it('keeps the original conflict and both local files when the version archive fails', async () => {
+    const { service, project, activePath, local, signal } = await loadedFixture()
+    await writeFile(local.localPath, 'new production work')
+    service.runProcess = async () => { throw new Error('Version cloud unavailable') }
+    await expect(service.archiveNow(project.id, null, { id: 'failed-version' }, signal)).rejects.toThrow('Version cloud unavailable')
+    expect(service.snapshot(project.id).sync.sourceConflictCount).toBe(1)
+    expect(service.state(project.id).preservedOriginalVersions).toBeUndefined()
+    expect(await readFile(local.localPath, 'utf8')).toBe('new production work')
+    expect(await readFile(path.join(activePath, 'sources/tmp/workshop/scene.hiplc'), 'utf8')).toBe('original bytes')
+  })
+
+  it('frees managed copies and recovers exact bytes while retaining production sources', async () => {
+    const { service, project, activePath, local, signal } = await loadedFixture()
+    const released = { id: 'release-1' }
+    await service.unloadNow(project.id, null, released, signal)
+    expect(released.count).toBe(1); expect(released.freedBytes).toBeGreaterThan(0)
+    await expect(readFile(path.join(activePath, 'sources/tmp/workshop/scene.hiplc'))).rejects.toThrow()
+    expect(await readFile(local.localPath, 'utf8')).toBe('original bytes')
+    expect(service.snapshot(project.id).workspace.state).toBe('unloaded')
+    expect(service.snapshot(project.id).workspace.recoverableCount).toBe(1)
+    await service.recoverNow(project.id, { id: 'recover-1' }, signal)
+    expect(await readFile(path.join(service.state(project.id).workspacePath, 'sources/tmp/workshop/scene.hiplc'), 'utf8')).toBe('original bytes')
+    expect(service.snapshot(project.id).workspace.recoverableCount).toBe(0)
+  })
+  // 10 October 2026, 12:36 CEST: plans count saved working additions and never confuse kept originals with copies.
+  it('plans only loaded copies even when the source is kept', async () => {
+    const { service, project, local } = await loadedFixture()
+    service.project(project.id).sources.find((source) => source.id === local.sourceId).keep = true
+    const { plan } = await service.request('unload-plan', { projectId: project.id })
+    expect(plan.count).toBe(1)
+    expect(plan.blockers).toHaveLength(0)
+    expect(plan.entries[0].id).toBe(local.id)
+  })
+  // 10 October 2026, 12:35 CEST: retain Finder metadata through release and every recovery retry.
+  it('retains Finder metadata locally and recovers its exact bytes', async () => {
+    const { service, project, activePath, signal } = await loadedFixture()
+    await writeFile(path.join(activePath, '.DS_Store'), 'finder layout')
+    const released = { id: 'finder-release' }
+    await service.unloadNow(project.id, null, released, signal)
+    expect(released.retainedMetadataCount).toBe(1)
+    const record = service.state(project.id).releases.at(-1)
+    expect(await readFile(record.retainedMetadata[0].path, 'utf8')).toBe('finder layout')
+    await service.recoverNow(project.id, { id: 'finder-recovery' }, signal)
+    expect(await readFile(path.join(service.state(project.id).workspacePath, '.DS_Store'), 'utf8')).toBe('finder layout')
+    expect(await readFile(record.retainedMetadata[0].path, 'utf8')).toBe('finder layout')
+  })
+  // 10 October 2026, 12:52 CEST: recovery handles a process stopped between the two metadata locations.
+  it('recovers metadata still in an interrupted release tree', async () => {
+    const { service, project, activePath, signal } = await loadedFixture()
+    await writeFile(path.join(activePath, '.DS_Store'), 'finder layout')
+    await service.unloadNow(project.id, null, { id: 'interrupted-finder-release' }, signal)
+    const record = service.state(project.id).releases.at(-1)
+    await mkdir(record.path, { recursive: true })
+    await rename(record.retainedMetadata[0].path, path.join(record.path, '.DS_Store'))
+    record.phase = 'interrupted'
+    await service.recoverNow(project.id, { id: 'interrupted-finder-recovery' }, signal)
+    expect(await readFile(path.join(service.state(project.id).workspacePath, '.DS_Store'), 'utf8')).toBe('finder layout')
+    expect(await readFile(path.join(record.path, '.DS_Store'), 'utf8')).toBe('finder layout')
+  })
+  it('refuses a loaded file edited after its restore proof', async () => {
+    const { service, project, activePath, signal } = await loadedFixture()
+    const file = path.join(activePath, 'sources/tmp/workshop/scene.hiplc')
+    await writeFile(file, 'new creative work')
+    await expect(service.unloadNow(project.id, null, { id: 'refused' }, signal)).rejects.toThrow('Modified')
+    expect(await readFile(file, 'utf8')).toBe('new creative work')
+  })
+  it('retains extra unarchived files and refuses incomplete selections', async () => {
+    const { service, project, activePath, signal } = await loadedFixture()
+    await expect(service.unloadNow(project.id, [], { id: 'partial' }, signal)).rejects.toThrow('complete')
+    await writeFile(path.join(activePath, 'new.txt'), 'not archived')
+    await expect(service.unloadNow(project.id, null, { id: 'extra' }, signal)).rejects.toThrow('Untracked')
+    expect(await readFile(path.join(activePath, 'new.txt'), 'utf8')).toBe('not archived')
+  })
+  it('does not release a workspace when its fresh cloud restore fails', async () => {
+    const { service, project, activePath, signal } = await loadedFixture()
+    service.runProcess = async () => { throw new Error('Cloud unavailable') }
+    await expect(service.unloadNow(project.id, null, { id: 'offline' }, signal)).rejects.toThrow('Cloud unavailable')
+    expect(await readFile(path.join(activePath, 'sources/tmp/workshop/scene.hiplc'), 'utf8')).toBe('original bytes')
+  })
+  it('recovers nested paths without duplicating their parent directories', async () => {
+    const { service, project, signal } = await loadedFixture('textures/nested/scene.hiplc')
+    await service.unloadNow(project.id, null, { id: 'nested-release' }, signal)
+    const job = { id: 'nested-recovery' }
+    await service.recoverNow(project.id, job, signal)
+    expect(job.loaded[0].path).toBe(path.join(service.state(project.id).workspacePath, 'sources/tmp/workshop/textures/nested/scene.hiplc'))
+  })
+  it('retains changes made while the cloud recovery probe runs', async () => {
+    const { service, project, activePath, signal } = await loadedFixture()
+    const originalRun = service.runProcess
+    const file = path.join(activePath, 'sources/tmp/workshop/scene.hiplc')
+    service.runProcess = async (...args) => { const result = await originalRun(...args); await writeFile(file, 'changed during cloud check'); return result }
+    await expect(service.unloadNow(project.id, null, { id: 'concurrent-edit' }, signal)).rejects.toThrow('Modified')
+    expect(await readFile(file, 'utf8')).toBe('changed during cloud check')
+  })
+  it('refuses symbolic links inside the managed workspace', async () => {
+    const { service, project, activePath, local, signal } = await loadedFixture()
+    await symlink(local.localPath, path.join(activePath, 'linked.hiplc'))
+    await expect(service.unloadNow(project.id, null, { id: 'linked' }, signal)).rejects.toThrow('symlink')
+    expect(await readFile(local.localPath, 'utf8')).toBe('original bytes')
+  })
+  it('archives edits and new files from a loaded copy without replacing production sources', async () => {
+    const { service, project, activePath, folder, signal } = await loadedFixture()
+    const workingFile = path.join(activePath, 'sources/tmp/workshop/scene.hiplc')
+    await writeFile(workingFile, 'edited working scene')
+    const added = path.join(activePath, 'sources/tmp/workshop/new.md')
+    await writeFile(added, 'new working note')
+    await service.inventory(project.id)
+    expect(service.state(project.id).inventory.localFiles.find((file) => file.id === 'workshop:scene.hiplc').localPath).toBe(workingFile)
+    const cloudBytes = new Map()
+    let archiveCalls = 0
+    service.runProcess = async (script, args) => {
+      if (script.endsWith('index-add-paths.mjs')) return { lastEvent: null }
+      if (script.endsWith('restaurer.mjs')) {
+        const target = path.join(args[2], args[1])
+        await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, cloudBytes.get(args[1]))
+        return { lastEvent: { ev: 'restaure', cible: target } }
+      }
+      archiveCalls++
+      const fiches = []
+      for (const file of service.state(project.id).inventory.localFiles) {
+        try {
+          const bytes = await readFile(path.join(args[0], file.relativePath)); cloudBytes.set(file.relativePath, bytes)
+          fiches.push({ rel: file.relativePath, taille: bytes.length, sha: await hashLocalFile(path.join(args[0], file.relativePath)), manifeste: `${file.relativePath}.file.json` })
+        } catch (error) { if (error.code !== 'ENOENT') throw error }
+      }
+      await writeFile(args.find((arg) => arg.startsWith('--index=')).slice(8), JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches }))
+      return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+    }
+    await service.archiveNow(project.id, null, { id: 'save-edits' }, signal)
+    expect(service.state(project.id).backups['workshop:scene.hiplc'].sha256).toBe(await hashLocalFile(workingFile))
+    expect(service.state(project.id).backups['workshop:new.md'].size).toBe(16)
+    expect(await readFile(path.join(folder, 'scene.hiplc'), 'utf8')).toBe('original bytes')
+    await service.unloadNow(project.id, null, { id: 'unload-edits' }, signal)
+    await service.inventory(project.id)
+    expect(service.snapshot(project.id).files.find((file) => file.id === 'workshop:scene.hiplc').status).toBe('older-local')
+    const cloudSnapshot = service.snapshot(project.id, { cloud: true })
+    expect(cloudSnapshot.jobs).toEqual([])
+    expect(cloudSnapshot.files.find((file) => file.id === 'workshop:scene.hiplc').sha256).toBe(service.state(project.id).backups['workshop:scene.hiplc'].sha256)
+    expect(cloudSnapshot.files.find((file) => file.id === 'workshop:scene.hiplc').localPath).toBeUndefined()
+    const previousCalls = archiveCalls
+    await service.archiveNow(project.id, null, { id: 'old-production' }, signal)
+    expect(archiveCalls).toBe(previousCalls)
+    const recovered = { id: 'recover-edits' }
+    await service.recoverNow(project.id, recovered, signal)
+    expect(await readFile(recovered.loaded.find((file) => file.id === 'workshop:scene.hiplc').path, 'utf8')).toBe('edited working scene')
+    expect(await readFile(recovered.loaded.find((file) => file.id === 'workshop:new.md').path, 'utf8')).toBe('new working note')
+  })
+  // 3 October 2026, 09:39 CEST: repeated LOAD keeps existing bytes and extends only missing managed destinations.
+  it('keeps the active workspace and its files when the same LOAD is repeated', async () => {
+    const { service, project, activePath, signal } = await loadedFixture()
+    const job = { id: 'second-load' }
+    await service.restoreNow(project.id, null, job, signal)
+    expect(job).toMatchObject({ count: 0, retainedCount: 1, loaded: [] })
+    expect(service.state(project.id).workspacePath).toBe(activePath)
+  })
+
+  async function additionalFixture() {
+    const context = await loadedFixture()
+    const { service, project, folder } = context
+    const cloud = new Map([['scene.hiplc', 'original bytes'], ['First.png', 'first archived bytes'], ['Second.png', 'second archived bytes']])
+    for (const [name, bytes] of cloud) if (name !== 'scene.hiplc') await writeFile(path.join(folder, name), bytes)
+    await service.inventory(project.id)
+    for (const file of service.state(project.id).inventory.localFiles.filter((file) => !file.loadedCopy)) service.state(project.id).backups[file.id] = { ...file,
+      sha256: await hashLocalFile(file.localPath), manifestPath: `pages/test/${file.relativePath}.file.json`, sourceFolder: 'pages/test', relativeManifest: `${file.relativePath}.file.json` }
+    service.runProcess = async (_script, args) => {
+      const target = path.join(args[2], args[1])
+      await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, cloud.get(args[1]))
+      return { lastEvent: { ev: 'restaure', cible: target } }
+    }
+    return { ...context, cloud, currentPath: path.join(context.config.storage.workspaceDir, project.id, 'Current.json') }
+  }
+
+  it('adds archived files without replacing an edited scene or changing its active LOAD identity', async () => {
+    const { service, project, activePath, folder, currentPath, signal } = await additionalFixture()
+    const workingScene = path.join(activePath, 'sources/tmp/workshop/scene.hiplc')
+    await writeFile(workingScene, 'working scene edit')
+    const before = JSON.parse(await readFile(currentPath, 'utf8'))
+    const job = { id: 'add-all' }
+    await service.restoreNow(project.id, null, job, signal)
+    expect(job).toMatchObject({ count: 2, retainedCount: 1 })
+    expect(await readFile(workingScene, 'utf8')).toBe('working scene edit')
+    expect(await readFile(path.join(folder, 'scene.hiplc'), 'utf8')).toBe('original bytes')
+    const after = JSON.parse(await readFile(currentPath, 'utf8'))
+    expect(after.path).toBe(before.path); expect(after.loadId).toBe(before.loadId)
+    expect(after.files).toHaveLength(3)
+    expect(after.additionIds).toEqual(['add-all'])
+    expect(service.snapshot(project.id).files.find((file) => file.id === 'workshop:First.png')).toMatchObject({ loadedCopy: true, status: 'verified' })
+    const repeated = { id: 'add-all-again' }
+    await service.restoreNow(project.id, null, repeated, signal)
+    expect(repeated).toMatchObject({ count: 0, retainedCount: 3 })
+  })
+
+  it('leaves the active copy and its record untouched when a later cloud download fails', async () => {
+    const { service, project, activePath, currentPath, signal, config } = await additionalFixture()
+    const before = await readFile(currentPath, 'utf8'), restore = service.runProcess
+    service.runProcess = async (script, args) => { if (args[1] === 'Second.png') throw new Error('Cloud failed'); return restore(script, args) }
+    await expect(service.restoreNow(project.id, ['workshop:First.png', 'workshop:Second.png'], { id: 'cloud-failure' }, signal)).rejects.toThrow('Cloud failed')
+    expect(await readFile(currentPath, 'utf8')).toBe(before)
+    await expect(readFile(path.join(activePath, 'sources/tmp/workshop/First.png'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(realpath(path.join(config.storage.workspaceDir, project.id, 'additions/cloud-failure'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(path.join(activePath, 'sources/tmp/workshop/scene.hiplc'), 'utf8')).toBe('original bytes')
+  })
+
+  // 3 October 2026, 09:52 CEST: an older cloud version cannot hide newer production bytes that have not been archived.
+  it('refuses adding an outdated archive over the identity of a changed production source', async () => {
+    const { service, project, folder, activePath, currentPath, signal } = await additionalFixture()
+    const before = await readFile(currentPath, 'utf8')
+    await writeFile(path.join(folder, 'First.png'), 'new production bytes waiting for archive')
+    await expect(service.restoreNow(project.id, ['workshop:First.png'], { id: 'outdated-source' }, signal)).rejects.toThrow('Archive changed production')
+    expect(await readFile(path.join(folder, 'First.png'), 'utf8')).toBe('new production bytes waiting for archive')
+    await expect(readFile(path.join(activePath, 'sources/tmp/workshop/First.png'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(currentPath, 'utf8')).toBe(before)
+  })
+
+  it('rolls back only newly published unchanged files when another destination appears during LOAD', async () => {
+    const { service, project, activePath, currentPath, signal } = await additionalFixture()
+    const before = await readFile(currentPath, 'utf8'), restore = service.runProcess
+    const second = path.join(activePath, 'sources/tmp/workshop/Second.png')
+    service.runProcess = async (script, args) => { if (args[1] === 'Second.png') await writeFile(second, 'new user bytes'); return restore(script, args) }
+    await expect(service.restoreNow(project.id, ['workshop:First.png', 'workshop:Second.png'], { id: 'collision' }, signal)).rejects.toMatchObject({ code: 'EEXIST' })
+    expect(await readFile(second, 'utf8')).toBe('new user bytes')
+    await expect(readFile(path.join(activePath, 'sources/tmp/workshop/First.png'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(path.join(activePath, 'sources/tmp/workshop/Second (2).png'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(currentPath, 'utf8')).toBe(before)
+  })
+
+  it('retains user changes to a newly published file even if another addition then fails', async () => {
+    const { service, project, activePath, currentPath, signal } = await additionalFixture()
+    const directory = path.join(activePath, 'sources/tmp/workshop'), prepare = service.prepareWorkspaceDirectory.bind(service)
+    const before = await readFile(currentPath, 'utf8')
+    let publicationCount = 0
+    service.prepareWorkspaceDirectory = async (target, root) => {
+      await prepare(target, root)
+      if (target === directory && ++publicationCount === 2) {
+        await writeFile(path.join(directory, 'First.png'), 'user changed newly loaded file')
+        await writeFile(path.join(directory, 'Second.png'), 'user created collision')
+      }
+    }
+    const job = { id: 'changed-during-failure' }
+    await expect(service.restoreNow(project.id, ['workshop:First.png', 'workshop:Second.png'], job, signal)).rejects.toMatchObject({ code: 'EEXIST' })
+    expect(job.retainedOnFailure).toBe(1)
+    expect(await readFile(path.join(directory, 'First.png'), 'utf8')).toBe('user changed newly loaded file')
+    expect(await readFile(currentPath, 'utf8')).toBe(before)
+  })
+
+  it('unloads and recovers every added file through the same exact cloud versions', async () => {
+    const { service, project, folder, activePath, signal } = await additionalFixture()
+    await service.restoreNow(project.id, null, { id: 'add-for-recovery' }, signal)
+    const release = { id: 'release-extended' }
+    await service.unloadNow(project.id, null, release, signal)
+    expect(release.count).toBe(3)
+    await expect(realpath(activePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    const recovered = { id: 'recover-extended' }
+    await service.recoverNow(project.id, recovered, signal)
+    expect(recovered.loaded).toHaveLength(3)
+    expect(await readFile(recovered.loaded.find((file) => file.id === 'workshop:First.png').path, 'utf8')).toBe('first archived bytes')
+    expect(await readFile(path.join(folder, 'scene.hiplc'), 'utf8')).toBe('original bytes')
+  })
+
+  // 3 October 2026, 09:42 CEST: destination ancestry and the verified change token remain authoritative across commit.
+  it('refuses a symbolic destination ancestor before publishing an added file outside the copy', async () => {
+    const { service, project, activePath, root, signal } = await additionalFixture()
+    const outside = path.join(root, 'outside-copy'); await mkdir(outside)
+    const directory = path.join(activePath, 'sources/tmp/workshop'), prepare = service.prepareWorkspaceDirectory.bind(service)
+    service.prepareWorkspaceDirectory = async (target, scope) => {
+      if (target === directory) {
+        await rename(directory, `${directory}-retained`)
+        await symlink(outside, directory)
+      }
+      return prepare(target, scope)
+    }
+    await expect(service.restoreNow(project.id, ['workshop:First.png'], { id: 'redirected-addition' }, signal)).rejects.toThrow('symlink')
+    await expect(readFile(path.join(outside, 'First.png'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(path.join(`${directory}-retained`, 'scene.hiplc'), 'utf8')).toBe('original bytes')
+  })
+
+  it('does not assign an old hash to bytes edited after the additional LOAD commit', async () => {
+    const { service, project, activePath, signal } = await additionalFixture()
+    const save = service.save.bind(service), target = path.join(activePath, 'sources/tmp/workshop/First.png')
+    let edited = false
+    service.save = async (id) => {
+      if (!edited && service.state(id).restorations['workshop:First.png']) { edited = true; await writeFile(target, 'post-commit working edit') }
+      return save(id)
+    }
+    await service.restoreNow(project.id, ['workshop:First.png'], { id: 'post-commit-edit' }, signal)
+    expect(service.snapshot(project.id).files.find((file) => file.id === 'workshop:First.png')).toMatchObject({ sha256: null, status: 'pending' })
+    expect(await readFile(target, 'utf8')).toBe('post-commit working edit')
+  })
+
+  // 3 October 2026, 09:48 CEST: first LOAD and recovery keep the same verified-byte token and immediately refresh their mapping.
+  it('retains an edit between initial restore verification and workspace activation without calling it verified', async () => {
+    const { service, project, signal } = await loadedFixture()
+    await service.unloadNow(project.id, null, { id: 'release-before-edit' }, signal)
+    const prepare = service.prepareWorkspaceWorkshop.bind(service)
+    service.prepareWorkspaceWorkshop = async (id, directory) => {
+      await prepare(id, directory)
+      await writeFile(path.join(directory, 'sources/tmp/workshop/scene.hiplc'), 'edited before activation')
+    }
+    await service.restoreNow(project.id, null, { id: 'new-initial-copy' }, signal)
+    expect(service.snapshot(project.id).files.find((file) => file.id === 'workshop:scene.hiplc')).toMatchObject({ sha256: null, status: 'pending' })
+  })
+
+  it('refreshes file paths on unload and recovery and does not certify an edit made during recovery activation', async () => {
+    const { service, project, folder, activePath, signal } = await loadedFixture()
+    await service.unloadNow(project.id, null, { id: 'release-for-activation' }, signal)
+    expect(service.snapshot(project.id).files[0].localPath).toBe(path.join(folder, 'scene.hiplc'))
+    expect(service.snapshot(project.id).files[0].loadedCopy).toBeUndefined()
+    const state = service.state(project.id)
+    let currentWorkspace = state.workspacePath
+    Object.defineProperty(state, 'workspacePath', { enumerable: true, configurable: true,
+      get: () => currentWorkspace,
+      set: (directory) => {
+        currentWorkspace = directory
+        if (directory) writeFileSync(path.join(directory, 'sources/tmp/workshop/scene.hiplc'), 'edited during activation')
+      },
+    })
+    await service.recoverNow(project.id, { id: 'recover-activation-edit' }, signal)
+    const file = service.snapshot(project.id).files[0]
+    expect(file).toMatchObject({ loadedCopy: true, sha256: null, status: 'pending' })
+    expect(file.localPath).not.toContain(activePath)
+    expect(file.localPath).toBe(path.join(currentWorkspace, 'sources/tmp/workshop/scene.hiplc'))
+    expect(await readFile(file.localPath, 'utf8')).toBe('edited during activation')
+  })
+  it('restores release metadata across service restarts', async () => {
+    const { service, project, config, signal } = await loadedFixture()
+    await service.unloadNow(project.id, null, { id: 'persistent' }, signal)
+    const restarted = await createAssetsService({ config })
+    cleanup.push(() => restarted.close())
+    expect(restarted.snapshot(project.id).workspace.recoverableCount).toBe(1)
+    expect(restarted.snapshot(project.id).workspace.loadedCount).toBe(0)
+  })
+})
+
+// 2 October 2026, 15:30 CEST: an automatic bulk job yields to queued actions after each verified batch.
+it('lets a queued action run between automatic backup batches', async () => {
+  const { service, project, config, folder } = await fixture()
+  config.storage.batchFiles = 1
+  config.storage.progressPath = path.join(folder, 'missing-progress.md')
+  await writeFile(path.join(folder, 'second.png'), 'second original')
+  await service.register(project)
+  const order = []
+  const publishedCounts = []
+  service.cloudPublisher = async (snapshot) => { publishedCounts.push(snapshot.sync.backedUpCount) }
+  service.runProcess = async (script, args) => {
+    if (script.endsWith('index-add-paths.mjs')) return { lastEvent: null }
+    order.push('batch')
+    const fiches = []
+    for (const file of service.state(project.id).inventory.localFiles) {
+      try { fiches.push({ rel: file.relativePath, taille: file.size, sha: await hashLocalFile(path.join(args[0], file.relativePath)), manifeste: `${file.relativePath}.file.json` }) }
+      catch (error) { if (error.code !== 'ENOENT') throw error }
+    }
+    await writeFile(args.find((arg) => arg.startsWith('--index=')).slice(8), JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches }))
+    return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+  }
+  service.state(project.id).watched = true
+  service.scheduleBackup(project.id)
+  service.enqueue(project.id, 'check', async () => { order.push('action') })
+  for (let pass = 0; pass < 10; pass++) {
+    await service.queue
+    await Promise.resolve()
+    if (!service.pending.size) break
+  }
+  expect(order).toEqual(['action', 'batch', 'batch'])
+  expect(service.snapshot(project.id).sync.pendingCount).toBe(0)
+  expect(publishedCounts).toEqual([1, 2])
+})
+
+// 21 October 2026: an edited note keeps its manifest path; the index already holds it, so the index must not be run (14 to 34 s) for it.
+it('runs the search index only for manifests it does not hold yet', async () => {
+  const { service, project, folder } = await fixture()
+  await service.register(project)
+  const indexed = []
+  service.runProcess = async (script, args) => {
+    if (script.endsWith('index-add-paths.mjs')) { indexed.push((await readFile(args[0], 'utf8')).trim().split('\n')); return { lastEvent: null } }
+    const fiches = await Promise.all(service.state(project.id).inventory.localFiles.map(async (file) => ({ rel: file.relativePath, taille: file.size,
+      sha: await hashLocalFile(path.join(args[0], file.relativePath)), manifeste: `${file.relativePath}.file.json` })).map((p) => p.catch(() => null)))
+    await writeFile(args.find((arg) => arg.startsWith('--index=')).slice(8), JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches: fiches.filter(Boolean) }))
+    return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+  }
+  const run = (id) => service.archiveNow(project.id, null, { id, background: true }, new AbortController().signal)
+  await run('first')
+  expect(indexed.length).toBeGreaterThan(0)
+  const callsAfterFirst = indexed.length
+  // same manifests, same content: nothing for the index to learn
+  service.state(project.id).pendingIndex = [...Object.values(service.state(project.id).backups).map((backup) => backup.manifestPath)]
+  await run('second')
+  expect(indexed.length).toBe(callsAfterFirst)
+  expect(service.state(project.id).pendingIndex).toEqual([])
+  // same manifest path, new content (a thumbnail may differ): indexed again
+  await writeFile(path.join(folder, 'scene.hiplc'), 'edited scene')
+  await run('third')
+  expect(indexed.length).toBeGreaterThan(callsAfterFirst)
+})
+
+// 21 October 2026: a pass with a single batch used to publish twice (mid-pass, then at the end), 17 s of Git each.
+it('publishes once for a pass that has a single batch, and mid-pass only when another batch follows', async () => {
+  const { service, project, config, folder } = await fixture()
+  config.storage.progressPath = path.join(folder, 'missing-progress.md')
+  config.storage.publishIntervalMs = 0
+  await writeFile(path.join(folder, 'second.png'), 'second original')
+  await service.register(project)
+  const published = []
+  service.cloudPublisher = async (snapshot) => { published.push(snapshot.sync.backedUpCount) }
+  service.runProcess = async (script, args) => {
+    if (script.endsWith('index-add-paths.mjs')) return { lastEvent: null }
+    const fiches = []
+    for (const file of service.state(project.id).inventory.localFiles) {
+      try { fiches.push({ rel: file.relativePath, taille: file.size, sha: await hashLocalFile(path.join(args[0], file.relativePath)), manifeste: `${file.relativePath}.file.json` }) }
+      catch (error) { if (error.code !== 'ENOENT') throw error }
+    }
+    await writeFile(args.find((arg) => arg.startsWith('--index=')).slice(8), JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches }))
+    return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+  }
+  await service.archiveNow(project.id, null, { id: 'one-batch', background: true }, new AbortController().signal, { maxBatches: 4 })
+  expect(published.length).toBe(1)
+  // two batches: the first one publishes mid-pass, the end publishes the rest
+  published.length = 0
+  config.storage.batchFiles = 1
+  await writeFile(path.join(folder, 'third.png'), 'third original')
+  await writeFile(path.join(folder, 'fourth.png'), 'fourth original')
+  await service.inventory(project.id)
+  await service.archiveNow(project.id, null, { id: 'two-batches', background: true }, new AbortController().signal, { maxBatches: 4 })
+  expect(published.length).toBe(2)
+})
+
+// 2 October 2026, 15:40 CEST: foreground actions wait for the active writer and pass waiting background jobs.
+it('prioritizes an interactive action without interrupting the active writer', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  let release, begin
+  const gate = new Promise((resolve) => { release = resolve })
+  const started = new Promise((resolve) => { begin = resolve })
+  const order = []
+  service.enqueue(project.id, 'archive', async () => { order.push('active'); begin(); await gate; order.push('verified') }, { background: true })
+  await started
+  service.enqueue(project.id, 'archive', async () => { order.push('background') }, { background: true })
+  service.enqueue(project.id, 'check', async () => { order.push('interactive') })
+  release()
+  await service.queue
+  expect(order).toEqual(['active', 'verified', 'interactive', 'background'])
+})
+
+// 2 October 2026, 15:25 CEST: bounded inert text cannot read outside a registered source or interpret HTML.
+it('previews registered text with a bounded read while refusing binary content and unknown paths', async () => {
+  const { service, project, folder } = await fixture()
+  await writeFile(path.join(folder, 'notes.md'), '<script>never execute</script>\nOriginal feedback')
+  await writeFile(path.join(folder, 'large.log'), 'x'.repeat(300000))
+  await writeFile(path.join(folder, 'binary.txt'), Buffer.from([1, 0, 2]))
+  await service.register(project)
+  const preview = await service.request('preview-text', { projectId: project.id, fileId: 'workshop:notes.md' })
+  expect(preview.text).toContain('<script>never execute</script>')
+  expect(preview.truncated).toBe(false)
+  const large = await service.request('preview-text', { projectId: project.id, fileId: 'workshop:large.log' })
+  expect(large.text.length).toBe(262144); expect(large.truncated).toBe(true)
+  await expect(service.request('preview-text', { projectId: project.id, fileId: '../outside.md' })).rejects.toThrow('unavailable')
+  await expect(service.request('preview-text', { projectId: project.id, fileId: 'workshop:binary.txt' })).rejects.toThrow('Binary')
+})
+
+// 20 October 2026, 15:16 CEST: explicit article reading preserves full embedded HTML without widening ordinary text previews.
+it.each(['html', 'htm'])('reads a standalone %s article beyond the text cap only when explicitly requested', async extension => {
+  const { service, project, folder } = await fixture()
+  const html = '<h1>UV-Match Height</h1>' + 'x'.repeat(300000)
+  await writeFile(path.join(folder, `article.${extension}`), html)
+  await writeFile(path.join(folder, 'notes.md'), 'Notes')
+  await service.register(project)
+  expect((await service.request('preview-text', {projectId:project.id,fileId:`workshop:article.${extension}`})).truncated).toBe(true)
+  const article = await service.request('preview-text', {projectId:project.id,fileId:`workshop:article.${extension}`,format:'html'})
+  expect(article.text).toBe(html)
+  expect(article.truncated).toBe(false)
+  await expect(service.request('preview-text', {projectId:project.id,fileId:'workshop:notes.md',format:'html'})).rejects.toThrow('HTML article required')
+})
+
+// 20 October 2026, 15:12 CEST: article metadata cannot overwrite an independently updated project definition.
+it('sets only the article reference after verifying its reviewed bytes', async () => {
+  const {service,project,folder}=await fixture()
+  const html='<h1>Reviewed article</h1>'
+  await writeFile(path.join(folder,'article.html'),html)
+  await service.register(project)
+  const {createHash}=await import('node:crypto')
+  const article={fileId:'workshop:article.html',title:'UV-Match Height',sha256:createHash('sha256').update(html).digest('hex'),thumbnailUrl:'data:image/jpeg;base64,YQ=='}
+  const registered={...service.project(project.id),summary:'Independent update',dependencies:['other-project']}
+  await service.register(registered)
+  const result=await service.request('set-article',{projectId:project.id,article})
+  expect(result.project.article).toEqual(article)
+  expect(result.project.summary).toBe('Independent update')
+  expect(result.project.dependencies).toEqual(['other-project'])
+  expect(result.project.sources.map(source=>source.id)).toEqual(registered.sources.map(source=>source.id))
+  await writeFile(path.join(folder,'article.html'),'<h1>Changed article</h1>')
+  await expect(service.request('set-article',{projectId:project.id,article})).rejects.toThrow('Reviewed article changed')
+  await expect(service.request('set-article',{projectId:project.id,article:{...article,fileId:'workshop:../article.html'}})).rejects.toThrow('Invalid project article')
+})
+
+// 2 October 2026, 15:35 CEST: local recovery must proceed during cloud writes without racing another local action.
+it('runs local lifecycle jobs during an upload and serializes them per project', async () => {
+  const { service, project, config } = await fixture()
+  await service.register(project)
+  let releaseUpload, releaseLocal, beginUpload, beginLocal
+  const uploadGate = new Promise((resolve) => { releaseUpload = resolve })
+  const localGate = new Promise((resolve) => { releaseLocal = resolve })
+  const uploadStarted = new Promise((resolve) => { beginUpload = resolve })
+  const localStarted = new Promise((resolve) => { beginLocal = resolve })
+  const order = []
+  service.enqueue(project.id, 'archive', async () => { order.push('upload'); beginUpload(); await uploadGate; service.state(project.id).uploadEvidence = true; await service.save(project.id) }, { background: true })
+  await uploadStarted
+  service.enqueue(project.id, 'restore', async () => { order.push('load'); beginLocal(); await localGate; service.state(project.id).localEvidence = true; await service.save(project.id) })
+  await localStarted
+  service.enqueue(project.id, 'unload', async () => { order.push('unload') })
+  expect(order).toEqual(['upload', 'load'])
+  releaseLocal()
+  await service.workspaceQueues.get(project.id)
+  expect(order).toEqual(['upload', 'load', 'unload'])
+  releaseUpload()
+  await service.queue
+  const persisted = JSON.parse(await readFile(service.statePath(project.id), 'utf8'))
+  expect(persisted.localEvidence).toBe(true); expect(persisted.uploadEvidence).toBe(true)
+})
+
+// 3 October 2026, 03:10 CEST: previews finish cleanly even when their client disconnects during streaming.
+it('completes image previews and settles disconnected streams', async () => {
+  const { service, project, folder } = await fixture()
+  const bytes = Buffer.alloc(262144, 7)
+  await writeFile(path.join(folder, 'preview.png'), bytes)
+  await service.register(project)
+  const { url } = await service.request('preview-url', { projectId: project.id, fileId: 'workshop:preview.png' })
+  const request = { url, socket: { remoteAddress: '127.0.0.1' } }
+  const received = []
+  const complete = new Writable({ write(chunk, _encoding, callback) { received.push(chunk); callback() } })
+  complete.setHeader = () => {}
+  await service.handlePreview(request, complete)
+  expect(Buffer.concat(received)).toEqual(bytes)
+  const disconnected = new Writable({ write(_chunk, _encoding, callback) { this.destroy(); callback() } })
+  disconnected.setHeader = () => {}
+  await service.handlePreview(request, disconnected)
+  expect(disconnected.destroyed).toBe(true)
+  const again = new Writable({ write(_chunk, _encoding, callback) { callback() } })
+  again.setHeader = () => {}
+  await service.handlePreview(request, again)
+  expect(again.writableFinished).toBe(true)
+})
+
+// 3 October 2026, 03:12 CEST: independent source failures remain visible until every failed watcher recovers.
+it('keeps watcher errors per source instead of clearing the whole project on one recovery', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  let report
+  service.watchFactory = class {
+    constructor(_backup, _settle, _reconnect, onReport) { report = onReport }
+    suivre() {}
+    oublier() {}
+    toutOublier() {}
+  }
+  await service.createWatcher()
+  report(`${project.id}:one`, 'first source unavailable')
+  report(`${project.id}:two`, 'second source unavailable')
+  report(`${project.id}:one`, 'surveillance du dossier rétablie')
+  expect(service.snapshot(project.id).sync.watchError).toBe('second source unavailable')
+  report(`${project.id}:two`, 'surveillance du dossier rétablie')
+  expect(service.snapshot(project.id).sync.watchError).toBeNull()
+  report(`${project.id}:two`, 'second source unavailable')
+  await service.setWatch(project.id, false)
+  expect(service.snapshot(project.id).sync.watchError).toBeNull()
+})
+
+// 9 October 2026, 00:01 CEST: queued watcher backups must honor an explicit stop before starting cloud work.
+it('skips a queued automatic backup after its watcher is stopped', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  service.watchFactory = class { suivre() {} oublier() {} toutOublier() {} }
+  let release, signalStarted
+  const gate = new Promise((resolve) => { release = resolve })
+  const started = new Promise((resolve) => { signalStarted = resolve })
+  const blocker = service.enqueue(project.id, 'archive', async () => { signalStarted(); await gate })
+  await started
+  const archive = vi.spyOn(service, 'archiveNow').mockResolvedValue(undefined)
+
+  await service.setWatch(project.id, true)
+  const queued = [...service.jobs.values()].find((job) => job.id !== blocker.jobId && job.projectId === project.id)
+  expect(queued?.state).toBe('queued')
+  await service.setWatch(project.id, false)
+
+  release()
+  await service.queue
+
+  expect(archive).not.toHaveBeenCalled()
+  expect(queued.state).toBe('interrupted')
+})
+
+// 8 October 2026, 20:04 CEST: a missing optional source is absent by design and must not enter the retrying watcher.
+it('does not watch a missing optional source', async () => {
+  const { service, project, root } = await fixture()
+  const optionalPath = path.join(root, 'unreal', 'not-created-yet')
+  await service.register({ ...project, sources: [...project.sources, { id: 'optional-unreal', namespace: 'unreal', localPath: optionalPath, optional: true }] })
+  const watched = []
+  service.state(project.id).watched = true
+  service.watchFactory = class {
+    suivre(id, localPath) { watched.push({ id, localPath }) }
+    oublier() {}
+    toutOublier() {}
+  }
+  await service.setWatch(project.id, true)
+  expect(watched.some((entry) => entry.id === `${project.id}:workshop`)).toBe(true)
+  expect(watched.some((entry) => entry.id === `${project.id}:optional-unreal`)).toBe(false)
+  expect(service.snapshot(project.id).sync.watchError).toBeNull()
+})
+
+// 8 October 2026, 20:10 CEST: a present optional root follows the normal watch path.
+it('watches a present optional source', async () => {
+  const { service, project, root } = await fixture()
+  const optionalPath = path.join(root, 'unreal', 'ready')
+  await mkdir(optionalPath)
+  await service.register({ ...project, sources: [...project.sources, { id: 'optional-unreal', namespace: 'unreal', localPath: optionalPath, optional: true }] })
+  const watched = []
+  service.state(project.id).watched = true
+  service.watchFactory = class {
+    suivre(id, localPath) { watched.push({ id, localPath }) }
+    oublier() {}
+    toutOublier() {}
+  }
+  await service.setWatch(project.id, true)
+  expect(watched.some((entry) => entry.id === `${project.id}:optional-unreal` && entry.localPath === optionalPath)).toBe(true)
+  expect(service.snapshot(project.id).sync.watchError).toBeNull()
+})
+
+// 3 October 2026, 03:19 CEST: a dependency declared only on its source must survive cloud publication.
+it('preserves a source shared host identity in cloud snapshots and mappings', async () => {
+  const { service, project } = await fixture()
+  project.sources[0].sharedProjectId = 'shared-core'
+  await service.register(project)
+  const local = service.snapshot(project.id)
+  const cloud = service.snapshot(project.id, { cloud: true })
+  expect(local.mapping.dependencies).toEqual(['shared-core'])
+  expect(cloud.mapping.dependencies).toEqual(local.mapping.dependencies)
+  expect(cloud.sources[0].sharedProjectId).toBe('shared-core')
+  expect(cloud.sources[0].localPath).toBeUndefined()
+})
+
+// 3 October 2026, 03:28 CEST: reconnecting a source discovers files created while the watcher was unavailable.
+it('inventories files immediately after a source watcher reconnects', async () => {
+  const { service, project, folder } = await fixture()
+  await service.register(project)
+  let report
+  service.config.watch.inventoryDebounceMs = 1
+  service.state(project.id).watched = true
+  service.watchFactory = class {
+    constructor(_backup, _settle, _reconnect, onReport) { report = onReport }
+    suivre() {}
+    oublier() {}
+    toutOublier() {}
+  }
+  await service.createWatcher()
+  await writeFile(path.join(folder, 'created-offline.md'), 'created while disconnected')
+  report(`${project.id}:workshop`, 'surveillance du dossier rétablie')
+  for (let attempt = 0; attempt < 50 && !service.snapshot(project.id).files.some((file) => file.name === 'created-offline.md'); attempt++) await new Promise((resolve) => setTimeout(resolve, 5))
+  expect(service.snapshot(project.id).files.some((file) => file.name === 'created-offline.md')).toBe(true)
+})
+
+// 3 October 2026, 03:32 CEST: starting with existing sources still prepares canonical feedback, memory and a watched workshop.
+it('initializes linked production sources with the same canonical project setup', async () => {
+  const { service, config, project, folder } = await fixture()
+  service.watchFactory = class { suivre() {} oublier() {} toutOublier() {} }
+  const result = await service.request('start', { id: project.id, name: project.name, project: { ...project, dependencies: ['shared-core'] } })
+  await service.queue
+  expect(result.setup.workshopPath).toBe(folder)
+  expect(result.setup.watched).toBe(true)
+  expect(result.project.dependencies).toEqual(['shared-core'])
+  expect(result.project.sources.some((source) => source.namespace === 'memory' && source.localPath === path.join(config.roots.memory, 'Projects', project.id))).toBe(true)
+  expect(await readFile(result.setup.feedbackPath, 'utf8')).toContain('Project initialized')
+  expect(await readFile(result.setup.memoryFile, 'utf8')).toContain(project.id)
+  expect(await readFile(path.join(folder, 'scene.hiplc'), 'utf8')).toBe('original bytes')
+})
+
+it('rejects a mismatched linked project identity before initializing directories', async () => {
+  const { service, project, config } = await fixture()
+  await expect(service.request('start', { id: 'another-project', name: 'Another project', project })).rejects.toThrow('does not match')
+  await expect(readFile(path.join(config.roots.memory, 'Projects', 'another-project', 'Project.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+})
+
+// 3 October 2026, 03:37 CEST: resuming a loaded project must route new files to its active workshop.
+it('resumes the active loaded workshop without changing the canonical source identity', async () => {
+  const { service, project, folder, config } = await fixture()
+  await service.register(project)
+  service.watchFactory = class { suivre() {} oublier() {} toutOublier() {} }
+  const active = path.join(config.storage.workspaceDir, project.id, 'loads', 'active-load')
+  await mkdir(active, { recursive: true })
+  service.state(project.id).workspacePath = active
+  const result = await service.request('start', { id: project.id, name: project.name })
+  await service.queue
+  expect(result.setup.workshopPath).toBe(path.join(active, 'sources', 'tmp', 'workshop'))
+  expect(result.setup.sourceWorkshopPath).toBe(folder)
+  expect(service.project(project.id).sources.find((source) => source.id === 'workshop').localPath).toBe(folder)
+  expect(service.snapshot(project.id).mapping.context.workshopPath).toBe(result.setup.workshopPath)
+  expect(service.snapshot(project.id, { cloud: true }).mapping.context.workshopPath).toBeUndefined()
+  await writeFile(path.join(result.setup.workshopPath, 'new-texture.exr'), 'new working bytes')
+  await service.inventory(project.id)
+  const file = service.snapshot(project.id).files.find((entry) => entry.id === 'workshop:new-texture.exr')
+  expect(file.localPath).toBe(path.join(result.setup.workshopPath, 'new-texture.exr'))
+  expect(file.loadedCopy).toBe(true)
+  const context = await readFile(path.join(config.storage.stateDir, 'contexts', `${project.id}.md`), 'utf8')
+  expect(context).toContain(`Write new project files in this workshop: ${result.setup.workshopPath}`)
+  let opened
+  service.openDirectory = async (directory) => { opened = directory }
+  await service.request('open-workshop', { projectId: project.id, path: '/unrelated-client-path' })
+  expect(opened).toBe(result.setup.workshopPath)
+})
+
+it('refuses a loaded workshop outside its managed project root before writing memory', async () => {
+  const { service, project, config } = await fixture()
+  await service.register(project)
+  service.state(project.id).workspacePath = config.roots.tmp
+  await expect(service.request('start', { id: project.id, name: project.name })).rejects.toThrow('Unsafe active workspace')
+  await expect(readFile(path.join(config.roots.memory, 'Projects', project.id, 'Project.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  let opened = false
+  service.openDirectory = async () => { opened = true }
+  await expect(service.request('open-workshop', { projectId: project.id })).rejects.toThrow('Unsafe active workspace')
+  expect(opened).toBe(false)
+})
+
+// 3 October 2026, 03:45 CEST: workshop opening reports Finder failures and rejects missing or redirected folders.
+it('opens the canonical workshop and reports an unavailable or redirected directory', async () => {
+  const { service, project, folder, root } = await fixture()
+  await service.register(project)
+  const opened = []
+  service.openDirectory = async (directory) => { opened.push(directory) }
+  await service.request('open-workshop', { projectId: project.id })
+  expect(opened).toEqual([folder])
+  service.openDirectory = async () => { throw new Error('Finder unavailable') }
+  await expect(service.request('open-workshop', { projectId: project.id })).rejects.toThrow('Finder unavailable')
+  await rename(folder, path.join(root, 'moved-workshop'))
+  await expect(service.request('open-workshop', { projectId: project.id })).rejects.toThrow()
+  await symlink(path.join(root, 'moved-workshop'), folder)
+  await expect(service.request('open-workshop', { projectId: project.id })).rejects.toThrow()
+  expect(opened).toHaveLength(1)
+})
+
+// 3 October 2026, 15:16 CEST: a repeated agent checkpoint is append-only, source-labeled, and never a claimed cloud proof.
+it('commits one explicit turn checkpoint and rejects an unsafe canonical feedback', async () => {
+  const { service, project, folder, config } = await fixture()
+  const feedbackPath = path.join(folder, 'FEEDBACK.md')
+  await writeFile(feedbackPath, '# Earlier knowledge\n')
+  await service.register({ ...project, feedbackPath })
+  const payload = { projectId: project.id, agent: 'antigravity', sessionId: 'real-session', checkpointId: 'turn-1', summary: 'Verified UV scale.\nNext: export.' }
+  const first = await service.request('checkpoint', payload)
+  expect(first.checkpoint).toMatchObject({ added: true, backupConfirmed: false })
+  const saved = await readFile(feedbackPath, 'utf8')
+  const second = await service.request('checkpoint', payload)
+  expect(second.checkpoint.added).toBe(false)
+  expect(await readFile(feedbackPath, 'utf8')).toBe(saved)
+  expect(saved.startsWith('# Earlier knowledge\n')).toBe(true)
+  const event = feedbackEvents(saved, { projectId: project.id }).find(entry => entry.provenance.mode === 'checkpoint')
+  expect(event.body).toBe(payload.summary)
+  expect(event.provenance.provider).toBe('antigravity')
+  const bindingsPath = path.join(config.storage.stateDir, 'SessionBindings.json')
+  await writeFile(bindingsPath, JSON.stringify({ 'real-session': 'another-project' }))
+  await expect(service.request('checkpoint', payload)).rejects.toThrow('different project')
+  expect(await readFile(feedbackPath, 'utf8')).toBe(saved)
+  await rm(bindingsPath)
+  await expect(service.request('checkpoint', { ...payload, sessionId: '../unsafe' })).rejects.toThrow('identity')
+  const outside = path.join(folder, 'outside.md')
+  await writeFile(outside, 'untouched'); await rm(feedbackPath); await symlink(outside, feedbackPath)
+  await expect(service.request('checkpoint', payload)).rejects.toThrow('unsafe')
+  expect(await readFile(outside, 'utf8')).toBe('untouched')
+})
+
+// 5 October 2026, 13:18 CEST: binding initializes the agent metadata and project context before the next mirror pass.
+it('indexes the actual conversation agent in its project context immediately on binding', async () => {
+  const { service, project } = await fixture()
+  await service.register(project)
+  await service.request('bind-session', { projectId: project.id, sessionId: 'actual-codex-session', agent: 'codex' })
+  const index = JSON.parse(await readFile(path.join(service.config.storage.stateDir, 'GlobalProjectIndex.json'), 'utf8'))
+  expect(index.projects[project.id].context.conversations[0]).toMatchObject({ sessionId: 'actual-codex-session', provider: 'codex', projectId: project.id, reader: { action: 'conversation', conversationId: 'codex:actual-codex-session' } })
+  const before = await readFile(path.join(service.config.storage.stateDir, 'SessionBindings.json'), 'utf8')
+  await expect(service.request('bind-session', { projectId: project.id, sessionId: 'actual-codex-session', agent: 'claude' })).rejects.toThrow('identity cannot change')
+  expect(await readFile(path.join(service.config.storage.stateDir, 'SessionBindings.json'), 'utf8')).toBe(before)
+})
+
+// 12 October 2026: verification failures may use exit code zero; diagnostics must survive.
+it('keeps child verification diagnostics on a zero exit code', async () => {
+  const { runAssetProcess } = await import('./AssetsService.mjs')
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises')
+  const directory = await mkdtemp(path.join(tmpdir(), 'assets-diagnostics-'))
+  try {
+    const script = path.join(directory, 'probe.mjs')
+    await writeFile(script, `console.error('verification rejected: HTTP 429'); console.log(JSON.stringify({zr:1,ev:'done',verifyKo:1}))`)
+    const result = await runAssetProcess(script, [])
+    expect(result.lastEvent.verifyKo).toBe(1)
+    expect(result.diagnostics).toContain('HTTP 429')
+  } finally { await rm(directory, {recursive:true,force:true}) }
+})
+
+// 21 October 2026: GitHub refused every write on the index repository ("Repository is above its size quota"); the index step then failed at the head
+// of every pass and nothing was archived for hours. The archive is the data, the index a convenience: it must never block the bytes.
+it('archives the bytes when the search index is refused, keeps its paths, and pauses automatic retries', async () => {
+  const { service, project, folder } = await fixture()
+  await service.register(project)
+  let indexCalls = 0, indexRefused = true
+  service.runProcess = async (script, args) => {
+    if (script.endsWith('index-add-paths.mjs')) {
+      indexCalls++
+      if (indexRefused) throw new Error('Repository is above its size quota')
+      return { lastEvent: null }
+    }
+    const snapshot = service.state(project.id).inventory.localFiles
+    const fiches = await Promise.all(snapshot.map(async (file) => ({ rel: file.relativePath, taille: file.size,
+      sha: await hashLocalFile(path.join(args[0], file.relativePath)), manifeste: `${file.relativePath}.file.json` })).map((p) => p.catch(() => null)))
+    const index = args.find((arg) => arg.startsWith('--index=')).slice(8)
+    await writeFile(index, JSON.stringify({ dest: args[1], at: new Date().toISOString(), fiches: fiches.filter(Boolean) }))
+    return { lastEvent: { ev: 'done', skipped: [], verifyKo: 0 } }
+  }
+  await service.inventory(project.id)
+  service.state(project.id).pendingIndex = ['pages/ZenRayAssets/test-project/sources/tmp/workshop/old.file.json']
+  const job = { id: 'automatic-1', background: true }
+  await service.archiveNow(project.id, null, job, new AbortController().signal)
+  // the bytes are archived and verified although the index was refused
+  const backup = service.state(project.id).backups['workshop:scene.hiplc']
+  expect(backup.sha256).toBe(await hashLocalFile(path.join(folder, 'scene.hiplc')))
+  expect(job.indexError).toContain('size quota')
+  expect(service.state(project.id).pendingIndex.length).toBeGreaterThan(0)
+  // the pause is on disk: a restarted service reads it instead of paying one more refusal
+  const pausedUntil = service.indexBlockedUntil
+  expect(pausedUntil).toBeGreaterThan(Date.now())
+  service.indexBlockedUntil = 0
+  await service.loadIndexPause()
+  expect(service.indexBlockedUntil).toBe(pausedUntil)
+  expect(indexCalls).toBe(1)                    // one attempt for the whole pass, not one per index point
+  // a second automatic pass inside the pause does not touch the refused repository again
+  await writeFile(path.join(folder, 'second.txt'), 'second file')
+  await service.archiveNow(project.id, null, { id: 'automatic-2', background: true }, new AbortController().signal)
+  expect(indexCalls).toBe(1)
+  expect(service.state(project.id).backups['workshop:second.txt']).toBeTruthy()
+  // once the pause is over and the repository accepts writes, the durable paths are indexed and cleared
+  indexRefused = false; service.indexBlockedUntil = 0
+  await service.archiveNow(project.id, null, { id: 'automatic-3', background: true }, new AbortController().signal)
+  expect(service.state(project.id).pendingIndex).toEqual([])
+  await service.setIndexPause(0)
+  await service.loadIndexPause()
+  expect(service.indexBlockedUntil).toBe(0)
+})

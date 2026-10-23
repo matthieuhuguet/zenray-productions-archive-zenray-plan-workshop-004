@@ -1,0 +1,92 @@
+import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+
+// ═══ LE BUDGET D'OUVERTURE DE L'APERÇU, TENU PAR UN TEST ════════════════════════════════════════
+//
+// OBJECTIF POSÉ PAR MATTHIEU le 2026-08-31 : « ça devrait s'ouvrir en 0,1 s ». Il en prenait deux.
+//
+// LE BUDGET, MESURÉ CETTE NUIT ET NON SUPPOSÉ :
+//   un aller-retour vers l'API ........ 150 à 250 ms
+//   déchiffrer une vignette 1080 ......... 0,1 ms
+//   déchiffrer un plein format 4 Mo ...... 0,9 ms
+//   déchiffrer une photo drone 18 Mo ..... 3,7 ms
+//
+// La conclusion est sans appel : le déchiffrement ne coûte RIEN, les allers-retours coûtent TOUT.
+// Tenir cent millisecondes impose donc ZÉRO aller-retour bloquant avant le premier pixel.
+//
+// CE QUE CE TEST GARDE, et pourquoi il lit le source plutôt que de mesurer : une régression de
+// vitesse ne se voit pas dans une suite de tests unitaires, elle ne se voit que chez l'utilisateur,
+// une fois déployée. Ce contrôle fige donc les DEUX décisions structurelles qui rendent l'ouverture
+// instantanée, et rougit si l'une disparaît.
+
+const quickLook = readFileSync('src/components/QuickLookOverlay.jsx', 'utf8')
+const app = readFileSync('src/App.jsx', 'utf8')
+const pages = readFileSync('src/create/Pages.jsx', 'utf8')
+// Les commentaires CITENT le code fautif pour expliquer pourquoi il a été retiré : un contrôle qui
+// les lit trouverait la faute dans sa propre explication. On ne regarde donc que le code.
+const sansCommentaires = (src) => src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+const appCode = sansCommentaires(`${app}\n${pages}`)
+const eagle = readFileSync('src/lib/eagleLink.js', 'utf8')
+
+describe('budget d’ouverture de l’aperçu : zéro aller-retour bloquant', () => {
+  it('le wrapper ne rend JAMAIS un écran vide en attendant la résolution', () => {
+    // C'était le premier coût : `if (!resolved) return <div />` bloquait tout pendant un aller-retour,
+    // alors que le corps sait afficher la vignette du cache immédiatement.
+    expect(quickLook, 'un `<div />` vide est réapparu dans le wrapper').not.toMatch(/if \(!resolved\) return <div \/>/)
+    expect(quickLook, 'le corps doit être monté même sans résolution').toMatch(/if \(!resolved\) return <QuickLookBody/)
+  })
+
+  it('la réponse déjà connue se lit SANS promesse', () => {
+    expect(eagle, '`eaglePathConnu` a disparu de eagleLink.js').toMatch(/export function eaglePathConnu/)
+    expect(quickLook, 'le wrapper doit consulter le cache synchrone avant de partir sur le réseau').toMatch(/eaglePathConnu\(item\?\.contentPath\)/)
+  })
+
+  it('la grille prend ses vignettes dans l’index, et NE lit pas 748 manifestes', () => {
+    // Correction d'une exigence que j'avais écrite à l'envers le 2026-08-31. J'avais interdit ici la
+    // lecture de l'index, pour que la grille remplisse le cache des manifestes et que l'aperçu soit
+    // instantané. Le remède était pire : 748 lectures par dossier, `raw` qui sature, le serveur qui
+    // retombe sur l'API REST, et le quota de 5000 requêtes horaires vidé en quarante secondes.
+    // 2026-09-11 The grid and ZenRay Assets now share ONE index resolver, `indexThumbFor`. The guard
+    // checks both halves: the resolver reads the index, and the grid goes through the resolver.
+    // FR : la grille et ZenRay Assets partagent un seul résolveur d'index ; la garde vérifie les deux moitiés.
+    expect(appCode, 'le résolveur commun doit lire l’index (getNodeThumb)')
+      .toMatch(/const indexThumbFor = \(p\) => \{\s*const v = p \? getNodeThumb\(p\) : null/)
+    expect(appCode, 'la grille doit passer par le résolveur d’index, pas par les manifestes un par un')
+      .toMatch(/const v = indexThumbFor\(e\.contentPath\)/)
+  })
+
+  it('SEULE l’image sélectionnée voit son manifeste préchauffé', () => {
+    // C'est ce qui réconcilie les deux contraintes : une lecture ciblée au moment où l'utilisateur a
+    // déjà choisi, au lieu de parier sur tout un dossier pour n'en servir qu'une.
+    expect(appCode, 'le préchauffage ciblé a disparu : l’aperçu va redevenir lent')
+      .toMatch(/readImgManifestCached\(p\)/)
+    expect(appCode, 'le préchauffage ne doit viser qu’UNE sélection unique')
+      .toMatch(/selected\.size === 1/)
+  })
+
+  it('la prop de tri reste mémoïsée : un objet neuf rerend tout l’aperçu', () => {
+    // Un objet littéral passé à un composant coûteux le fait se rerendre à chaque frappe, ce qui
+    // relance ses résolutions d'image. Coût mesuré : une à deux secondes par flèche.
+    expect(pages, 'triQuickLook doit rester dans un useMemo').toMatch(/const triQuickLook = useMemo\(/)
+    expect(appCode, 'la prop tri ne doit pas être un objet littéral').not.toMatch(/tri=\{\{/)
+  })
+
+  it('l’affichage reste progressif : vignette d’abord, plein format ensuite', () => {
+    // C'est ce que Matthieu décrit comme le bon comportement : « il allait chercher la miniature et
+    // après un léger temps de chargement il affichait la résolution supérieure ».
+    const i = quickLook.indexOf('resolveThumbUrl(m)')
+    const j = quickLook.indexOf('await resolveFullUrl(m)')
+    expect(i, 'resolveThumbUrl a disparu du corps').toBeGreaterThan(0)
+    expect(j, 'resolveFullUrl a disparu du corps').toBeGreaterThan(0)
+    expect(i, 'la vignette doit être demandée AVANT le plein format').toBeLessThan(j)
+  })
+
+  it('la vignette reste légère : 1080, pas davantage', () => {
+    const conf = readFileSync('src/config/thumbnail.js', 'utf8')
+    const m = conf.match(/export const THUMB_MAX_SHORT = (\d+)/)
+    expect(m, 'THUMB_MAX_SHORT introuvable').toBeTruthy()
+    // À 2160 la vignette pèse 338 Ko au lieu de 142 : deux fois et demie plus lourde à charger,
+    // soit l'inverse de ce qu'il faut pour parcourir des images à la flèche.
+    expect(Number(m[1]), 'une vignette plus grande ralentit le parcours').toBeLessThanOrEqual(1080)
+  })
+})

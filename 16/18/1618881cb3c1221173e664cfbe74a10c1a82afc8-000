@@ -1,0 +1,124 @@
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { apiPost, ErreurApi, causeApi } from './apiPost.js'
+
+// ═══ UN ÉCHEC SERVEUR NE DOIT JAMAIS RESSEMBLER À UN SUCCÈS ═════════════════════════════════════
+//
+// Ce fichier existe à cause d'une perte de données possible, découverte le 2026-08-31 : la corbeille
+// copiait une page puis supprimait l'originale, et la copie pouvait échouer sans que rien ne le dise.
+// La suppression, elle, partait quand même.
+//
+// Les cas ci-dessous rejouent les trois formes d'échec réellement rencontrées sur ce projet.
+
+const reponse = (statut, corps, ok = statut < 400) => ({
+  ok, status: statut, statusText: 'x',
+  json: async () => { if (corps === undefined) throw new Error('corps illisible'); return corps },
+})
+
+afterEach(() => { vi.unstubAllGlobals() })
+
+describe('apiPost lève au lieu de rendre un échec déguisé', () => {
+  it('le quota GitHub épuisé (403) lève, il ne rend pas', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => reponse(403, { error: 'API rate limit exceeded' })))
+    await expect(apiPost('save', { path: 'pages/A.md' })).rejects.toThrow(ErreurApi)
+  })
+
+  it('le conflit de sha (409) lève — deux écritures concurrentes', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => reponse(409, { error: 'sha does not match' })))
+    await expect(apiPost('delete', { path: 'pages/A.md' })).rejects.toThrow(/409/)
+  })
+
+  it('LE CAS QUI TROMPAIT : un 200 portant { error } lève quand même', async () => {
+    // C'est celui-ci qu'aucune vérification de `r.ok` n'aurait attrapé, et il existe : le serveur
+    // répond parfois 200 en décrivant l'échec dans le corps.
+    vi.stubGlobal('fetch', vi.fn(async () => reponse(200, { error: 'invalid-source' })))
+    await expect(apiPost('save', {})).rejects.toThrow(/invalid-source/)
+  })
+
+  it('un corps illisible ne masque pas le statut', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => reponse(500, undefined, false)))
+    await expect(apiPost('save', {})).rejects.toThrow(/500/)
+  })
+
+  it('un vrai succès passe, et rend le corps', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => reponse(200, { ok: true, sha: 'abc' })))
+    await expect(apiPost('save', {})).resolves.toEqual({ ok: true, sha: 'abc' })
+  })
+
+  it('l’erreur PORTE l’action et le statut, pour que l’appelant trie sans lire la chaîne', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => reponse(403, { error: 'quota' })))
+    const e = await apiPost('delete', {}).catch((x) => x)
+    expect(e.action).toBe('delete')
+    expect(e.statut).toBe(403)
+  })
+})
+
+describe('le parcours de la corbeille : copier puis supprimer', () => {
+  // Reproduit l'enchaînement exact de `move()` dans App.jsx, sans React ni réseau réel.
+  const restaurer = async () => {
+    await apiPost('save', { path: 'pages/A.md', markdown: '# A' })
+    await apiPost('delete', { path: 'trash/A.md', sha: 'abc' })
+  }
+
+  it('LA PERTE DE DONNÉES : copie refusée, la suppression NE PART PAS', async () => {
+    const appels = []
+    vi.stubGlobal('fetch', vi.fn(async (_u, o) => {
+      const action = JSON.parse(o.body).action
+      appels.push(action)
+      return action === 'save' ? reponse(403, { error: 'quota' }) : reponse(200, { ok: true })
+    }))
+    await expect(restaurer()).rejects.toThrow(ErreurApi)
+    // Le point entier de ce fichier tient dans cette ligne.
+    expect(appels).toEqual(['save'])
+    expect(appels).not.toContain('delete')
+  })
+
+  it('quand la copie aboutit, la suppression suit normalement', async () => {
+    const appels = []
+    vi.stubGlobal('fetch', vi.fn(async (_u, o) => { appels.push(JSON.parse(o.body).action); return reponse(200, { ok: true }) }))
+    await restaurer()
+    expect(appels).toEqual(['save', 'delete'])
+  })
+})
+
+describe('la cause d’un échec ne se perd jamais en route', () => {
+  // Régression réelle du 2026-08-31 : en faisant lever apiPost, j'ai cassé le contrat d'une
+  // vingtaine d'appelants qui écrivaient `.catch(() => null)`. Ce catch n'attrapait qu'une panne
+  // réseau ; il attrapait désormais AUSSI l'échec serveur, et le transformait en `null`.
+  // Matthieu a vu « 0 déplacé(s), 1 échec(s) » sans la moindre cause.
+
+  it('causeApi rend le CORPS du serveur, celui que l’interface sait afficher', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 409, statusText: 'x', json: async () => ({ error: 'exists' }) })))
+    const j = await apiPost('move', {}).catch(causeApi)
+    expect(j.error).toBe('exists')   // « nom déjà pris », et non « erreur move » suivi de rien
+  })
+
+  it('sur une panne réseau, elle rend quand même un objet exploitable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline') }))
+    const j = await apiPost('move', {}).catch(causeApi)
+    expect(j.ok).toBe(false)
+    expect(j.error).toBeTruthy()
+  })
+
+  it('elle ne rend JAMAIS null — c’est exactement ce qui effaçait la cause', async () => {
+    for (const reponse of [
+      { ok: false, status: 500, statusText: 'x', json: async () => { throw new Error('illisible') } },
+      { ok: false, status: 403, statusText: 'x', json: async () => ({ error: 'quota' }) },
+    ]) {
+      vi.stubGlobal('fetch', vi.fn(async () => reponse))
+      const j = await apiPost('move', {}).catch(causeApi)
+      expect(j, 'causeApi a rendu null : la cause est perdue').not.toBeNull()
+      expect(j.error || j.ok === false).toBeTruthy()
+    }
+  })
+
+  it('AUCUN appel à apiPost ne jette plus sa cause à la poubelle', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { globSync } = await import('node:fs')
+    const fichiers = ['src/App.jsx', 'src/create/ZenRayAudioPanel.jsx', 'src/create/folderMarker.js']
+    for (const f of fichiers) {
+      const src = readFileSync(f, 'utf8')
+      const avale = [...src.matchAll(/apiPost\([^\n]*?\)\.catch\(\(\) => null\)/g)]
+      expect(avale.length, `${f} avale encore la cause de ${avale.length} appel(s)`).toBe(0)
+    }
+  })
+})

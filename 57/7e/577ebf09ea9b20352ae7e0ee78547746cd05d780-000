@@ -1,0 +1,334 @@
+// GUEST UPLOAD, THE LOGIC (2 October 2026). Pure: no HTTP, no env, no GitHub client of its own. Everything external is injected
+// (`gh` = server/githubGraphql.js or its in-memory twin, `resolveShare`, the media key, the receipt secret, the clock), so one
+// test can drive the browser uploader straight into this code against a fake GitHub.
+//
+// WHAT HAPPENS TO A REQUEST
+//   1. the share token is checked (signed, not expired, not revoked, a FOLDER share);
+//   2. the daily cap and the guest's folder are read from the drive repo (one query);
+//   3. every part (a chunk of a photo, or its thumbnail) is hashed, encrypted with the master key (AES-GCM, IV = first 12 bytes of
+//      the hash of the plaintext: the same bytes always give the same ciphertext, so a retry rewrites nothing) and committed to the
+//      public image shard in ONE commit; parts that already exist are skipped;
+//   4. photos whose last part just arrived get their `.img.json` manifest, written in ONE commit of the drive repo together with the
+//      guest folder marker and the day's counter. The commit names the head it was planned on: if somebody committed meanwhile the
+//      plan is redone, so a path can NEVER be overwritten and nothing is ever deleted.
+// Reads and writes go through GraphQL only, so the owner's REST quota is untouched.
+import { GUEST } from '../src/config/guestUpload.js'
+import { sliceParts } from '../src/lib/guestFrame.js'
+import { cleanGuestName, cleanSubPath, splitImageName, looksLikeImage } from '../src/lib/guestNames.js'
+import { GhError } from './githubGraphql.js'
+
+const enc = new TextEncoder()
+const hexOf = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join('')
+const b64Of = (u8) => (typeof Buffer !== 'undefined' ? Buffer.from(u8).toString('base64') : btoa(String.fromCharCode(...u8)))
+const sha256 = async (u8) => new Uint8Array(await crypto.subtle.digest('SHA-256', u8))
+const PID_RE = /^[A-Za-z0-9_-]{1,40}$/
+const HASH_RE = /^[0-9a-f]{64}$/
+const SHARD_RE = /^zenrayshards-img-[0-9a-f]{12}$/
+const THUMB_MAX_BYTES = 2 * 1024 * 1024
+const MAX_PARTS_PER_REQUEST = 40
+const MAX_COMMIT_TRIES = 8
+
+const retryReply = (reason, waitMs = 3000) => ({ ok: false, retry: true, reason, waitMs })
+const stopReply = (reason, extra = {}) => ({ ok: false, retry: false, reason, ...extra })
+const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10)
+const msToNextUtcMidnight = (ms) => { const d = new Date(ms); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - ms }
+const jitter = (ms) => ms + Math.floor(Math.random() * ms)
+const sleepDefault = (ms) => new Promise((r) => setTimeout(r, ms))
+
+export async function importMediaKey(keyB64) {
+  return crypto.subtle.importKey('raw', Uint8Array.from(atob(keyB64), (c) => c.charCodeAt(0)), 'AES-GCM', false, ['encrypt'])
+}
+
+// RECEIPTS. A part committed by an earlier request is later cited by the final request that writes the manifest. The client carries
+// the receipts between the two, so they are signed (HMAC): a guest cannot make a manifest point at a path, shard or IV of its choice.
+async function hmacKey(secret) { return crypto.subtle.importKey('raw', enc.encode(String(secret)), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']) }
+async function signReceipt(secret, tokenId, r) {
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), enc.encode([tokenId, r.pid, r.shard, r.role, r.idx, r.path, r.iv].join('|')))
+  return hexOf(new Uint8Array(sig)).slice(0, 32)
+}
+
+async function encryptPart(u8, key, ext) {
+  const hash = await sha256(u8)
+  const h = hexOf(hash)
+  const iv = hash.subarray(0, 12)
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, u8))
+  return { path: `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.${ext}`, iv: b64Of(iv), bytes: cipher }
+}
+
+// A guest's own folder: `<share root>/<name>`, marked by `.zrguest.json`. A folder of the same name that the OWNER made (no marker)
+// is never reused: the guest gets « <name> (invité) » instead, so guests can never write into the owner's own folders.
+function pickFolderName(name, probes) {
+  const [primaryMarker, primaryTree, altMarker, altTree] = probes
+  if (primaryMarker.kind === 'blob' || primaryTree.kind !== 'tree') return { name, hasMarker: primaryMarker.kind === 'blob' }
+  return { name: `${name} (invité)`, hasMarker: altMarker.kind === 'blob' && altTree.kind === 'tree' }
+}
+
+/**
+ * @param ctx { header, payload:Uint8Array, gh, key:CryptoKey, secret:string, resolveShare:(token)=>Promise<{path,kind,guestUpload?}>,
+ *              now?:()=>number, sleep?:(ms)=>Promise, owner?:string }
+ * @returns a JSON-able reply. Never throws: every failure becomes `{ ok:false, retry:true, ... }` (the client retries, the guest sees nothing)
+ *          or a polite stop (`daily`, `invalid-link`, `disabled`).
+ */
+export async function processGuestUpload(ctx) {
+  try { return await run(ctx) } catch (e) {
+    if (e instanceof GhError) {
+      if (e.kind === 'rate') return retryReply('rate', Math.min(e.waitMs || 30_000, 120_000))
+      return retryReply(e.kind === 'fatal' ? 'server' : 'busy', e.kind === 'fatal' ? 10_000 : 3_000)
+    }
+    if (e && e.message === 'bad-frame') return stopReply('bad-request')
+    return retryReply('server', 10_000)
+  }
+}
+
+async function run(ctx) {
+  const { header, payload, gh, key, secret } = ctx
+  const now = ctx.now || Date.now
+  const sleep = ctx.sleep || sleepDefault
+  const owner = ctx.owner || gh.owner || 'matthieuhuguet'
+  if (!header || header.v !== 1 || typeof header.d !== 'string') return stopReply('bad-request')
+
+  // 1. the share ------------------------------------------------------------------------------------------------------
+  let share
+  try { share = await ctx.resolveShare(header.d) } catch (e) { if (e instanceof GhError) throw e; return stopReply('invalid-link') }
+  if (!share || share.kind !== 'folder' || typeof share.path !== 'string' || !/^pages\//.test(share.path) || share.path.includes('..')) return stopReply('invalid-link')
+  if (share.guestUpload === false) return stopReply('disabled')
+  const root = share.path.replace(/\/+$/, '')
+  const tokenId = hexOf((await sha256(enc.encode(header.d))).subarray(0, 8))
+
+  const name = cleanGuestName(header.name)
+  const sub = cleanSubPath(header.sub)
+  const op = header.op === 'mkdir' ? 'mkdir' : 'put'
+  const today = dayOf(now())
+  const STATE = GUEST.STATE_DIR
+  const altName = `${name} (invité)`
+
+  // 2. parse and validate what the client sent -----------------------------------------------------------------------
+  const partsMeta = Array.isArray(header.parts) ? header.parts : []
+  const photosMeta = Array.isArray(header.photos) ? header.photos : []
+  if (partsMeta.length > MAX_PARTS_PER_REQUEST || photosMeta.length > GUEST.REQUEST_PHOTOS + 2) return stopReply('bad-request')
+  const partBytes = op === 'put' ? sliceParts(partsMeta, payload || new Uint8Array(0)) : []
+
+  const photos = new Map()                    // pid -> validated photo
+  const results = []                          // reply entries, in request order
+  for (const p of photosMeta) {
+    const bad = (reason) => results.push({ pid: String(p && p.pid || '').slice(0, 40), status: 'rejected', reason })
+    if (!p || !PID_RE.test(p.pid || '') || photos.has(p.pid)) { bad('bad'); continue }
+    const nm = splitImageName(p.name)
+    if (!nm) { bad('type'); continue }
+    if (!Number.isInteger(p.size) || p.size < 1 || p.size > GUEST.MAX_PHOTO_BYTES) { bad('size'); continue }
+    if (!HASH_RE.test(p.hash || '') || !Number.isInteger(p.nChunks) || p.nChunks < 1 || p.nChunks > 96) { bad('bad'); continue }
+    photos.set(p.pid, { ...p, ...nm, w: Math.max(0, Math.min(100000, Number(p.w) || 0)), h: Math.max(0, Math.min(100000, Number(p.h) || 0)), cited: Array.isArray(p.receipts) ? p.receipts : [], parts: [], receipts: [] })
+  }
+  partsMeta.forEach((pm, i) => {
+    const ph = pm && photos.get(pm.pid)
+    if (!ph) return
+    const bytes = partBytes[i]
+    if (pm.role === 'chunk' && Number.isInteger(pm.idx) && pm.idx >= 0 && pm.idx < ph.nChunks && bytes.length >= 1 && bytes.length <= GUEST.PART_BYTES) ph.parts.push({ role: 'chunk', idx: pm.idx, bytes })
+    else if (pm.role === 'thumb' && bytes.length >= 1 && bytes.length <= THUMB_MAX_BYTES && looksLikeImage(bytes)) ph.parts.push({ role: 'thumb', idx: 0, bytes })
+    else if (pm.role === 'thumbs' && bytes.length >= 1 && bytes.length <= THUMB_MAX_BYTES && looksLikeImage(bytes)) ph.parts.push({ role: 'thumbs', idx: 0, bytes }) // light grid thumbnail
+  })
+  for (const ph of photos.values()) {
+    const first = ph.parts.find((x) => x.role === 'chunk' && x.idx === 0)
+    if (first && !looksLikeImage(first.bytes)) { results.push({ pid: ph.pid, status: 'rejected', reason: 'type' }); photos.delete(ph.pid) }
+  }
+
+  // receipts cited from earlier requests must be genuine
+  let shardFromReceipts = null
+  for (const ph of photos.values()) {
+    for (const r of ph.cited.slice(0, 120)) {
+      if (!r || !SHARD_RE.test(r.shard || '') || typeof r.path !== 'string' || typeof r.iv !== 'string' || (r.role !== 'chunk' && r.role !== 'thumb' && r.role !== 'thumbs')) continue
+      const expected = await signReceipt(secret, tokenId, { pid: ph.pid, shard: r.shard, role: r.role, idx: r.role === 'chunk' ? r.idx : 0, path: r.path, iv: r.iv })
+      if (expected !== r.sig) continue
+      ph.receipts.push({ role: r.role, idx: r.role === 'chunk' ? r.idx : 0, path: r.path, iv: r.iv, shard: r.shard })
+      shardFromReceipts = r.shard
+    }
+  }
+
+  // 3. read the drive repo once: counter, shard, guest folder, candidate manifest paths -------------------------------
+  const finalizing = [...photos.values()].filter((p) => p.finalize === true)
+  const dirOf = (folder) => `${root}/${folder}${sub ? `/${sub}` : ''}`
+  const baseProbePaths = [
+    `${STATE}/shard.json`, `${STATE}/ledger/${today}.json`,
+    `${root}/${name}/${GUEST.GUEST_MARKER}`, `${root}/${name}`,
+    `${root}/${altName}/${GUEST.GUEST_MARKER}`, `${root}/${altName}`,
+  ]
+  const candidateProbes = () => {
+    // for each finalizing photo, under both possible folder names: the plain manifest path and the hash-suffixed one
+    const out = []
+    for (const ph of finalizing) for (const f of [name, altName]) out.push(`${dirOf(f)}/${ph.display}.img.json`, `${dirOf(f)}/${ph.stem}-${ph.hash.slice(0, 8)}.${ph.extRaw}.img.json`)
+    return out
+  }
+  const readData = async () => {
+    const paths = [...baseProbePaths, ...(op === 'put' ? candidateProbes() : [])]
+    const st = await gh.read(gh.dataRepo, paths)
+    return { ...st, at: (i) => st.items[i], paths }
+  }
+  let data = await readData()
+  const readJson = (item) => { try { return item && item.kind === 'blob' && item.text ? JSON.parse(item.text) : null } catch { return null } }
+  let ledger = readJson(data.items[1])
+  const used0 = ledger && Number.isFinite(ledger.n) ? ledger.n : 0
+  if (op === 'put' && finalizing.length && used0 >= GUEST.DAILY_MAX) return stopReply('daily', { waitMs: msToNextUtcMidnight(now()), used: used0, max: GUEST.DAILY_MAX })
+
+  // 4. the guest's folder ------------------------------------------------------------------------------------------------
+  let folder = pickFolderName(name, data.items.slice(2, 6))
+  const folderMeta = () => ({ v: 1, name: folder.name, by: name, createdAt: new Date(now()).toISOString() })
+
+  if (op === 'mkdir') {
+    if (!sub) return { ok: true, folder: folder.name, results: [] }
+    for (let attempt = 0; attempt < MAX_COMMIT_TRIES; attempt++) {
+      const st = attempt === 0 ? data : await readData()
+      folder = pickFolderName(name, st.items.slice(2, 6))
+      const adds = [{ path: `${dirOf(folder.name)}/${GUEST.FOLDER_MARKER}`, text: JSON.stringify({ folder: true, createdAt: Date.now() }) }]
+      if (!folder.hasMarker) adds.push({ path: `${root}/${folder.name}/${GUEST.GUEST_MARKER}`, text: JSON.stringify(folderMeta()) })
+      try { await gh.commit(gh.dataRepo, { expectedHeadOid: st.oid, headline: 'guest: new folder', additions: adds }); return { ok: true, folder: folder.name, sub, results: [] } } catch (e) { if (!(e instanceof GhError && e.kind === 'stale')) throw e; await sleep(jitter(150)) }
+    }
+    return retryReply('busy')
+  }
+
+  // 5. the shard: choose it, then commit the parts ----------------------------------------------------------------------
+  const allParts = [...photos.values()].flatMap((ph) => ph.parts.map((pt) => ({ ph, pt })))
+  let shard = null
+  let shardOid = null
+  if (allParts.length || finalizing.length) {
+    shard = shardFromReceipts || null
+    if (!shard) {
+      const st = readJson(data.items[0])
+      shard = st && SHARD_RE.test(st.repo || '') ? st.repo : null
+      if (shard) {
+        const probe = await gh.read(shard, [])
+        if (probe.diskUsageKb >= GUEST.SHARD_ROLLOVER_KB) shard = null
+      }
+      if (!shard) {
+        shard = await gh.createShard()
+        await saveShardState(gh, { repo: shard, createdAt: new Date(now()).toISOString() }, sleep)
+        data = await readData()                  // the head moved: re-read so the first manifest commit is not stale
+      }
+    }
+  }
+  const encrypted = []                         // { ph, pt, path, iv, bytes }
+  for (const { ph, pt } of allParts) {
+    const ext = pt.role === 'thumb' || pt.role === 'thumbs' ? (looksLikeImageJpeg(pt.bytes) ? 'jpg' : 'webp') : 'bin'
+    encrypted.push({ ph, pt, ...(await encryptPart(pt.bytes, key, ext)) })
+  }
+  if (encrypted.length) {
+    for (let attempt = 0; attempt < MAX_COMMIT_TRIES; attempt++) {
+      const st = await gh.read(shard, encrypted.map((e) => e.path))
+      shardOid = st.oid
+      const adds = encrypted.filter((_, i) => st.items[i].kind !== 'blob')
+      if (!adds.length) break
+      // two guests can send the same bytes in one request: one file per path
+      const seen = new Set(); const unique = adds.filter((a) => (seen.has(a.path) ? false : (seen.add(a.path), true)))
+      try { shardOid = await gh.commit(shard, { expectedHeadOid: st.oid, headline: `+${unique.length} guest part${unique.length > 1 ? 's' : ''}`, additions: unique.map((a) => ({ path: a.path, bytes: a.bytes })) }); break } catch (e) {
+        if (!(e instanceof GhError && e.kind === 'stale') || attempt === MAX_COMMIT_TRIES - 1) throw e
+        await sleep(jitter(150))
+      }
+    }
+  } else if (finalizing.length) {
+    shardOid = (await gh.read(shard, [])).oid
+  }
+  for (const e of encrypted) {
+    const r = { pid: e.ph.pid, shard, role: e.pt.role, idx: e.pt.idx, path: e.path, iv: e.iv }
+    e.ph.receipts.push({ role: r.role, idx: r.idx, path: r.path, iv: r.iv, shard })
+    e.ph.newReceipts = e.ph.newReceipts || []
+    e.ph.newReceipts.push({ ...r, sig: await signReceipt(secret, tokenId, r) })
+  }
+
+  // 6. manifests, for the photos that are now complete ---------------------------------------------------------------------
+  const outcome = new Map()                    // pid -> { status, path }
+  const addedManifestPaths = []
+  const plan = (st) => {
+    const stItems = st.items
+    folder = pickFolderName(name, stItems.slice(2, 6))
+    const folderIdx = folder.name === name ? 0 : 1
+    const taken = new Set()
+    const adds = []
+    let added = 0
+    finalizing.forEach((ph, k) => {
+      const base = `${dirOf(folder.name)}/${ph.display}.img.json`
+      const hashed = `${dirOf(folder.name)}/${ph.stem}-${ph.hash.slice(0, 8)}.${ph.extRaw}.img.json`
+      const idxBase = baseProbePaths.length + k * 4 + folderIdx * 2     // probes are laid out photo by photo, folder by folder: [plain, hashed]
+      const baseItem = stItems[idxBase], hashedItem = stItems[idxBase + 1]
+      const baseManifest = readJson(baseItem)
+      let target = null
+      if (baseItem.kind !== 'blob' && !taken.has(base)) target = base
+      else if (baseItem.kind === 'blob' && baseManifest && baseManifest.contentHash === ph.hash) { outcome.set(ph.pid, { status: 'exists', path: base }); return }
+      else if (hashedItem.kind === 'blob' || taken.has(hashed)) { outcome.set(ph.pid, { status: 'exists', path: hashed }); return }
+      else target = hashed
+      const manifest = buildManifest({ ph, shard, shardOid, owner, name: folder.name, now: now(), by: name })
+      if (!manifest) { outcome.set(ph.pid, { status: 'incomplete' }); return }
+      taken.add(target)
+      adds.push({ path: target, text: JSON.stringify(manifest, null, 2) })
+      outcome.set(ph.pid, { status: 'added', path: target })
+      added++
+    })
+    return { adds, added }
+  }
+  let usedAfter = used0
+  if (finalizing.length) {
+    for (let attempt = 0; attempt < MAX_COMMIT_TRIES; attempt++) {
+      const st = attempt === 0 ? data : await readData()
+      outcome.clear()
+      const { adds, added } = plan(st)
+      const ledgerNow = readJson(st.items[1])
+      usedAfter = (ledgerNow && Number.isFinite(ledgerNow.n) ? ledgerNow.n : 0) + added
+      if (!adds.length) break
+      if (!folder.hasMarker) adds.push({ path: `${root}/${folder.name}/${GUEST.GUEST_MARKER}`, text: JSON.stringify(folderMeta()) })
+      adds.push({ path: `${STATE}/ledger/${today}.json`, text: JSON.stringify({ n: usedAfter, day: today }) })
+      try { await gh.commit(gh.dataRepo, { expectedHeadOid: st.oid, headline: `guest: +${added} photo${added > 1 ? 's' : ''} (${name})`, additions: adds }); break } catch (e) {
+        if (!(e instanceof GhError && e.kind === 'stale') || attempt === MAX_COMMIT_TRIES - 1) throw e
+        await sleep(jitter(200))
+      }
+    }
+  }
+
+  // 7. the reply ------------------------------------------------------------------------------------------------------------
+  for (const ph of photos.values()) {
+    const o = outcome.get(ph.pid)
+    if (o) results.push({ pid: ph.pid, status: o.status, path: o.path, receipts: ph.newReceipts || [] })
+    else results.push({ pid: ph.pid, status: 'part', receipts: ph.newReceipts || [] })
+  }
+  return { ok: true, folder: folder.name, shard, results, day: { used: usedAfter, max: GUEST.DAILY_MAX } }
+}
+
+const looksLikeImageJpeg = (u8) => u8[0] === 0xff && u8[1] === 0xd8
+
+async function saveShardState(gh, state, sleep) {
+  for (let attempt = 0; attempt < MAX_COMMIT_TRIES; attempt++) {
+    const st = await gh.read(gh.dataRepo, [])
+    try { await gh.commit(gh.dataRepo, { expectedHeadOid: st.oid, headline: 'guest: new image shard', additions: [{ path: `${GUEST.STATE_DIR}/shard.json`, text: JSON.stringify(state) }] }); return } catch (e) {
+      if (!(e instanceof GhError && e.kind === 'stale') || attempt === MAX_COMMIT_TRIES - 1) throw e
+      await sleep(150 + Math.floor(Math.random() * 150))
+    }
+  }
+}
+
+// The manifest is the SAME schema as every other image of the drive (src/components/ImageNodeViewer.jsx reads it), plus `ivs` (one
+// IV per chunk) when the photo is stored in several independently encrypted chunks.
+function buildManifest({ ph, shard, shardOid, owner, now, by }) {
+  const chunks = ph.receipts.filter((r) => r.role === 'chunk').sort((a, b) => a.idx - b.idx)
+  const unique = []
+  for (const c of chunks) if (!unique.some((u) => u.idx === c.idx)) unique.push(c)
+  if (unique.length !== ph.nChunks || unique.some((c, i) => c.idx !== i) || unique.some((c) => c.shard !== shard)) return null
+  const thumb = ph.receipts.find((r) => r.role === 'thumb' && r.shard === shard)
+  const m = {
+    type: 'image', v: 1, name: ph.display, title: ph.stem, ext: ph.ext, w: ph.w, h: ph.h, size: ph.size, tags: [],
+    addedAt: new Date(now).toISOString(), by, contentHash: ph.hash,
+    vis: 'public', cdnRepo: shard, cdnChunks: unique.map((c) => c.path), cdnCommit: shardOid, alg: 'AES-GCM', iv: unique[0].iv,
+  }
+  if (unique.length > 1) m.ivs = unique.map((c) => c.iv)
+  if (thumb) {
+    m.thumb = `https://cdn.jsdelivr.net/gh/${owner}/${shard}@${shardOid}/${thumb.path}`
+    m.thumbIv = thumb.iv
+    const tw = Number(ph.thumbW) || 0, th = Number(ph.thumbH) || 0
+    if (tw && th) { m.thumbW = tw; m.thumbH = th }
+  }
+  // light grid thumbnail (about 30-70 KB): a gallery tile asks for this one, the standard thumbnail stays for the viewer
+  const grid = ph.receipts.find((r) => r.role === 'thumbs' && r.shard === shard)
+  if (grid) {
+    m.thumbS = `https://cdn.jsdelivr.net/gh/${owner}/${shard}@${shardOid}/${grid.path}`
+    m.thumbSIv = grid.iv
+    const gw = Number(ph.thumbSW) || 0, gh = Number(ph.thumbSH) || 0
+    if (gw && gh) { m.thumbSW = gw; m.thumbSH = gh }
+  }
+  return m
+}

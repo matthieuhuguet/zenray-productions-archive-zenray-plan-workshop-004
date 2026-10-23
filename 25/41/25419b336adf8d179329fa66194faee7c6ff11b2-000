@@ -1,0 +1,64 @@
+// 23 October 2026: one door to the model for ZenRay Knowledge. Backend "api" (Anthropic API key, the organisation's credit,
+// so Matthieu's Claude subscription is never drained) or "cli" (`claude -p`, his subscription). Same prompts, same proof gate.
+// FR : une seule porte vers le modèle. « api » (clé API, crédit de l'organisation) ou « cli » (abonnement) ; mêmes prompts, même porte de preuve.
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { readFile, stat } from 'node:fs/promises'
+import path from 'node:path'
+import Anthropic from '@anthropic-ai/sdk'
+
+const run = promisify(execFile)
+export const envFile = () => path.join(process.env.HOME, 'Library/Application Support/ZenRayKnowledge/.env')
+
+/** The API key from the private settings file (refused when other users can read it), or from the environment. */
+export async function apiKey() {
+  try {
+    const info = await stat(envFile())
+    if (!(info.mode & 0o077)) {
+      const m = /^\s*ANTHROPIC_API_KEY\s*=\s*"?([^"\s]+)"?\s*$/m.exec(await readFile(envFile(), 'utf8'))
+      if (m) return m[1]
+    }
+  } catch {}
+  return process.env.ANTHROPIC_API_KEY || null
+}
+
+export class ModelError extends Error { constructor(message, { down = false } = {}) { super(message); this.down = down } }
+
+/** Ask the model once. Resolves the text; throws ModelError (`down: true` when retrying now is useless: auth, credit, limit). */
+export async function callModel(config, system, user) {
+  const settings = config.extract
+  if ((settings.backend || 'cli') === 'api') {
+    const key = await apiKey()
+    if (!key) throw new ModelError('no API key: run node scripts/Knowledge/SetApiKey.mjs', { down: true })
+    const client = new Anthropic({ apiKey: key, maxRetries: 3, timeout: settings.timeoutMs })
+    try {
+      const stream = client.messages.stream({
+        model: settings.apiModel, max_tokens: settings.maxOutputTokens, output_config: { effort: settings.effort },
+        system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: user }],
+      })
+      const message = await stream.finalMessage()
+      if (message.stop_reason === 'refusal') throw new ModelError(`refusal (${message.stop_details?.category || 'unknown'})`)
+      if (message.stop_reason === 'max_tokens') throw new ModelError('answer cut at max_tokens')
+      return message.content.filter((b) => b.type === 'text').map((b) => b.text).join('')
+    } catch (error) {
+      if (error instanceof ModelError) throw error
+      if (error instanceof Anthropic.AuthenticationError || error instanceof Anthropic.PermissionDeniedError) throw new ModelError(`API key refused: ${error.message}`, { down: true })
+      if (error instanceof Anthropic.RateLimitError) throw new ModelError(`rate limit: ${error.message}`, { down: true })
+      if (error instanceof Anthropic.BadRequestError && /credit|balance|billing/i.test(error.message)) throw new ModelError(`credit: ${error.message}`, { down: true })
+      if (error instanceof Anthropic.APIError) throw new ModelError(`API ${error.status || ''}: ${error.message}`)
+      throw new ModelError(String(error.message || error))
+    }
+  }
+  try {
+    const { stdout } = await run('claude', ['-p', '--no-session-persistence', '--model', settings.model, '--effort', settings.effort, '--tools', '', '--disable-slash-commands', '--output-format', 'json', '--system-prompt', system, user], { timeout: settings.timeoutMs, maxBuffer: 32 * 1024 * 1024, cwd: '/tmp' })
+    const answer = JSON.parse(stdout)
+    if (answer.is_error) throw new ModelError(String(answer.result || 'model error'), { down: /on hold|restricted|limit|not logged|401|403/i.test(String(answer.result)) })
+    return String(answer.result || '')
+  } catch (error) {
+    if (error instanceof ModelError) throw error
+    let message = String(error.stdout || error.message || error)
+    try { message = JSON.parse(error.stdout).result || message } catch {}
+    throw new ModelError(message.slice(0, 300), { down: /on hold|restricted|limit|not logged|401|403/i.test(message) })
+  }
+}

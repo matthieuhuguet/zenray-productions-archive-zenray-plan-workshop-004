@@ -1,0 +1,53 @@
+// 23 October 2026: answer a new question. First the base itself (a question already asked is found by its words, no model);
+// then the model, given only the memory passages that share its words, with the same proof gate. No proof, no answer.
+// FR : répondre à une question nouvelle. D'abord la base (sans modèle), puis le modèle, nourri des seuls passages de la mémoire
+// qui partagent ses mots, avec la même porte de preuve. Pas de preuve, pas de réponse.
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { questionKey, searchIndex, tokenize, buildIndexMap } from '../../../src/lib/knowledgeIndex.js'
+import { memoryFiles, memoryUnits } from './Sources.mjs'
+import { checkEntry } from './Validate.mjs'
+import { callModel } from './Model.mjs'
+
+const jaccard = (a, b) => { const x = new Set(a.split(' ')), y = new Set(b.split(' ')); const inter = [...x].filter((w) => y.has(w)).length; return inter / (x.size + y.size - inter || 1) }
+
+/** The same question already in the base, when its words overlap at 60 % or more. */
+export function findSame(entries, question) {
+  const key = questionKey(question)
+  const map = buildIndexMap(entries.map((e) => ({ q: e.q })))
+  for (const position of searchIndex(map, question, { limit: 5 })) if (jaccard(key, questionKey(entries[position].q)) >= 0.6) return entries[position]
+  return null
+}
+
+/** Memory passages that share the most words with the question (deterministic retrieval, no embeddings). */
+export async function passagesFor(config, question, { limit = 6, maxChars = 30000 } = {}) {
+  const words = new Set(tokenize(question))
+  const scored = []
+  for (const file of await memoryFiles(config)) for (const unit of memoryUnits(file, { ...config, memory: { ...config.memory, unitChars: 3000 } })) {
+    const tokens = tokenize(unit.text); let hits = 0
+    for (const t of tokens) if (words.has(t)) hits++
+    if (hits) scored.push({ unit, score: hits / Math.sqrt(tokens.length + 20) })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  const out = []; let size = 0
+  for (const { unit } of scored.slice(0, limit)) { if (size + unit.text.length > maxChars) break; out.push(unit); size += unit.text.length }
+  return out
+}
+
+/** Ask the model with the passages; resolves { entry, ref } or { none: reason } or { error }. */
+export async function answerWithCli(config, root, question) {
+  const passages = await passagesFor(config, question)
+  if (!passages.length) return { none: 'aucun passage de la mémoire ne partage ses mots' }
+  const prompt = await readFile(path.join(root, 'scripts/Knowledge/prompts/Ask.md'), 'utf8')
+  const text = passages.map((p, i) => `### PASSAGE ${i + 1} · ${p.ref}\n${p.text}`).join('\n\n')
+  try {
+    const raw = JSON.parse(/\{[\s\S]*\}/.exec(await callModel(config, prompt, `QUESTION : ${question}\n\n${text}`))[0])
+    if (!raw.found) return { none: 'la mémoire ne contient pas la réponse' }
+    const verdict = checkEntry({ ...raw, q: question.endsWith('?') ? question : `${question} ?` }, text, config)
+    if (!verdict.ok) return { none: `réponse refusée (${verdict.reason})` }
+    const source = passages.find((p) => p.text.replace(/\s+/g, ' ').toLowerCase().includes(verdict.entry.proof.replace(/\s+/g, ' ').toLowerCase().slice(0, 40)))
+    return { entry: verdict.entry, ref: source?.ref || passages[0].ref }
+  } catch (error) {
+    return { error: String(error.message).slice(0, 300) }
+  }
+}

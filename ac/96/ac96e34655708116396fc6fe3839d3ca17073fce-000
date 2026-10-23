@@ -1,0 +1,102 @@
+# test_push_policy_env.py (12 October 2026): the film worker no longer pins the push batch size.
+# EN: the push batch is decided by scripts/lib/push-batch-policy.mjs. The worker used to set ZR_SHARD_PUSH_BATCH_MB=190 for every
+#     film; that forced the old 2 part rule everywhere. It must not do it any more, and the upload step must still get the
+#     environment of the worker unchanged (so an operator who sets ZR_SHARD_PUSH_BATCH_MB keeps a FIXED batch).
+# FR : le worker ne fixe plus la taille du lot de poussee ; l'environnement du worker atteint l'etape d'envoi tel quel.
+# Run: python3 -I scripts/Films/tests/test_push_policy_env.py
+import ast
+import pathlib
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+WORKER = HERE.parent / 'ProcessFilmsSequentially.py'
+SOURCE = WORKER.read_text()
+TREE = ast.parse(SOURCE)
+
+PINNED_NAMES = {'ZR_SHARD_PUSH_BATCH_MB'}
+
+
+def find_function(name):
+    for node in ast.walk(TREE):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f'function {name} not found in {WORKER}')
+
+
+def subscript_key(target):
+    """'up_env' and 'KEY' for a statement of the form up_env['KEY'] = ..."""
+    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+        index = target.slice
+        if isinstance(index, ast.Constant) and isinstance(index.value, str):
+            return target.value.id, index.value
+    return None, None
+
+
+def test_no_assignment_pins_the_batch():
+    function = find_function('process_one_task')
+    assigned = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                owner, key = subscript_key(target)
+                if key:
+                    assigned.append((owner, key))
+    pinned = [pair for pair in assigned if pair[1] in PINNED_NAMES]
+    assert not pinned, f'the worker pins the push batch again: {pinned}'
+    # the keys the upload step really sets are still there (the test would pass on an empty function otherwise)
+    keys = {key for owner, key in assigned if owner == 'up_env'}
+    assert {'ZR_ZDATA_CLONE', 'ZR_MAPPED_BATCH', 'ZR_DEFER_INDEX_ADD'} <= keys, keys
+
+
+def test_upload_environment_is_a_copy_of_the_worker_environment():
+    function = find_function('process_one_task')
+    origin = None
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'up_env' for t in node.targets):
+            origin = ast.unparse(node.value)
+            break
+    assert origin == 'dict(env)', f'up_env must start from the worker environment, got {origin}'
+
+
+def test_main_carries_the_ramp_state_between_films_without_overriding_the_operator():
+    function = find_function('main')
+    calls = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'setdefault':
+            if node.args and isinstance(node.args[0], ast.Constant):
+                calls.append(node.args[0].value)
+    assert 'ZR_PUSH_STATE_FILE' in calls and 'ZR_PUSH_METRICS_FILE' in calls, calls
+
+
+def test_red_case_detects_a_pinned_batch():
+    # the same inspection applied to a broken variant of the source must fail (the test proves it can see the fault)
+    broken = SOURCE.replace("up_env['ZR_MAPPED_BATCH'] = '1'", "up_env['ZR_MAPPED_BATCH'] = '1'\n            up_env['ZR_SHARD_PUSH_BATCH_MB'] = '190'")
+    assert broken != SOURCE
+    tree = ast.parse(broken)
+    found = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == 'process_one_task':
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Assign):
+                    for target in inner.targets:
+                        _, key = subscript_key(target)
+                        if key in PINNED_NAMES:
+                            found = True
+    assert found
+
+
+def test_worker_passes_verify_mode_explicitly():
+    # 13 October 2026: worker and library must never disagree on the verify mode; no second 1 in N rule in the worker.
+    function = find_function('process_one_task')
+    source = ast.unparse(function)
+    assert "f'--mode={mode}'" in source or "--mode={mode}" in source, 'run_verify must pass --mode to VerifyVideoCloud.mjs'
+    assert 'full_every' not in source and 'index % ' not in source.replace('index % 2', ''), 'the worker must not carry its own sampling rule'
+    assert 'VerifyVideoCloudIdentity.mjs' not in source, 'identity-only shortcut bypasses the library policy'
+
+
+for test in (test_no_assignment_pins_the_batch, test_upload_environment_is_a_copy_of_the_worker_environment,
+             test_main_carries_the_ramp_state_between_films_without_overriding_the_operator, test_red_case_detects_a_pinned_batch, test_worker_passes_verify_mode_explicitly):
+    test()
+    print(f'ok {test.__name__}')
+print('push policy env tests OK')
+sys.exit(0)

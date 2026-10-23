@@ -1,0 +1,892 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { usePlayer } from '../audio/PlayerContext.jsx'
+import { isDuplicatePlayCommand } from '../audio/playerState.js'
+import { isLoggedIn, login } from '../audio/spotifyAuth.js'
+import { me as spotifyMe, myPlaylists, myTracks, spotifyAlbum, spotifyPlaylist, spotifyTrack, spotifyArtist, spotifyArtistTopTracks, spotifyArtistAlbums } from '../audio/spotifyApi.js'
+import { readJson, saveJsonWithRetry } from '../lib/saveJson.js'
+import { apiPost, causeApi } from '../lib/apiPost.js'
+import { getIndexPaths, injectSearchIndexPaths, loadSearchIndex, rollbackSearchIndexPaths } from '../search/searchIndexClient.js'
+import ZenRayAudioWorkspace from './ZenRayAudioWorkspace.jsx'
+
+const clean = (value) => String(value || 'Playlist').replace(/[\\/:*?\"<>|]/g, '-').trim().slice(0, 100) || 'Playlist'
+const leaf = (value) => String(value || '').split('/').pop().replace(/\.(media\.json|json)$/i, '')
+const parentName = (path) => String(path || '').split('/').slice(-2, -1)[0] || 'ZenRay Audio'
+const isMusicManifest = (manifest) => !!manifest && (
+  (manifest.mime || '').startsWith('audio/')
+  || manifest.mediaKind === 'audio'
+  || manifest.type === 'playlist'
+  || (manifest.type === 'youtube' && manifest.audioOnly)
+  || manifest.type === 'spotify'
+)
+
+const parseProviderUrl = (value) => {
+  const raw = String(value || '').trim()
+  const spotify = raw.match(/(?:open\.spotify\.com\/|spotify:)(album|playlist|track)[/:]([A-Za-z0-9]+)/)
+  if (spotify) return { provider: 'spotify', kind: spotify[1], id: spotify[2], uri: `spotify:${spotify[1]}:${spotify[2]}` }
+  const youtube = raw.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([A-Za-z0-9_-]{6,})/)
+  if (youtube) return { provider: 'youtube', id: youtube[1], url: `https://www.youtube.com/watch?v=${youtube[1]}` }
+  return null
+}
+
+function trackFrom(path, manifest) {
+  const album = manifest.album || parentName(path)
+  if (manifest.type === 'youtube') return {
+    source: 'youtube', videoId: manifest.videoId, uri: manifest.url,
+    title: manifest.title || leaf(path), artist: manifest.author || 'YouTube',
+    album, cover: manifest.poster || '', dur: manifest.duration || 0, manifestPath: path,
+  }
+  if (manifest.type === 'spotify') return {
+    source: 'spotify', uri: manifest.uri, contextUri: manifest.contextUri,
+    title: manifest.title || leaf(path), artist: manifest.artist || 'Spotify',
+    album, cover: manifest.cover || '', dur: manifest.duration || 0, manifestPath: path,
+  }
+  return {
+    source: 'local', streamPath: path, title: manifest.title || leaf(path),
+    artist: manifest.artist || 'ZenRay', album, cover: manifest.cover || manifest.poster || '',
+    dur: manifest.duration || manifest.probe?.duration || 0,
+    mime: manifest.mime || 'audio/mpeg', manifestPath: path,
+  }
+}
+
+// ── ÉCRITURES LOCALES PRIORITAIRES (write-through) — 2026-07-22, CAUSE RACINE du « rien ne s'ajoute » ──────
+// readManifest lit avec raw=1, donc via raw.githubusercontent.com : ce CDN a son PROPRE cache (~5 min, déjà
+// documenté dans ce projet pour appendPublicDelta). Conséquence : on écrivait bien la playlist (commit GitHub
+// immédiat), mais la relecture qui suit renvoyait l'ANCIEN contenu et écrasait l'affichage -> titre déposé
+// invisible, apparition "aléatoire" quelques minutes plus tard, et seule la pochette tenait (posée en optimiste
+// sur activePlaylist). Passer en API non-raw n'est pas une option : lecture par sha = quota (incident 403 payé).
+// Solution : tout manifeste QUE NOUS venons d'écrire est mémorisé ici et sert de vérité tant que le CDN n'a pas
+// rattrapé. Persisté en localStorage pour survivre à un rechargement de page. Entrées purgées après TTL.
+const LOCAL_MANIFEST_KEY = 'zr-audio:local-manifests-v1'
+const LOCAL_MANIFEST_TTL = 15 * 60 * 1000
+const loadLocalManifests = () => {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LOCAL_MANIFEST_KEY) || '{}')
+    const now = Date.now()
+    const out = {}
+    for (const [path, entry] of Object.entries(raw)) if (entry && now - (entry.at || 0) < LOCAL_MANIFEST_TTL) out[path] = entry
+    return out
+  } catch { return {} }
+}
+let localManifests = loadLocalManifests()
+const rememberManifest = (path, manifest) => {
+  localManifests = { ...localManifests, [path]: { at: Date.now(), manifest } }
+  try { localStorage.setItem(LOCAL_MANIFEST_KEY, JSON.stringify(localManifests)) } catch { /* quota : le cache mémoire suffit */ }
+}
+const forgetManifest = (path) => {
+  if (!localManifests[path]) return
+  const next = { ...localManifests }
+  delete next[path]
+  localManifests = next
+  try { localStorage.setItem(LOCAL_MANIFEST_KEY, JSON.stringify(next)) } catch { /* idem */ }
+}
+const localManifestOf = (path) => {
+  const entry = localManifests[path]
+  if (!entry) return null
+  if (Date.now() - (entry.at || 0) >= LOCAL_MANIFEST_TTL) { forgetManifest(path); return null }
+  return entry.manifest
+}
+
+async function readManifest(path, signal) {
+  const json = await fetch(`/api/page?action=read&raw=1&path=${encodeURIComponent(path)}`, {
+    cache: 'no-store', signal,
+  }).then((response) => response.ok ? response.json() : null).catch((error) => {
+    if (error?.name === 'AbortError') throw error
+    return null
+  })
+  let remote = null
+  try { remote = json && !json.missing ? JSON.parse(json.markdown) : null } catch { remote = null }
+  // Notre écriture récente prime sur la version (potentiellement périmée) servie par le CDN.
+  const local = localManifestOf(path)
+  if (!local) return remote
+  if (remote && JSON.stringify(remote) === JSON.stringify(local)) { forgetManifest(path); return remote } // CDN rattrapé
+  return local
+}
+
+async function pool(list, concurrency, fn) {
+  const output = new Array(list.length)
+  let cursor = 0
+  await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, async () => {
+    while (cursor < list.length) {
+      const index = cursor++
+      output[index] = await fn(list[index], index)
+    }
+  }))
+  return output
+}
+
+export default function ZenRayAudioPanel({
+  open,
+  t,
+  folder,
+  entries,
+  targetPath,
+  targetArtistId,
+  pendingSpotifyUrl,
+  onAddAudio,
+  onRefresh,
+  onClose,
+}) {
+  const player = usePlayer()
+  const fileInput = useRef(null)
+  const playGate = useRef({ key: '', at: 0 })
+  const consumedTarget = useRef('')
+  const consumedTargetArtist = useRef('')
+  const consumedSpotifyUrl = useRef('')
+  const loadSeq = useRef(0)
+  const [rows, setRows] = useState([])
+  const [loading, setLoading] = useState(false)
+  // Sections (refonte 2026-07-20, retour Matthieu : "Tracks / This Folder / Playlists, uniquement ces
+  // trois options") : 'folder' = le dossier Create depuis lequel le lecteur est ouvert (défaut),
+  // 'tracks' = TOUS les médias audio du site (scan index lazy ci-dessous), 'playlists' = les playlists,
+  // 'liked' = titres likés ZenRay. Les anciennes sections home/albums/songs n'existent plus.
+  const [section, setSection] = useState('folder')
+  const [query, setQuery] = useState('')
+  const [selected, setSelected] = useState(() => new Set())
+  const [newName, setNewName] = useState('')
+  const [spotifyUrl, setSpotifyUrl] = useState('')
+  const [busy, setBusy] = useState('')
+  const [spotifyResults, setSpotifyResults] = useState([])
+  const [spotifySearching, setSpotifySearching] = useState(false)
+  const spotifySeq = useRef(0)
+  const [youtubeResults, setYoutubeResults] = useState([])
+  const [youtubeSearching, setYoutubeSearching] = useState(false)
+  const youtubeSeq = useRef(0)
+  // Bibliothèque Spotify RÉELLE de Matthieu (sidebar gauche, retour 2026-07-19 : "chargé depuis mon
+  // profil spotify directement"). L'OAuth PKCE + myPlaylists()/me() existaient déjà (spotifyAuth.js,
+  // spotifyApi.js) mais n'étaient jamais appelés hors de l'import ponctuel par lien -- personne
+  // n'affichait la vraie bibliothèque. isLoggedIn() ne suffit pas seul : le token peut exister mais
+  // être expiré depuis longtemps (session jamais rouverte) -- me() sert alors de vérification réelle,
+  // pas seulement déclarative.
+  const [spotifyConnected, setSpotifyConnected] = useState(isLoggedIn())
+  const [spotifyProfile, setSpotifyProfile] = useState(null)
+  const [spotifyPlaylistsData, setSpotifyPlaylistsData] = useState([])
+  const [spotifyLibraryLoading, setSpotifyLibraryLoading] = useState(false)
+  // Liked Songs Spotify RÉELS (retour 2026-07-19 : "récupérer celui de spotify"), distincts des titres
+  // likés ZenRay (propre à l'app, stockés en local). myTracks() existait déjà côté API, jamais appelé.
+  const [spotifyLikedTracks, setSpotifyLikedTracks] = useState([])
+
+  const scope = useMemo(() => {
+    const current = String(folder || '').replace(/\/+$/, '')
+    return current && current !== 'pages' && current.startsWith('pages/') ? current : 'pages/Music'
+  }, [folder])
+
+  const reload = async (signal) => {
+    const sequence = ++loadSeq.current
+    setLoading(true)
+    await loadSearchIndex().catch(() => null)
+    if (signal?.aborted || sequence !== loadSeq.current) return
+    const prefix = `${scope}/`
+    const indexed = getIndexPaths().filter((path) => path.startsWith(prefix) && path.endsWith('.media.json'))
+    const current = (entries || []).map((entry) => entry.contentPath).filter((path) => path?.endsWith('.media.json'))
+    const paths = Array.from(new Set([...indexed, ...current]))
+    const loaded = await pool(paths, 8, async (path) => {
+      const manifest = await readManifest(path, signal)
+      if (!isMusicManifest(manifest)) return null
+      return { path, manifest, track: manifest.type === 'playlist' ? null : trackFrom(path, manifest) }
+    })
+    if (signal?.aborted || sequence !== loadSeq.current) return
+    setRows(loaded.filter(Boolean))
+    setLoading(false)
+  }
+
+  useEffect(() => {
+    if (!open) return undefined
+    const controller = new AbortController()
+    reload(controller.signal).catch((error) => {
+      if (error?.name !== 'AbortError') setLoading(false)
+    })
+    return () => {
+      controller.abort()
+      loadSeq.current += 1
+    }
+  }, [open, scope]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!open) return undefined
+    if (!isLoggedIn()) { setSpotifyConnected(false); setSpotifyProfile(null); setSpotifyPlaylistsData([]); setSpotifyLikedTracks([]); return undefined }
+    let live = true
+    setSpotifyLibraryLoading(true)
+    Promise.all([spotifyMe(), myPlaylists(), myTracks()]).then(([profile, playlistsPage, tracksPage]) => {
+      if (!live) return
+      // me() renvoie null si le token est mort (refresh échoué -> logout déjà fait par spotifyAuth) :
+      // c'est le seul signal fiable de connexion réelle, isLoggedIn() ne garantit qu'un token PRÉSENT.
+      setSpotifyConnected(!!profile)
+      setSpotifyProfile(profile)
+      setSpotifyPlaylistsData(playlistsPage?.items?.filter(Boolean) || [])
+      setSpotifyLikedTracks((tracksPage?.items || []).map((item) => item.track).filter(Boolean))
+    }).finally(() => { if (live) setSpotifyLibraryLoading(false) })
+    return () => { live = false }
+  }, [open])
+
+  // Playlist OUVERTE (bug réel corrigé le 2026-07-19, 2e passe : "je clique sur une playlist... ça
+  // l'affiche pas dans le panneau central et dans le panneau de droite"). La 1re passe n'avait corrigé
+  // que l'état du LECTEUR (flag mixed) : aucune notion de "playlist affichée" n'existait, le centre
+  // restait sur l'album actif quoi qu'on clique. activePlaylist est cette notion : posée par tout clic
+  // de playlist (Spotify réelle, ZenRay, Liked Songs), consommée par le panneau central pour lister les
+  // titres, et par le panneau droit via la piste en cours.
+  const [activePlaylist, setActivePlaylist] = useState(null) // { kind, key, name, owner, cover, tracks, loading }
+  const clearActivePlaylist = () => setActivePlaylist(null)
+  // Page artiste (2026-07-19, demande Matthieu : cliquer le nom de l'artiste depuis le mini-player, le
+  // lecteur normal ou le panneau de droite -- minimum 3 boutons -- doit ouvrir sa page Spotify : titres
+  // populaires + albums, comme l'officiel). Vue EXCLUSIVE avec activePlaylist -- ouvrir un artiste
+  // remplace ce qui est affiché au centre, jamais un empilement des deux.
+  const [activeArtist, setActiveArtist] = useState(null) // { id, name, image, followers, topTracks, albums, loading }
+  const clearActiveArtist = () => setActiveArtist(null)
+  const openArtist = async (artistId, fallbackName) => {
+    if (!artistId) return
+    setActivePlaylist(null)
+    setActiveArtist({ id: artistId, name: fallbackName || '', image: '', followers: null, topTracks: [], albums: [], loading: true })
+    const [artist, top, albumsPage] = await Promise.all([
+      spotifyArtist(artistId), spotifyArtistTopTracks(artistId), spotifyArtistAlbums(artistId),
+    ])
+    setActiveArtist((prev) => (prev && prev.id === artistId) ? {
+      ...prev,
+      name: artist?.name || prev.name,
+      image: artist?.images?.[0]?.url || '',
+      followers: artist?.followers?.total ?? null,
+      topTracks: (top?.tracks || []).map((track) => spotifyTrackFrom(track)),
+      // Dédoublonne les singles/albums qui partagent le même titre (Spotify liste souvent une réédition
+      // ET l'originale) -- garde la première occurrence rencontrée (déjà triée par date de sortie desc).
+      albums: (() => {
+        const seen = new Set()
+        const out = []
+        for (const album of (albumsPage?.items || [])) {
+          const key = (album.name || '').toLowerCase()
+          if (seen.has(key)) continue
+          seen.add(key)
+          out.push({ id: album.id, title: album.name, cover: album.images?.[0]?.url || '', year: (album.release_date || '').slice(0, 4) })
+        }
+        return out
+      })(),
+      loading: false,
+    } : prev)
+  }
+  // ARTISTE PAR NOM (2026-07-22, demande Matthieu : rendre l'artiste d'un titre LOCAL/YouTube cliquable ->
+  // page artiste Spotify). On n'a pas d'ID Spotify pour ces titres, seulement un nom. On réutilise l'endpoint
+  // public /api/spotify-search (Client Credentials, sans login) qui cherche des TITRES : on prend le 1er titre
+  // dont un artiste porte EXACTEMENT ce nom (sinon le 1er artiste du 1er résultat), et on ouvre sa page via
+  // openArtist. Repli : recherche web Spotify si aucun ID trouvé. Zéro changement serveur.
+  const openArtistByName = async (name) => {
+    const q = (name || '').trim()
+    if (!q) return
+    const data = await fetch(`/api/spotify-search?q=${encodeURIComponent(q)}`).then((r) => r.json()).catch(() => null)
+    const tracks = (data && data.tracks && data.tracks.items) || []
+    const lc = q.toLowerCase()
+    let artist = null
+    for (const track of tracks) {
+      const a = (track.artists || []).find((x) => (x.name || '').toLowerCase() === lc) || (track.artists || [])[0]
+      if (a && a.id) { artist = a; break }
+    }
+    if (artist && artist.id) return openArtist(artist.id, artist.name)
+    window.open(`https://open.spotify.com/search/${encodeURIComponent(q)}`, '_blank', 'noopener,noreferrer')
+  }
+  // Clic sur un album depuis la page artiste : réutilise le mécanisme playlist existant (mêmes rendu et
+  // lecture qu'un album/une playlist Spotify ouverts ailleurs) plutôt que d'inventer une 2e vue -- retour
+  // Matthieu du 2026-07-16 sur la simplification : pas de code parallèle pour ce qui existe déjà.
+  const openArtistAlbum = async (album) => {
+    setActiveArtist(null)
+    setActivePlaylist({ kind: 'spotify', key: album.id, name: album.title, owner: 'Spotify', cover: album.cover, tracks: [], loading: true })
+    const full = await spotifyAlbum(album.id)
+    const items = (full?.tracks?.items || []).map((track) => spotifyTrackFrom(track, album.title, album.cover))
+    setActivePlaylist((prev) => prev && prev.key === album.id ? { ...prev, tracks: items, loading: false } : prev)
+  }
+
+  // `artists` (2026-07-19, feature "cliquer sur l'artiste") : Spotify renvoie une LISTE d'artistes par
+  // titre (featuring compris) -- gardée telle quelle (id + nom chacun) en plus du texte `artist` déjà
+  // affiché partout, pour que le lecteur puisse rendre CHAQUE nom cliquable individuellement, comme
+  // l'officiel. `artist` (string jointe) reste inchangé : rien d'existant ne casse.
+  // fallbackCover (2026-07-20, bug réel "depuis un album d'artiste, ni les icônes ni les pochettes
+  // ne chargent") : l'endpoint /albums/{id} liste ses pistes SANS track.album (c'est déjà le contexte)
+  // -> track.album?.images est toujours vide par construction, chaque ligne perdait sa pochette.
+  // L'appelant qui CONNAÎT la pochette du conteneur (album/playlist) la passe en secours.
+  const spotifyTrackFrom = (track, fallbackAlbum, fallbackCover = '') => ({
+    source: 'spotify', uri: track.uri, title: track.name,
+    artist: (track.artists || []).map((artist) => artist.name).join(', '),
+    artists: (track.artists || []).map((artist) => ({ id: artist.id, name: artist.name })),
+    album: track.album?.name || fallbackAlbum || 'Spotify',
+    cover: track.album?.images?.[0]?.url || fallbackCover || '', dur: (track.duration_ms || 0) / 1000,
+  })
+
+  const openSpotifyPlaylist = async (playlist) => {
+    setActiveArtist(null)
+    setActivePlaylist({ kind: 'spotify', key: playlist.id, name: playlist.name, owner: playlist.owner?.display_name || 'Spotify', cover: playlist.images?.[0]?.url || '', tracks: [], loading: true })
+    const full = await spotifyPlaylist(playlist.id)
+    const items = (full?.tracks?.items || []).map((item) => item.track).filter(Boolean).map((track) => spotifyTrackFrom(track, playlist.name))
+    setActivePlaylist((prev) => prev && prev.key === playlist.id ? { ...prev, tracks: items, loading: false } : prev)
+    // Lecture par la file mixte (chaque titre = une URI Spotify) plutôt que par context_uri : même
+    // chemin que les playlists ZenRay et les Liked Songs -> un seul comportement à maintenir, et le
+    // clic sur un titre PRÉCIS de la liste affichée fonctionne à l'identique.
+    if (items.length) playTracks(items)
+  }
+  // Spotify n'expose pas de context_uri public pour "Liked Songs" (pseudo-playlist) : URIs directes.
+  const openSpotifyLiked = () => {
+    setActiveArtist(null)
+    const items = spotifyLikedTracks.map((track) => spotifyTrackFrom(track)).filter((track) => track.uri)
+    setActivePlaylist({ kind: 'liked', key: 'spotify-liked', name: 'Liked Songs', owner: 'Spotify', cover: '', tracks: items, loading: false })
+    if (items.length) playTracks(items)
+  }
+
+  const tracks = useMemo(() => rows.filter((row) => row.track).map((row) => row.track), [rows])
+  // La fenêtre de recherche affiche deux résultats locaux au repos, puis six par page quand son groupe est
+  // développé. On garde davantage de candidats ici pour que la pagination ait une vraie matière.
+  const localMatches = useMemo(() => {
+    const needle = query.trim().toLowerCase()
+    if (!needle) return []
+    return tracks.filter((track) => `${track.title} ${track.artist} ${track.album}`.toLowerCase().includes(needle)).slice(0, 48)
+  }, [tracks, query])
+  // Pile façon boîte mail (retour Matthieu 2026-07-20) : la playlist la plus récente EN HAUT.
+  // Les anciennes sans createdAt tombent en bas ('' se classe dernier en ordre descendant).
+  // Section "Tracks" = TOUS les médias audio du site (pas seulement le dossier ouvert) : scan de
+  // l'index complet, LAZY (déclenché au premier clic sur le chip Tracks, jamais à l'ouverture) et
+  // caché pour la session -- des centaines de manifestes possibles, pool(8) comme reload().
+  const [allRows, setAllRows] = useState(null)
+  const [allLoading, setAllLoading] = useState(false)
+  const loadAllTracks = async () => {
+    if (allRows || allLoading) return
+    setAllLoading(true)
+    await loadSearchIndex().catch(() => null)
+    const paths = getIndexPaths().filter((path) => path.startsWith('pages/') && path.endsWith('.media.json'))
+    const loaded = await pool(paths, 8, async (path) => {
+      const manifest = await readManifest(path)
+      if (!isMusicManifest(manifest)) return null
+      return { path, manifest, track: manifest.type === 'playlist' ? null : trackFrom(path, manifest) }
+    })
+    setAllRows(loaded.filter(Boolean))
+    setAllLoading(false)
+  }
+  const allTracks = useMemo(() => (allRows || []).map((row) => row.track).filter(Boolean), [allRows])
+  // Pile façon boîte mail (retour Matthieu 2026-07-20) : la plus récente EN HAUT. Union scope + scan
+  // site-wide (dédupliquée par chemin) pour que les playlists restent visibles quel que soit le dossier
+  // d'ouverture. (La section Albums est SUPPRIMÉE -- retour 2026-07-20 : "je ne comprends pas l'intérêt".)
+  const playlists = useMemo(() => {
+    const map = new Map()
+    for (const row of rows) if (row.manifest?.type === 'playlist') map.set(row.path, row)
+    for (const row of (allRows || [])) if (row.manifest?.type === 'playlist' && !map.has(row.path)) map.set(row.path, row)
+    return [...map.values()].sort((a, b) => String(b.manifest.createdAt || '').localeCompare(String(a.manifest.createdAt || '')))
+  }, [rows, allRows])
+
+  const playTracks = (list, index = 0) => {
+    if (!list.length) return
+    const at = Math.max(0, Math.min(index, list.length - 1))
+    const track = list[at]
+    const commandKey = `${track?.manifestPath || track?.streamPath || track?.uri || track?.videoId || ''}:${at}`
+    const now = performance.now()
+    if (isDuplicatePlayCommand(playGate.current, commandKey, now)) return
+    playGate.current = { key: commandKey, at: now }
+    player.playMixedQueue(list, at)
+  }
+
+  const playRow = (row) => {
+    if (row.manifest?.type === 'playlist') {
+      setActiveArtist(null)
+      setQuery('')
+      const items = row.manifest?.items || []
+      // AFFICHER la playlist au centre (pas seulement la jouer) : même contrat que les playlists Spotify.
+      setActivePlaylist({ kind: 'zenray', key: row.path, name: row.manifest?.title || row.manifest?.name || 'Playlist', owner: row.manifest?.artist || 'ZenRay', cover: row.manifest?.cover || '', tracks: items, loading: false })
+      if (items.length) playTracks(items)
+      // Manifeste importé sans items matérialisés (ancien format) : le context_uri Spotify reste le
+      // seul moyen de le jouer -- l'affichage montre alors une liste vide, honnête.
+      else if (row.manifest?.contextUri) player.playSpotify(null, row.manifest.contextUri)
+      return
+    }
+    playTracks(tracks, tracks.indexOf(row.track))
+  }
+
+  useEffect(() => {
+    if (!open) { consumedTarget.current = ''; return }
+    if (!targetPath || consumedTarget.current === targetPath || !rows.length) return
+    const row = rows.find((candidate) => candidate.path === targetPath)
+    if (!row) return
+    consumedTarget.current = targetPath
+    setSection(row.manifest?.type === 'playlist' ? 'playlists' : 'folder')
+    playRow(row)
+  }, [open, targetPath, rows]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Deep-link "ouvrir la page artiste" (2026-07-19) : le mini-player FLOTTANT (PlayerBar, hors Create)
+  // n'a pas accès à openArtist -- même patron que targetPath ci-dessus (zr:create-music), consommé une
+  // seule fois pour ne pas ré-ouvrir l'artiste à chaque re-render tant que le panneau reste ouvert.
+  useEffect(() => {
+    if (!open) { consumedTargetArtist.current = ''; return }
+    if (!targetArtistId || consumedTargetArtist.current === targetArtistId) return
+    consumedTargetArtist.current = targetArtistId
+    openArtist(targetArtistId)
+  }, [open, targetArtistId]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const selectedTracks = rows
+    .filter((row) => selected.has(row.path))
+    .flatMap((row) => row.track ? [row.track] : (row.manifest?.items || []))
+
+  const toggleRow = (row, event) => {
+    if (event.metaKey || event.ctrlKey || event.shiftKey) {
+      setSelected((before) => {
+        const next = new Set(before)
+        next.has(row.path) ? next.delete(row.path) : next.add(row.path)
+        return next
+      })
+    } else {
+      setSelected(new Set([row.path]))
+    }
+  }
+
+  // Bug réel corrigé le 2026-07-20 ("les nouvelles playlists ne fonctionnent pas / je ne la vois
+  // pas") : saveJsonWithRetry écrit le manifeste mais n'indexe RIEN, or reload() ne liste que
+  // getIndexPaths() + entries -- un chemin fraîchement créé n'était dans aucun des deux, la playlist
+  // restait invisible jusqu'à la reconstruction d'index. Même classe de bug que .plan.json (déjà payé) ;
+  // même remède que App.jsx newPlanBoard : injection CLIENT immédiate + delta SERVEUR durable.
+  const registerNewManifest = (path) => {
+    injectSearchIndexPaths([path])
+    apiPost('index-add', { paths: [path] }).catch(() => {})
+  }
+
+  // T7 (2026-07-22, demande Matthieu) : « déposer un morceau dans THIS FOLDER crée un média correspondant,
+  // comme si on l'avait uploadé » -> écrit un .media.json dans le dossier COURANT (scope), ensuite visible
+  // dans This Folder ET dans Create. C'est l'INVERSE exact de trackFrom() (voir en tête de fichier) : on
+  // reconstruit le manifeste depuis la forme canonique d'un morceau, quelle que soit sa source.
+  //   - youtube : {type:'youtube', audioOnly:true, videoId, url, title, author, poster}
+  //   - spotify : {type:'spotify', uri, title, artist, cover, duration}
+  //   - local   : le média EXISTE déjà sur le site (manifestPath) -> on ne duplique PAS le binaire, on
+  //               n'écrit rien et on le signale (pas de faux doublon dans l'arborescence).
+  const saveTrackToFolder = async (track) => {
+    if (!track) return { ok: false }
+    if (track.source === 'local' || track.manifestPath) return { ok: false, reason: 'already-local' }
+    const title = track.title || 'Titre'
+    const path = `${scope}/${clean(title)}.${Date.now().toString(36)}.media.json`
+    const data = track.source === 'youtube'
+      ? {
+          type: 'youtube', v: 1, audioOnly: true, mediaKind: 'audio', videoId: track.videoId,
+          url: track.uri || (track.videoId ? `https://www.youtube.com/watch?v=${track.videoId}` : ''),
+          title, author: track.artist || 'YouTube', poster: track.cover || '',
+          duration: track.dur || 0, addedAt: new Date().toISOString(),
+        }
+      : {
+          type: 'spotify', v: 1, mediaKind: 'audio', uri: track.uri, title,
+          artist: track.artist || 'Spotify', album: track.album || '', cover: track.cover || '',
+          duration: track.dur || 0, addedAt: new Date().toISOString(),
+        }
+    setBusy('folder')
+    const result = await saveJsonWithRetry(path, () => data)
+    setBusy('')
+    if (result.ok) { rememberManifest(path, data); registerNewManifest(path); await reload(); onRefresh?.() }
+    return result
+  }
+
+  // allowEmpty : le bouton "Créer" de la bibliothèque doit pouvoir poser une playlist VIDE (une nouvelle
+  // vue à remplir ensuite), distinct du flux "Créer avec N" qui, lui, exige une sélection réelle.
+  const savePlaylist = async (name, items, extra = {}, allowEmpty = false) => {
+    if (!name || (!allowEmpty && !items.length && !extra.contextUri)) return
+    setBusy('playlist')
+    const path = `${scope}/${clean(name)}.${Date.now().toString(36)}.media.json`
+    const data = {
+      type: 'playlist', v: 1, mime: 'audio/x-zenray-playlist', name, title: name, items,
+      cover: extra.cover || items.find((track) => track.cover)?.cover || '',
+      createdAt: new Date().toISOString(), ...extra,
+    }
+    const result = await saveJsonWithRetry(path, () => data)
+    setBusy('')
+    if (result.ok) {
+      rememberManifest(path, data)
+      registerNewManifest(path)
+      setNewName('')
+      setSelected(new Set())
+      // La playlist neuve S'OUVRE immédiatement au centre (retour 2026-07-20 : "la playlist nouvelle
+      // devrait s'afficher") -- même contrat qu'un clic dessus dans la bibliothèque.
+      setActiveArtist(null)
+      setActivePlaylist({ kind: 'zenray', key: path, name, owner: 'ZenRay', cover: data.cover || '', tracks: items, loading: false })
+      await reload()
+      onRefresh?.()
+    }
+  }
+
+  // Playlist multi-source (retour 2026-07-19, prompt initial jamais traité : "aucun moyen de créer une
+  // playlist multi media spotify/youtube/local depuis cette vue"). Le "+" de chaque résultat de recherche
+  // (YouTube/Spotify/local, déjà câblés) ajoute désormais AUSSI à la playlist ZenRay ouverte -- si aucune
+  // n'est ouverte, en crée une à la volée avec ce premier titre (bouton "Créer" existant reste dispo pour
+  // poser une playlist vide nommée d'abord ; ce chemin-ci part du contenu, pas du nom).
+  // T4 (2026-07-22) — RÉSILIENCE DES PLAYLISTS, bug de PERTE DE DONNÉES corrigé. Toutes les écritures de
+  // playlist repartaient de `rows.find(path)` : si la ligne n'était pas (ou plus) dans `rows` -- playlist
+  // trouvée par le scan global allRows, liste pas encore rechargée après une création, drop sur une playlist
+  // hors de la section courante -- alors `row` valait undefined, `existingItems` retombait à [] et l'écriture
+  // ÉCRASAIT la playlist entière avec un seul titre. Désormais on relit le manifeste DISTANT en dernier
+  // recours (readJson) avant toute réécriture : on n'écrase jamais ce qu'on n'a pas lu.
+  // Manifeste connu LOCALEMENT (rows -> allRows -> playlist ouverte). Sert de SECOURS quand l'état distant
+  // n'est pas encore lisible ; ce n'est JAMAIS la source d'autorité (voir mutatePlaylist ci-dessous).
+  const knownPlaylistManifest = (path) => {
+    const row = rows.find((candidate) => candidate.path === path)
+      || (allRows || []).find((candidate) => candidate.path === path)
+    if (row?.manifest) return row.manifest
+    if (activePlaylist?.key === path) return { title: activePlaylist.name, cover: activePlaylist.cover, items: activePlaylist.tracks || [] }
+    return null
+  }
+
+  // ÉCRITURE DE PLAYLIST — READ-MODIFY-WRITE RÉEL (2026-07-22, correctif du bug « les playlists ne gardent
+  // aucun titre »). DEUX défauts cumulés expliquaient la perte :
+  //   1. tous les appels passaient `() => data` à saveJsonWithRetry : ce paramètre est un MUTATE qui reçoit
+  //      l'état FRAIS du drive et doit produire le suivant. En ignorant `cur`, on écrivait un objet figé
+  //      calculé depuis l'état React -- et sur conflit 409 le retry ré-appliquait ce même objet figé, donc
+  //      l'écriture concurrente était écrasée au lieu d'être fusionnée. Toute la protection anti-perte de
+  //      saveJson.js était neutralisée.
+  //   2. le repli distant lisait `readJson(path)` en croyant recevoir le manifeste : readJson renvoie
+  //      `{sha, data}` -> `.items` valait undefined -> la liste repartait à [] et la playlist était écrasée
+  //      avec un seul titre (bug introduit la veille en voulant justement fiabiliser ce chemin).
+  // Désormais : UNE seule porte d'écriture, `mutate(items, base)` appliqué à l'état RÉEL du drive. Aucune
+  // écriture de playlist ne doit contourner cette fonction.
+  // POCHETTE DÉRIVÉE (2026-07-22, demande Matthieu : « la pochette ne doit reprendre que le PREMIER média de
+  // la playlist »). Exception : une pochette choisie à la main via le popover pose coverPinned:true et n'est
+  // alors plus jamais écrasée par un ajout/retrait/réordonnancement.
+  const coverForItems = (items, base) => (base && base.coverPinned)
+    ? (base.cover || '')
+    : ((items || []).find((item) => item && item.cover)?.cover || '')
+
+  const mutatePlaylist = async (path, mutate) => {
+    const known = knownPlaylistManifest(path)
+    setBusy('playlist')
+    const result = await saveJsonWithRetry(path, (cur) => {
+      const base = (cur && typeof cur === 'object' && Object.keys(cur).length) ? cur : (known || {})
+      const items = Array.isArray(base.items) ? base.items : []
+      const next = mutate(items, base)
+      return { ...base, type: 'playlist', v: 1, mime: 'audio/x-zenray-playlist', ...next }
+    })
+    setBusy('')
+    // Write-through : ce qu'on vient d'écrire devient la vérité locale, sinon la relecture (cache CDN raw,
+    // ~5 min) réafficherait l'ancienne liste et le titre déposé disparaîtrait.
+    if (result.ok && result.data) rememberManifest(path, result.data)
+    return result
+  }
+
+  // T5 (2026-07-22) : changer la POCHETTE d'une playlist ZenRay. `cover` accepte une URL du site (vignette
+  // jsDelivr issue de l'index) OU un dataURL JPEG (image uploadée/collée, réduite à 1024px côté UI ~80 Ko --
+  // même recette que PlanBoard, le manifeste passe par l'API GitHub donc on ne stocke jamais un brut lourd).
+  const setPlaylistCover = async (path, cover) => {
+    if (!path) return
+    // Les items ne sont PAS touchés : le mutate ne renvoie que `cover`, tout le reste vient de l'état frais.
+    const result = await mutatePlaylist(path, () => ({ cover: cover || '', coverPinned: !!cover }))
+    if (result.ok) {
+      setActivePlaylist((prev) => (prev && prev.key === path) ? { ...prev, cover: cover || '' } : prev)
+      await reload()
+    }
+  }
+
+  const addTrackToActivePlaylist = async (track) => {
+    if (activePlaylist?.kind === 'zenray') {
+      let nextItems = []
+      const result = await mutatePlaylist(activePlaylist.key, (items, base) => {
+        nextItems = [...items, track]
+        return { items: nextItems, cover: coverForItems(nextItems, base) }
+      })
+      if (result.ok) {
+        setActivePlaylist((prev) => (prev && prev.key === activePlaylist.key) ? { ...prev, tracks: nextItems } : prev)
+        await reload()
+      }
+      return
+    }
+    const name = `Nouvelle playlist ${new Date().toLocaleDateString('fr-FR')}`
+    const path = `${scope}/${clean(name)}.${Date.now().toString(36)}.media.json`
+    const data = { type: 'playlist', v: 1, mime: 'audio/x-zenray-playlist', name, title: name, items: [track], cover: track.cover || '', createdAt: new Date().toISOString() }
+    setBusy('playlist')
+    const result = await saveJsonWithRetry(path, () => data)
+    setBusy('')
+    if (result.ok) {
+      rememberManifest(path, data)
+      registerNewManifest(path)
+      await reload()
+      setActivePlaylist({ kind: 'zenray', key: path, name, owner: 'ZenRay', cover: track.cover || '', tracks: [track], loading: false })
+    }
+  }
+
+  // Bug réel corrigé le 2026-07-20 ("clic droit -> ajouter à une playlist ne fonctionne pas") :
+  // addTrackToActivePlaylist ci-dessus n'ajoutait QUE dans la playlist actuellement OUVERTE (ou en créait
+  // une nouvelle) -- aucun moyen de choisir une playlist EXISTANTE précise depuis le clic droit ou le "+"
+  // d'un résultat de recherche. Ce chemin-ci cible un `path` explicite (choisi dans un petit sélecteur
+  // côté UI), fonctionne pour n'importe quelle piste (importée OU brute Spotify/YouTube/locale jamais
+  // encore ajoutée à ZenRay) puisqu'il n'a besoin que de l'OBJET track, jamais d'une row existante.
+  const addTrackToPlaylistPath = async (track, path) => {
+    // C'est LE chemin du drag & drop sur une playlist du panneau gauche : il part de l'état FRAIS du drive
+    // (mutatePlaylist), donc il fonctionne même si la playlist n'est pas dans `rows` et il fusionne avec une
+    // écriture concurrente au lieu de l'écraser.
+    // INSTANTANÉITÉ (2026-07-22) : le titre apparaît AVANT l'aller-retour réseau. L'écriture qui suit ne fait
+    // que confirmer ; en cas d'échec on retire la ligne optimiste (pas de faux positif durable).
+    if (activePlaylist?.key === path) setActivePlaylist((prev) => (prev && prev.key === path) ? { ...prev, tracks: [...(prev.tracks || []), track] } : prev)
+    let nextItems = []
+    const result = await mutatePlaylist(path, (items, base) => {
+      nextItems = [...items, track]
+      return { items: nextItems, cover: coverForItems(nextItems, base) }
+    })
+    if (result.ok) {
+      if (activePlaylist?.key === path) setActivePlaylist((prev) => (prev && prev.key === path) ? { ...prev, tracks: nextItems } : prev)
+      await reload()
+    } else if (activePlaylist?.key === path) {
+      setActivePlaylist((prev) => (prev && prev.key === path) ? { ...prev, tracks: (prev.tracks || []).filter((candidate) => candidate !== track) } : prev)
+    }
+    return result.ok
+  }
+  // Créer une NOUVELLE playlist nommée directement avec cette piste dedans (chemin "+ Nouvelle playlist"
+  // du sélecteur), sans passer par le flux séparé savePlaylist(nom, sélection) qui exige une sélection
+  // Finder préalable -- celui-ci part du contenu (une piste unique), pas d'une sélection de lignes.
+  // Réordonnancement drag & drop (retour Matthieu : "pouvoir réagencer ses propres playlists où on le
+  // souhaite") : écrit le nouvel ordre `items` tel quel, sans passer par une fusion -- l'appelant a déjà
+  // calculé le tableau complet réordonné.
+  const reorderPlaylist = async (path, newItems) => {
+    // Seul cas où l'ordre voulu REMPLACE la liste distante (l'appelant a déjà calculé le tableau complet) ;
+    // title/cover/createdAt viennent quand même de l'état frais grâce à mutatePlaylist.
+    const result = await mutatePlaylist(path, (items, base) => ({ items: newItems, cover: coverForItems(newItems, base) }))
+    if (result.ok) {
+      if (activePlaylist?.key === path) setActivePlaylist((prev) => (prev && prev.key === path) ? { ...prev, tracks: newItems } : prev)
+      await reload()
+    }
+  }
+  const createPlaylistWithTrack = async (name, track) => {
+    const clean_ = clean(name)
+    const path = `${scope}/${clean_}.${Date.now().toString(36)}.media.json`
+    const data = { type: 'playlist', v: 1, mime: 'audio/x-zenray-playlist', name: clean_, title: clean_, items: [track], cover: track.cover || '', createdAt: new Date().toISOString() }
+    setBusy('playlist')
+    const result = await saveJsonWithRetry(path, () => data)
+    setBusy('')
+    if (result.ok) {
+      rememberManifest(path, data)
+      registerNewManifest(path)
+      setActiveArtist(null)
+      setActivePlaylist({ kind: 'zenray', key: path, name: clean_, owner: 'ZenRay', cover: track.cover || '', tracks: [track], loading: false })
+      await reload()
+    }
+    return result.ok
+  }
+
+  // Retirer UNE piste d'une playlist ZenRay OUVERTE, via son clic droit (retour Matthieu 2026-07-20 :
+  // "bouton de suppression des tracklists sur le clic droit"). Filtre par RÉFÉRENCE exacte -- le track
+  // vient du même tableau que celui affiché (activePlaylist.tracks), donc fiable même avec doublons.
+  const removeTrackFromActivePlaylist = async (track) => {
+    if (activePlaylist?.kind !== 'zenray') return
+    // Comparaison par IDENTITÉ d'abord (référence exacte du tableau affiché), sinon par clé stable : l'état
+    // frais du drive ne contient PAS les mêmes instances d'objets que l'UI -> `!==` seul ne retirerait rien.
+    const keyOf = (candidate) => String(candidate?.manifestPath || candidate?.streamPath || candidate?.uri || candidate?.videoId || candidate?.title || '')
+    const targetKey = keyOf(track)
+    let nextItems = []
+    let removed = false
+    const result = await mutatePlaylist(activePlaylist.key, (items, base) => {
+      removed = false
+      nextItems = items.filter((candidate) => {
+        if (removed) return true
+        if (candidate === track || (targetKey && keyOf(candidate) === targetKey)) { removed = true; return false }
+        return true
+      })
+      return { items: nextItems, cover: coverForItems(nextItems, base) }
+    })
+    if (result.ok) {
+      setActivePlaylist((prev) => (prev && prev.key === activePlaylist.key) ? { ...prev, tracks: nextItems } : prev)
+      await reload()
+    }
+  }
+
+  // Supprimer une playlist ENTIÈRE (retour Matthieu 2026-07-20 : "bouton de suppression des playlists
+  // directement dans le lecteur"). apiPost('delete') exige le sha courant (même contrat que le reste
+  // de l'app -- App.jsx deleteNode) ; rollbackSearchIndexPaths() la retire de l'index CLIENT tout de
+  // suite, sans attendre un rebuild serveur.
+  const deletePlaylistPath = async (path) => {
+    const { sha } = await readJson(path)
+    if (!sha) return false
+    setBusy('playlist')
+    const result = await apiPost('delete', { path, sha }).catch(causeApi)
+    setBusy('')
+    if (!result?.ok) return false
+    rollbackSearchIndexPaths([path])
+    if (activePlaylist?.key === path) setActivePlaylist(null)
+    await reload()
+    return true
+  }
+
+  // Recherche multi-source (retour Matthieu 2026-07-16 : "le plus important" ; 2026-07-17 : "JE T'AI
+  // POURTANT DEJA DONNE LES ACCES"). Correction réelle : la recherche appelait spotifyApi.search(), qui
+  // exige le token OAuth NAVIGATEUR (login personnel via accounts.spotify.com) -- pas du tout le
+  // Client ID/Secret que Matthieu a fournis. Ces deux identifiants Spotify sont DIFFÉRENTS : le
+  // Client ID/Secret (grant "Client Credentials", server/spotify-search.js) lit le catalogue public SANS
+  // connexion utilisateur ; le VITE_SPOTIFY_CLIENT_ID (PKCE navigateur, spotifyAuth.js) sert uniquement à
+  // IMPORTER dans le compte personnel (importProvider plus bas, inchangé). La recherche n'a donc plus
+  // aucune raison d'exiger un login. Debounce 350 ms + garde de séquence (même motif que loadSeq ci-dessus).
+  useEffect(() => {
+    const needle = query.trim()
+    if (needle.length < 2) { setSpotifyResults([]); setSpotifySearching(false); return undefined }
+    setSpotifySearching(true)
+    const sequence = ++spotifySeq.current
+    const timer = setTimeout(async () => {
+      const data = await fetch(`/api/spotify-search?q=${encodeURIComponent(needle)}`).then((r) => r.json()).catch(() => null)
+      if (sequence !== spotifySeq.current) return
+      const items = (data?.tracks?.items || []).map((track) => ({
+        source: 'spotify', uri: track.uri, title: track.name,
+        artist: (track.artists || []).map((artist) => artist.name).join(', '),
+        album: track.album?.name || 'Spotify', cover: track.album?.images?.[0]?.url || '',
+        dur: (track.duration_ms || 0) / 1000,
+      }))
+      setSpotifyResults(items)
+      setSpotifySearching(false)
+    }, 350)
+    return () => clearTimeout(timer)
+  }, [query])
+
+  // YouTube (retour Matthieu 2026-07-17 : "pourquoi il faut l'API google... trouve une solution"). Passe
+  // par server/youtube-search.js -- l'endpoint interne (innertube) que youtube.com utilise pour son PROPRE
+  // lecteur web, aucune clé Google Cloud personnelle. Même motif debounce + garde de séquence.
+  useEffect(() => {
+    const needle = query.trim()
+    if (needle.length < 2) { setYoutubeResults([]); setYoutubeSearching(false); return undefined }
+    setYoutubeSearching(true)
+    const sequence = ++youtubeSeq.current
+    const timer = setTimeout(async () => {
+      const data = await fetch(`/api/youtube-search?q=${encodeURIComponent(needle)}`).then((r) => r.json()).catch(() => null)
+      if (sequence !== youtubeSeq.current) return
+      setYoutubeResults(data?.results || [])
+      setYoutubeSearching(false)
+    }, 350)
+    return () => clearTimeout(timer)
+  }, [query])
+
+  const importProvider = async (urlOverride) => {
+    const raw = urlOverride ?? spotifyUrl
+    const parsed = parseProviderUrl(raw)
+    if (!parsed) return
+    setBusy(parsed.provider)
+    try {
+      if (parsed.provider === 'youtube') {
+        const meta = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(parsed.url)}&format=json`)
+          .then((response) => response.ok ? response.json() : null).catch(() => null)
+        const title = meta?.title || `YouTube ${parsed.id}`
+        const data = {
+          type: 'youtube', v: 1, audioOnly: true, mediaKind: 'audio', videoId: parsed.id,
+          url: parsed.url, title, author: meta?.author_name || 'YouTube',
+          poster: meta?.thumbnail_url || `https://i.ytimg.com/vi/${parsed.id}/hqdefault.jpg`,
+          addedAt: new Date().toISOString(),
+        }
+        const ytPath = `${scope}/${clean(title)}.${Date.now().toString(36)}.media.json`
+        const result = await saveJsonWithRetry(ytPath, () => data)
+        if (result.ok) { rememberManifest(ytPath, data); registerNewManifest(ytPath); await reload(); onRefresh?.() }
+      } else {
+        if (!isLoggedIn()) {
+          sessionStorage.setItem('zr:spotify:pendingImport', raw)
+          login()
+          return
+        }
+        if (parsed.kind === 'album') {
+          const album = await spotifyAlbum(parsed.id)
+          if (album) {
+            const items = (album.tracks?.items || []).map((track) => ({
+              source: 'spotify', uri: track.uri, title: track.name,
+              artist: (track.artists || []).map((artist) => artist.name).join(', '),
+              album: album.name, cover: album.images?.[0]?.url || '', dur: (track.duration_ms || 0) / 1000,
+            }))
+            await savePlaylist(album.name, items, {
+              source: 'spotify', contextUri: album.uri, cover: album.images?.[0]?.url || '',
+              artist: (album.artists || []).map((artist) => artist.name).join(', '),
+            })
+          }
+        } else if (parsed.kind === 'playlist') {
+          const playlist = await spotifyPlaylist(parsed.id)
+          if (playlist) {
+            const items = (playlist.tracks?.items || []).map((item) => item.track).filter(Boolean).map((track) => ({
+              source: 'spotify', uri: track.uri, title: track.name,
+              artist: (track.artists || []).map((artist) => artist.name).join(', '),
+              album: track.album?.name || playlist.name,
+              cover: track.album?.images?.[0]?.url || playlist.images?.[0]?.url || '',
+              dur: (track.duration_ms || 0) / 1000,
+            }))
+            await savePlaylist(playlist.name, items, {
+              source: 'spotify', contextUri: playlist.uri, cover: playlist.images?.[0]?.url || '',
+              artist: playlist.owner?.display_name || 'Spotify',
+            })
+          }
+        } else {
+          const track = await spotifyTrack(parsed.id)
+          if (track) await savePlaylist(track.name, [{
+            source: 'spotify', uri: track.uri, title: track.name,
+            artist: (track.artists || []).map((artist) => artist.name).join(', '),
+            album: track.album?.name || 'Spotify', cover: track.album?.images?.[0]?.url || '',
+            dur: (track.duration_ms || 0) / 1000,
+          }], { source: 'spotify', cover: track.album?.images?.[0]?.url || '' })
+        }
+      }
+      setSpotifyUrl('')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // Le résultat de recherche est déjà un morceau jouable : le clic principal ne passe jamais par
+  // importProvider. Cela évite le login Spotify ou l'écriture de manifeste au moment où l'utilisateur veut
+  // seulement écouter, et supprime le faux "rechargement" observé sur la recherche multi-source.
+  const playSpotifyResult = (track) => playTracks([track])
+  const playYoutubeResult = (video) => playTracks([{
+    source: 'youtube', videoId: video.videoId, uri: `https://www.youtube.com/watch?v=${video.videoId}`,
+    title: video.title || 'YouTube', artist: video.channel || 'YouTube', album: 'YouTube',
+    cover: video.thumbnail || '', dur: Number(video.duration) || 0,
+  }])
+
+  useEffect(() => {
+    if (!open) { consumedSpotifyUrl.current = ''; return }
+    if (!pendingSpotifyUrl || consumedSpotifyUrl.current === pendingSpotifyUrl) return
+    consumedSpotifyUrl.current = pendingSpotifyUrl
+    setSpotifyUrl(pendingSpotifyUrl)
+    importProvider(pendingSpotifyUrl)
+  }, [open, pendingSpotifyUrl]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!open) return null
+  return <ZenRayAudioWorkspace
+    t={t}
+    rows={rows}
+    tracks={tracks}
+    allTracks={allTracks}
+    allTracksLoading={allLoading}
+    onLoadAllTracks={loadAllTracks}
+    playlists={playlists}
+    loading={loading}
+    query={query}
+    setQuery={setQuery}
+    section={section}
+    setSection={setSection}
+    selected={selected}
+    toggleRow={toggleRow}
+    playTracks={playTracks}
+    playRow={playRow}
+    player={player}
+    onAddAudio={onAddAudio}
+    scope={scope}
+    reload={reload}
+    fileInput={fileInput}
+    spotifyUrl={spotifyUrl}
+    setSpotifyUrl={setSpotifyUrl}
+    importProvider={importProvider}
+    localMatches={localMatches}
+    spotifyResults={spotifyResults}
+    spotifySearching={spotifySearching}
+    onPlaySpotifyResult={playSpotifyResult}
+    youtubeResults={youtubeResults}
+    youtubeSearching={youtubeSearching}
+    onPlayYoutubeResult={playYoutubeResult}
+    busy={busy}
+    selectedTracks={selectedTracks}
+    newName={newName}
+    setNewName={setNewName}
+    savePlaylist={savePlaylist}
+    onClose={onClose}
+    spotifyConnected={spotifyConnected}
+    spotifyProfile={spotifyProfile}
+    spotifyPlaylistsData={spotifyPlaylistsData}
+    spotifyLibraryLoading={spotifyLibraryLoading}
+    onConnectSpotify={login}
+    onPlaySpotifyPlaylist={openSpotifyPlaylist}
+    spotifyLikedTracks={spotifyLikedTracks}
+    onPlaySpotifyLiked={openSpotifyLiked}
+    activePlaylist={activePlaylist}
+    onClearPlaylist={clearActivePlaylist}
+    onAddToPlaylist={addTrackToActivePlaylist}
+    onAddTrackToPlaylistPath={addTrackToPlaylistPath}
+    onRemoveTrackFromActivePlaylist={removeTrackFromActivePlaylist}
+    onDeletePlaylistPath={deletePlaylistPath}
+    onCreatePlaylistWithTrack={createPlaylistWithTrack}
+    onReorderPlaylist={reorderPlaylist}
+    activeArtist={activeArtist}
+    onOpenArtist={openArtist}
+    onOpenArtistByName={openArtistByName}
+    onSaveTrackToFolder={saveTrackToFolder}
+    onSetPlaylistCover={setPlaylistCover}
+    onClearArtist={clearActiveArtist}
+    onOpenArtistAlbum={openArtistAlbum}
+  />
+}

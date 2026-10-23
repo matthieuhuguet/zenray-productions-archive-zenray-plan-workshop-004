@@ -1,0 +1,72 @@
+// 8 October 2026, 10:25 CEST: guard a large registry save against concurrent edits to the same path.
+// 8 October 2026, 10:53 CEST: keep UTF-8 registry text compact in the Git Data API request.
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { saveLargeContent } from './page.js'
+
+const contentPath = 'contents/pages/.zr-assets-workspaces.json'
+const response = (value, status = 200) => new Response(JSON.stringify(value), { status })
+afterEach(() => vi.unstubAllGlobals())
+
+describe('saveLargeContent', () => {
+  it('commits a matching version through Git Data and verifies its blob SHA on the branch', async () => {
+    const markdown = '{"projects":[{"id":"assets"}]}'
+    let currentSha = 'before'
+    const calls = []
+    const fetchImpl = vi.fn(async (url, init = {}) => {
+      const parsed = new URL(url)
+      const path = parsed.pathname.split('/repos/matthieuhuguet/zenray-data/')[1]
+      const method = init.method || 'GET'
+      calls.push({ path, method, init })
+      if (path === contentPath) return response({ sha: parsed.searchParams.get('ref') === 'head-1' ? 'before' : currentSha })
+      if (path === 'git/blobs' && method === 'POST') return response({ sha: 'after' }, 201)
+      if (path === 'git/ref/heads/main') return response({ object: { sha: 'head-1' } })
+      if (path === 'git/commits/head-1') return response({ tree: { sha: 'tree-1' } })
+      if (path === 'git/trees' && method === 'POST') return response({ sha: 'tree-2' }, 201)
+      if (path === 'git/commits' && method === 'POST') return response({ sha: 'commit-2' }, 201)
+      if (path === 'git/refs/heads/main' && method === 'PATCH') {
+        currentSha = 'after'
+        return response({ ref: 'refs/heads/main' })
+      }
+      return response({ message: `unexpected ${method} ${path}` }, 500)
+    })
+    vi.stubGlobal('fetch', fetchImpl)
+
+    await expect(saveLargeContent('test-token', 'pages/.zr-assets-workspaces.json', markdown, 'before'))
+      .resolves.toEqual({ ok: true, sha: 'after' })
+
+    const blobWrite = calls.find(({ path, method }) => path === 'git/blobs' && method === 'POST')
+    expect(JSON.parse(blobWrite.init.body)).toEqual({ content: markdown, encoding: 'utf-8' })
+    expect(calls.some(({ path, method }) => path === contentPath && method === 'PUT')).toBe(false)
+    expect(calls.some(({ path, method }) => path === 'git/trees' && method === 'POST')).toBe(true)
+  })
+
+  it('refuses a stale SHA before uploading a blob', async () => {
+    const fetchImpl = vi.fn(async () => response({ sha: 'newer' }))
+    vi.stubGlobal('fetch', fetchImpl)
+
+    await expect(saveLargeContent('test-token', 'pages/.zr-assets-workspaces.json', 'new content', 'older'))
+      .resolves.toMatchObject({ ok: false, conflict: true })
+    expect(fetchImpl.mock.calls.some(([url, init = {}]) => String(url).endsWith('/git/blobs') && init.method === 'POST')).toBe(false)
+  })
+
+  it('refuses a same-file change that races with blob upload', async () => {
+    const calls = []
+    const fetchImpl = vi.fn(async (url, init = {}) => {
+      const parsed = new URL(url)
+      const path = parsed.pathname.split('/repos/matthieuhuguet/zenray-data/')[1]
+      const method = init.method || 'GET'
+      calls.push({ path, method })
+      if (path === contentPath) return response({ sha: parsed.searchParams.get('ref') === 'head-1' ? 'raced' : 'before' })
+      if (path === 'git/blobs' && method === 'POST') return response({ sha: 'after' }, 201)
+      if (path === 'git/ref/heads/main') return response({ object: { sha: 'head-1' } })
+      if (path === 'git/commits/head-1') return response({ tree: { sha: 'tree-1' } })
+      return response({ message: `unexpected ${method} ${path}` }, 500)
+    })
+    vi.stubGlobal('fetch', fetchImpl)
+
+    await expect(saveLargeContent('test-token', 'pages/.zr-assets-workspaces.json', 'new content', 'before'))
+      .resolves.toMatchObject({ ok: false, conflict: true })
+    expect(calls.some(({ path, method }) => path === 'git/trees' && method === 'POST')).toBe(false)
+    expect(calls.some(({ path, method }) => path === 'git/refs/heads/main' && method === 'PATCH')).toBe(false)
+  })
+})

@@ -1,0 +1,88 @@
+// Rendu Markdown SÛR — un seul point d'entrée pour tout l'app.
+//
+// EN CLAIR POUR TOUS : l'app affiche des aperçus de pages écrites en Markdown (un texte simple où
+// "**gras**" devient gras, etc.). Ces aperçus sont injectés dans la page via innerHTML. Problème :
+// la bibliothèque marked, depuis sa version 5, laisse passer TEL QUEL le HTML brut écrit dans le
+// Markdown. Donc un fichier piégé contenant <script>…</script> ou <img onerror=…> verrait son code
+// s'exécuter dans l'app (faille XSS). Ici tout le contenu vit sur le drive privé GitHub de Matthieu,
+// donc la surface est limitée, mais rendre du HTML brut d'origine arbitraire reste une vraie faille.
+//
+// CE QUE FAIT CE MODULE : il configure marked avec un rendu qui ÉCHAPPE le HTML brut (les balises
+// deviennent du texte visible "&lt;script&gt;" au lieu d'être exécutées), tout en gardant intact le
+// Markdown normal (gras, titres, listes, liens, images Markdown). Aucune dépendance ajoutée (pas de
+// DOMPurify) : on neutralise à la source, dans marked lui-même.
+//
+// USAGE : importer `safeMarkedParse` et l'utiliser partout où on faisait `marked.parse(...)` avant
+// d'injecter via dangerouslySetInnerHTML. Centralisé pour qu'il n'existe qu'UNE seule vérité.
+import { Marked } from 'marked'
+
+const escapeHtml = (s) =>
+  String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+const escapeAttribute = (s) =>
+  escapeHtml(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+
+// Liste blanche positive : les URL web/mail explicites et les chemins internes.
+// On décode aussi les formes percent/entity qui pourraient cacher « javascript: »
+// avant que le navigateur ne réinterprète la valeur de l'attribut HTML.
+function safeMarkdownUrl(raw, { image = false } = {}) {
+  if (typeof raw !== 'string') return null
+  const value = raw.trim()
+  if (!value || /[\u0000-\u0020\u007f-\u009f]/.test(value)) return null
+  let probe = value.replace(/&#(?:x([0-9a-f]+)|(\d+));?/gi, (_, hex, dec) => {
+    const code = Number.parseInt(hex || dec, hex ? 16 : 10)
+    return Number.isFinite(code) && code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : ''
+  }).replace(/&colon;/gi, ':')
+  for (let i = 0; i < 2 && probe.includes('%'); i += 1) {
+    try {
+      const decoded = decodeURIComponent(probe)
+      if (decoded === probe) break
+      probe = decoded
+    } catch {
+      return null
+    }
+  }
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(probe)) return null
+
+  const scheme = probe.match(/^([a-z][a-z0-9+.-]*):/i)
+  if (scheme) {
+    const allowed = image ? new Set(['http', 'https']) : new Set(['http', 'https', 'mailto'])
+    if (!allowed.has(scheme[1].toLowerCase())) return null
+  }
+  return value
+}
+
+// Instance dédiée (n'altère pas un éventuel marked global) configurée pour neutraliser le HTML brut.
+// Le renderer `html` reçoit soit un token { raw/text }, soit (anciennes signatures) une chaîne :
+// on échappe la source brute dans les deux cas -> le HTML s'affiche en texte littéral, jamais exécuté.
+const safeMarked = new Marked({ async: false, gfm: true, breaks: false })
+safeMarked.use({
+  renderer: {
+    html(token) {
+      const raw = typeof token === 'string' ? token : (token && (token.raw || token.text)) || ''
+      return escapeHtml(raw)
+    },
+    link(token) {
+      const text = this.parser.parseInline(token.tokens || [])
+      const href = safeMarkdownUrl(token.href)
+      if (!href) return text
+      const title = token.title ? ` title="${escapeAttribute(token.title)}"` : ''
+      return `<a href="${escapeAttribute(href)}"${title}>${text}</a>`
+    },
+    image(token) {
+      const src = safeMarkdownUrl(token.href, { image: true })
+      if (!src) return escapeHtml(token.text || '')
+      const title = token.title ? ` title="${escapeAttribute(token.title)}"` : ''
+      return `<img src="${escapeAttribute(src)}" alt="${escapeAttribute(token.text || '')}"${title}>`
+    },
+  },
+})
+
+export function safeMarkedParse(md) {
+  try {
+    return safeMarked.parse(typeof md === 'string' ? md : '')
+  } catch {
+    // Dernier filet : en cas d'erreur de parsing, on renvoie le texte échappé (jamais d'injection).
+    return escapeHtml(md || '')
+  }
+}

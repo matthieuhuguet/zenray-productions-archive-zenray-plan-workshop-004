@@ -1,0 +1,214 @@
+// 4 October 2026: the application panel of one vacancy. The letter is already written from his template, his CV and his latest work;
+// he edits it, copies it, opens the studio's own application page and marks it sent. Nothing here ever sends anything.
+// FR : le panneau de candidature d'une annonce. La lettre est deja ecrite depuis son gabarit, son CV et ses derniers travaux ;
+// il l'edite, la copie, ouvre la page de candidature du studio et la marque envoyee. Rien n'est jamais envoye d'ici.
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { saveJsonWithRetry } from '../../lib/saveJson.js'
+import { urlLectureAffichage } from '../../lib/urlLecture.js'
+import { notify } from '../Notifications.jsx'
+import { studioKey } from '../../lib/freelanceStudioKey.js'
+import { acceptSuggestion, addUserVersion, copyBundle, currentVersion, dismissSuggestion, mailtoUrl, relativeTime, suggestionOf, versionsOf } from '../../lib/freelanceEngineModel.js'
+import { Button, GlassPill, P, SectionTitle, glassStyle, textareaStyle } from './ui.jsx'
+
+const CHANNELS = ['mail', 'linkedin', 'formulaire du studio', 'autre']
+const HOOK_NOTE = {
+  saved: 'Accroche : ton paragraphe pour ce studio.',
+  offer: 'Accroche construite depuis l’offre et les compétences de ton CV.',
+  claude: 'Accroche écrite par Claude depuis l’offre et ton CV : relis-la, elle ne dit rien que ton CV ne dise déjà.',
+  none: 'Pas de paragraphe personnel pour ce studio : ajoutes-en un plus bas, il servira aux prochaines lettres.',
+  'saved-other-language': 'Ton paragraphe pour ce studio existe en français seulement : ajoute sa version dans cette langue plus bas.',
+}
+const REASON = { initial: 'préparée automatiquement', refresh: 'mise à jour automatique', regenerate: 'régénérée', edit: 'modifiée par toi', 'accepted-suggestion': 'mise à jour acceptée', 'sent-template': 'ta lettre d’origine' }
+
+const copy = async (text, label) => {
+  try { await navigator.clipboard.writeText(text); notify({ title: `${label} copié`, body: 'Prêt à coller.' }) }
+  catch { notify({ title: 'Copie impossible', body: 'Le navigateur refuse l’accès au presse-papiers.' }) }
+}
+
+const parseArchive = (response) => {
+  if (!response || response.missing || typeof response.markdown !== 'string') return null
+  const data = JSON.parse(response.markdown)
+  return Array.isArray(data.versions) ? data : null
+}
+
+export default function FreelanceLetter({ t, studio, engine, template, bridge, onSent, onTemplateSaved, templatePath }) {
+  const known = studio.engine || {}
+  const [path, setPath] = useState(known.letterPath || '')
+  const [archive, setArchive] = useState(null)
+  const [state, setState] = useState(known.letterPath ? 'loading' : 'empty')
+  const [error, setError] = useState('')
+  const [draft, setDraft] = useState({ text: '', subject: '' })
+  const [busy, setBusy] = useState('')
+  const [channel, setChannel] = useState('mail')
+  const [showHistory, setShowHistory] = useState(false)
+  const [hookText, setHookText] = useState('')
+  const alive = useRef(true)
+
+  useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
+  useEffect(() => { setPath(known.letterPath || ''); setState(known.letterPath ? 'loading' : 'empty'); setArchive(null) }, [studio.id, known.letterPath])
+
+  const apply = useCallback((data) => {
+    setArchive(data)
+    const version = currentVersion(data)
+    setDraft({ text: version ? version.text : '', subject: version ? version.subject : '' })
+    setState(version ? 'ready' : 'empty')
+  }, [])
+
+  const load = useCallback(async (file) => {
+    setState('loading'); setError('')
+    try {
+      const response = await fetch(urlLectureAffichage(file, { fresh: true }), { cache: 'no-cache' })
+      if (!response.ok) throw new Error('La lettre ne se charge pas pour le moment.')
+      const data = parseArchive(await response.json())
+      if (!alive.current) return
+      if (!data) { setState('empty'); return }
+      apply(data)
+    } catch (e) { if (alive.current) { setError(e.message); setState('error') } }
+  }, [apply])
+  useEffect(() => { if (path) load(path) }, [path, load])
+
+  const language = (currentVersion(archive)?.lang) || known.language || 'fr'
+  const version = currentVersion(archive)
+  const dirty = Boolean(version) && (draft.text.trim() !== version.text || draft.subject !== version.subject)
+  const suggestion = suggestionOf(archive)
+  const key = studioKey(studio.name)
+  const savedHook = template && template.hooks && template.hooks[key] && template.hooks[key][language] && template.hooks[key][language].text
+  useEffect(() => { setHookText(savedHook || '') }, [savedHook, studio.id, language])
+
+  const emails = known.contactEmails || []
+  const applyUrl = known.applyUrl || studio.link
+  const mailto = useMemo(() => mailtoUrl({ to: emails[0], subject: draft.subject, body: draft.text }), [emails, draft])
+  const cvUrl = engine && engine.cv && engine.cv.pdf && (engine.cv.pdf[language] || engine.cv.pdf.en)
+
+  const withService = async (label, work) => {
+    setBusy(label); setError('')
+    try { return await work() }
+    catch (e) { setError(e.message); notify({ title: 'Lettre non préparée', body: e.message }); return null }
+    finally { if (alive.current) setBusy('') }
+  }
+
+  const prepare = (lang = null) => withService('prepare', async () => {
+    const result = await bridge.letter(studio.id, lang)
+    setPath(result.letterPath)
+    if (result.letterPath === path) await load(result.letterPath)
+    notify({ title: 'Lettre préparée', body: 'Écrite avec ton gabarit, ton CV et tes derniers travaux.' })
+  })
+
+  const persist = (mutate, doneTitle) => withService('save', async () => {
+    const result = await saveJsonWithRetry(path, mutate)
+    if (!result.ok) throw new Error(String(result.error || 'Enregistrement impossible'))
+    apply(result.data)
+    if (doneTitle) notify({ title: doneTitle, body: 'Chaque version reste gardée dans l’historique.' })
+    return result.data
+  })
+
+  const saveEdit = () => persist((current) => addUserVersion(current, { text: draft.text, subject: draft.subject, lang: language, at: new Date().toISOString() }), 'Version enregistrée')
+  const markSent = async () => {
+    if (dirty && !await saveEdit()) return
+    onSent({ text: draft.text.trim(), channel })
+  }
+  const saveHook = () => withService('hook', async () => {
+    const today = new Date().toISOString().slice(0, 10)
+    const result = await saveJsonWithRetry(templatePath, (current) => {
+      const base = current && current.fr ? current : template
+      const previous = (base.hooks && base.hooks[key]) || {}
+      return { ...base, status: 'custom', hooks: { ...(base.hooks || {}), [key]: { ...previous, studio: studio.name, source: 'matthieu', at: today, [language]: { ...(previous[language] || {}), text: hookText.trim() } } } }
+    })
+    if (!result.ok) throw new Error(String(result.error || 'Enregistrement impossible'))
+    onTemplateSaved && onTemplateSaved(result.data)
+    await bridge.letter(studio.id, language)
+    await load(path || `freelance/letters/${studio.id}.json`)
+    notify({ title: 'Paragraphe gardé', body: 'La lettre est régénérée avec ton paragraphe, et il servira aux prochaines.' })
+  })
+
+  const box = { border: `1px solid ${t.border}`, borderRadius: P.radius, background: t.surface, padding: P.cardPadding, marginBottom: 24 }
+  const note = { fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary, lineHeight: 1.5, margin: '8px 0 0' }
+  return (
+    <section aria-label="Candidature" style={box}>
+      <SectionTitle t={t} title="Candidature" count={version ? REASON[version.reason] || '' : ''} />
+
+      {state === 'loading' && <p style={note}>Chargement de la lettre…</p>}
+      {state === 'error' && <div role="alert" style={note}>{error} <Button t={t} small onClick={() => load(path)}>Réessayer</Button></div>}
+
+      {state === 'empty' && (
+        <div>
+          <p style={{ ...note, margin: '0 0 12px' }}>Aucune lettre préparée pour cette fiche. Elle sera écrite avec ton gabarit, ton CV publié et tes derniers travaux.</p>
+          <Button t={t} primary onClick={() => prepare()} disabled={Boolean(busy)}>{busy === 'prepare' ? 'Préparation…' : 'Préparer la lettre'}</Button>
+          {error && <p role="alert" style={{ ...note, color: '#eb584f' }}>{error}</p>}
+        </div>
+      )}
+
+      {state === 'ready' && version && (
+        <>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14 }}>
+            <Button t={t} primary onClick={() => copy(draft.text, 'Lettre')}>Copier la lettre</Button>
+            <Button t={t} onClick={() => copy(copyBundle({ subject: draft.subject, text: draft.text }), 'Objet et lettre')}>Copier objet + lettre</Button>
+            {applyUrl && <a href={applyUrl} target="_blank" rel="noreferrer" style={{ ...glassStyle(t), textDecoration: 'none' }}>Page de candidature ↗</a>}
+            {known.careersUrl && known.careersUrl !== applyUrl && <a href={known.careersUrl} target="_blank" rel="noreferrer" style={{ ...glassStyle(t), textDecoration: 'none' }}>Toutes les offres du studio ↗</a>}
+            {known.employerUrl && <a href={known.employerUrl} target="_blank" rel="noreferrer" style={{ ...glassStyle(t), textDecoration: 'none' }}>Site du studio ↗</a>}
+            {mailto && <a href={mailto} style={{ ...glassStyle(t), textDecoration: 'none' }}>Ouvrir dans Mail</a>}
+            {cvUrl && <a href={cvUrl} target="_blank" rel="noreferrer" style={{ ...glassStyle(t), textDecoration: 'none' }}>CV ({language.toUpperCase()}) ↗</a>}
+          </div>
+
+          {emails.length > 0 && (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14, fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary }}>
+              <span>Contact public :</span>
+              {emails.map((address) => <GlassPill key={address} t={t} onClick={() => copy(address, 'Adresse')} title="Copier l’adresse">{address}</GlassPill>)}
+            </div>
+          )}
+          {emails.length === 0 && <p style={{ ...note, margin: '0 0 14px' }}>Aucune adresse de recrutement publiée : passe par la page de candidature du studio.</p>}
+
+          {suggestion && (
+            <div role="status" style={{ ...glassStyle(t, '#4295f7'), display: 'flex', flexWrap: 'wrap', gap: 10, padding: '10px 14px', borderRadius: P.radius, marginBottom: 14, whiteSpace: 'normal' }}>
+              <span style={{ flex: '1 1 260px' }}>Une version plus récente existe (CV ou travaux mis à jour). Ta version reste en place.</span>
+              <Button t={t} small onClick={() => persist((c) => acceptSuggestion(c, new Date().toISOString()), 'Version remplacée')} disabled={Boolean(busy)}>Remplacer par la nouvelle</Button>
+              <Button t={t} small onClick={() => persist((c) => dismissSuggestion(c))} disabled={Boolean(busy)}>Ignorer</Button>
+            </div>
+          )}
+
+          <label style={{ display: 'block', fontFamily: P.sans, fontSize: 12, color: t.textSecondary, margin: '0 0 4px' }} htmlFor={`subject-${studio.id}`}>Objet</label>
+          <input id={`subject-${studio.id}`} value={draft.subject} onChange={(e) => setDraft({ ...draft, subject: e.target.value })}
+            style={{ ...textareaStyle(t), resize: 'none', maxWidth: P.letterWidth, display: 'block', marginBottom: 12 }} />
+          <label style={{ display: 'block', fontFamily: P.sans, fontSize: 12, color: t.textSecondary, margin: '0 0 4px' }} htmlFor={`letter-${studio.id}`}>Lettre</label>
+          <textarea id={`letter-${studio.id}`} value={draft.text} onChange={(e) => setDraft({ ...draft, text: e.target.value })}
+            style={{ ...textareaStyle(t), maxWidth: P.letterWidth, minHeight: P.letterMinHeight, lineHeight: P.letterLines, fontSize: 13.5, display: 'block' }} />
+
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', margin: '12px 0 4px' }}>
+            <Button t={t} onClick={saveEdit} disabled={!dirty || Boolean(busy)}>{dirty ? 'Enregistrer mes modifications' : 'Enregistrée'}</Button>
+            <Button t={t} onClick={() => prepare(language === 'fr' ? 'en' : 'fr')} disabled={Boolean(busy)} title="Réécrit la lettre dans l’autre langue">{language === 'fr' ? 'Version anglaise' : 'Version française'}</Button>
+            <Button t={t} onClick={() => prepare(language)} disabled={Boolean(busy)} title="Repart du gabarit, du CV et des derniers travaux">Régénérer</Button>
+            <span style={{ flex: 1 }} />
+            {CHANNELS.map((name) => <GlassPill key={name} t={t} onClick={() => setChannel(name)} active={channel === name}>{name}</GlassPill>)}
+            <Button t={t} primary onClick={markSent} disabled={!draft.text.trim() || Boolean(busy)} title="Garde le texte exact avec sa date dans les messages envoyés">Marquer comme envoyée</Button>
+          </div>
+
+          <p style={note}>{HOOK_NOTE[version.hookSource] || HOOK_NOTE.none}</p>
+          {version.translated && <p style={note}>Traduction du gabarit : relis-la avant de l’envoyer.</p>}
+          {version.subjectMayBeImposed && <p style={{ ...note, color: '#d68c00' }}>L’annonce semble imposer un objet précis : vérifie-la avant d’utiliser celui-ci.</p>}
+          {error && <p role="alert" style={{ ...note, color: '#eb584f' }}>{error}</p>}
+
+          <details style={{ marginTop: 14 }}>
+            <summary style={{ cursor: 'pointer', fontFamily: P.sans, fontSize: 13 }}>Paragraphe personnel pour {studio.name}</summary>
+            <p style={note}>Une phrase ou deux sur ce studio, dans tes mots. Elle prend la place de l’accroche automatique et sert aux prochaines lettres.</p>
+            <textarea value={hookText} onChange={(e) => setHookText(e.target.value)} aria-label="Paragraphe personnel pour ce studio" placeholder="Ce qui m’a donné envie d’écrire à ce studio…"
+              style={{ ...textareaStyle(t), maxWidth: P.letterWidth, minHeight: 110, marginTop: 8, display: 'block' }} />
+            <div style={{ marginTop: 8 }}><Button t={t} onClick={saveHook} disabled={!hookText.trim() || hookText.trim() === savedHook || Boolean(busy)}>Enregistrer et régénérer</Button></div>
+          </details>
+
+          <details open={showHistory} onToggle={(e) => setShowHistory(e.currentTarget.open)} style={{ marginTop: 10 }}>
+            <summary style={{ cursor: 'pointer', fontFamily: P.sans, fontSize: 13 }}>Historique des versions ({versionsOf(archive).length})</summary>
+            <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+              {versionsOf(archive).slice().reverse().map((entry, index) => (
+                <div key={`${entry.at}-${index}`} style={{ display: 'flex', gap: 10, alignItems: 'baseline', fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary }}>
+                  <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, minWidth: 110 }}>{relativeTime(entry.at)}</span>
+                  <span>{entry.by === 'matthieu' ? 'toi' : 'automatique'} · {REASON[entry.reason] || entry.reason || ''} · {String(entry.lang || '').toUpperCase()}</span>
+                  <button type="button" onClick={() => setDraft({ text: entry.text, subject: entry.subject })} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'inherit', fontSize: 12.5 }}>charger dans l’éditeur</button>
+                </div>
+              ))}
+            </div>
+          </details>
+        </>
+      )}
+    </section>
+  )
+}

@@ -1,0 +1,334 @@
+// INDEX DE RECHERCHE CÔTÉ CLIENT — chargé UNE fois, gardé en local, scoré sans réseau.
+//
+// EN CLAIR POUR TOUS : avant, chaque lettre tapée dans la recherche partait demander au serveur
+// la liste des fichiers qui matchent. Lent, et ça spammait le réseau. Maintenant on télécharge
+// la grande liste de tous les chemins UNE seule fois, on la range dans une petite base locale du
+// navigateur (IndexedDB) qui survit au reload, et on cherche en mémoire instantanément. On ne
+// re-télécharge que si le serveur dit que la liste a changé (champ builtAt).
+//
+// TECHNIQUE : IndexedDB store clé->valeur. Une seule clé 'pages' stocke { builtAt, paths }.
+// Tout est best-effort : si IndexedDB est indispo (navigation privée, quota), on retombe sur un
+// chargement réseau simple sans persistance. Jamais d'exception qui casse la recherche.
+
+import { decryptBytes } from '../media/crypto.js'
+
+const DB_NAME = 'zr-search-index'
+const STORE = 'idx'
+const KEY = 'pages'
+let dbPromise = null
+
+// INDEX SHARDÉ CHIFFRÉ servi par CDN (raw.githubusercontent, hors quota API REST). head.json (clair, dossiers
+// hachés) liste les shards ; chaque shard `s/<h>-<part>.json` = { iv, ct } AES-GCM (clé maître, même que les
+// médias). On lit head + tous les shards via raw@main (~5 min de cache, 0 appel API GitHub), on déchiffre et on
+// fusionne en { paths, thumbs, content }. Scalable (pas de mur 50 Mo) et privacy gardée (ciphertext public).
+const IDX_BASE = 'https://raw.githubusercontent.com/matthieuhuguet/zenray-index-public/main'
+const bytesFromB64 = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
+
+async function fetchHead() {
+  try { const h = await fetch(`${IDX_BASE}/head.json`, { cache: 'no-store' }).then((r) => r.ok ? r.json() : null); return (h && Array.isArray(h.shards) && h.shards.length) ? h : null } catch { return null }
+}
+// 14 October 2026: the delta is 22 MB (it carries every Assets archive path). Checking whether it changed used to download and parse all of
+// it on every refresh, which is every view change. Its first bytes carry `builtAt` and the start of the ciphertext, which is all that is compared.
+// Returns the builtAt (or '' when the delta is absent or empty), or null when it could not be read this time.
+export async function peekDeltaBuiltAt(fetchImpl = fetch) {
+  try {
+    const response = await fetchImpl(`${IDX_BASE}/delta.json`, { cache: 'no-store', headers: { Range: 'bytes=0-399' } })
+    if (response.status === 404) return ''
+    if (!response.ok) return null
+    let text = ''
+    if (response.body && typeof response.body.getReader === 'function') {
+      const reader = response.body.getReader(), decoder = new TextDecoder()
+      let received = 0
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        text += decoder.decode(value, { stream: true }); received += value.length
+        if ((/"builtAt":"[^"]+"/.test(text) && /"ct":"/.test(text)) || received > 1024) { reader.cancel().catch(() => {}); break }
+      }
+    } else if (typeof response.text === 'function') text = (await response.text()).slice(0, 1024)
+    else if (typeof response.json === 'function') { const whole = await response.json(); return whole && whole.ct ? (whole.builtAt || '') : '' }
+    const at = /"builtAt":"([^"]+)"/.exec(text)
+    return at && /"ct":"/.test(text) ? at[1] : ''
+  } catch { return null }
+}
+// 14 October 2026: the decrypted shards merged, BEFORE the delta, kept for the page's life. While only the delta moves (every archive pass
+// moves it), a refresh reuses this base and downloads, decrypts and merges the delta alone instead of the 27 shards again.
+let shardBase = null // { key, merged }
+const shardKeyOf = (head) => `${head.builtAt || ''}#${head.shards.map((s) => `${s.h}-${s.part ?? ''}-${s.n ?? ''}`).join(',')}`
+async function loadShardBase(head) {
+  const key = shardKeyOf(head)
+  if (shardBase && shardBase.key === key) return shardBase.merged
+  const parts = await Promise.all(head.shards.map(async (s) => {
+    const fn = s.part != null ? `${s.h}-${s.part}.json` : `${s.h}.json`
+    try {
+      const blob = await fetch(`${IDX_BASE}/s/${fn}`).then((r) => r.ok ? r.json() : null)
+      if (!blob || !blob.ct) return null
+      const clear = await decryptBytes(bytesFromB64(blob.ct), blob.iv)
+      return JSON.parse(new TextDecoder().decode(new Uint8Array(clear)))
+    } catch { return null }
+  }))
+  const merged = { builtAt: null, paths: [], thumbs: {}, content: {}, sizes: {}, mimes: {} }
+  for (const r of parts) { if (!r) continue; if (Array.isArray(r.paths)) merged.paths.push(...r.paths); Object.assign(merged.thumbs, r.thumbs || {}); Object.assign(merged.content, r.content || {}); Object.assign(merged.sizes, r.sizes || {}); Object.assign(merged.mimes, r.mimes || {}) }
+  // Only a COMPLETE base is kept: a shard that failed to load must be fetched again next time, not remembered as missing.
+  if (parts.every(Boolean)) shardBase = { key, merged }
+  return merged
+}
+async function loadFromCDN(head) {
+  head = head || await fetchHead()
+  if (!head) return null
+  const base = await loadShardBase(head)
+  // The delta is merged into a COPY: the base is shared by every later refresh and must stay exactly the shards.
+  const merged = { builtAt: null, paths: base.paths.slice(), thumbs: { ...base.thumbs }, content: { ...base.content }, sizes: { ...base.sizes }, mimes: { ...base.mimes } }
+  // DELTA : ajouts récents (drop/archive/push/HLS) pas encore repliés dans les shards. Petit, chiffré, fusionné.
+  let deltaAt = ''
+  try {
+    const dr = await fetch(`${IDX_BASE}/delta.json`, { cache: 'no-store' }).then((r) => r.ok ? r.json() : null)
+    if (dr && dr.ct) {
+      deltaAt = dr.builtAt || ''
+      const d = JSON.parse(new TextDecoder().decode(new Uint8Array(await decryptBytes(bytesFromB64(dr.ct), dr.iv))))
+      if (Array.isArray(d.paths)) { const seen = new Set(merged.paths); for (const p of d.paths) if (!seen.has(p)) merged.paths.push(p); Object.assign(merged.thumbs, d.thumbs || {}); Object.assign(merged.content, d.content || {}); Object.assign(merged.sizes, d.sizes || {}); Object.assign(merged.mimes, d.mimes || {}) }
+      // rm = chemins déplacés/supprimés : on les ôte des chemins issus des shards (sinon résultats périmés -> 404).
+      if (Array.isArray(d.rm) && d.rm.length) { const rm = new Set(d.rm); merged.paths = merged.paths.filter((p) => !rm.has(p)); for (const p of d.rm) { delete merged.thumbs[p]; delete merged.content[p] } }
+    }
+  } catch {}
+  merged.builtAt = `${head.builtAt || ''}|${deltaAt}` // jeton combiné : change si shards OU delta changent
+  return merged.paths.length ? merged : null
+}
+
+function openDB() {
+  if (dbPromise) return dbPromise
+  dbPromise = new Promise((resolve) => {
+    try {
+      if (typeof indexedDB === 'undefined') return resolve(null)
+      const req = indexedDB.open(DB_NAME, 1)
+      req.onupgradeneeded = () => {
+        try { const db = req.result; if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE) } catch {}
+      }
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => resolve(null)
+    } catch { resolve(null) }
+  })
+  return dbPromise
+}
+
+function idbReadIndex() {
+  return openDB().then((db) => {
+    if (!db) return null
+    return new Promise((resolve) => {
+      try {
+        const rq = db.transaction(STORE, 'readonly').objectStore(STORE).get(KEY)
+        rq.onsuccess = () => resolve(rq.result && Array.isArray(rq.result.paths) ? rq.result : null)
+        rq.onerror = () => resolve(null)
+      } catch { resolve(null) }
+    })
+  }).catch(() => null)
+}
+
+function idbWriteIndex(rec) {
+  openDB().then((db) => {
+    if (!db) return
+    try { db.transaction(STORE, 'readwrite').objectStore(STORE).put(rec, KEY) } catch {}
+  }).catch(() => {})
+}
+
+// État mémoire (vivant tant que l'onglet est ouvert) : évite même le coût IndexedDB par frappe.
+// E (vignette dans l'index v2) : le record porte AUSSI `thumbs` (carte chemin->{u}|{r,p}) pour
+// que la recherche affiche les vignettes sans relire un .img.json par image. thumbs absent
+// (cache v1) -> traité comme {} -> fallback lecture manifeste (comportement actuel inchangé).
+let mem = null // { builtAt, paths, thumbs }
+let inflight = null
+// 9 October 2026, 16:37 CEST: Notify open project galleries after cached index refreshes.
+const searchIndexSubscribers = new Set()
+function notifySearchIndexSubscribers() {
+  for (const subscriber of searchIndexSubscribers) subscriber(mem)
+}
+
+export function subscribeSearchIndex(subscriber) {
+  if (typeof subscriber !== 'function') return () => {}
+  searchIndexSubscribers.add(subscriber)
+  if (mem) subscriber(mem)
+  return () => searchIndexSubscribers.delete(subscriber)
+}
+
+// Optimistic overlay for mutations performed in this tab. It survives an
+// invalidate/reload while raw GitHub/CDN is still propagating the new delta.
+const localAdds = new Set()
+const localRemoves = new Set()
+
+function applyLocalOverlay(rec) {
+  if (!rec) rec = { builtAt: null, paths: [], thumbs: {}, content: {}, sizes: {}, mimes: {} }
+  const seen = new Set((rec.paths || []).filter((p) => !localRemoves.has(p)))
+  for (const p of localAdds) seen.add(p)
+  rec.paths = [...seen]
+  return rec
+}
+
+// Charge l'index, en privilégiant le cache local. Vérifie le builtAt serveur (action=index est léger
+// à appeler côté GitHub car le serveur garde un cache mémoire 120 s). Si builtAt identique au cache
+// local, on garde la copie locale. Sinon on prend la liste fraîche renvoyée et on la persiste.
+export async function loadSearchIndex() {
+  if (mem) {
+    // Rafraîchissement opportuniste en arrière-plan (ne bloque pas l'appelant).
+    if (!inflight) refresh().catch(() => {})
+    mem = applyLocalOverlay(mem)
+    return mem
+  }
+  if (inflight) return inflight
+  inflight = (async () => {
+    const local = await idbReadIndex()
+    if (local) {
+      // STALE-WHILE-REVALIDATE RÉEL : l'ancien code lisait bien IndexedDB, puis attendait quand même
+      // tous les shards CDN avant de rendre `mem` (8,1 s mesurées sur Plan). La copie locale est déjà
+      // exploitable : on la rend maintenant tout de suite et le réseau la rafraîchit hors chemin critique.
+      mem = applyLocalOverlay({ builtAt: local.builtAt || null, paths: local.paths, thumbs: (local.thumbs && typeof local.thumbs === 'object') ? local.thumbs : {}, content: (local.content && typeof local.content === 'object') ? local.content : {}, sizes: (local.sizes && typeof local.sizes === 'object') ? local.sizes : {}, mimes: (local.mimes && typeof local.mimes === 'object') ? local.mimes : {} })
+      notifySearchIndexSubscribers()
+      inflight = null
+      refresh().catch(() => {})
+      return mem
+    }
+    // 1) Source PRIMAIRE : index shardé chiffré servi par CDN (0 quota API GitHub).
+    try {
+      const fresh = await loadFromCDN()
+      if (fresh && fresh.paths.length && (!mem || mem.builtAt !== fresh.builtAt)) { mem = fresh; idbWriteIndex(fresh); notifySearchIndexSubscribers() }
+    } catch {}
+    // 2) FALLBACK : ancien index privé via l'API (si le CDN est indispo ou pas encore peuplé).
+    if (!mem || !mem.paths || !mem.paths.length) {
+      try {
+        const j = await fetch('/api/page?action=index', { cache: 'no-store' }).then((r) => r.json())
+        if (j && Array.isArray(j.paths) && j.paths.length) {
+          const fresh = { builtAt: j.builtAt || null, paths: j.paths, thumbs: (j.thumbs && typeof j.thumbs === 'object') ? j.thumbs : {}, content: (j.content && typeof j.content === 'object') ? j.content : {} }
+          if (!mem || mem.builtAt !== fresh.builtAt) { mem = fresh; idbWriteIndex(fresh); notifySearchIndexSubscribers() }
+        }
+      } catch {}
+    }
+    inflight = null
+    mem = applyLocalOverlay(mem)
+    notifySearchIndexSubscribers()
+    return mem
+  })()
+  return inflight
+}
+
+// Vérifie en arrière-plan si l'index a changé ; met à jour mem + IndexedDB le cas échéant.
+// search-6 : on demande d'abord la TÊTE (head=1, quelques octets) pour comparer builtAt. On ne
+// re-télécharge le corps complet (~11-28 Mo) QUE si le serveur annonce un builtAt différent. Évite
+// de transférer tout l'index à chaque rafraîchissement opportuniste alors qu'il n'a pas changé.
+async function refresh() {
+  try {
+    // head.json + delta.json sont minuscules (raw, ~5 min de cache, 0 API). On ne recharge les shards que si le
+    // jeton combiné (shards|delta) a changé -> capte aussi bien un rebuild complet qu'un simple ajout récent.
+    const head = await fetchHead(); if (!head) return
+    const deltaAt = await peekDeltaBuiltAt()
+    if (deltaAt === null) return // unreadable right now: keep what is in memory, try again on the next refresh
+    if (`${head.builtAt || ''}|${deltaAt}` === (mem ? mem.builtAt : null)) return
+    const fresh = await loadFromCDN(head)
+    if (fresh && fresh.paths.length && (!mem || mem.builtAt !== fresh.builtAt)) { mem = applyLocalOverlay(fresh); idbWriteIndex(mem); notifySearchIndexSubscribers() }
+  } catch {}
+}
+
+// Invalide le cache mémoire (à appeler après un ajout de nœud pour forcer un rechargement frais).
+export function invalidateSearchIndex() { mem = null; inflight = null }
+
+// ═══ AMORCER L'INDEX EN MÉMOIRE, POUR UN BANC OU UN TEST ════════════════════════════════════════
+//
+// L'index se charge normalement depuis le CDN, ce qui suppose un réseau et plusieurs mégaoctets. Un
+// banc de mesure ou un test a besoin du même contenu SANS cela : sans point d'entrée, ils
+// mesureraient un chemin de code qui n'existe pas en vrai — celui où l'index est vide.
+//
+// C'est un point d'injection, pas un raccourci de production : rien dans l'application ne l'appelle,
+// et son nom le dit. Il remplace le contenu en mémoire sans toucher au cache persistant.
+export function amorcerIndexLocal({ paths = [], thumbs = {}, content = {}, sizes = {}, mimes = {} } = {}) {
+  mem = { builtAt: 'amorce-locale', paths, thumbs, content, sizes, mimes }
+  notifySearchIndexSubscribers()
+  return mem
+}
+
+// Make new placements searchable in the same event loop, before GitHub/raw CDN
+// propagation. The server remains the durable source of truth via delta.json.
+export function injectSearchIndexPaths(paths) {
+  const list = (Array.isArray(paths) ? paths : []).filter((p) => typeof p === 'string' && p)
+  for (const p of list) { localRemoves.delete(p); localAdds.add(p) }
+  mem = applyLocalOverlay(mem)
+  idbWriteIndex(mem)
+  notifySearchIndexSubscribers()
+}
+
+export function rollbackSearchIndexPaths(paths) {
+  const list = new Set((Array.isArray(paths) ? paths : []).filter((p) => typeof p === 'string' && p))
+  for (const p of list) localAdds.delete(p)
+  if (mem) { mem.paths = (mem.paths || []).filter((p) => !list.has(p)); idbWriteIndex(mem); notifySearchIndexSubscribers() }
+}
+
+// Carte chemin -> contenu plein-texte normalisé issue de l'index SERVEUR (v3). Vide tant que l'index n'a pas
+// été régénéré avec contenu. La recherche la fusionne avec le contenu LOCAL (contentIndex.js, auto-indexé).
+export function getIndexContent() { return (mem && mem.content) || {} }
+
+// Taille d'un nœud (octets) depuis l'index -> affichée dans l'app SANS aucun appel API. null si inconnue.
+export function getNodeSize(path) { const s = mem && mem.sizes; return (s && Number.isFinite(s[path])) ? s[path] : null }
+export function getNodeMime(path) { const m = mem && mem.mimes; return (m && m[path]) ? m[path] : null }
+// Liste COMPLÈTE des chemins indexés (100k+) — source FIABLE, non tronquée (contrairement à action=tree). Utilisée
+// par la vue Archives pour énumérer les .file.json sans dépendre de l'arbre git récursif qui tronque.
+export function getIndexPaths() { return (mem && Array.isArray(mem.paths)) ? mem.paths : [] }
+
+// ── PERF RECHERCHE : INDEX NORMALISÉ PRÉ-CALCULÉ UNE SEULE FOIS (2026-07-22, lag à 200k+ éléments) ──────────
+// AVANT : le scoring dans App.jsx faisait `norm(p)` (toLowerCase + NFD normalize + 3 regex) sur les 200 000+
+// chemins À CHAQUE FRAPPE, ET reconstruisait un Set de 200k pour dédoublonner -> le NFD normalize massif bloquait
+// le thread principal = frappe qui lague. FIX (pas du chargement progressif) : on normalise TOUT l'index UNE fois
+// (np = chemin normalisé, nn = nom de fichier normalisé) + un Set des chemins, mémoïsés sur la RÉFÉRENCE du tableau
+// `mem.paths`. Toute mutation de l'index (inject/rollback/refresh/invalidate) crée un nouveau tableau paths -> le
+// cache s'invalide tout seul (comparaison de référence). Ensuite chaque frappe ne fait QUE du matching de chaînes
+// déjà normalisées (scoreMatch), zéro NFD, zéro Set reconstruit -> fluide. Le coût unique (~une passe) est payé au
+// 1er caractère, jamais répété. À terme (1M+), migrer ce même getNormedIndex dans un Web Worker (thread dédié).
+let _normed = null // { paths:<ref>, np:string[], nn:string[], set:Set }
+const _normForIdx = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[-_./]+/g, ' ').replace(/\s+/g, ' ').trim()
+export function getNormedIndex() {
+  const paths = getIndexPaths()
+  if (_normed && _normed.paths === paths) return _normed
+  const n = paths.length
+  const np = new Array(n)
+  const nn = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const p = paths[i]
+    np[i] = _normForIdx(p)
+    const slash = p.lastIndexOf('/')
+    nn[i] = _normForIdx(slash >= 0 ? p.slice(slash + 1) : p)
+  }
+  _normed = { paths, np, nn, set: new Set(paths) }
+  return _normed
+}
+// Vignette d'image depuis l'index (URL/objet {u,iv}) — sert d'aperçu direct sans réassembler l'original.
+export function getNodeThumb(path) { const t = mem && mem.thumbs; return (t && t[path]) || null }
+
+// Méta de l'index chargé (pour l'indicateur bas de Create, à la place du quota API). builtAt = jeton combiné
+// "shards|delta" -> on n'en montre que la partie shards (date du dernier rebuild complet). source = CDN si on a
+// chargé depuis le repo public chiffré, sinon null.
+export function getIndexMeta() {
+  if (!mem || !mem.paths) return null
+  const at = typeof mem.builtAt === 'string' ? mem.builtAt.split('|')[0] : null
+  return { count: mem.paths.length, builtAt: at || null, source: 'CDN' }
+}
+
+// SCORING T6 : préfixe > nom > segment de chemin > contenu/sous-chaîne.
+// CONTRAT DE NORMALISATION (verrouillé, search-3) : nq, normPath et normName DOIVENT avoir été
+// passés par la MÊME normalisation que App.jsx `norm` -> minuscules, accents retirés (NFD),
+// séparateurs `/ - _ .` remplacés par des espaces, espaces compactés. La détection de "segment de
+// chemin" ci-dessous repose sur ce contrat (les segments sont délimités par des espaces, pas par `/`).
+// Si l'appelant change sa normalisation, ce contrat doit rester tenu sous peine de casser le score 1.
+// Plus le score est BAS, meilleur c'est (on trie ascendant).
+//   0  = le nom commence par la requête (préfixe exact du nom)        -> meilleur
+//   1  = un segment du chemin commence par la requête
+//   2  = le nom contient la requête (pas en préfixe)
+//   3  = le chemin contient la requête (contenu / sous-chaîne ailleurs)
+//   -1 = pas de match
+export function scoreMatch(normPath, normName, nq) {
+  if (!nq) return 3
+  if (normName.startsWith(nq)) return 0
+  // Segment de chemin commençant par la requête (ex: "build/cal" matche segment "calendar").
+  // split(/\s+/) (tout blanc) plutôt qu'un espace littéral : robuste même si la normalisation laisse
+  // un double espace, sans rien changer au comportement nominal.
+  const segs = normPath.split(/\s+/)
+  for (const s of segs) { if (s.startsWith(nq)) return 1 }
+  if (normName.includes(nq)) return 2
+  if (normPath.includes(nq)) return 3
+  return -1
+}

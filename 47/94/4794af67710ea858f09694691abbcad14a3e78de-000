@@ -1,0 +1,284 @@
+// 2026-09-12 ZenRay Freelance v2 pure logic: legacy reading, dated history, messages, dashboard.
+// FR : logique pure de ZenRay Freelance, lecture de l'ancien schéma, historique daté, messages.
+import { describe, it, expect } from 'vitest'
+import {
+  normalizeStore, normalizeStudio, setStatus, addMessage, lastMessage, groupByStatus,
+  counts, timeline, searchStudios, readableDate, statusColor, applyStudioChange,
+  chronologyOf, foundDateOf, contactedDateOf, daysDiff,
+  normalizeAttachment, addAttachment, removeAttachment,
+} from './freelanceStudios.js'
+import { UI } from '../config/colors.js'
+
+const base = () => normalizeStudio({ id: 's1', name: 'Sloclap', role: 'Tech artist', status: 'to_contact' })
+
+describe('normalizeStore', () => {
+  it('reads the legacy applications file so no past candidature is lost', () => {
+    const st = normalizeStore({ applications: [{ id: 'a1', company: 'Quantic Dream', role: 'TA', date: '2026-08-02', status: 'Entretien', notes: 'n' }] })
+    expect(st.v).toBe(2)
+    expect(st.studios[0]).toMatchObject({ name: 'Quantic Dream', status: 'interview', createdAt: '2026-08-02', contactedAt: '2026-08-02' })
+  })
+  it('reads the v2 file and drops a nameless row instead of showing an empty card', () => {
+    const st = normalizeStore({ v: 2, studios: [{ id: 's1', name: 'Dontnod', status: 'contacted' }, { id: 's2', role: 'nothing' }] })
+    expect(st.studios).toHaveLength(1)
+    expect(st.studios[0].status).toBe('contacted')
+  })
+  it('never throws on a broken file', () => {
+    expect(normalizeStore(null).studios).toEqual([])
+    expect(normalizeStore({ studios: 'oops' }).studios).toEqual([])
+  })
+})
+
+describe('setStatus', () => {
+  it('appends a dated event and stamps the first contact date', () => {
+    const s = setStatus(base(), 'contacted', '2026-09-12')
+    expect(s.status).toBe('contacted')
+    expect(s.contactedAt).toBe('2026-09-12')
+    expect(s.history).toEqual([{ at: '2026-09-12', from: 'to_contact', to: 'contacted', note: '' }])
+  })
+  it('keeps the past intact on a later change, and keeps the first contact date', () => {
+    const s = setStatus(setStatus(base(), 'contacted', '2026-09-12'), 'interview', '2026-09-20')
+    expect(s.history.map((h) => h.to)).toEqual(['contacted', 'interview'])
+    expect(s.contactedAt).toBe('2026-09-12')
+  })
+  it('ignores an unknown status and a change to the same status', () => {
+    expect(setStatus(base(), 'nope').history).toEqual([])
+    expect(setStatus(base(), 'to_contact').history).toEqual([])
+  })
+})
+
+describe('addMessage', () => {
+  it('stores the exact text sent and turns the studio contacted by itself', () => {
+    const s = addMessage(base(), { text: '  Bonjour, je suis tech artist…  ', channel: 'linkedin', at: '2026-09-12' })
+    expect(lastMessage(s)).toEqual({ at: '2026-09-12', channel: 'linkedin', text: 'Bonjour, je suis tech artist…' })
+    expect(s.status).toBe('contacted')
+    expect(s.history[0].note).toBe('premier message')
+  })
+  it('a second message does not change a status already further down the pipeline', () => {
+    const s = addMessage(setStatus(base(), 'interview', '2026-09-13'), { text: 'relance', at: '2026-09-20' })
+    expect(s.status).toBe('interview')
+    expect(s.messages).toHaveLength(1)
+  })
+  it('refuses an empty message', () => {
+    expect(addMessage(base(), { text: '   ' }).messages).toEqual([])
+  })
+})
+
+describe('dashboard', () => {
+  const list = [
+    addMessage(base(), { text: 'a', at: '2026-09-12' }),
+    normalizeStudio({ id: 's2', name: 'Asobo', status: 'to_contact' }),
+    normalizeStudio({ id: 's3', name: 'Ubisoft', status: 'interview' }),
+  ]
+  it('groups by pipeline order and drops empty sections', () => {
+    expect(groupByStatus(list).map((g) => g.key)).toEqual(['to_contact', 'contacted', 'interview'])
+  })
+  it('counts what Matthieu looks at: to contact, contacted, answered, messages', () => {
+    expect(counts(list)).toEqual({ total: 3, toContact: 1, contacted: 2, answered: 1, messages: 1, attachments: 0, deprecated: 0 })
+  })
+  it('the timeline is the progress backup, most recent first', () => {
+    const older = setStatus(normalizeStudio({ id: 's4', name: 'Arkane', status: 'to_contact' }), 'contacted', '2026-08-01')
+    const tl = timeline([...list, older])
+    expect(tl[0].at >= tl[tl.length - 1].at).toBe(true)
+    expect(tl.some((e) => e.kind === 'message' && e.text === 'a')).toBe(true)
+    expect(tl.some((e) => e.kind === 'status' && e.studio === 'Arkane')).toBe(true)
+  })
+  it('searches the message text too, not only the studio name', () => {
+    expect(searchStudios(list, 'sloclap').map((s) => s.name)).toEqual(['Sloclap'])
+    expect(searchStudios(list, 'a').length).toBeGreaterThan(0)
+    expect(searchStudios(list, '').length).toBe(3)
+  })
+  it('detects outdated studios and transitions them to deprecated', async () => {
+    const { isOutdatedStudio, deprecateStudio, deprecateOutdatedStudios } = await import('./freelanceStudios.js')
+    const openStudio = { id: 'o1', name: 'Epic', status: 'to_contact', engine: { closedAt: '' } }
+    const closedStudio = { id: 'c1', name: 'Riot', status: 'to_contact', engine: { closedAt: '2026-10-06' } }
+    const expiredStudio = { id: 'e1', name: 'Valve', status: 'to_contact', engine: { validThrough: '2026-10-01' } }
+    const alreadyContacted = { id: 'ac1', name: 'Bungie', status: 'contacted', engine: { closedAt: '2026-10-06' } }
+
+    expect(isOutdatedStudio(openStudio, '2026-10-07')).toBe(false)
+    expect(isOutdatedStudio(closedStudio, '2026-10-07')).toBe(true)
+    expect(isOutdatedStudio(expiredStudio, '2026-10-07')).toBe(true)
+
+    const dep = deprecateStudio(closedStudio, '2026-10-07', 'Offre fermée')
+    expect(dep.status).toBe('deprecated')
+    expect(dep.history.at(-1)).toMatchObject({ from: 'to_contact', to: 'deprecated' })
+
+    const updated = deprecateOutdatedStudios([openStudio, closedStudio, expiredStudio, alreadyContacted], '2026-10-07')
+    expect(updated.find((s) => s.id === 'o1').status).toBe('to_contact')
+    expect(updated.find((s) => s.id === 'c1').status).toBe('deprecated')
+    expect(updated.find((s) => s.id === 'e1').status).toBe('deprecated')
+    // contacted studios are preserved
+    expect(updated.find((s) => s.id === 'ac1').status).toBe('contacted')
+  })
+})
+
+describe('presentation', () => {
+  it('formats a date in French and takes its colors from the palette', () => {
+    expect(readableDate('2026-09-12')).toBe('12 septembre 2026')
+    expect(readableDate('')).toBe('')
+    expect(statusColor('contacted')).toBe(UI.orange)
+    expect(statusColor('unknown')).toBe(UI.gray)
+  })
+
+  it('computes exact chronology and dates for contacted and to_contact studios', () => {
+    const sContacted = {
+      id: 'job_drama',
+      name: 'Drama Studios',
+      role: 'Environment Technical Artist',
+      status: 'contacted',
+      createdAt: '2026-09-30',
+      contactedAt: '2026-10-07',
+      messages: [{ at: '2026-10-07', channel: 'mail', text: 'Candidature' }],
+      engine: { firstSeenAt: '2026-09-30', publishedAt: '2026-09-29' },
+    }
+    expect(foundDateOf(sContacted)).toBe('2026-09-29')
+    expect(contactedDateOf(sContacted)).toBe('2026-10-07')
+    expect(daysDiff('2026-09-30', '2026-10-07')).toBe(7)
+
+    const c = chronologyOf(sContacted, '2026-10-07')
+    expect(c.foundAt).toBe('2026-09-29')
+    expect(c.foundLabel).toBe('29 septembre 2026')
+    expect(c.contactedAt).toBe('2026-10-07')
+    expect(c.contactedLabel).toBe('7 octobre 2026')
+    expect(c.daysToContact).toBe(8)
+    expect(c.daysSinceContact).toBe(0)
+
+    const sPending = {
+      id: 'job_ripple',
+      name: 'Ripple & Roll',
+      status: 'to_contact',
+      createdAt: '2026-09-30',
+      engine: { firstSeenAt: '2026-09-30' },
+      messages: [],
+    }
+    const cPending = chronologyOf(sPending, '2026-10-07')
+    expect(cPending.foundAt).toBe('2026-09-30')
+    expect(cPending.contactedAt).toBe('')
+    expect(cPending.daysToContact).toBeNull()
+    expect(cPending.daysSinceFound).toBe(7)
+
+    const sTimestamp = {
+      id: 'job_larian',
+      name: 'Larian Studios',
+      status: 'contacted',
+      createdAt: '2026-09-30',
+      contactedAt: '2026-10-05',
+      engine: { publishedAt: '1785842170280' },
+      messages: [{ at: '2026-10-05', channel: 'mail', text: 'Candidature Larian' }],
+    }
+    const cTimestamp = chronologyOf(sTimestamp, '2026-10-07')
+    expect(cTimestamp.publishedAt).toBe('2026-08-04')
+    expect(cTimestamp.publishedLabel).toBe('4 août 2026')
+    expect(cTimestamp.contactedLabel).toBe('5 octobre 2026')
+    expect(cTimestamp.daysSinceContact).toBe(2)
+  })
+})
+
+// 30 September 2026, 19:49 Europe/Paris: A stale browser must retain newly imported offers and source files.
+describe('concurrent catalogue changes', () => {
+  it('records a message from a stale tab without losing the source detail or a new offer', () => {
+    const before = base()
+    const remoteMessage = { at: '2026-09-30', channel: 'discord', text: 'Message ajouté ailleurs' }
+    const current = normalizeStore({ v: 2, batch: 'research', studios: [
+      { ...before, offerDetailsPath: 'freelance/offers/s1.json', messages: [remoteMessage] },
+      { id: 's2', name: 'Nouveau studio' },
+    ] })
+    const result = applyStudioChange(current, before, addMessage(before, { text: 'Bonjour', at: '2026-09-30' }))
+    expect(result.batch).toBe('research')
+    expect(result.studios).toHaveLength(2)
+    expect(result.studios[0].offerDetailsPath).toBe('freelance/offers/s1.json')
+    expect(result.studios[0].messages.map((message) => message.text)).toEqual(['Message ajouté ailleurs', 'Bonjour'])
+  })
+  it('refuses to overwrite notes edited elsewhere or resurrect a deleted studio', () => {
+    const before = base()
+    const current = normalizeStore({ studios: [{ ...before, notes: 'Nouvelles conditions' }] })
+    expect(() => applyStudioChange(current, before, { ...before, notes: 'Mon texte' })).toThrow('autre onglet')
+    expect(() => applyStudioChange({ studios: [] }, before, { ...before, notes: 'Mon texte' })).toThrow('supprimée')
+  })
+  it('can retry an applied change without duplicating messages or history', () => {
+    const before = base()
+    const next = addMessage(before, { text: 'Bonjour', at: '2026-09-30' })
+    expect(applyStudioChange(normalizeStore({ studios: [next] }), before, next).studios[0]).toEqual(next)
+  })
+})
+
+// 07 October 2026: Attachments tests for files, media, folders and concurrent synchronization.
+describe('attachments', () => {
+  it('normalizes attachment records with fallback kind, date and id', () => {
+    const raw = { name: 'cv_matthieu.pdf', size: 102400 }
+    const norm = normalizeAttachment(raw)
+    expect(norm.name).toBe('cv_matthieu.pdf')
+    expect(norm.kind).toBe('pdf')
+    expect(norm.size).toBe(102400)
+    expect(norm.id).toMatch(/^att_/)
+    expect(norm.addedAt).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+  })
+
+  it('rejects invalid or nameless attachment records', () => {
+    expect(normalizeAttachment(null)).toBeNull()
+    expect(normalizeAttachment({})).toBeNull()
+    expect(normalizeAttachment({ name: '   ' })).toBeNull()
+  })
+
+  it('adds an attachment to a studio and prevents duplicate by id or nodePath', () => {
+    const s = base()
+    const att1 = { id: 'att_1', name: 'demo_reel.mp4', kind: 'video', nodePath: 'pages/Freelance/Attachments/Sloclap/demo_reel.mp4.media.json' }
+    const with1 = addAttachment(s, att1)
+    expect(with1.attachments).toHaveLength(1)
+    expect(with1.attachments[0].name).toBe('demo_reel.mp4')
+
+    // Same nodePath updates existing entry rather than duplicating
+    const att1Updated = { id: 'att_2', name: 'demo_reel_v2.mp4', kind: 'video', nodePath: 'pages/Freelance/Attachments/Sloclap/demo_reel.mp4.media.json' }
+    const withUpdated = addAttachment(with1, att1Updated)
+    expect(withUpdated.attachments).toHaveLength(1)
+    expect(withUpdated.attachments[0].name).toBe('demo_reel_v2.mp4')
+  })
+
+  it('removes an attachment by id', () => {
+    const s = base()
+    const withAtt = addAttachment(s, { id: 'att_to_del', name: 'draft.png', kind: 'image' })
+    expect(withAtt.attachments).toHaveLength(1)
+    const afterDel = removeAttachment(withAtt, 'att_to_del')
+    expect(afterDel.attachments).toHaveLength(0)
+  })
+
+  it('searches studios by attachment filename', () => {
+    const s1 = addAttachment(base(), { id: 'att_pdf', name: 'portfolio_tech_art.pdf' })
+    const s2 = normalizeStudio({ id: 's2', name: 'Ubisoft', role: 'Dev' })
+    expect(searchStudios([s1, s2], 'portfolio_tech_art').map((s) => s.name)).toEqual(['Sloclap'])
+    expect(searchStudios([s1, s2], 'pdf').map((s) => s.name)).toEqual(['Sloclap'])
+  })
+
+  it('counts attachments and records them in progress timeline', () => {
+    const s1 = addAttachment(base(), { id: 'att_sound', name: 'sfx.wav', addedAt: '2026-10-07' })
+    expect(counts([s1]).attachments).toBe(1)
+    const tl = timeline([s1])
+    expect(tl.some((item) => item.kind === 'attachment' && item.text === 'sfx.wav')).toBe(true)
+  })
+
+  it('safely merges attachments across concurrent tabs without losing remote additions', () => {
+    const before = base()
+    const remoteAttachment = { id: 'att_remote', name: 'remote_file.pdf', kind: 'pdf', size: 5000 }
+    const current = normalizeStore({ studios: [{ ...before, attachments: [remoteAttachment] }] })
+
+    // Local tab adds a new attachment
+    const localAttachment = { id: 'att_local', name: 'local_demo.mp4', kind: 'video', size: 12000 }
+    const next = addAttachment(before, localAttachment)
+
+    const merged = applyStudioChange(current, before, next)
+    const studio = merged.studios[0]
+    expect(studio.attachments).toHaveLength(2)
+    expect(studio.attachments.map((a) => a.id)).toEqual(['att_remote', 'att_local'])
+  })
+
+  it('preserves deletion of an attachment made in the current tab', () => {
+    const attA = { id: 'att_a', name: 'a.png' }
+    const attB = { id: 'att_b', name: 'b.png' }
+    const before = { ...base(), attachments: [attA, attB] }
+    const current = normalizeStore({ studios: [before] })
+
+    // Local tab deletes attA
+    const next = removeAttachment(before, 'att_a')
+    const merged = applyStudioChange(current, before, next)
+    expect(merged.studios[0].attachments.map((a) => a.id)).toEqual(['att_b'])
+  })
+})

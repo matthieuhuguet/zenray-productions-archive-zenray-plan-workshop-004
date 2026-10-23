@@ -1,0 +1,172 @@
+// ZenRayMedia — modèle de composition Lego.
+// Une ligne empile verticalement ; ses éléments partagent l'espace horizontal et se replient
+// automatiquement au rendu. Le modèle ne dépend ni du DOM ni de l'horloge : il reste testable,
+// sérialisable dans .zmedia.json et strictement reproductible.
+
+import { makeId } from './contracts.js'
+
+export const COMPOSITION_VERSION = 1
+export const PLACEMENTS = ['above', 'below', 'left', 'right']
+
+export function emptyComposition(themeId) {
+  return { v: COMPOSITION_VERSION, themeId, serial: 0, rows: [] }
+}
+
+export function normalizeComposition(value, themeId) {
+  if (!value || value.themeId !== themeId || !Array.isArray(value.rows)) return emptyComposition(themeId)
+  // ON CONSERVE L'INCONNU AU LIEU DE LE RECONSTRUIRE (inversion de doctrine, 2026-08-01, carte C1).
+  //
+  // Cette fonction rendait un littéral à quatre clefs, et elle est appelée en tête de `insertItem`,
+  // `addComponent`, `addImage`, `removeItem`, `moveItem`, `patchItem`, `duplicateItem`, plus deux
+  // fois dans `MediaApp.jsx`. Toute clef qu'elle ne connaissait pas mourait donc au premier GESTE,
+  // en mémoire, sans qu'aucun rechargement soit en cause : un champ `timeline` ou une propriété de
+  // disposition posée sur une ligne ne survivait pas à un simple déplacement d'élément.
+  //
+  // Le contrat s'ouvre ICI, UNE seule fois, et plus jamais en V1. L'ouvrir une seconde fois pour
+  // une carte ultérieure serait un coût inutile et un second risque de régression sur des documents
+  // déjà enregistrés.
+  //
+  // La permissivité a son revers, et il est gardé par des tests dans les DEUX sens : ce qui est
+  // légitime survit, et une composition dont le thème ou les rangées sont invalides repart vide.
+  return {
+    ...value,
+    v: COMPOSITION_VERSION,
+    themeId,
+    serial: Number.isFinite(value.serial) ? value.serial : 0,
+    rows: value.rows
+      .filter((row) => row && Array.isArray(row.items))
+      .map((row, ri) => ({
+        ...row,
+        id: row.id || makeId('row', themeId, ri),
+        items: row.items.filter(Boolean).map((item) => ({
+          hidden: false,
+          locked: false,
+          props: {},
+          ...item,
+        })),
+      }))
+      .filter((row) => row.items.length),
+  }
+}
+
+function allocate(composition, prefix, salt) {
+  const serial = composition.serial + 1
+  return { id: makeId(prefix, `${composition.themeId}:${salt}`, serial), serial }
+}
+
+export function componentInstance(composition, component) {
+  const next = allocate(composition, 'cmp', component.id)
+  return {
+    serial: next.serial,
+    item: {
+      id: next.id,
+      kind: 'component',
+      themeId: composition.themeId,
+      componentId: component.id,
+      name: component.name,
+      group: component.group,
+      hidden: false,
+      locked: false,
+      props: {},
+    },
+  }
+}
+
+export function imageInstance(composition, image) {
+  const next = allocate(composition, 'img', image.path || image.name)
+  return {
+    serial: next.serial,
+    item: {
+      id: next.id,
+      kind: 'image',
+      name: image.name || 'Image',
+      refPath: image.path || null,
+      url: image.url || '',
+      hidden: false,
+      locked: false,
+      props: { fit: 'cover', radius: 18, ratio: '16 / 9' },
+    },
+  }
+}
+
+function locate(rows, itemId) {
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const itemIndex = rows[rowIndex].items.findIndex((item) => item.id === itemId)
+    if (itemIndex >= 0) return { rowIndex, itemIndex }
+  }
+  return null
+}
+
+function newRow(composition, item, serial) {
+  return { id: makeId('row', `${composition.themeId}:${item.id}`, serial), items: [item] }
+}
+
+export function insertItem(value, item, targetId = null, placement = 'below', serial = value.serial) {
+  const composition = normalizeComposition(value, value.themeId)
+  const rows = composition.rows.map((row) => ({ ...row, items: [...row.items] }))
+  const target = targetId ? locate(rows, targetId) : null
+
+  if (!target) {
+    rows.push(newRow(composition, item, serial))
+  } else if (placement === 'left' || placement === 'right') {
+    rows[target.rowIndex].items.splice(target.itemIndex + (placement === 'right' ? 1 : 0), 0, item)
+  } else {
+    rows.splice(target.rowIndex + (placement === 'below' ? 1 : 0), 0, newRow(composition, item, serial))
+  }
+  return { ...composition, serial: Math.max(composition.serial, serial), rows }
+}
+
+export function addComponent(value, component, targetId = null, placement = 'below') {
+  const composition = normalizeComposition(value, value.themeId)
+  const created = componentInstance(composition, component)
+  return insertItem(composition, created.item, targetId, placement, created.serial)
+}
+
+export function addImage(value, image, targetId = null, placement = 'below') {
+  const composition = normalizeComposition(value, value.themeId)
+  const created = imageInstance(composition, image)
+  return insertItem(composition, created.item, targetId, placement, created.serial)
+}
+
+export function removeItem(value, itemId) {
+  const composition = normalizeComposition(value, value.themeId)
+  return {
+    ...composition,
+    rows: composition.rows
+      .map((row) => ({ ...row, items: row.items.filter((item) => item.id !== itemId) }))
+      .filter((row) => row.items.length),
+  }
+}
+
+export function moveItem(value, itemId, targetId, placement) {
+  if (!PLACEMENTS.includes(placement) || itemId === targetId) return value
+  const composition = normalizeComposition(value, value.themeId)
+  const source = locate(composition.rows, itemId)
+  if (!source) return composition
+  const item = composition.rows[source.rowIndex].items[source.itemIndex]
+  return insertItem(removeItem(composition, itemId), item, targetId, placement, composition.serial)
+}
+
+export function patchItem(value, itemId, patch) {
+  const composition = normalizeComposition(value, value.themeId)
+  return {
+    ...composition,
+    rows: composition.rows.map((row) => ({
+      ...row,
+      items: row.items.map((item) => (item.id === itemId ? { ...item, ...patch } : item)),
+    })),
+  }
+}
+
+export function duplicateItem(value, itemId) {
+  const composition = normalizeComposition(value, value.themeId)
+  const source = locate(composition.rows, itemId)
+  if (!source) return composition
+  const original = composition.rows[source.rowIndex].items[source.itemIndex]
+  const next = allocate(composition, original.kind === 'image' ? 'img' : 'cmp', original.id)
+  return insertItem(composition, { ...original, id: next.id }, itemId, 'below', next.serial)
+}
+
+export function countItems(value) {
+  return (value?.rows || []).reduce((sum, row) => sum + (row.items?.length || 0), 0)
+}

@@ -1,0 +1,125 @@
+#!/usr/bin/env node
+// ZenRayMedia — découpe de crops depuis une capture d'écran.
+//
+// Reconstruire un thème demande de regarder un composant à la fois : le bandeau, puis le menu,
+// puis la carte, puis le filet. Regarder la capture entière à chaque fois fait perdre le détail
+// exact qu'on cherche à mesurer — c'est ainsi que trois composants de LIBÉRATION ont été écrits
+// « à peu près » alors que la mesure était disponible.
+//
+// Ce script isole une zone et l'écrit en PNG sans perte, prête à être lue et mesurée.
+// Il sert aussi à VÉRIFIER un rectangle avant de le confier au détecteur de police : un rect
+// faux produit un classement faux mais d'apparence parfaitement crédible.
+//
+// USAGE
+//   node scripts/zrm-crop.mjs <image> x,y,w,h <sortie.png>
+//   node scripts/zrm-crop.mjs <image> --grid 4x3 <dossier/>     découpe en tuiles numérotées
+//   node scripts/zrm-crop.mjs --probe <fonts.probe.json>        dump tous les rects du fichier
+
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import path from 'node:path'
+import { chromium } from 'playwright'
+
+const mime = (p) => (/\.png$/i.test(p) ? 'image/png' : 'image/jpeg')
+
+async function withPage(fn) {
+  const browser = await chromium.launch()
+  try {
+    const page = await browser.newPage()
+    await page.setContent('<!doctype html><meta charset="utf-8"><body></body>')
+    return await fn(page)
+  } finally {
+    await browser.close()
+  }
+}
+
+async function loadUrl(file) {
+  const buf = await readFile(file)
+  return `data:${mime(file)};base64,${buf.toString('base64')}`
+}
+
+async function cropOne(page, url, rect, out) {
+  const png = await page.evaluate(
+    async ([u, r]) => {
+      const img = new Image()
+      img.src = u
+      await img.decode()
+      // Un rect qui déborde donnerait des bandes transparentes silencieuses : on le borne à
+      // l'image réelle et on renvoie la taille effective, pour que l'appelant le sache.
+      const x = Math.max(0, Math.min(r[0], img.naturalWidth - 1))
+      const y = Math.max(0, Math.min(r[1], img.naturalHeight - 1))
+      const w = Math.min(r[2], img.naturalWidth - x)
+      const h = Math.min(r[3], img.naturalHeight - y)
+      const c = document.createElement('canvas')
+      c.width = w
+      c.height = h
+      c.getContext('2d').drawImage(img, x, y, w, h, 0, 0, w, h)
+      return { data: c.toDataURL('image/png'), w, h, natural: [img.naturalWidth, img.naturalHeight] }
+    },
+    [url, rect],
+  )
+  await mkdir(path.dirname(out), { recursive: true })
+  await writeFile(out, Buffer.from(png.data.split(',')[1], 'base64'))
+  return png
+}
+
+async function main() {
+  const argv = process.argv.slice(2)
+  const probe = argv.includes('--probe') ? argv[argv.indexOf('--probe') + 1] : null
+
+  if (probe) {
+    // Mode vérification : chaque sonde du fichier est dumpée en PNG à côté, sous le nom du rôle.
+    // On regarde les PNG AVANT de lancer la détection ; c'est le seul garde-fou contre un rect
+    // qui pointe à côté et produit néanmoins un classement d'apparence sérieuse.
+    const spec = JSON.parse(await readFile(probe, 'utf8'))
+    const dir = path.dirname(probe)
+    const outDir = path.join(dir, 'probes')
+    await withPage(async (page) => {
+      for (const p of spec.probes) {
+        const url = await loadUrl(path.resolve(dir, p.image))
+        const out = path.join(outDir, `${p.role}.png`)
+        const r = await cropOne(page, url, p.rect, out)
+        console.log(`${p.role.padEnd(22)} ${r.w}x${r.h}  ← ${p.image} ${p.rect.join(',')}  → ${path.relative(process.cwd(), out)}`)
+      }
+    })
+    return
+  }
+
+  const grid = argv.includes('--grid') ? argv[argv.indexOf('--grid') + 1] : null
+  const positional = argv.filter((a) => !a.startsWith('--'))
+
+  if (grid) {
+    const [image, outDir] = [positional[0], positional[positional.length - 1]]
+    const [cols, rows] = grid.split('x').map(Number)
+    const url = await loadUrl(image)
+    await withPage(async (page) => {
+      const size = await page.evaluate(async (u) => {
+        const i = new Image()
+        i.src = u
+        await i.decode()
+        return [i.naturalWidth, i.naturalHeight]
+      }, url)
+      const tw = Math.floor(size[0] / cols)
+      const th = Math.floor(size[1] / rows)
+      const base = path.basename(image, path.extname(image))
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const out = path.join(outDir, `${base}__r${r + 1}c${c + 1}.png`)
+          await cropOne(page, url, [c * tw, r * th, tw, th], out)
+        }
+      }
+      console.log(`${cols * rows} tuiles de ${tw}x${th} → ${outDir}`)
+    })
+    return
+  }
+
+  const [image, rectStr, out] = positional
+  if (!image || !rectStr || !out) throw new Error('usage : node scripts/zrm-crop.mjs <image> x,y,w,h <sortie.png>')
+  const rect = rectStr.split(',').map(Number)
+  const url = await loadUrl(image)
+  await withPage(async (page) => {
+    const r = await cropOne(page, url, rect, out)
+    console.log(`${r.w}x${r.h} (source ${r.natural.join('x')}) → ${out}`)
+  })
+}
+
+main().catch((e) => { console.error(e.message || e); process.exit(1) })

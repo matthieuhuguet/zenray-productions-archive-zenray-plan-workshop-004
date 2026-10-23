@@ -1,0 +1,159 @@
+// push-policy-guard.mjs (12 October 2026): the inventory of every script that runs `git push`, and the rule that none runs outside
+// the push batch policy without a written reason.
+// EN: a script is OK when it imports lib/push-batch-policy.mjs (routed) or when it is listed in PUSH_ALLOWLIST with a reason. The
+//     list is closed on both sides: an unlisted script that pushes fails the guard, and a listed script that no longer pushes (or
+//     no longer exists) fails it too, so the list never becomes a graveyard. The guard also refuses a hard coded fixed batch.
+// FR : un script est conforme s'il importe la politique (route) ou s'il figure dans PUSH_ALLOWLIST avec une raison ; la liste est
+//     fermee des deux cotes (un script qui pousse sans figurer echoue, une entree perimee echoue aussi).
+import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
+import path from 'node:path'
+
+const SCANNED_ROOTS = ['scripts', 'server', 'relay', 'Cloud', 'functions', 'api']
+const SCANNED_EXTENSIONS = new Set(['.mjs', '.js', '.cjs', '.py', '.sh', '.ts'])
+const SKIPPED_DIRECTORIES = new Set(['node_modules', '_staging', '_archive', '_deprecated', '__fixtures__', 'dist', 'tests', 'release', 'out'])
+const TEST_FILE = /\.(test|spec)\.[cm]?[jt]sx?$/
+// A quoted `push` word is how every git invocation of this repository names the subcommand (['push', ...], 'push', "push").
+const PUSH_LITERAL = /['"]push['"]/
+// An actual import of the policy module (a mention in a comment is not routing).
+// A shell line `git push ...` / `git -C dir push ...` (the quoted form above does not exist in shell scripts).
+const SHELL_PUSH = /^\s*(?:\S+=\S+\s+)*git\s+(?:-[cC]\s+\S+\s+)*push\b/m
+// A blob created through the GitHub Git Data API (POST .../git/blobs) is a payload path that has no `push` word (F2, 12 October 2026).
+// Reading a blob (GET git/blobs/<sha>) is not matched: the word POST has to sit next to the path.
+const API_BLOB_PUSH = /git\/blobs['"`][\s\S]{0,120}?POST|['"]POST['"][\s\S]{0,40}?git\/blobs['"`]/
+// Importing the policy is not enough to be routed: the file must USE the engine (a controller or runPushBatch), otherwise it only reads
+// numbers from the configuration and runs its own push loop (archive-folder.mjs).
+// FR : importer la politique ne suffit pas, il faut utiliser le moteur ; sinon le fichier garde sa propre boucle de push.
+const ENGINE_USE = /\b(?:runPushBatch|sharedPushController|createPushController|sharedBatchAdapter)\b/
+const stripComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*(?:\/\/|#).*$/gm, '')
+const POLICY_IMPORT = /(?:\bfrom\s+|\bimport\s*\(\s*)['"][^'"]*push-batch-policy\.mjs['"]/
+// The policy and the guard talk about `push` without running it.
+const SELF_FILES = new Set(['scripts/lib/push-batch-policy.mjs', 'scripts/lib/push-policy-guard.mjs'])
+// A fixed batch written as a literal assignment of the legacy variable (the pin removed from the film worker on 12 October 2026).
+const PINNED_BATCH = /ZR_SHARD_PUSH_BATCH_MB['"\]]*\s*(?:\]\s*)?[:=]\s*['"]?\d/
+
+const small = (what) => `${what}: text or a few KiB, never a media payload, far below any push limit.`
+
+// One entry per script that pushes and does not import the policy. `kind` is for the reader of the report.
+export const PUSH_ALLOWLIST = Object.freeze([
+  // Payload paths that are NOT routed yet, with the measured bound that keeps them under the 1 900 MiB threshold.
+  { file: 'scripts/video-fmp4.mjs', kind: 'payload-bounded', reason: 'Legacy public fMP4 pipeline, incremental pushes of about 1.5 GiB (comment at line 99), below the 1 900 MiB threshold; superseded by AttachVideoCmafDashHls.mjs and video-hls-lib.mjs. Change request: move it to openVideoGitShard.pushFiles.' },
+  { file: 'scripts/eagle-img-gitpush.mjs', kind: 'one-off-migration', reason: 'One-off Eagle image migration, increments of about 600 files and under 1 GiB (comment above pushIncrement).' },
+  { file: 'scripts/eagle-import-git.mjs', kind: 'one-off-migration', reason: 'One-off Eagle AVIF import, flush every FLUSH images of a few hundred KiB each.' },
+  { file: 'scripts/migrate-encrypt-public.mjs', kind: 'one-off-migration', reason: 'One-off encryption migration of public image shards, bounded by --limit per run (comment at the push).' },
+  { file: 'scripts/rebuild-shard-clean.mjs', kind: 'one-off-migration', reason: 'One-off shard rebuild, 4 GiB shard cap, orphan commits pushed in bins; images only.' },
+  { file: 'scripts/reorg-public-shards.mjs', kind: 'one-off-migration', reason: 'One-off public shard reorganisation, new repositories filled by bins, images only.' },
+  { file: 'scripts/upload-img-list-git.mjs', kind: 'manifest-text', reason: small('Image list manifests committed to zenray-data; its payload goes through img-ingest.mjs (bounded 900 MiB)') },
+  { file: 'scripts/archive-thumbs.mjs', kind: 'payload-bounded', reason: 'Thumbnail repository (WebP thumbnails of a few KiB) pushed in 4 attempts, and zenray-data manifests.' },
+  { file: 'scripts/backfill-grid-thumbs-git.mjs', kind: 'manifest-text', reason: small('Thumbnail manifests of zenray-data') },
+  { file: 'scripts/fix-thumb-manifests-git.mjs', kind: 'manifest-text', reason: small('Thumbnail manifest repair of zenray-data') },
+  { file: 'scripts/rename-drives-git.mjs', kind: 'manifest-text', reason: small('Manifest renames of zenray-data') },
+  { file: 'scripts/build-search-index.mjs', kind: 'manifest-text', reason: 'Search index shards (encrypted JSON of at most a few MiB each) and zenray-data; no media payload.' },
+  // Manifest and metadata pushes (text of a few KiB to a few MiB).
+  { file: 'scripts/upload-mapped-git.mjs', kind: 'manifest-text', reason: small('Manifests of zenray-data committed every ZR_MAPPED_BATCH files; its video payload runs through video-raw-lib.mjs, which is routed') },
+  { file: 'scripts/AttachVideoCmafDashHls.mjs', kind: 'manifest-text', reason: small('Playlists and manifests of the shared manifest clone; its segment push goes through openVideoGitShard.pushFiles, which is routed') },
+  { file: 'scripts/AttachSidecarSubtitles.mjs', kind: 'manifest-text', reason: small('Subtitle tracks inside manifests') },
+  { file: 'scripts/AttachSubtitleTracks.mjs', kind: 'manifest-text', reason: small('Subtitle tracks inside manifests') },
+  { file: 'scripts/attach-subtitles.mjs', kind: 'manifest-text', reason: small('Subtitle tracks inside manifests') },
+  { file: 'scripts/Films/ProcessFilmsSequentially.py', kind: 'manifest-text', reason: small('Manifest clone commits of the film worker; the archive payload runs through upload-mapped-git.mjs and video-raw-lib.mjs') },
+  { file: 'scripts/AssetsCloudGitWriter.mjs', kind: 'manifest-text', reason: small('Workspace registry markdown') },
+  { file: 'scripts/Freelance/CloudStore.mjs', kind: 'manifest-text', reason: small('Freelance JSON store') },
+  { file: 'scripts/RenameCloudMedia.mjs', kind: 'manifest-text', reason: small('Manifest renames') },
+  { file: 'scripts/RepairAudioNames.mjs', kind: 'manifest-text', reason: small('Audio name repair of manifests') },
+  { file: 'scripts/RepairFilmPosters.mjs', kind: 'manifest-text', reason: small('Manifests; the poster images go through openVideoGitShard.pushFiles, which is routed') },
+  { file: 'scripts/archive-organize.mjs', kind: 'manifest-text', reason: small('Archive manifest moves, nothing is re-uploaded') },
+  { file: 'relay/journal-relay.mjs', kind: 'manifest-text', reason: small('PROGRESS.md journal copied to the zenray-journal repository') },
+  // Payload through the GitHub Git Data API (POST git/blobs): no pack, so the 2 GiB per push limit does not apply; one blob per request.
+  { file: 'scripts/video-mse-lib.mjs', kind: 'api-blob', reason: 'Legacy MSE pipeline: blobs created through the Git Data API (6 at a time, one blob per request, at most 100 MiB each), then one tree and one commit; no pack, so no pack size limit. Superseded by video-hls-lib.mjs.' },
+  { file: 'scripts/stream-bench.mjs', kind: 'api-blob', reason: 'Streaming benchmark: slices of a test file posted as blobs, a measurement tool that never carries a film.' },
+  { file: 'scripts/shelf-sgf2026.mjs', kind: 'one-off-migration', reason: 'One-off shelf import: a few poster images posted as blobs through the Git Data API.' },
+  { file: 'scripts/upload-vidraw-all.mjs', kind: 'false-positive', reason: 'Bandwidth probe: one 5 MiB random blob posted to measure the line speed, nothing is kept; the film payload goes through video-raw-lib.mjs.' },
+  { file: 'server/upload-shard.js', kind: 'api-blob', reason: 'Server upload endpoint: one chunk (at most the 100 MiB blob limit of the API) per request, committed by the Git Data API, no pack.' },
+  { file: 'server/upload-vid.js', kind: 'api-blob', reason: 'Server upload endpoint for video chunks: one blob per request through the Git Data API, no pack.' },
+  { file: 'server/page.js', kind: 'manifest-text', reason: small('Page JSON saved as a blob by the Git Data API') },
+  { file: 'server/media.js', kind: 'manifest-text', reason: small('Media manifests saved as blobs by the Git Data API') },
+  { file: 'server/gitDataCommit.js', kind: 'manifest-text', reason: small('Generic Git Data API commit helper used for text files and registry entries') },
+  { file: 'server/publish.js', kind: 'manifest-text', reason: small('Published pages and manifests saved as blobs by the Git Data API') },
+  // Mentions of the word `push` that do not run git push.
+  { file: 'scripts/PackageMuxedFmp4.mjs', kind: 'false-positive', reason: 'FMP4-SINGLE experiment: the word "push" is a progress step name; the bytes go through openVideoGitShard.pushFiles, which is routed to the push batch policy.' },
+  { file: 'scripts/Films/QueueStatus.py', kind: 'false-positive', reason: 'Status tracker of the film worker: it names the progress phase "push" in a pattern and never runs git.' },
+  { file: 'scripts/Films/StreamBatchBanner.py', kind: 'false-positive', reason: 'Status follower of the streaming batch (17 October 2026): it names the push stage and measures network bytes with netstat; it never runs git.' },
+  { file: 'server/japanese.js', kind: 'manifest-text', reason: small('Japanese study corpus lines saved as blobs by the Git Data API') },
+  { file: 'relay/activity-source.mjs', kind: 'false-positive', reason: 'Reads the process list to display running git pushes; never runs one.' },
+  { file: 'scripts/lib/img-pipeline.mjs', kind: 'false-positive', reason: 'The word appears in a documentation comment (pattern to reuse), no push is executed in this module; the image shard push lives in img-ingest.mjs.' },
+])
+
+function* walk(directory) {
+  let entries
+  try { entries = readdirSync(directory, { withFileTypes: true }) } catch { return }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (SKIPPED_DIRECTORIES.has(entry.name) || entry.name.startsWith('.')) continue
+      yield* walk(path.join(directory, entry.name))
+    } else if (entry.isFile()) {
+      if (TEST_FILE.test(entry.name) || /^test_.*\.py$/.test(entry.name)) continue
+      if (SCANNED_EXTENSIONS.has(path.extname(entry.name))) yield path.join(directory, entry.name)
+    }
+  }
+}
+
+/**
+ * Scans `root` and reports: files that push outside the policy and are not allowlisted, stale allowlist entries, entries without a
+ * real reason, and fixed batches written as literals.
+ * FR : analyse `root` et rend les ecarts ; une liste vide partout = conforme.
+ */
+export function scanPushPaths({ root, allowlist = PUSH_ALLOWLIST, roots = SCANNED_ROOTS } = {}) {
+  const pushers = new Map()    // relative file -> { routed }
+  const pinned = []
+  for (const top of roots) {
+    const start = path.join(root, top)
+    if (!existsSync(start) || !statSync(start).isDirectory()) continue
+    for (const file of walk(start)) {
+      const relative = path.relative(root, file).split(path.sep).join('/')
+      let text
+      try { text = readFileSync(file, 'utf8') } catch { continue }
+      if (SELF_FILES.has(relative)) continue
+      if (PINNED_BATCH.test(text)) pinned.push(relative)
+      const code = stripComments(text)
+      const pushes = PUSH_LITERAL.test(text) || (relative.endsWith('.sh') && SHELL_PUSH.test(text)) || API_BLOB_PUSH.test(code)
+      if (pushes) pushers.set(relative, { routed: POLICY_IMPORT.test(text) && ENGINE_USE.test(code) })
+    }
+  }
+  const listed = new Map(allowlist.map((entry) => [entry.file, entry]))
+  const unlisted = []
+  for (const [file, info] of pushers) {
+    if (!info.routed && !listed.has(file)) unlisted.push(file)
+  }
+  const stale = []
+  const weak = []
+  for (const entry of allowlist) {
+    const info = pushers.get(entry.file)
+    if (!info) stale.push(`${entry.file} (missing or no longer pushes)`)
+    else if (info.routed) stale.push(`${entry.file} (now routed through the policy, remove it from the allowlist)`)
+    if (!entry.reason || entry.reason.trim().length < 20) weak.push(entry.file)
+  }
+  return {
+    pushers: [...pushers.keys()].sort(),
+    routed: [...pushers].filter(([, info]) => info.routed).map(([file]) => file).sort(),
+    unlisted: unlisted.sort(),
+    stale: stale.sort(),
+    weak: weak.sort(),
+    pinned: pinned.sort(),
+  }
+}
+
+/**
+ * Scans a DEPLOYED copy of worker scripts that lives outside the repository (for example the running film worker directory) for a
+ * pinned fixed batch. Returns the list of files that pin it (F3, 12 October 2026: ResumeMoviesUpload.py and FinishFilteredUploads.py
+ * of the deployed worker still set ZR_SHARD_PUSH_BATCH_MB=190, which disables the policy silently).
+ * FR : analyse une copie DEPLOYEE de scripts hors depot et rend les fichiers qui figent un lot (la politique est alors coupee).
+ */
+export function scanPinnedBatches(directory) {
+  const pinned = []
+  let entries
+  try { entries = readdirSync(directory, { withFileTypes: true }) } catch { return pinned }
+  for (const entry of entries) {
+    if (!entry.isFile() || !SCANNED_EXTENSIONS.has(path.extname(entry.name))) continue
+    try { if (PINNED_BATCH.test(readFileSync(path.join(directory, entry.name), 'utf8'))) pinned.push(entry.name) } catch { /* unreadable */ }
+  }
+  return pinned.sort()
+}

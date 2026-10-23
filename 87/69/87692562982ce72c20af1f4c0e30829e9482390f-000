@@ -1,0 +1,2199 @@
+#!/usr/bin/env node
+import { validateProjectArticle } from '../src/lib/assetsProjectArticle.js'
+import { createConversationCatalog } from './Assets/ConversationCatalog.mjs'
+import { createConversationMirror, CONVERSATION_LIBRARY_ID } from './Assets/ConversationMirror.mjs'
+import { conversationArchiveEntries } from '../src/lib/assetsConversationArchives.js'
+// 2 October 2026, 13:20 CEST: scoped snapshots reuse the archive, restore and watcher engines.
+import { constants, createReadStream, createWriteStream, appendFileSync } from 'node:fs'
+import { mkdir, readdir, readFile, writeFile, rename, rm, lstat, realpath, open, copyFile } from 'node:fs/promises'
+import { spawn, execFile } from 'node:child_process'
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
+import http from 'node:http'
+import { acquireDirectoryLock, directoryLockOptions } from './lib/directory-lock.mjs'
+import { nextArchiveRepoSuffix } from './lib/archive-route.mjs'
+import { createIndexLedger } from './lib/index-ledger.mjs'
+// 12 October 2026: the unload authority is the identity proof, not a full re-download of every file (decision D3 of Matthieu).
+// FR : l'autorite de dechargement est la preuve par identite, plus le re-telechargement integral de chaque fichier.
+import { createArchiveIdentityProver } from './lib/archive-identity-proof.mjs'
+import { recordVerificationOutcome, reserveVerificationSlot } from './lib/video-identity-proof.mjs'
+import { fileChangeToken } from './lib/fingerprint-cache.mjs'
+import { PROJECT_PREVIEW_CONFIG, isTextPreviewFile } from '../src/lib/projectPreview.js'
+import { verifyWorkspaceTree, removeVerifiedWorkspace, assertWorkspaceIdle, workspaceFinderMetadata } from './AssetsWorkspaceLifecycle.mjs'
+import { buildProjectMapping, buildGlobalProjectIndex, renderProjectContext, projectWorkshopPath } from '../src/lib/projectContextIndex.js'
+import { mapSceneReferences } from '../src/lib/sceneReferenceMapping.js'
+import { buildScenePreparationPlan } from '../src/lib/scenePreparation.js'
+import { createSceneAuditRunner } from './Assets/SceneAuditRunner.mjs'
+import { publishRestoreWithoutOverwrite } from '../Cloud/scripts/lib/safe-restore.mjs'
+import { readProjectHistory } from './AssetsHistory.mjs'
+import { createFeedbackCapture } from './AssetsFeedbackCapture.mjs'
+import { createConversationIndexSync } from './Assets/ConversationIndexSync.mjs'
+import { renderFileMap } from './Assets/FindInProject.mjs'
+import { normalizeWorkspaceProject, safeRelativePath, sourceCloudFolder, workspaceFileId,
+  combineWorkspaceFiles, workspaceSummary, buildWorkspacePlan, pathIsSelected } from '../src/lib/projectWorkspace.js'
+import { summarizeWorkspaceProject } from '../src/lib/assetsWorkspaceCatalogue.js'
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+export const DEFAULT_ASSETS_CONFIG = path.join(REPO_ROOT, 'scripts', 'AssetsConfig.json')
+const execFileAsync = promisify(execFile)
+const isInside = (root, target) => target === root || target.startsWith(`${root}${path.sep}`)
+const changeToken = (entry) => `${entry.dev}:${entry.ino}:${fileChangeToken({ size: entry.size, mtime: entry.mtimeMs, ctime: entry.ctimeMs })}`
+const archivedMtime = (backup) => Number.isFinite(backup?.mtimeMs) ? backup.mtimeMs : Number(String(backup?.changeToken || '').split(':').at(-2))
+const sameArchivedContentMetadata = (file, backup) => Boolean(backup?.sha256 && backup.size === file.size && archivedMtime(backup) === file.mtimeMs)
+const errorText = (error) => String(error?.message || error).replace(/(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|Bearer\s+\S+)/g, '[redacted]')
+const CLOUD_TRANSFER_TYPES = new Set(['archive', 'restore', 'recover'])
+
+// 9 October 2026, 23:10 CEST: keep macOS awake only while a cloud transfer is active, then release it.
+export function createIdleSleepInhibitor({ platform = process.platform, spawnProcess = spawn, retryMs = 60000 } = {}) {
+  let child = null, retryTimer = null, requested = false, onError = () => {}
+  const scheduleRetry = (error) => {
+    onError(error)
+    if (!requested || retryTimer || platform !== 'darwin') return
+    retryTimer = setTimeout(() => { retryTimer = null; launch() }, retryMs)
+    retryTimer.unref?.()
+  }
+  const launch = () => {
+    if (!requested || child || platform !== 'darwin') return
+    let next
+    try { next = spawnProcess('/usr/bin/caffeinate', ['-i', '-w', String(process.pid)], { stdio: 'ignore' }) }
+    catch (error) { scheduleRetry(error); return }
+    child = next
+    next.once('error', (error) => {
+      if (child !== next) return
+      child = null
+      scheduleRetry(error)
+    })
+    next.once('exit', (code, signal) => {
+      if (child !== next) return
+      child = null
+      if (requested) scheduleRetry(new Error(`caffeinate exited unexpectedly (${signal || code})`))
+    })
+  }
+  return {
+    start(onFailure = () => {}) {
+      onError = onFailure
+      if (requested || platform !== 'darwin') return
+      requested = true
+      launch()
+    },
+    stop() {
+      requested = false
+      if (retryTimer) clearTimeout(retryTimer)
+      retryTimer = null
+      const current = child
+      child = null
+      try { current?.kill('SIGTERM') } catch {}
+    },
+  }
+}
+
+// 14 October 2026: bounded-concurrency map that keeps input order; the first failure stops handing out new work.
+export async function mapLimit(items, limit, task) {
+  const results = new Array(items.length)
+  let next = 0, failure = null
+  const worker = async () => {
+    while (!failure && next < items.length) {
+      const index = next++
+      try { results[index] = await task(items[index], index) }
+      catch (error) { failure ||= { error }; return }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit || 1, items.length)) }, worker))
+  if (failure) throw failure.error
+  return results
+}
+
+// 14 October 2026: `space: 0` writes compact JSON (about 15 % smaller and faster to stringify) for machine-only state files.
+export async function atomicJson(file, value, { space = 2 } = {}) {
+  await mkdir(path.dirname(file), { recursive: true })
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`
+  await writeFile(temporary, JSON.stringify(value, null, space || undefined), { mode: 0o600 })
+  await rename(temporary, file)
+}
+
+export function validateSourceScope(source, config) {
+  const target = path.resolve(source.localPath)
+  // 3 October 2026, 04:03 CEST: explicit library roots extend a source family without granting access to their parent folders.
+  const roots = [config.roots[source.namespace], ...(config.additionalRoots?.[source.namespace] || [])].map((root) => path.resolve(root))
+  const root = roots.filter((entry) => isInside(entry, target)).sort((a, b) => b.length - a.length)[0]
+  if (!root) throw new Error(`Source outside configured ${source.namespace} root`)
+  if (target === root && !source.include?.length) throw new Error('A whole source root requires an explicit include list')
+  const protectedParts = new Set(config.scan.blockedSegments.map((entry) => entry.toLowerCase()))
+  const check = (value) => {
+    if (value.split(path.sep).some((entry) => protectedParts.has(entry.toLowerCase()) || /^\.env(?:\.|$)/i.test(entry))) {
+      throw new Error('Sensitive source path refused')
+    }
+  }
+  check(target)
+  for (const include of source.include || []) check(include)
+  return target
+}
+
+export function isExcludedSourcePath(relativePath, source, config) {
+  const parts = relativePath.split('/')
+  const names = new Set([...config.scan.excludedNames, ...config.scan.blockedSegments].map((name) => name.toLowerCase()))
+  if (parts.some((name) => names.has(name.toLowerCase()) || /^\.env(?:\.|$)/i.test(name) || name.startsWith('._'))) return true
+  if (!config.scan.includeHidden && parts.some((name) => name.startsWith('.'))) return true
+  if (config.scan.excludedExtensions.some((ext) => relativePath.toLowerCase().endsWith(ext))) return true
+  return [...config.scan.excludedPaths, ...(source.exclude || [])].some((exclude) => {
+    const relative = relativePath.toLowerCase()
+    const scope = exclude.toLowerCase()
+    return relative === scope || relative.startsWith(`${scope}/`) || relative.includes(`/${scope}/`)
+  })
+}
+
+export async function scanSource(source, config) {
+  const root = validateSourceScope(source, config)
+  const files = [], issues = [], excluded = []
+  let checkedRoot
+  try {
+    const entry = await lstat(root)
+    checkedRoot = await realpath(root)
+    if (entry.isSymbolicLink() || checkedRoot !== root || !entry.isDirectory()) throw new Error('Source root must be a real directory without symlink ancestors')
+  } catch (error) {
+    return { source: { ...source, present: false, count: 0, bytes: 0, status: error.code === 'ENOENT' ? 'missing' : 'error',
+      checkedAt: new Date().toISOString() }, files, excluded,
+      issues: source.optional && error.code === 'ENOENT' ? [] : [{ sourceId: source.id, code: error.code || 'unsafe-root', message: errorText(error) }] }
+  }
+  const destinations = new Set()
+  const visit = async (directory, prefix = '') => {
+    let entries
+    try { entries = await readdir(directory, { withFileTypes: true }) }
+    catch (error) { issues.push({ sourceId: source.id, relativePath: prefix, code: error.code, message: errorText(error) }); return }
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const rawRelative = prefix ? `${prefix}/${entry.name}` : entry.name
+      if (isExcludedSourcePath(rawRelative, source, config)) { excluded.push(rawRelative); continue }
+      const absolute = path.join(directory, entry.name)
+      if (entry.isSymbolicLink()) { excluded.push(rawRelative); issues.push({ sourceId: source.id, relativePath: rawRelative, code: 'symlink-skipped' }); continue }
+      if (entry.isDirectory()) {
+        if (!source.include || source.include.some((include) => include === rawRelative || include.startsWith(`${rawRelative}/`) || rawRelative.startsWith(`${include}/`))) {
+          await visit(absolute, rawRelative)
+        }
+        continue
+      }
+      if (!entry.isFile() || !pathIsSelected(rawRelative, source.include)) continue
+      if (files.length >= config.scan.maxFiles) throw new Error('Inventory limit exceeded; incomplete inventory refused')
+      let relativePath
+      try { relativePath = safeRelativePath(rawRelative) }
+      catch { issues.push({ sourceId: source.id, relativePath: rawRelative, code: 'invalid-path' }); continue }
+      const collisionKey = relativePath.toLowerCase()
+      if (destinations.has(collisionKey)) throw new Error(`Case or Unicode filename collision in ${source.id}: ${relativePath}`)
+      destinations.add(collisionKey)
+      try {
+        const metadata = await lstat(absolute)
+        if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error('File changed type during scan')
+        files.push({ id: workspaceFileId(source.id, relativePath), sourceId: source.id, relativePath,
+          localPath: absolute, size: metadata.size, mtimeMs: metadata.mtimeMs, ctimeMs: metadata.ctimeMs,
+          changeToken: changeToken(metadata) })
+      } catch (error) { issues.push({ sourceId: source.id, relativePath, code: error.code || 'scan-failed', message: errorText(error) }) }
+    }
+  }
+  await visit(root)
+  return { source: { ...source, present: true, status: issues.some((issue) => issue.code !== 'symlink-skipped') ? 'error' : 'present',
+    count: files.length, bytes: files.reduce((sum, file) => sum + file.size, 0), checkedAt: new Date().toISOString() }, files, excluded, issues }
+}
+
+export async function snapshotSourceFile(file, destination, sourceRoot) {
+  const actual = await realpath(file.localPath)
+  if (actual !== file.localPath || !isInside(path.resolve(sourceRoot), actual)) throw new Error('Source escaped its declared root')
+  const descriptor = await open(file.localPath, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const before = await descriptor.stat()
+    // 8 October 2026, 15:45 CEST: accept a ctime-only touch after inventory, then fingerprint the exact stable snapshot.
+    const [expectedDevice, expectedInode, expectedSize, expectedMtime] = String(file.changeToken || '').split(':')
+    if (!before.isFile() || !Number.isFinite(Number(expectedMtime)) || String(before.dev) !== expectedDevice || String(before.ino) !== expectedInode || before.size !== file.size || before.size !== Number(expectedSize) || before.mtimeMs !== Number(expectedMtime)) throw new Error('Source changed since inventory')
+    const snapshotToken = changeToken(before)
+    await mkdir(path.dirname(destination), { recursive: true })
+    const hash = createHash('sha256')
+    const hashing = new Transform({ transform(chunk, _encoding, callback) { hash.update(chunk); callback(null, chunk) } })
+    await pipeline(descriptor.createReadStream({ autoClose: false }), hashing, createWriteStream(destination, { flags: 'wx', mode: before.mode & 0o777 }))
+    const after = await descriptor.stat()
+    if (changeToken(after) !== snapshotToken) throw new Error('Source changed during snapshot')
+    const currentPath = await lstat(file.localPath)
+    if (!currentPath.isFile() || currentPath.isSymbolicLink() || changeToken(currentPath) !== snapshotToken || await realpath(file.localPath) !== file.localPath) throw new Error('Source changed during snapshot')
+    return { ...file, ctimeMs: after.ctimeMs, changeToken: snapshotToken, sha256: hash.digest('hex') }
+  } catch (error) { await rm(destination, { force: true }); throw error }
+  finally { await descriptor.close() }
+}
+
+export async function hashLocalFile(file, expectedToken = null) {
+  const hash = createHash('sha256')
+  if (!expectedToken) {
+    for await (const chunk of createReadStream(file)) hash.update(chunk)
+    return hash.digest('hex')
+  }
+  // 3 October 2026, 10:09 CEST: a version comparison hashes the inventoried descriptor, never a substituted path.
+  const descriptor = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const before = await descriptor.stat()
+    if (!before.isFile() || changeToken(before) !== expectedToken) throw new Error('Source changed before version comparison')
+    for await (const chunk of descriptor.createReadStream({ autoClose: false })) hash.update(chunk)
+    if (changeToken(await descriptor.stat()) !== expectedToken) throw new Error('Source changed during version comparison')
+    return hash.digest('hex')
+  } finally { await descriptor.close() }
+}
+
+export function batchWorkspaceFiles(files, config) {
+  const batches = []
+  let current = [], bytes = 0
+  for (const file of files) {
+    if (current.length && (current.length >= config.storage.batchFiles || bytes + file.size > config.storage.batchBytes)) {
+      batches.push(current); current = []; bytes = 0
+    }
+    current.push(file); bytes += file.size
+  }
+  if (current.length) batches.push(current)
+  return batches
+}
+
+export async function runAssetProcess(script, args, { env = process.env, onEvent = () => {}, signal, cwd = REPO_ROOT, timeoutMs = 0, killGraceMs = 0 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [script, ...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' })
+    let buffered = '', last = '', lastEvent = null
+    let timeout, killTimeout, timedOut = false, settled = false, abortError = null
+    const killTree = (signalName) => {
+      if (!child.pid) return
+      if (process.platform === 'win32') { child.kill(signalName); return }
+      try { process.kill(-child.pid, signalName) }
+      catch (error) { if (error.code !== 'ESRCH') child.kill(signalName) }
+    }
+    const processGroupExists = () => {
+      if (!child.pid) return false
+      if (process.platform === 'win32') return child.exitCode === null
+      try { process.kill(-child.pid, 0); return true }
+      catch (error) { return error.code !== 'ESRCH' }
+    }
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      if (!timedOut && !abortError) clearTimeout(killTimeout)
+      signal?.removeEventListener('abort', onAbort)
+      callback(value)
+    }
+    const beginStop = (error) => {
+      if (timedOut || abortError) return
+      if (error?.code === 'ASSET_PROCESS_TIMEOUT') timedOut = true
+      else abortError = error
+      killTree('SIGTERM')
+      killTimeout = setTimeout(() => { if (processGroupExists()) killTree('SIGKILL'); killTimeout = null }, Math.max(0, killGraceMs))
+      killTimeout.unref?.()
+    }
+    const onAbort = () => {
+      const reason = signal?.reason
+      const error = new Error(reason instanceof Error ? reason.message : 'The operation was aborted', { cause: reason })
+      error.name = 'AbortError'
+      error.code = 'ABORT_ERR'
+      beginStop(error)
+    }
+    const line = (value) => {
+      if (!value.startsWith('{"zr":')) return
+      try { const event = JSON.parse(value); lastEvent = event; onEvent(event) } catch {}
+    }
+    child.stdout.on('data', (data) => {
+      buffered += data
+      let index
+      while ((index = buffered.indexOf('\n')) >= 0) { line(buffered.slice(0, index)); buffered = buffered.slice(index + 1) }
+    })
+    child.stderr.on('data', (data) => { last = (last + errorText(data)).slice(-1600) })
+    child.once('error', (error) => finish(reject, timedOut ? new Error(`Asset engine timed out after ${timeoutMs} ms`) : abortError || error))
+    child.once('close', (code) => {
+      if (buffered) line(buffered)
+      if (timedOut) finish(reject, new Error(`Asset engine timed out after ${timeoutMs} ms`))
+      else if (abortError) finish(reject, abortError)
+      else if (code !== 0) finish(reject, new Error(`Asset engine failed (${code}): ${last.trim() || 'see engine logs'}`))
+      // 12 October 2026: preserve failed verification diagnostics even when the child exits zero.
+      else finish(resolve, { code, lastEvent, diagnostics: last.trim() })
+    })
+    // 9 October 2026, 22:30 CEST: terminate the whole child process group so nested Git workers cannot outlive a retry.
+    if (signal?.aborted) onAbort()
+    else signal?.addEventListener('abort', onAbort, { once: true })
+    // 9 October 2026, 22:30 CEST: bound cloud child work so the persistent watcher can retry after a network stall.
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) timeout = setTimeout(() => {
+      beginStop(Object.assign(new Error(`Asset engine timed out after ${timeoutMs} ms`), { code: 'ASSET_PROCESS_TIMEOUT' }))
+    }, timeoutMs)
+    timeout?.unref?.()
+  })
+}
+
+export class AssetsService {
+  constructor(config, { repoRoot = REPO_ROOT, runProcess = runAssetProcess, getToken, publishCloud = null, watchFactory = null, identityProver = null, runSceneAudit, runScenePreparation, sleepInhibitor, openDirectory = (directory) => execFileAsync('/usr/bin/open', [directory], { timeout: config.bridge.requestTimeoutMs }) } = {}) {
+    this.previewSecret = randomUUID()
+    this.config = config
+    this.repoRoot = repoRoot
+    this.runProcess = runProcess
+    this.sleepInhibitor = sleepInhibitor ?? (config.storage.preventIdleSleepDuringTransfers ? createIdleSleepInhibitor({ retryMs: config.storage.retryMs }) : null)
+    this.sleepInhibitorActive = false
+    this.sleepWarningRecorded = false
+    this.openDirectory = openDirectory
+    this.getToken = getToken || (async () => process.env.GITHUB_TOKEN || (await execFileAsync('gh', ['auth', 'token'], { timeout: config.bridge.requestTimeoutMs })).stdout.trim())
+    this.cloudPublisher = publishCloud
+    // null = every unload keeps its full restore probe (the behaviour before 12 October 2026)
+    this.identityProver = identityProver
+    this.watchFactory = watchFactory
+    // 3 October 2026, 04:25 CEST: scene analysis runs independently of inventory and cloud writes.
+    this.runSceneAudit = runSceneAudit || (config.sceneAudit?.enabled ? createSceneAuditRunner({ ...config.sceneAudit, auditScriptPath: path.join(repoRoot, 'scripts/Assets/AuditHoudiniScene.py'), preparationScriptPath: path.join(repoRoot, 'scripts/Assets/PrepareHoudiniScene.py') }) : null)
+    this.runScenePreparation = runScenePreparation || this.runSceneAudit?.prepare || null
+    this.sceneAuditTimers = new Map()
+    this.sceneAuditTasks = new Map()
+    this.sceneAuditErrors = new Map()
+    this.projects = new Map()
+    this.states = new Map()
+    this.jobs = new Map()
+    this.dashboardTransferSamples = new Map()
+    this.events = []
+    this.conversationCatalog = createConversationCatalog({ stateDir: config.storage.stateDir, fileToken: changeToken })
+    this.conversationMirror = createConversationMirror({ catalog: this.conversationCatalog, service: this, atomicJson, snapshotFile: snapshotSourceFile, fileToken: changeToken, stateDir: config.storage.stateDir })
+    // 7 October 2026, 10:30 CEST: each project's ConversationIndex regenerates by itself and is verified after every write.
+    this.conversationIndexSync = createConversationIndexSync({ stateDir: config.storage.stateDir, catalog: this.conversationCatalog, onEvent: (projectId, type, detail) => this.event(projectId, type, detail) })
+    this.writerQueue = Promise.resolve()
+    this.workspaceQueues = new Map()
+    this.saveSlots = new Map()
+    this.revisions = new Map()
+    this.filesMemo = new Map()
+    this.lastBackupStartedAt = new Map()
+    // 21 October 2026: what the search index already holds, so an unchanged manifest costs no index run (see lib/index-ledger.mjs).
+    this.indexLedger = createIndexLedger(path.join(config.storage.stateDir, 'IndexedPaths.txt'))
+    this.backupDelayTimers = new Map()
+    this.queuedTasks = []
+    this.completions = new Map()
+    this.draining = false
+    this.pending = new Set()
+    this.dirty = new Set()
+    this.controllers = new Set()
+    this.watchErrors = new Map()
+    this.watchRetryTimers = new Map()
+    this.inventoryTimers = new Map()
+    this.contextIndexQueue = Promise.resolve()
+    this.disposed = false
+  }
+
+  // 21 October 2026: the pause after a refused index survives a restart; before, each reload of the service paid one more 34 s refusal.
+  indexPausePath() { return path.join(this.config.storage.stateDir, 'IndexPause.json') }
+  async loadIndexPause() {
+    try { this.indexBlockedUntil = Number(JSON.parse(await readFile(this.indexPausePath(), 'utf8')).until) || 0 }
+    catch { this.indexBlockedUntil = 0 }
+  }
+  async setIndexPause(until) {
+    this.indexBlockedUntil = until
+    try { await writeFile(this.indexPausePath(), JSON.stringify({ until, at: new Date().toISOString() }), { mode: 0o600 }) } catch { /* the pause then only lasts until the next restart */ }
+  }
+
+  async initialize() {
+    await mkdir(this.config.storage.stateDir, { recursive: true })
+    await this.loadIndexPause()
+    // 15 October 2026: a write interrupted by a crash leaves `<file>.<pid>.<uuid>.tmp` behind (a 16 MB one was found). Only such files older
+    // than an hour are removed, never one a live writer could still own.
+    try {
+      const stale = Date.now() - 60 * 60 * 1000
+      for (const name of await readdir(this.config.storage.stateDir)) {
+        if (!/\.\d+\.[0-9a-f-]{36}\.tmp$/.test(name)) continue
+        const target = path.join(this.config.storage.stateDir, name)
+        if ((await lstat(target)).mtimeMs < stale) await rm(target, { force: true })
+      }
+    } catch { /* cleanup is best effort */ }
+    try { this.events = (await readFile(path.join(this.config.storage.stateDir, 'Events.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line)).slice(-this.config.storage.maxEvents) }
+    catch (error) { if (error.code !== 'ENOENT') throw new Error('Project history is unreadable; original events retained') }
+    const definitions = [...this.config.projects]
+    try {
+      const registry = JSON.parse(await readFile(path.join(this.config.storage.stateDir, 'Projects.json'), 'utf8'))
+      for (const project of registry.projects || []) {
+        const position = definitions.findIndex((entry) => entry.id === project.id)
+        if (position < 0) definitions.push(project); else definitions[position] = project
+      }
+    } catch (error) { if (error.code !== 'ENOENT') throw new Error('Runtime project registry is unreadable') }
+    for (const definition of definitions) {
+      const project = this.validateProject(definition)
+      this.projects.set(project.id, project)
+      let state = { backups: {}, restorations: {}, watched: false, jobs: [] }
+      try { state = { ...state, ...JSON.parse(await readFile(this.statePath(project.id), 'utf8')) } }
+      catch (error) { if (error.code !== 'ENOENT') state.error = 'Saved project status is unreadable; inventory required' }
+      if (['queued', 'running', 'restoring'].includes(state.syncState)) {
+        state.syncState = 'interrupted'; state.error = 'Previous service stopped before completion; backup can resume'
+      }
+      // 2 October 2026, 15:10 CEST: reconcile an interrupted release without deleting anything at startup.
+      for (const release of state.releases || []) {
+        if (!['prepared', 'removing', 'interrupted'].includes(release.phase)) continue
+        try { await lstat(release.activePath) }
+        catch (error) { if (error.code !== 'ENOENT') throw error; if (state.workspacePath === release.activePath) state.workspacePath = null }
+      }
+      this.states.set(project.id, state)
+    }
+    return this
+  }
+
+  validateProject(definition) {
+    const project = normalizeWorkspaceProject(definition, this.config.storage)
+    // 13 October 2026, 09:55 CEST: thumbnail indexing is an explicit per-project choice.
+    if (project.indexThumbnailMode && !['resolve', 'paths-only'].includes(project.indexThumbnailMode)) throw new Error('Unknown index thumbnail mode')
+    for (const source of project.sources) validateSourceScope(source, this.config)
+    return project
+  }
+
+  statePath(id) { return path.join(this.config.storage.stateDir, `Project-${id}.json`) }
+  project(id) { const project = this.projects.get(id); if (!project) throw new Error('Unknown project id'); return project }
+  state(id) { this.project(id); return this.states.get(id) }
+  // 2 October 2026, 15:35 CEST: same-project state writes stay ordered while uploads and recovery run independently.
+  get queue() { return Promise.all([this.writerQueue, ...this.workspaceQueues.values()]) }
+  // 14 October 2026: every state mutation bumps a revision so derived views (file list, cloud projection) are rebuilt only when it changed.
+  touch(id) { this.revisions.set(id, (this.revisions.get(id) || 0) + 1) }
+
+  // 14 October 2026: saves of one project are coalesced. One write runs, at most one more waits, and that waiting write serialises the
+  // latest state when it starts, so a burst of 50 transitions costs two writes of a 70 MB state instead of fifty.
+  async save(id) {
+    this.touch(id)
+    const slot = this.saveSlots.get(id) || { running: null, waiting: null }
+    this.saveSlots.set(id, slot)
+    if (slot.waiting) return slot.waiting
+    const write = () => atomicJson(this.statePath(id), this.state(id), { space: 0 })
+    const start = () => {
+      const current = write().finally(() => {
+        if (slot.running === current) slot.running = null
+        if (!slot.running && !slot.waiting) this.saveSlots.delete(id)
+      })
+      slot.running = current
+      return current
+    }
+    if (!slot.running) return start()
+    const waiting = slot.running.catch(() => {}).then(() => { slot.waiting = null; return start() })
+    slot.waiting = waiting
+    return waiting
+  }
+
+  event(projectId, type, detail = '') {
+    const event = { id: randomUUID(), projectId, type, title: type, detail: errorText(detail), createdAt: new Date().toISOString() }
+    appendFileSync(path.join(this.config.storage.stateDir, 'Events.jsonl'), JSON.stringify(event) + '\n', { mode: 0o600 })
+    this.events.push(event)
+    this.events = this.events.slice(-this.config.storage.maxEvents)
+    return event
+  }
+
+  async inventory(id) {
+    const project = this.project(id), state = this.state(id)
+    const scans = await Promise.all(project.sources.map((source) => scanSource(source, this.config)))
+    // 2 October 2026, 15:40 CEST: an active copy supplies working bytes while canonical Memory stays on its original source.
+    const byId = new Map(scans.flatMap((scan) => scan.files).map((file) => [file.id, file]))
+    const originals = new Map(byId), comparisonHashes = {}
+    if (state.workspacePath) {
+      const loadsRoot = path.join(this.config.storage.workspaceDir, id, 'loads')
+      if (path.dirname(state.workspacePath) !== loadsRoot || await realpath(state.workspacePath) !== state.workspacePath) throw new Error('Unsafe active workspace')
+      for (const source of project.sources.filter((entry) => entry.namespace !== 'memory')) {
+        const root = path.join(state.workspacePath, 'sources', source.namespace)
+        const workingPath = path.join(root, source.id)
+        try { await lstat(workingPath) } catch (error) { if (error.code === 'ENOENT') continue; throw error }
+        const scan = await scanSource({ ...source, localPath: workingPath }, { ...this.config, roots: { ...this.config.roots, [source.namespace]: root } })
+        // 3 October 2026, 10:09 CEST: production edits remain visible when their identity also has a loaded copy.
+        for (const file of scan.files) {
+          const original = originals.get(file.id), baseline = state.productionBaselines?.[file.id]
+          let sourceConflict = null
+          if (original && original.changeToken !== baseline?.changeToken) {
+            const checkedHash = async (entry) => {
+              const cached = state.comparisonHashes?.[entry.localPath]
+              let sha256 = cached?.changeToken === entry.changeToken ? cached.sha256 : null
+              if (!sha256) {
+                if (await realpath(entry.localPath) !== entry.localPath) throw new Error('Compared source escaped its declared path')
+                sha256 = await hashLocalFile(entry.localPath, entry.changeToken)
+                if (changeToken(await lstat(entry.localPath)) !== entry.changeToken || await realpath(entry.localPath) !== entry.localPath) throw new Error('Source changed during version comparison')
+              }
+              comparisonHashes[entry.localPath] = { changeToken: entry.changeToken, sha256 }
+              return sha256
+            }
+            const originalSha256 = await checkedHash(original)
+            if (originalSha256 !== (baseline?.sha256 || state.backups[file.id]?.sha256)) {
+              const copySha256 = await checkedHash(file)
+              if (copySha256 !== originalSha256) {
+                const previous = state.inventory?.localFiles.find((entry) => entry.id === file.id)?.sourceConflict
+                sourceConflict = { originalPath: original.localPath, originalChangeToken: original.changeToken, originalSha256, originalSize: original.size, copySha256, reason: baseline?.sha256 ? 'original-changed' : 'baseline-missing',
+                  detectedAt: previous?.originalSha256 === originalSha256 && previous?.copySha256 === copySha256 ? previous.detectedAt : new Date().toISOString() }
+              }
+            }
+          }
+          byId.set(file.id, { ...file, workingRoot: workingPath, loadedCopy: true, sourceConflict })
+        }
+        scans.push({ ...scan, source: null })
+      }
+    }
+    state.comparisonHashes = comparisonHashes
+    // 8 October 2026, 14:42 CEST: hash bytes when a backed-up file changes only its ctime token.
+    for (const file of byId.values()) {
+      const backup = state.backups[file.id]
+      if (!backup || backup.changeToken === file.changeToken || !sameArchivedContentMetadata(file, backup)) continue
+      const sha256 = await hashLocalFile(file.localPath, file.changeToken)
+      if (sha256 === backup.sha256) backup.changeToken = file.changeToken
+    }
+    const checkedAt = new Date().toISOString()
+    const localFiles = [...byId.values()].map((file) => {
+      const backup = state.backups[file.id], restored = state.restorations[file.id]
+      const sha256 = backup?.changeToken === file.changeToken ? backup.sha256 : restored?.path === file.localPath && restored.changeToken === file.changeToken ? restored.sha256 : null
+      const baseline = state.productionBaselines?.[file.id]
+      const olderLocal = !file.loadedCopy && baseline?.changeToken === file.changeToken && baseline.sha256 !== backup?.sha256
+      return { ...file, sha256, olderLocal, preservedOriginalVersion: state.preservedOriginalVersions?.[file.id] || null }
+    })
+    state.inventory = { checkedAt, sources: scans.map((scan) => scan.source).filter(Boolean), localFiles,
+      excluded: scans.reduce((count, scan) => count + scan.excluded.length, 0), issues: scans.flatMap((scan) => scan.issues) }
+    await this.save(id)
+    const index = await this.refreshContextIndex()
+    const fileMapWrite = await this.writeFileMap(id, index).catch((error) => { this.event(id, 'file-map-error', errorText(error)); return null })
+    // 9 October 2026, 02:20 CEST: include the generated file map's post-write metadata in the inventory that archives it.
+    if (fileMapWrite?.changed) {
+      const fileMap = localFiles.find((file) => file.localPath === fileMapWrite.file)
+      if (fileMap) {
+        const source = project.sources.find((entry) => entry.id === fileMap.sourceId)
+        const metadata = await lstat(fileMapWrite.file)
+        const canonicalPath = await realpath(fileMapWrite.file)
+        if (!source || !metadata.isFile() || metadata.isSymbolicLink() || canonicalPath !== fileMap.localPath || !isInside(source.localPath, canonicalPath)) {
+          throw new Error('Generated file map escaped its tracked source')
+        }
+        const previousSize = fileMap.size
+        Object.assign(fileMap, { size: metadata.size, mtimeMs: metadata.mtimeMs, ctimeMs: metadata.ctimeMs,
+          changeToken: changeToken(metadata), sha256: null })
+        const sourceInventory = state.inventory.sources.find((entry) => entry.id === fileMap.sourceId)
+        if (sourceInventory) sourceInventory.bytes += metadata.size - previousSize
+        await this.save(id)
+      }
+    }
+    this.scheduleSceneAudits(id)
+    return this.snapshot(id)
+  }
+
+  // 7 October 2026, 14:45 CEST: FileMap.md in the project memory follows the live inventory; written only when its content changes, and verified (every inventoried file counted once).
+  async writeFileMap(id, index) {
+    const locations = index?.projects?.[id]?.locations || {}, memory = (locations.memory || []).find((location) => location.localPath.endsWith(`/Projects/${id}`)) || (locations.memory || [])[0]
+    if (!memory?.localPath) return null
+    const map = renderFileMap(id, this.state(id).inventory?.localFiles || [], locations)
+    if (map.counted !== map.files) throw new Error(`File map counted ${map.counted} of ${map.files} files`)
+    const file = path.join(memory.localPath, 'FileMap.md')
+    let current = null
+    try { current = await readFile(file, 'utf8') } catch (error) { if (error.code !== 'ENOENT') throw error }
+    if (current === map.markdown) return { file, changed: false }
+    const temporary = `${file}.${process.pid}.tmp`
+    try { await writeFile(temporary, map.markdown, { mode: 0o600 }); await rename(temporary, file) } finally { await rm(temporary, { force: true }) }
+    return { file, changed: true, folders: map.folders, files: map.files }
+  }
+
+  // 2 October 2026: one derived mapping index stays current without duplicating authoritative project definitions.
+  refreshContextIndex() {
+    // 7 October 2026, audit finding 1: callers that arrive while a rebuild is queued but has not started share it, because it reads the state when it STARTS (never older than the caller's change). 67 rebuilds in 180 s collapse to at most one waiting run.
+    if (this.contextIndexWaiting) return this.contextIndexWaiting
+    const task = this.contextIndexQueue.catch(() => {}).then(async () => {
+      this.contextIndexWaiting = null
+      try { this.conversationBindings = JSON.parse(await readFile(path.join(this.config.storage.stateDir, 'SessionBindings.json'), 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+      try { this.conversationMetadata = JSON.parse(await readFile(path.join(this.config.storage.stateDir, 'SessionConversationMetadata.json'), 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+      const index = buildGlobalProjectIndex([...this.projects.keys()].map((id) => this.snapshot(id)))
+      await atomicJson(path.join(this.config.storage.stateDir, 'GlobalProjectIndex.json'), index)
+      const directory = path.join(this.config.storage.stateDir, 'contexts')
+      await mkdir(directory, { recursive: true })
+      for (const id of Object.keys(index.projects)) {
+        const file = path.join(directory, `${id}.md`), text = renderProjectContext(index, id)
+        // Rewrite a context file only when its text changed (audit finding 1: 1,206 identical writes per 3 minutes).
+        let current = null
+        try { current = await readFile(file, 'utf8') } catch (error) { if (error.code !== 'ENOENT') throw error }
+        if (current === text) continue
+        const temporary = `${file}.${randomUUID()}.tmp`
+        await writeFile(temporary, text, { mode: 0o600 })
+        await rename(temporary, file)
+      }
+      return index
+    })
+    this.contextIndexQueue = task
+    this.contextIndexWaiting = task
+    return task
+  }
+
+  // 3 October 2026, 04:15 CEST: scene references derive from current inventories, including their declared shared libraries.
+  sceneReferenceContexts(id) {
+    const audits = Object.entries(this.state(id).sceneAudits || {})
+    if (!audits.length) return []
+    const projects = [...this.projects.values()].map((project) => {
+      const memo = this.combinedFiles(project.id)
+      // 3 October 2026, 05:00 CEST: preserve declared source identity separately from the active copy's actual read path.
+      memo.sceneFiles ||= memo.files.map((file) => ({ ...file, canonicalPath: file.present ? file.localPath : null,
+        originCanonicalPath: file.loadedCopy ? path.join(project.sources.find((source) => source.id === file.sourceId).localPath, file.relativePath) : null }))
+      return { ...project, files: memo.sceneFiles }
+    })
+    return audits.map(([sceneFileId, entry]) => {
+      const file = this.state(id).inventory?.localFiles.find((candidate) => candidate.id === sceneFileId)
+      const preparation = this.scenePreparationEvidence(id, sceneFileId, projects)
+      if (!file || file.changeToken !== entry.changeToken) return { sceneFileId, sceneSha256: entry.audit.sceneSha256, state: 'stale', references: [], ...(preparation ? { preparation: { ...preparation, state: 'stale' } } : {}), portabilityVerified: false }
+      return { ...mapSceneReferences({ projectId: id, sceneFileId, sceneSha256: entry.audit.sceneSha256, audit: entry.audit, projects }), state: 'current', ...(preparation ? { preparation } : {}) }
+    })
+  }
+
+  // 3 October 2026, 09:08 CEST: export a narrow historical proof; current copy paths and hashes determine whether it is still applicable.
+  scenePreparationEvidence(id, sceneFileId, projects) {
+    const proof = this.state(id).scenePreparations?.[sceneFileId]
+    if (!proof) return null
+    const files = new Map(projects.flatMap((project) => (project.files || []).map((file) => [`${project.id}/${file.id}`, file])))
+    const current = [{ projectId: id, fileId: sceneFileId, targetPath: proof.plan.scenePath, sha256: proof.plan.sceneSha256 }, ...proof.plan.resources]
+      .every((target) => { const file = files.get(`${target.projectId}/${target.fileId}`); return file?.present && file.loadedCopy && file.localPath === target.targetPath && file.sha256 === target.sha256 })
+    return { state: current ? 'verified' : 'stale', checkedAt: proof.report.checkedAt, sceneSha256: proof.report.sceneSha256,
+      sceneOpened: proof.report.sceneOpened, resourceCount: proof.report.resourceBytesVerified,
+      inputCount: proof.report.reboundInputs.length, libraryCount: proof.report.loadedLibraries.length,
+      instanceCount: proof.report.loadedLibraries.reduce((count, library) => count + library.instancePaths.length, 0),
+      unresolvedReferenceCount: proof.plan.unresolvedReferences.length, warningCount: proof.report.warnings?.length || 0,
+      diagnosticCount: String(proof.report.processDiagnostics || '').split('\n').filter((line) => line.trim()).length,
+      resourceVersions: proof.plan.resources.map(({ projectId, fileId, sha256 }) => ({ projectId, fileId, sha256 })),
+      savedScene: false, portabilityVerified: false }
+  }
+
+  // 3 October 2026, 04:46 CEST: machine diagnostics use source identities while authored feedback keeps its original text.
+  cloudDiagnostic(id, value) {
+    if (typeof value !== 'string') return value
+    const aliases = [
+      ...this.project(id).sources.map((source) => [source.localPath, `[source:${source.id}]`]),
+      ...Object.entries(this.config.roots).map(([namespace, root]) => [root, `[${namespace}]`]),
+      [this.config.storage.stateDir, '[local-state]'], [this.config.storage.workspaceDir, '[workspace]'],
+      [this.repoRoot, '[application]'], [process.env.HOME, '[home]'],
+      ['/Applications', '[applications]'], ['/private/var', '[temporary]'], ['/var/folders', '[temporary]'], ['/tmp', '[temporary]'], ['/Volumes', '[volume]'],
+    ].filter(([root]) => typeof root === 'string' && root.length > 1).sort(([left], [right]) => right.length - left.length)
+    let text = errorText(value)
+    for (const [root, alias] of aliases) {
+      const escaped = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      text = text.replace(new RegExp(`${escaped}(?=/|$|['"),])`, 'g'), () => alias)
+    }
+    return text.replace(/\/Users\/[^/\n]+(?=\/)/g, '[home]')
+  }
+
+  cloudEvent(id, { sourcePath, ...event }) {
+    const technical = ['watch', 'inventory-error', 'error', 'done', 'verify'].includes(event.type)
+    return technical ? { ...event, ...(event.detail !== undefined ? { detail: this.cloudDiagnostic(id, event.detail) } : {}), ...(event.body !== undefined ? { body: this.cloudDiagnostic(id, event.body) } : {}) } : event
+  }
+
+  // 14 October 2026: the combined file list of a 50 000 file project costs about 170 ms and every project snapshot used to rebuild the list
+  // of EVERY project (scene references), so a refresh was quadratic. The list is rebuilt only when one of its inputs changed.
+  combinedFiles(id) {
+    const project = this.project(id), state = this.state(id)
+    const inventory = state.inventory
+    const revision = this.revisions.get(id) || 0
+    let memo = this.filesMemo.get(id)
+    if (!inventory || !memo || memo.project !== project || memo.inventory !== inventory || memo.backups !== state.backups
+      || memo.restorations !== state.restorations || memo.revision !== revision) {
+      memo = { project, inventory, backups: state.backups, restorations: state.restorations, revision,
+        files: combineWorkspaceFiles(project, inventory?.localFiles || [], state.backups, state.restorations), cloudFiles: null, sceneFiles: null }
+      if (inventory) this.filesMemo.set(id, memo)
+    }
+    return memo
+  }
+
+  snapshot(id, { cloud = false } = {}) {
+    const project = this.project(id), state = this.state(id)
+    const inventory = state.inventory || { checkedAt: null, localFiles: [], sources: project.sources, excluded: 0, issues: [] }
+    const memo = this.combinedFiles(id)
+    const files = memo.files
+    const jobs = (state.jobs || []).map((jobId) => this.jobs.get(jobId)).filter(Boolean)
+    const active = jobs.find((job) => job.state === 'running' && job.type !== 'archive') || jobs.find((job) => job.state === 'running') || jobs.find((job) => job.state === 'queued')
+    const observedState = active ? active.state === 'queued' ? 'queued' : ['restore', 'recover'].includes(active.type) ? 'restoring' : 'running' : state.syncState
+    const summary = workspaceSummary(files, { state: observedState, error: state.error, checkedAt: inventory.checkedAt })
+    const result = { ...project, checkedAt: inventory.checkedAt, sources: inventory.sources, files,
+      inventory: { count: summary.count, bytes: summary.bytes, excluded: inventory.excluded, issues: inventory.issues },
+      sync: { ...summary, watched: !!state.watched,
+        // 3 October 2026, 04:51 CEST: count outstanding scene analyses, including delayed and serialized work, without claiming parallel execution.
+        sceneAuditPendingCount: [...this.sceneAuditTimers.keys(), ...this.sceneAuditTasks.keys()].filter((key) => key.startsWith(`${id}/`)).length,
+        feedbackError: this.feedbackError || null,
+        conversationIndexError: this.conversationIndexSync?.status().projects[id]?.error || null,
+        sceneAuditError: [...this.sceneAuditErrors].filter(([key]) => key.startsWith(`${id}/`)).map(([, detail]) => detail).join('; ') || null,
+        watchError: [...this.watchErrors].filter(([key]) => key.startsWith(`${id}:`)).map(([, detail]) => detail).join('; ') || null,
+        publishedAt: state.publishedAt || null },
+      workspace: { state: state.workspacePath ? 'loaded' : 'unloaded', path: state.workspacePath || null,
+        loadedCount: Object.values(state.restorations).filter((entry) => state.workspacePath && isInside(state.workspacePath, entry.path)).length,
+        releasedBytes: (state.releases || []).filter((entry) => entry.phase === 'unloaded').reduce((sum, entry) => sum + entry.allocatedBytes, 0),
+        recoverableCount: (state.releases || []).filter((entry) => !['recovered', 'cancelled'].includes(entry.phase)).length,
+        // 12 October 2026: how each released copy was proven, counted separately for the panel (identity proof vs full restore probe)
+        verification: { identityProofCount: state.verification?.identityProofCount || 0, fullReadBackCount: state.verification?.fullReadBackCount || 0,
+          lastMode: state.verification?.lastMode || null, lastAt: state.verification?.lastAt || null } },
+      jobs, sceneReferences: this.sceneReferenceContexts(id),
+      events: this.events.filter((event) => event.projectId === id) }
+    // 5 October 2026, 11:00 CEST: project links derive from the existing session registry, never from conversation titles.
+    result.conversations = Object.entries(this.conversationBindings || {}).filter(([, projectId]) => projectId === id).map(([sessionId]) => {
+      const saved = Object.values(this.conversationMirror.state().entries).find(entry => entry.summary?.sessionId === sessionId)?.summary || this.conversationMetadata?.[sessionId]
+      return { id: saved?.id || sessionId, sessionId, projectId: id, provider: saved?.provider || null, title: saved?.title || sessionId, reader: { action: 'conversation', conversationId: saved?.id || null } }
+    })
+    if (id === CONVERSATION_LIBRARY_ID) result.conversations = conversationArchiveEntries(this.conversationMirror.state().entries, files, { cloud })
+    if (!cloud) return { ...result, mapping: buildProjectMapping(result) }
+    const { sources, files: cloudFiles, workspace, feedbackPath, ...rest } = result
+    const cloudResult = { ...rest, jobs: [], events: rest.events.map((event) => this.cloudEvent(id, event)),
+      sceneReferences: rest.sceneReferences.map((scene) => ({ ...scene, ...(scene.preparation ? { preparation: { ...scene.preparation, state: 'historical' } } : {}) })),
+      inventory: { ...rest.inventory, issues: rest.inventory.issues.map((issue) => ({ ...issue, ...(issue.message ? { message: this.cloudDiagnostic(id, issue.message) } : {}) })) },
+      sync: { ...rest.sync, error: this.cloudDiagnostic(id, rest.sync.error), state: 'snapshot', watched: undefined, watchError: undefined, feedbackError: undefined, conversationIndexError: undefined, sceneAuditError: undefined, sceneAuditPendingCount: undefined }, localState: 'unknown',
+      // 3 October 2026, 03:19 CEST: retain shared host identity while omitting machine-specific source paths.
+      sources: sources.map(({ id: sourceId, namespace, keep, count, bytes, checkedAt, optional, include, exclude, sharedProjectId }) => ({ id: sourceId, namespace, keep, count, bytes, checkedAt, optional, include, exclude, sharedProjectId })),
+      files: memo.cloudFiles ||= cloudFiles.map(({ localPath, workingRoot, changeToken, ctimeMs, sourceConflict, manifestPath, relativeManifest, sourceFolder, ...file }) => ({ ...file, ...(sourceConflict ? { sourceConflict: { originalSha256: sourceConflict.originalSha256, originalSize: sourceConflict.originalSize, copySha256: sourceConflict.copySha256, reason: sourceConflict.reason, detectedAt: sourceConflict.detectedAt } } : {}), ...(state.backups[file.id] ? { size: state.backups[file.id].size, sha256: state.backups[file.id].sha256 } : {}), olderLocal: undefined, loadedCopy: undefined, present: undefined, status: file.cloudPath ? 'backed-up' : 'pending' })),
+      workspace: { state: 'unknown' }, feedbackPath: (() => { const file = files.find((entry) => entry.localPath === feedbackPath); return file?.cloudPath || (file?.expectedCloudPath ? `${file.expectedCloudPath}.file.json` : null) })() }
+    return { ...cloudResult, mapping: buildProjectMapping(cloudResult, { cloud: true }) }
+  }
+
+  async register(definition) {
+    const project = this.validateProject(definition)
+    const lock = await acquireDirectoryLock(path.join(this.config.storage.stateDir, 'registry.lock'), directoryLockOptions('court', 'Assets registry'))
+    try {
+      let registry = { projects: [] }
+      try { registry = JSON.parse(await readFile(path.join(this.config.storage.stateDir, 'Projects.json'), 'utf8')) }
+      catch (error) { if (error.code !== 'ENOENT') throw error }
+      const previous = this.projects.get(project.id)
+      if (previous && previous.sources.some((source) => project.sources.some((next) => next.id === source.id && (next.localPath !== source.localPath || next.namespace !== source.namespace)))) {
+        throw new Error('Changing an existing source mapping requires a new source id')
+      }
+      registry.projects = [...registry.projects.filter((entry) => entry.id !== project.id), project]
+      await atomicJson(path.join(this.config.storage.stateDir, 'Projects.json'), registry)
+      this.projects.set(project.id, project)
+      if (!this.states.has(project.id)) this.states.set(project.id, { backups: {}, restorations: {}, watched: false, jobs: [] })
+      this.event(project.id, 'registered', project.name)
+      return await this.inventory(project.id)
+    } finally { await lock.release() }
+  }
+
+  enqueue(id, type, task, { background = false, requireWatched = false } = {}) {
+    this.project(id)
+    const job = { id: randomUUID(), projectId: id, type, state: 'queued', createdAt: new Date().toISOString(), error: null, background }
+    this.jobs.set(job.id, job)
+    const state = this.state(id)
+    state.jobs = [...(state.jobs || []), job.id].slice(-this.config.storage.maxEvents)
+    state.syncState = 'queued'
+    this.event(id, 'queued', type)
+    let complete
+    this.completions.set(job.id, new Promise((resolve) => { complete = resolve }))
+    const lifecycle = ['restore', 'unload', 'recover', 'prepare-scene'].includes(type)
+    // 9 October 2026, 00:10 CEST: queue priority and watcher ownership are separate; only watcher-owned backups stop after watch-off.
+    const skipStoppedBackground = () => {
+      if (!requireWatched || state.watched) return false
+      job.state = 'interrupted'
+      job.error = null
+      const anotherPendingJob = [...this.jobs.values()].some((candidate) => candidate.id !== job.id && candidate.projectId === id && ['queued', 'running'].includes(candidate.state))
+      if (!anotherPendingJob && state.syncState === 'queued') state.syncState = null
+      this.event(id, 'backup-cancelled', 'Watcher stopped before the queued automatic backup started')
+      return true
+    }
+    const run = async () => {
+      if (this.disposed) { job.state = 'interrupted'; return }
+      let lock
+      const controller = new AbortController()
+      this.controllers.add(controller)
+      try {
+        if (skipStoppedBackground()) return
+        lock = await acquireDirectoryLock(path.join(this.config.storage.stateDir, lifecycle ? `workspace-${id}.lock` : 'writer.lock'), directoryLockOptions('long', lifecycle ? 'Assets local lifecycle' : 'Assets cloud writer'))
+        if (skipStoppedBackground()) return
+        job.state = 'running'; job.startedAt = new Date().toISOString()
+        state.syncState = type === 'restore' ? 'restoring' : 'running'; state.error = null
+        this.refreshSleepInhibitor()
+        await this.save(id)
+        await task(job, controller.signal)
+        job.state = 'done'
+        state.syncState = null
+        this.event(id, 'done', type)
+      } catch (error) {
+        job.state = 'error'; job.error = errorText(error); state.syncState = 'error'; state.error = job.error
+        this.event(id, 'error', job.error)
+      } finally {
+        job.finishedAt = new Date().toISOString()
+        this.controllers.delete(controller)
+        this.refreshSleepInhibitor()
+        await this.save(id)
+        await lock?.release()
+      }
+    }
+    if (lifecycle) {
+      const previous = this.workspaceQueues.get(id) || Promise.resolve()
+      const executing = previous.catch(() => {}).then(run).finally(() => {
+        complete(); this.completions.delete(job.id)
+        if (this.workspaceQueues.get(id) === executing) this.workspaceQueues.delete(id)
+      })
+      this.workspaceQueues.set(id, executing)
+      return { jobId: job.id, job: { ...job }, state: 'queued', checkedAt: new Date().toISOString() }
+    }
+    this.queuedTasks.push({ job, run, complete, background })
+    if (!this.draining) {
+      this.draining = true
+      // 2 October 2026, 15:40 CEST: interactive jobs precede waiting automatic passes without preempting a writer.
+      this.writerQueue = Promise.resolve().then(async () => {
+        try {
+          while (this.queuedTasks.length) {
+            this.queuedTasks.sort((left, right) => Number(left.background) - Number(right.background))
+            const entry = this.queuedTasks.shift()
+            try { await entry.run() }
+            finally { entry.complete(); this.completions.delete(entry.job.id) }
+            await Promise.resolve()
+          }
+        } finally { this.draining = false }
+      })
+    }
+    return { jobId: job.id, job: { ...job }, state: 'queued', checkedAt: new Date().toISOString() }
+  }
+
+  refreshSleepInhibitor() {
+    if (!this.sleepInhibitor) return
+    const activeJob = [...this.jobs.values()].find((job) => job.state === 'running' && CLOUD_TRANSFER_TYPES.has(job.type))
+    if (activeJob && !this.sleepInhibitorActive) {
+      this.sleepInhibitorActive = true
+      this.sleepWarningRecorded = false
+      const reportFailure = () => {
+        if (!this.sleepInhibitorActive || this.sleepWarningRecorded) return
+        this.sleepWarningRecorded = true
+        const currentJob = [...this.jobs.values()].find((job) => job.state === 'running' && CLOUD_TRANSFER_TYPES.has(job.type))
+        if (currentJob) this.event(currentJob.projectId, 'sleep-protection-warning', 'Idle sleep protection failed; the active transfer will continue and may pause if macOS sleeps')
+      }
+      try { this.sleepInhibitor.start(reportFailure) }
+      catch { reportFailure() }
+      return
+    }
+    if (!activeJob && this.sleepInhibitorActive) {
+      this.sleepInhibitorActive = false
+      this.sleepInhibitor.stop()
+    }
+  }
+
+  // 2 October 2026, 14:33 CEST: index work survives a crash between verified bytes and cloud discovery.
+  async indexPending(id, env, signal, stageRoot) {
+    const state = this.state(id), pending = state.pendingIndex || []
+    if (!pending.length) return
+    // 21 October 2026: an edited note keeps its manifest path, which the index already holds; reading the 37 MB delta to learn that cost 14 to 34 s.
+    const shaByManifest = new Map(Object.values(state.backups || {}).map((backup) => [backup.manifestPath, backup.sha256]))
+    const todo = await this.indexLedger.missing(pending.map((manifestPath) => ({ path: manifestPath, sha256: shaByManifest.get(manifestPath) })))
+    if (!todo.length) { state.pendingIndex = []; await this.save(id); return }
+    await mkdir(stageRoot, { recursive: true })
+    const list = path.join(stageRoot, 'IndexPaths.txt')
+    await writeFile(list, `${todo.map((entry) => entry.path).join('\n')}\n`)
+    const indexEnv = this.project(id).indexThumbnailMode === 'paths-only' ? { ...env, ZR_INDEX_SKIP_THUMBNAILS: '1' } : env
+    await this.runProcess(path.join(this.repoRoot, 'scripts', 'index-add-paths.mjs'), [list], { env: indexEnv, signal,
+      timeoutMs: this.config.storage.indexProcessTimeoutMs, killGraceMs: this.config.storage.processKillGraceMs })
+    await this.indexLedger.record(todo)
+    state.pendingIndex = []; await this.save(id)
+  }
+
+  async publishProject(id) {
+    if (!this.cloudPublisher) return
+    // 3 October 2026, 04:41 CEST: a shared archive refreshes its audited consumers without recursively publishing dependencies.
+    // 21 October 2026: a publication costs 8 to 31 s and nobody knew which part; each part is now measured and joins the pass's timing event.
+    const parts = {}
+    const lap = async (name, work) => { const startedAt = Date.now(); try { return await work() } finally { parts[name] = (parts[name] || 0) + Date.now() - startedAt } }
+    const consumers = await lap('pubConsumers', async () => [...this.projects.keys()].filter((projectId) => projectId !== id && this.sceneReferenceContexts(projectId).some((scene) => scene.dependencies?.includes(id))))
+    // 9 October 2026, 09:57 CEST: Build the cloud context from local snapshots; project summaries no longer carry the global file map.
+    const { cloudSnapshots, contextIndex } = await lap('pubPrepare', async () => {
+      const cloudSnapshots = [...this.projects.keys()].map((projectId) => this.snapshot(projectId, { cloud: true }))
+      return { cloudSnapshots, contextIndex: buildGlobalProjectIndex(cloudSnapshots, { cloud: true }) }
+    })
+    for (const projectId of [id, ...consumers]) {
+      const history = await lap('pubHistory', () => this.request('history', { projectId }))
+      const projectSnapshot = cloudSnapshots.find((project) => project.id === projectId)
+      // 15 October 2026: GitHub refuses a file above 100 MiB. A project snapshot is one file; the Japanese one reached 104.7 MB before
+      // anyone knew. A warning at 90 MB leaves time to shard it, instead of an error found after the fact.
+      if ((projectSnapshot.files || []).length > 20000) {
+        const warnAt = this.config.storage.snapshotWarnBytes || 90_000_000
+        const bytes = Buffer.byteLength(JSON.stringify(projectSnapshot))
+        if (bytes > warnAt) this.event(projectId, 'snapshot-size-warning', `${Math.round(bytes / 1e6)} MB of 104 MB (GitHub 100 MiB file limit): the project snapshot needs sharding`)
+      }
+      await lap('pubWrite', () => this.cloudPublisher({ ...projectSnapshot, events: history.events.map((event) => this.cloudEvent(projectId, event)) }, contextIndex))
+      this.state(projectId).publishedAt = new Date().toISOString(); await lap('pubSave', () => this.save(projectId))
+    }
+    return parts
+  }
+
+  // 3 October 2026, 10:17 CEST: archive an immutable original version before the loaded copy advances the main identity.
+  async preserveOriginalVersions(id, fileIds, job, signal) {
+    const state = this.state(id), project = this.project(id)
+    const conflicts = state.inventory.localFiles.filter((file) => file.sourceConflict && (fileIds === null || fileIds.includes(file.id)))
+    if (!conflicts.length) return
+    const workshopSource = project.sources.find((source) => source.namespace === 'tmp')
+    const workshop = projectWorkshopPath(this.snapshot(id))
+    if (!workshopSource || !workshop || !state.workspacePath || !isInside(state.workspacePath, workshop)) throw new Error('Tracked active TMP required to preserve divergent versions')
+    job.preservedVersions ||= []
+    for (const file of conflicts) {
+      if (signal.aborted) throw new Error('Version preservation interrupted')
+      const conflict = file.sourceConflict, source = project.sources.find((entry) => entry.id === file.sourceId)
+      const relativePath = safeRelativePath(`${this.config.storage.versionDirectory}/${source.id}/${conflict.originalSha256}/${file.relativePath}`)
+      if (!pathIsSelected(relativePath, workshopSource.include) || (workshopSource.exclude || []).some((entry) => pathIsSelected(relativePath, [entry]))) throw new Error('Version destination excluded from tracked TMP')
+      const target = path.join(workshop, relativePath), versionId = workspaceFileId(workshopSource.id, relativePath)
+      await this.prepareWorkspaceDirectory(path.dirname(target), state.workspacePath)
+      const stageRoot = path.join(this.config.storage.stateDir, 'versions', job.id, source.id, conflict.originalSha256)
+      const temporary = path.join(stageRoot, file.relativePath)
+      try {
+        let existing = false
+        try {
+          const metadata = await lstat(target)
+          if (!metadata.isFile() || metadata.isSymbolicLink() || await realpath(target) !== target || await hashLocalFile(target, changeToken(metadata)) !== conflict.originalSha256) throw new Error('Preserved version destination changed; existing bytes retained')
+          existing = true
+        } catch (error) { if (error.code !== 'ENOENT') throw error }
+        if (!existing) {
+          const snapshot = await snapshotSourceFile({ ...file, localPath: conflict.originalPath, size: conflict.originalSize, changeToken: conflict.originalChangeToken }, temporary, source.localPath)
+          if (snapshot.sha256 !== conflict.originalSha256) throw new Error('Original changed before version preservation')
+          await publishRestoreWithoutOverwrite(temporary, target, { onConflict: 'reject' })
+        }
+        await this.inventory(id)
+        const versionJob = { id: randomUUID() }
+        await this.archiveNow(id, [versionId], versionJob, signal, { preserveVersions: false })
+        const backup = state.backups[versionId], version = state.inventory.localFiles.find((entry) => entry.id === versionId)
+        if (!backup || backup.sha256 !== conflict.originalSha256 || !version || backup.changeToken !== version.changeToken || backup.size !== conflict.originalSize) throw new Error('Original version archive proof missing; divergence retained')
+        if (await realpath(conflict.originalPath) !== conflict.originalPath || changeToken(await lstat(conflict.originalPath)) !== conflict.originalChangeToken) throw new Error('Original changed while its previous version was archived; retry required')
+        state.productionBaselines ||= {}
+        state.productionBaselines[file.id] = { changeToken: conflict.originalChangeToken, sha256: conflict.originalSha256 }
+        state.preservedOriginalVersions ||= {}
+        state.preservedOriginalVersions[file.id] = { versionId, sha256: backup.sha256, manifestPath: backup.manifestPath, preservedAt: new Date().toISOString() }
+        await this.save(id)
+        job.preservedVersions.push({ fileId: file.id, versionId, sha256: backup.sha256, manifestPath: backup.manifestPath })
+        this.event(id, 'version-preserved', JSON.stringify(job.preservedVersions.at(-1)))
+      } finally { await rm(stageRoot, { recursive: true, force: true }) }
+    }
+    await this.inventory(id)
+  }
+
+  async archiveNow(id, fileIds, job, signal, { maxBatches = Infinity, preserveVersions = true } = {}) {
+    // 14 October 2026: where the time goes in one pass (milliseconds per phase), kept on the job and logged as one event.
+    // A one-file pass used to cost 45 s and nobody could say why.
+    const timing = job.timing = {}
+    const timed = async (name, work) => { const startedAt = Date.now(); try { return await work() } finally { timing[name] = (timing[name] || 0) + Date.now() - startedAt } }
+    const passStartedAt = Date.now()
+    const publishSafely = async () => {
+      try { job.publishParts = await timed('publish', () => this.publishProject(id)) }
+      catch (error) { job.publishError = errorText(error); this.event(id, 'publish-error', job.publishError) }
+    }
+    // 21 October 2026: the search index is a convenience, the archive is the data. GitHub answered 403 "Repository is above its size quota" to every
+    // write on zenray-index-public (105 GB, 9 097 commits), so the index step failed at the head of EVERY pass and no project could archive for
+    // hours. A failed index now keeps its paths in `pendingIndex` (durable), is recorded, and pauses further attempts for `indexFailureCooldownMs`
+    // (shared by all projects, the index repository being global) instead of costing `indexProcessTimeoutMs` at each of the pass's index points.
+    // An automatic pass honours the pause; a pass the user asked for tries once (the repository may have been freed), and no pass retries after its own failure.
+    let indexFailedInPass = false
+    const indexSafely = async () => {
+      if (indexFailedInPass) return
+      if (job.background && this.indexBlockedUntil && Date.now() < this.indexBlockedUntil) return
+      try {
+        await timed('index', () => this.indexPending(id, env, signal, stageRoot))
+        if (this.indexBlockedUntil) await this.setIndexPause(0)
+      } catch (error) {
+        if (signal?.aborted) throw error
+        indexFailedInPass = true
+        job.indexError = errorText(error)
+        await this.setIndexPause(Date.now() + (this.config.storage.indexFailureCooldownMs || 0))
+        this.event(id, 'index-error', job.indexError)
+      }
+    }
+    await timed('inventory', () => this.inventory(id))
+    if (preserveVersions) await timed('versions', () => this.preserveOriginalVersions(id, fileIds, job, signal))
+    const project = this.project(id), state = this.state(id)
+    // 15 October 2026: Sets, not repeated array scans (a selection of 40 000 files was 40 000 x 50 000 comparisons).
+    const wantedIds = fileIds === null ? null : new Set(fileIds)
+    const requested = state.inventory.localFiles.filter((file) => wantedIds === null || wantedIds.has(file.id))
+    if (wantedIds) { const found = new Set(requested.map((file) => file.id)); for (const fileId of wantedIds) if (!found.has(fileId)) throw new Error('Archive selection contains unknown or missing files') }
+    if (fileIds && requested.some((file) => file.sourceConflict)) throw new Error('Original and loaded copy diverged; retain both versions before choosing an archive source')
+    job.sourceConflictCount = requested.filter((file) => file.sourceConflict).length
+    const selected = requested.filter((file) => !file.sourceConflict && !file.olderLocal && state.backups[file.id]?.changeToken !== file.changeToken && (!file.sha256 || file.sha256 !== state.backups[file.id]?.sha256 || file.size !== state.backups[file.id]?.size))
+    if (state.inventory.issues.some((issue) => !['symlink-skipped', 'ENOENT'].includes(issue.code))) throw new Error('Source inventory contains errors; fix them before backup')
+    const token = await this.getToken()
+    if (!token) throw new Error('GitHub credential unavailable')
+    // 8 October 2026, 15:54 CEST: avoid refetching the verified zenray-data object graph for every archive batch.
+    const env = { ...process.env, GITHUB_TOKEN: token, ZR_API_BASE: process.env.ZR_API_BASE || `http://127.0.0.1:${this.config.bridge.port}`,
+      ZR_ARCHIVE_REFERENCE_REPO: path.join(this.config.storage.stateDir, 'repositories', 'matthieuhuguet_zenray-data') }
+    const stageRoot = path.join(this.config.storage.stateDir, 'staging', job.id)
+    const manifestPaths = []
+    // 8 October 2026, 17:12 CEST: rotate bounded background batches so changing indexes cannot starve later sources.
+    const sourceCursor = Number.isFinite(maxBatches)
+      ? project.sources.findIndex((source) => source.id === state.nextAutoArchiveSourceId)
+      : -1
+    const orderedSources = sourceCursor > 0
+      ? [...project.sources.slice(sourceCursor), ...project.sources.slice(0, sourceCursor)]
+      : project.sources
+    // 21 October 2026: the in-pass publication exists for passes that run several batches; with one batch it published right before the final one
+    // (measured: a two-file pass paid two publications, 17 s each). Only a batch that is followed by another publishes mid-pass.
+    const plannedBatches = orderedSources.reduce((sum, source) => sum + batchWorkspaceFiles(selected.filter((file) => file.sourceId === source.id), this.config).length, 0)
+    try {
+      await indexSafely()
+      let completedBatches = 0
+      // 14 October 2026: each index step rewrites the whole public delta (22 MB measured, 6 API calls, 7 to 15 s). Batches of one long pass
+      // are indexed together every `indexMinIntervalMs` and once more at the end; the paths stay in `pendingIndex` (durable) meanwhile.
+      let lastIndexedAt = Date.now()
+      sourceLoop: for (const source of orderedSources) {
+        const sourceFiles = selected.filter((file) => file.sourceId === source.id)
+        let batchNumber = 0
+        for (const batch of batchWorkspaceFiles(sourceFiles, this.config)) {
+          // 2 October 2026, 15:30 CEST: bounded automatic passes yield between verified batches.
+          if (completedBatches >= maxBatches) break sourceLoop
+          if (signal.aborted) throw new Error('Backup interrupted')
+          const stage = path.join(stageRoot, `${id}-${source.id}-${String(++batchNumber).padStart(3, '0')}`)
+          // 14 October 2026: copy and fingerprint a batch with a few files at once; staging is local disk and hashing is CPU, so one file at a time wasted both.
+          let snapshotted
+          try {
+            snapshotted = await timed('snapshot', () => mapLimit(batch, this.config.storage.snapshotConcurrency || 1, (file) => snapshotSourceFile(file, path.join(stage, file.relativePath), file.workingRoot || source.localPath)))
+          } catch (error) {
+            // A file edited after the inventory ends the pass cleanly once progress was made; the continuation starts from a fresh inventory.
+            if (completedBatches > 0 && /^Source changed (since inventory|during snapshot)/.test(String(error?.message))) {
+              await rm(stage, { recursive: true, force: true })
+              job.softStopped = true
+              break sourceLoop
+            }
+            throw error
+          }
+          const indexFile = path.join(this.config.storage.stateDir, 'indexes', id, `${source.id}.json`)
+          await mkdir(path.dirname(indexFile), { recursive: true })
+          const args = [stage, sourceCloudFolder(project, source), '--json', '--skip-noise', `--index=${indexFile}`]
+          if (this.config.storage.archiveMode === 'exact') args.push('--no-stream')
+          const archiveEnv = { ...env, ZR_ARCHIVE_REPO_SUFFIX: state.archiveRouteSuffixes?.[source.id] || '' }
+          let outcome
+          try {
+            outcome = await timed('engine', () => this.runProcess(path.join(this.repoRoot, 'scripts', 'archive-folder.mjs'), args, { env: archiveEnv, signal,
+              timeoutMs: this.config.storage.archiveProcessTimeoutMs, killGraceMs: this.config.storage.processKillGraceMs,
+              onEvent: (event) => { job.progress = { ...event, sourceId: source.id }; if (['done', 'verify'].includes(event.ev)) this.event(id, event.ev, JSON.stringify(event)) } }))
+          } catch (error) {
+            const wrappedError = String(error?.message || error)
+            const rejectedDepot = /(?:^|\n)Error: push-refus-definitif\s+([^\s]+)/.exec(wrappedError)?.[1]
+            if (job.progress?.ev === 'rollover' && job.progress.sourceId === source.id && rejectedDepot === job.progress.depot) {
+              // 8 October 2026, 20:41 CEST: match the permanent rejection inside the service's wrapped child error.
+              state.archiveRouteSuffixes ||= {}
+              state.archiveRouteSuffixes[source.id] = nextArchiveRepoSuffix(state.archiveRouteSuffixes[source.id] || '')
+              await this.save(id)
+            }
+            throw error
+          }
+          const done = outcome.lastEvent
+          if (done?.ev !== 'done' || done.verifyKo || done.skipped?.length) throw new Error('Archive engine did not confirm every selected file' + (outcome.diagnostics ? ': ' + outcome.diagnostics : ''))
+          const index = JSON.parse(await readFile(indexFile, 'utf8'))
+          if (index.dest !== sourceCloudFolder(project, source)) throw new Error('Archive index belongs to a different source')
+          // 15 October 2026: one lookup table instead of a linear `find` (with a Unicode normalisation) per file. On the Japanese corpus
+          // (87 000 cards, 2 000 files per batch) the linear search was 170 million normalisations: a 25 s freeze of the whole service.
+          const cardsByRel = new Map()
+          for (const entry of index.fiches) cardsByRel.set(entry.rel.normalize('NFC'), entry)
+          for (const file of snapshotted) {
+            const card = cardsByRel.get(file.relativePath)
+            if (!card || card.sha !== file.sha256 || card.taille !== file.size || !card.manifeste) throw new Error(`Archive source fingerprint mismatch: ${file.relativePath}`)
+            const relativeManifest = safeRelativePath(card.manifeste)
+            const manifestPath = `${index.dest}/${relativeManifest}`
+            state.backups[file.id] = { id: file.id, sourceId: source.id, relativePath: file.relativePath,
+              size: file.size, mtimeMs: file.mtimeMs, sha256: file.sha256, changeToken: file.changeToken, manifestPath, backedUpAt: index.at,
+              sourceFolder: index.dest, relativeManifest }
+            manifestPaths.push(manifestPath)
+            state.pendingIndex = [...new Set([...(state.pendingIndex || []), manifestPath])]
+            this.touch(id)
+          }
+          await this.save(id)
+          if (Date.now() - lastIndexedAt >= (this.config.storage.indexMinIntervalMs || 0)) {
+            await indexSafely()
+            lastIndexedAt = Date.now()
+          }
+          // 3 October 2026, 04:11 CEST: a final automatic batch publishes once after its refreshed inventory.
+          if (completedBatches + 1 < Math.min(maxBatches, plannedBatches) && Date.now() - new Date(state.publishedAt || 0).getTime() >= this.config.storage.publishIntervalMs) await publishSafely()
+          await rm(stage, { recursive: true, force: true })
+          completedBatches++
+          if (Number.isFinite(maxBatches) && project.sources.length) {
+            const sourceIndex = project.sources.findIndex((entry) => entry.id === source.id)
+            state.nextAutoArchiveSourceId = project.sources[(sourceIndex + 1) % project.sources.length]?.id
+            await this.save(id)
+          }
+          // 14 October 2026: an automatic pass hands the writer to a waiting interactive action at the batch boundary; the rest continues right after.
+          if (job.background && this.queuedTasks.some((task) => !task.background)) { job.yielded = true; break sourceLoop }
+        }
+      }
+      await indexSafely()
+      await timed('inventory', () => this.inventory(id))
+      const finalFiles = new Map(state.inventory.localFiles.map((file) => [file.id, file]))
+      job.count = manifestPaths.length
+      job.remainingCount = selected.filter((file) => {
+        const current = finalFiles.get(file.id), backup = state.backups[file.id]
+        return !current || current.sourceConflict || current.olderLocal || !backup || current.size !== backup.size || current.sha256 !== backup.sha256
+      }).length
+      // 14 October 2026: a pass that found nothing to archive republishes the project only when its last publication is older than the
+      // heartbeat; before, every no-op pass paid about 27 s of Git to rewrite the same metadata.
+      const heartbeatMs = this.config.storage.publishHeartbeatMs || 0
+      const nothingNew = selected.length === 0 && manifestPaths.length === 0
+      if (nothingNew && heartbeatMs && state.publishedAt && Date.now() - new Date(state.publishedAt).getTime() < heartbeatMs) timing.publish = 0
+      else {
+        // 15 October 2026: the metadata publication failing (GitHub refused a 105 MB snapshot: the 100 MiB file limit) must not turn a pass whose
+        // BYTES are archived and verified into an error that retries every minute for ever. The failure is recorded and retried later.
+        await publishSafely()
+      }
+      timing.total = Date.now() - passStartedAt
+      this.event(id, 'timing', JSON.stringify({ files: selected.length, batches: completedBatches, ...timing, ...(timing.publish ? job.publishParts : {}) }))
+    } finally { await rm(stageRoot, { recursive: true, force: true }) }
+  }
+
+  async restoreNow(id, fileIds, job, signal) {
+    fileIds ??= null
+    await this.inventory(id)
+    if (this.state(id).workspacePath) return this.extendWorkspace(id, fileIds, job, signal)
+    const project = this.project(id), state = this.state(id)
+    const plan = buildWorkspacePlan(project, this.snapshot(id).files, { action: 'load', fileIds })
+    if (plan.blockers.length) throw new Error('Selected files lack an exact cloud fingerprint')
+    if (!plan.entries.length) throw new Error('Select at least one archived file to LOAD')
+    const workspace = path.join(this.config.storage.workspaceDir, id)
+    const attempt = path.join(workspace, 'loads', job.id)
+    await mkdir(attempt, { recursive: true })
+    if (await realpath(attempt) !== attempt) throw new Error('Workspace destination contains a symlink')
+    job.loaded = []
+    for (const file of plan.entries) {
+      const backup = state.backups[file.id]
+      if (!backup) throw new Error('Archive proof missing')
+      const source = project.sources.find((entry) => entry.id === file.sourceId)
+      const destination = path.join(attempt, 'sources', source.namespace, source.id)
+      const verification = {}
+      const target = await this.restoreOriginal(backup, destination, job, signal, verification)
+      const actualHash = backup.sha256
+      job.loaded.push({ id: file.id, path: target, sha256: actualHash, verifiedChangeToken: verification.changeToken, backup: { ...backup } })
+    }
+    await this.prepareWorkspaceWorkshop(id, attempt)
+    await atomicJson(path.join(workspace, 'Current.json'), { projectId: id, loadId: job.id, path: attempt, verifiedAt: new Date().toISOString(), files: job.loaded })
+    state.productionBaselines ||= {}
+    for (const file of state.inventory?.localFiles || []) if (!file.loadedCopy && file.sha256) state.productionBaselines[file.id] = { changeToken: file.changeToken, sha256: file.sha256 }
+    state.workspacePath = attempt
+    for (const file of job.loaded) state.restorations[file.id] = { path: file.path, sha256: file.sha256, changeToken: file.verifiedChangeToken, verifiedAt: new Date().toISOString() }
+    this.touch(id)
+    await this.save(id)
+    if (this.watcher && state.watched) this.watcher.suivre(`${id}:workspace`, attempt)
+    this.event(id, 'restored', `${job.loaded.length} files independently verified`)
+    job.count = job.loaded.length
+    await this.inventory(id)
+  }
+
+  // 3 October 2026, 05:13 CEST: partial LOAD and recovery create the same active workshop that project context advertises.
+  async prepareWorkspaceWorkshop(id, directory) {
+    const workshop = projectWorkshopPath({ ...this.project(id), workspace: { state: 'loaded', path: directory } })
+    if (!workshop) return
+    await this.prepareWorkspaceDirectory(workshop, directory)
+  }
+
+  // 3 October 2026, 09:34 CEST: new managed folders reject symbolic ancestors before creating anything outside their root.
+  async prepareWorkspaceDirectory(directory, root) {
+    if (!isInside(root, directory)) throw new Error('Unsafe managed directory destination')
+    let parent = directory
+    while (true) {
+      try { if (await realpath(parent) !== parent) throw new Error('Managed destination contains a symlink'); break }
+      catch (error) { if (error.code !== 'ENOENT') throw error; parent = path.dirname(parent) }
+    }
+    await mkdir(directory, { recursive: true })
+    if (await realpath(directory) !== directory) throw new Error('Managed destination contains a symlink')
+  }
+
+  // 3 October 2026, 09:34 CEST: extend a verified partial LOAD without replacing existing working bytes or its project identity.
+  async extendWorkspace(id, fileIds, job, signal) {
+    const project = this.project(id), state = this.state(id)
+    const workspace = path.join(this.config.storage.workspaceDir, id), active = state.workspacePath
+    const currentPath = path.join(workspace, 'Current.json')
+    const currentBytes = await readFile(currentPath, 'utf8'), current = JSON.parse(currentBytes)
+    if (current.projectId !== id || current.path !== active || path.dirname(active) !== path.join(workspace, 'loads') || await realpath(active) !== active) throw new Error('No safe active workspace to extend')
+    const files = this.snapshot(id).files
+    if (fileIds?.some((fileId) => !files.some((file) => file.id === fileId))) throw new Error('Unknown file selection')
+    const selected = fileIds === null ? files : files.filter((file) => fileIds.includes(file.id))
+    if (!selected.length) throw new Error('Select at least one archived file to LOAD')
+    const additions = []
+    job.retainedCount = 0; job.loaded = []
+    for (const file of selected) {
+      const source = project.sources.find((entry) => entry.id === file.sourceId)
+      const target = path.join(active, 'sources', source.namespace, source.id, safeRelativePath(file.relativePath))
+      if (!isInside(active, target)) throw new Error('Unsafe additional file destination')
+      try {
+        const metadata = await lstat(target)
+        if (!metadata.isFile() || await realpath(target) !== target) throw new Error('Existing workspace destination is not a regular scoped file')
+        job.retainedCount++; continue
+      } catch (error) { if (error.code !== 'ENOENT') throw error }
+      if (file.present && !file.loadedCopy && !['verified', 'backed-up', 'older-local'].includes(file.status)) throw new Error('Archive changed production files before loading their cloud copies')
+      const backup = state.backups[file.id]
+      if (!backup?.manifestPath || !/^[a-f0-9]{64}$/.test(backup.sha256 || '')) throw new Error('Selected files lack an exact cloud fingerprint')
+      if (backup.sourceId !== source.id || backup.relativePath !== file.relativePath) throw new Error('Archive identity does not match the selected file')
+      additions.push({ file, source, target, backup: { ...backup } })
+    }
+    if (!additions.length) { job.count = 0; return }
+    const stage = path.join(workspace, 'additions', job.id)
+    await this.prepareWorkspaceDirectory(stage, workspace)
+    let committed = false
+    const published = []
+    try {
+      for (const addition of additions) {
+        if (signal?.aborted) throw new Error('Additional LOAD interrupted; existing files retained')
+        const destination = path.join(stage, 'sources', addition.source.namespace, addition.source.id)
+        await this.prepareWorkspaceDirectory(destination, stage)
+        addition.temporary = await this.restoreOriginal(addition.backup, destination, job, signal)
+      }
+      for (const addition of additions) {
+        if (signal?.aborted) throw new Error('Additional LOAD interrupted; existing files retained')
+        await this.prepareWorkspaceDirectory(path.dirname(addition.target), active)
+        await publishRestoreWithoutOverwrite(addition.temporary, addition.target, { onConflict: 'reject' })
+        const metadata = await lstat(addition.target)
+        published.push({ ...addition, changeToken: changeToken(metadata) })
+        if (await realpath(addition.target) !== addition.target || metadata.size !== addition.backup.size || await hashLocalFile(addition.target) !== addition.backup.sha256) throw new Error('Additional LOAD byte verification failed')
+      }
+      if (await readFile(currentPath, 'utf8') !== currentBytes || state.workspacePath !== active || await realpath(active) !== active) throw new Error('Active workspace changed during additional LOAD')
+      for (const addition of published) if (await realpath(addition.target) !== addition.target || changeToken(await lstat(addition.target)) !== addition.changeToken) throw new Error('New workspace file changed before LOAD commit')
+      job.loaded = published.map(({ file, target, backup }) => ({ id: file.id, path: target, sha256: backup.sha256, backup }))
+      const combined = new Map((current.files || []).map((file) => [file.id, file]))
+      for (const file of job.loaded) combined.set(file.id, file)
+      await atomicJson(currentPath, { ...current, verifiedAt: new Date().toISOString(), additionIds: [...(current.additionIds || []), job.id], files: [...combined.values()] })
+      committed = true
+      state.productionBaselines ||= {}
+      for (const { file } of additions) if (!file.loadedCopy && file.sha256) state.productionBaselines[file.id] = { changeToken: file.changeToken, sha256: file.sha256 }
+      for (const { file, target, backup, changeToken: token } of published) state.restorations[file.id] = { path: target, sha256: backup.sha256, changeToken: token, verifiedAt: new Date().toISOString() }
+      this.touch(id)
+      await this.save(id)
+      job.count = job.loaded.length
+      this.event(id, 'restored', `${job.count} additional files independently verified; ${job.retainedCount} existing files retained`)
+      await this.inventory(id)
+    } catch (error) {
+      if (!committed) for (const addition of published) {
+        try {
+          if (await realpath(addition.target) === addition.target && changeToken(await lstat(addition.target)) === addition.changeToken && await hashLocalFile(addition.target) === addition.backup.sha256) await rm(addition.target)
+          else job.retainedOnFailure = (job.retainedOnFailure || 0) + 1
+        } catch (cleanupError) { if (cleanupError.code !== 'ENOENT') job.retainedOnFailure = (job.retainedOnFailure || 0) + 1 }
+      }
+      throw error
+    } finally { await rm(stage, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }) }
+  }
+
+  // 2 October 2026, 15:10 CEST: cloud recovery is tested again before removing managed copies.
+  // 3 October 2026, 09:47 CEST: keep the change token of the bytes actually verified instead of later user-edited bytes.
+  async restoreOriginal(backup, destination, job, signal, verification = null) {
+    destination = path.resolve(destination)
+    const token = await this.getToken()
+    const result = await this.runProcess(path.join(this.repoRoot, 'Cloud', 'scripts', 'restaurer.mjs'),
+      [backup.sourceFolder, backup.relativePath, destination, `--manifest=${backup.relativeManifest}`, `--sha256=${backup.sha256}`],
+      { env: { ...process.env, GITHUB_TOKEN: token }, signal, onEvent: (event) => { job.progress = { ...event, scopeId: backup.id } } })
+    const restored = result.lastEvent
+    if (restored?.ev !== 'restaure' || !restored.cible || !isInside(destination, path.resolve(restored.cible))) throw new Error('Restore engine did not confirm a scoped destination')
+    const target = await realpath(restored.cible)
+    if (!isInside(destination, target) || target !== restored.cible) throw new Error('Restored file escaped the workspace')
+    const metadata = await lstat(target)
+    if (!metadata.isFile() || metadata.size !== backup.size || await hashLocalFile(target) !== backup.sha256) throw new Error('Independent restore byte verification failed')
+    const after = await lstat(target)
+    if (changeToken(after) !== changeToken(metadata) || await realpath(target) !== target) throw new Error('Restored file changed during independent verification')
+    if (verification) verification.changeToken = changeToken(after)
+    return target
+  }
+
+  // 10 October 2026, 12:36 CEST: the plan and operation share every actual loaded file, including canonical memory copies.
+  async prepareUnloadProof(id, fileIds, { checkIdle = false } = {}) {
+    const state = this.state(id)
+    const workspace = path.join(this.config.storage.workspaceDir, id)
+    const current = JSON.parse(await readFile(path.join(workspace, 'Current.json'), 'utf8'))
+    if (current.projectId !== id || current.path !== state.workspacePath || path.dirname(current.path) !== path.join(workspace, 'loads')) throw new Error('No verified active workspace to unload')
+    if (!current.files?.length) throw new Error('No loaded files to unload')
+    if (checkIdle && process.platform === 'darwin') await assertWorkspaceIdle(current.path)
+    if (state.inventory.localFiles.some((file) => file.sourceConflict)) throw new Error('Original and loaded copy diverged; retain both versions before unloading')
+    if (fileIds && current.files.some((file) => !fileIds.includes(file.id))) throw new Error('Unload requires the complete loaded workspace; clear the selection')
+    const candidates = new Map(current.files.map((file) => [file.id, file]))
+    for (const file of state.inventory.localFiles.filter((entry) => entry.loadedCopy)) candidates.set(file.id, { ...candidates.get(file.id), id: file.id, path: file.localPath })
+    if (fileIds && [...candidates.keys()].some((fileId) => !fileIds.includes(fileId))) throw new Error('Unload requires the complete loaded workspace; clear the selection')
+    const files = []
+    for (const file of candidates.values()) {
+      if (!isInside(current.path, file.path)) throw new Error('Loaded file escaped its workspace')
+      const hash = await hashLocalFile(file.path)
+      const backup = [state.backups[file.id], file.backup].find((entry) => entry?.sha256 === hash)
+      if (!backup) throw new Error('Modified workspace file retained: archive the working copy first')
+      files.push({ ...backup, relativePath: path.relative(current.path, file.path).split(path.sep).join('/'), backup: { ...backup } })
+    }
+    const metadata = (await workspaceFinderMetadata(current.path)).filter((entry) => !files.some((file) => file.relativePath === entry.relativePath))
+    const completeProof = [...files, ...metadata]
+    await verifyWorkspaceTree(current.path, completeProof)
+    return { state, workspace, current, files, metadata, completeProof }
+  }
+
+  // 12 October 2026: returns { proven: true } only on POSITIVE evidence. Not enabled, sampled for a full probe, unsupported format,
+  // or any failure all return { proven: false, reason } and the caller runs the full restore probe exactly as before.
+  // FR : { proven: true } seulement sur preuve positive ; sinon l'appelant garde la sonde de restauration integrale.
+  async proveByIdentity(id, file, localPath, job, session) {
+    if (!session) return { proven: false, reason: 'disabled' }
+    const settings = this.identityProver.settings
+    const statsPath = path.join(this.config.storage.stateDir, settings.statsFileName)
+    let plan
+    try { plan = await reserveVerificationSlot({ statsPath, config: settings }) }
+    catch (error) { return { proven: false, reason: 'counter-unavailable', detail: errorText(error) } }
+    if (plan.mode !== 'identity') return { proven: false, reason: plan.reason, sampledFull: plan.reason === 'sampled' }
+    let result
+    try {
+      result = await session.prove({ manifestPath: file.backup.manifestPath, sha256: file.backup.sha256, size: file.backup.size, localPath })
+    } catch (error) { result = { supported: true, ok: false, failure: { class: 'error', code: 'exception', message: errorText(error) } } }
+    if (result.supported && result.ok) {
+      await this.recordVerification(id, job, 'identity-v1', { counters: result.counters, seconds: result.seconds })
+      return { proven: true }
+    }
+    const reason = !result.supported ? `unsupported-${result.reason}` : `failed-${result.failure.class}-${result.failure.code}`
+    this.event(id, 'identity-proof-fallback', JSON.stringify({ fileId: file.id, reason }))
+    return { proven: false, reason, escalated: true, unsupported: !result.supported }
+  }
+
+  async recordVerification(id, job, mode, detail = {}) {
+    const state = this.state(id)
+    state.verification ||= { identityProofCount: 0, fullReadBackCount: 0, lastMode: null, lastAt: null }
+    const identity = mode === 'identity-v1'
+    state.verification[identity ? 'identityProofCount' : 'fullReadBackCount'] += 1
+    state.verification.lastMode = mode
+    state.verification.lastAt = new Date().toISOString()
+    job.verification ||= { identityProofCount: 0, fullReadBackCount: 0 }
+    job.verification[identity ? 'identityProofCount' : 'fullReadBackCount'] += 1
+    const settings = this.identityProver?.settings
+    if (settings) {
+      const statsPath = path.join(this.config.storage.stateDir, settings.statsFileName)
+      const reason = detail.sampledFull ? 'sampled' : detail.unsupported ? 'unsupported' : detail.escalated ? 'escalated' : 'configured'
+      await recordVerificationOutcome({ statsPath, kind: identity ? 'identity' : 'full', reason }).catch(() => {})
+    }
+    await this.save(id)
+  }
+
+  async unloadNow(id, fileIds, job, signal) {
+    await this.inventory(id)
+    const { state, workspace, current, files, metadata, completeProof } = await this.prepareUnloadProof(id, fileIds, { checkIdle: true })
+    const probe = path.join(workspace, 'checks', job.id)
+    const session = this.identityProver?.session() ?? null
+    try {
+      try {
+        for (const file of files) {
+          if (signal.aborted) throw new Error('Unload interrupted; originals retained')
+          // 12 October 2026: positive evidence by object identity replaces the full restore probe; anything else keeps the probe.
+          const decision = await this.proveByIdentity(id, file, path.join(current.path, file.relativePath), job, session)
+          if (decision.proven) continue
+          const destination = path.join(probe, file.sourceId)
+          await mkdir(destination, { recursive: true })
+          if (await realpath(destination) !== destination) throw new Error('Unsafe recovery probe')
+          await this.restoreOriginal(file.backup, destination, job, signal)
+          await this.recordVerification(id, job, 'full-readback', decision)
+        }
+      } finally { await session?.close().catch(() => {}) }
+      const evidence = await verifyWorkspaceTree(current.path, completeProof)
+      if (process.platform === 'darwin') await assertWorkspaceIdle(current.path)
+      const releasedPath = path.join(workspace, 'releases', job.id)
+      await mkdir(path.dirname(releasedPath), { recursive: true })
+      if (await realpath(path.dirname(releasedPath)) !== path.dirname(releasedPath)) throw new Error('Unsafe release destination')
+      const retainedRoot = path.join(workspace, 'retained-metadata', job.id)
+      const retainedMetadata = metadata.map((file) => ({ ...file, path: path.join(retainedRoot, file.relativePath) }))
+      const record = { id: job.id, phase: 'prepared', activePath: current.path, path: releasedPath, files, retainedMetadata, ...evidence, createdAt: new Date().toISOString() }
+      state.releases = [...(state.releases || []), record]
+      await this.save(id)
+      try { await rename(current.path, releasedPath) }
+      catch (error) { record.phase = 'cancelled'; await this.save(id); throw error }
+      state.workspacePath = null
+      this.watcher?.oublier(`${id}:workspace`)
+      try {
+        await verifyWorkspaceTree(releasedPath, completeProof)
+        if (process.platform === 'darwin') await assertWorkspaceIdle(releasedPath)
+        if (signal.aborted) throw new Error('Unload interrupted; recovery available')
+        // 10 October 2026, 12:35 CEST: same-volume rename preserves Finder bytes outside the tree being removed.
+        for (const file of retainedMetadata) {
+          await this.prepareWorkspaceDirectory(path.dirname(file.path), workspace)
+          await rename(path.join(releasedPath, file.relativePath), file.path)
+        }
+        if (retainedMetadata.length) {
+          record.retainedAllocatedBytes = (await verifyWorkspaceTree(retainedRoot, retainedMetadata)).allocatedBytes
+          record.allocatedBytes = evidence.allocatedBytes - record.retainedAllocatedBytes
+        }
+        record.phase = 'removing'; await this.save(id)
+        await removeVerifiedWorkspace(releasedPath, files, { signal })
+        record.phase = 'unloaded'; record.finishedAt = new Date().toISOString()
+      } catch (error) {
+        if (record.phase !== 'removing') {
+          for (const file of retainedMetadata) {
+            try { await copyFile(file.path, path.join(releasedPath, file.relativePath), constants.COPYFILE_EXCL) }
+            catch (restoreError) { if (restoreError.code !== 'ENOENT') { record.metadataRecoveryError = restoreError.message; await this.save(id); throw restoreError } }
+          }
+          await rename(releasedPath, current.path); state.workspacePath = current.path; record.phase = 'cancelled'
+          if (this.watcher && state.watched) this.watcher.suivre(`${id}:workspace`, current.path)
+        } else record.phase = 'interrupted'
+        await this.save(id); throw error
+      }
+      for (const file of current.files) if (state.restorations[file.id]?.path === file.path) delete state.restorations[file.id]
+      this.touch(id)
+      await atomicJson(path.join(workspace, 'Current.json'), { projectId: id, path: null, releaseId: record.id, files: [] })
+      await this.save(id)
+      job.count = files.length; job.retainedMetadataCount = retainedMetadata.length
+      job.freedBytes = record.allocatedBytes
+      this.event(id, 'unloaded', `${files.length} managed copies released; ${job.freedBytes} allocated bytes removed; production sources retained`)
+      await this.inventory(id)
+    } finally { await rm(probe, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }) }
+  }
+
+  async recoverNow(id, job, signal) {
+    const state = this.state(id)
+    if (state.workspacePath) throw new Error('An active workspace already exists; unload it before recovery')
+    const release = [...(state.releases || [])].reverse().find((entry) => !['recovered', 'cancelled'].includes(entry.phase))
+    if (!release) throw new Error('No released workspace to recover')
+    const workspace = path.join(this.config.storage.workspaceDir, id)
+    const attempt = path.join(workspace, 'loads', job.id)
+    await mkdir(attempt, { recursive: true })
+    if (await realpath(attempt) !== attempt) throw new Error('Unsafe recovery workspace')
+    job.loaded = []
+    for (const file of release.files) {
+      if (signal.aborted) throw new Error('Recovery interrupted')
+      const prefix = file.relativePath.slice(0, -file.backup.relativePath.length)
+      if (!file.relativePath.endsWith(file.backup.relativePath)) throw new Error('Invalid recovery source path')
+      const verification = {}
+      const target = await this.restoreOriginal(file.backup, path.join(attempt, prefix), job, signal, verification)
+      job.loaded.push({ id: file.id, path: target, sha256: file.sha256, verifiedChangeToken: verification.changeToken, backup: { ...file.backup } })
+    }
+    await this.prepareWorkspaceWorkshop(id, attempt)
+    // 10 October 2026, 12:35 CEST: restore preserved Finder metadata as well as the cloud-backed working files.
+    const metadata = release.retainedMetadata || []
+    if (metadata.length) {
+      for (const file of metadata) {
+        // 10 October 2026, 12:52 CEST: a crash during metadata relocation can leave bytes on either side of the rename.
+        let source = null
+        for (const candidate of [file.path, path.join(release.path, file.relativePath)]) {
+          if (!isInside(workspace, candidate)) throw new Error('Unsafe retained metadata location')
+          try {
+            if (await realpath(candidate) !== candidate) throw new Error('Retained metadata symlink refused')
+            const stat = await lstat(candidate)
+            if (!stat.isFile() || stat.size !== file.size || await hashLocalFile(candidate, changeToken(stat)) !== file.sha256) throw new Error('Retained metadata changed; local bytes retained')
+            source = candidate; break
+          } catch (error) { if (error.code !== 'ENOENT') throw error }
+        }
+        if (!source) throw new Error('Retained metadata missing; recovery remains incomplete')
+        const target = path.join(attempt, file.relativePath)
+        await this.prepareWorkspaceDirectory(path.dirname(target), attempt)
+        await copyFile(source, target, constants.COPYFILE_EXCL)
+      }
+    }
+    await verifyWorkspaceTree(attempt, [...release.files, ...metadata])
+    await atomicJson(path.join(workspace, 'Current.json'), { projectId: id, path: attempt, loadId: job.id, files: job.loaded, verifiedAt: new Date().toISOString() })
+    state.productionBaselines ||= {}
+    for (const file of state.inventory?.localFiles || []) if (!file.loadedCopy && file.sha256) state.productionBaselines[file.id] = { changeToken: file.changeToken, sha256: file.sha256 }
+    state.workspacePath = attempt
+    for (const file of job.loaded) state.restorations[file.id] = { path: file.path, sha256: file.sha256, changeToken: file.verifiedChangeToken, verifiedAt: new Date().toISOString() }
+    this.touch(id)
+    release.phase = 'recovered'; release.recoveredAt = new Date().toISOString()
+    await this.save(id); job.count = job.loaded.length
+    if (this.watcher && state.watched) this.watcher.suivre(`${id}:workspace`, attempt)
+    this.event(id, 'recovered', `${job.count} released files recovered from their exact cloud versions`)
+    await this.inventory(id)
+  }
+
+  async createWatcher() {
+    if (this.watcher) return this.watcher
+    // 2 October 2026, 13:22 CEST: compile the existing TypeScript watcher instead of copying its logic.
+    let factory = this.watchFactory
+    if (!factory) {
+      const source = await readFile(path.join(this.repoRoot, 'Cloud/electron/watcher.ts'), 'utf8')
+      const fingerprint = createHash('sha256').update(source).digest('hex').slice(0, 16)
+      const runtime = path.join(this.config.storage.stateDir, 'runtime', `CloudWatcher-${fingerprint}.mjs`)
+      await mkdir(path.dirname(runtime), { recursive: true })
+      const { transform } = await import('esbuild')
+      const { code } = await transform(source, { loader: 'ts', format: 'esm', target: 'node22' })
+      await writeFile(runtime, code, { mode: 0o600 })
+      factory = (await import(new URL(`file://${runtime}`))).Surveillance
+    }
+    this.watcher = new factory((sourceKey) => {
+      const id = sourceKey.split(':')[0]
+      this.scheduleBackup(id)
+    }, () => this.config.watch.settleSeconds, () => this.config.watch.reconnectSeconds,
+    (sourceKey, detail) => {
+      const id = sourceKey.split(':')[0]
+      // 3 October 2026, 03:12 CEST: recovering one source must not erase another source's ongoing failure.
+      if (/rétablie/.test(detail)) {
+        this.watchErrors.delete(sourceKey)
+        // 3 October 2026, 03:29 CEST: discover changes missed while disconnected instead of waiting for the next backup sweep.
+        this.scheduleInventory(id)
+      } else this.watchErrors.set(sourceKey, detail)
+      this.event(id, 'watch', detail)
+    }, undefined, (sourceKey) => this.scheduleInventory(sourceKey.split(':')[0]))
+    this.sweep = setInterval(() => {
+      for (const [id, state] of this.states) if (state.watched) this.scheduleBackup(id)
+    }, this.config.watch.sweepSeconds * 1000)
+    this.sweep.unref()
+    return this.watcher
+  }
+
+  // 2 October 2026: local discovery advances independently of the cloud writer and its settling delay.
+  scheduleInventory(id) {
+    if (this.disposed || !this.state(id).watched || this.inventoryTimers.has(id)) return
+    const timer = setTimeout(async () => {
+      this.inventoryTimers.delete(id)
+      try { await this.inventory(id) }
+      catch (error) { this.event(id, 'inventory-error', errorText(error)) }
+    }, this.config.watch.inventoryDebounceMs ?? 1000)
+    this.inventoryTimers.set(id, timer)
+    timer.unref()
+  }
+
+  // 3 October 2026, 04:36 CEST: discover working scenes and refresh known ones after stable bytes; historical files remain inventoried and archived.
+  scheduleSceneAudits(id, delayMs = this.config.watch.settleSeconds * 1000) {
+    if (this.disposed || !this.runSceneAudit || !this.state(id).watched) return
+    const candidates = new Map(Object.entries(this.state(id).sceneAudits || {}))
+    if (this.config.sceneAudit?.discoverScenes) {
+      const excludedFolders = new Set([...(this.config.sceneAudit.excludedFolders || []), this.config.storage.versionDirectory].filter(Boolean))
+      for (const file of this.state(id).inventory?.localFiles || []) {
+        const source = this.project(id).sources.find((entry) => entry.id === file.sourceId)
+        if (!['tmp', 'houdini'].includes(source?.namespace) || !/\.hip(?:lc|nc)?$/i.test(file.relativePath) || file.relativePath.split('/').slice(0, -1).some((segment) => excludedFolders.has(segment.toLowerCase()))) continue
+        if (!candidates.has(file.id)) candidates.set(file.id, null)
+      }
+    }
+    for (const [key, pending] of this.sceneAuditTimers) if (key.startsWith(`${id}/`) && !candidates.has(key.slice(id.length + 1))) {
+      clearTimeout(pending.timer); this.sceneAuditTimers.delete(key)
+    }
+    for (const key of this.sceneAuditErrors.keys()) if (key.startsWith(`${id}/`) && !candidates.has(key.slice(id.length + 1)) && !this.sceneAuditTasks.has(key)) this.sceneAuditErrors.delete(key)
+    for (const [fileId, entry] of candidates) {
+      const key = `${id}/${fileId}`
+      const file = this.state(id).inventory?.localFiles.find((candidate) => candidate.id === fileId)
+      const pending = this.sceneAuditTimers.get(key)
+      if (!file || file.changeToken === entry?.changeToken) {
+        if (pending) { clearTimeout(pending.timer); this.sceneAuditTimers.delete(key) }
+        if (!this.sceneAuditTasks.has(key)) this.sceneAuditErrors.delete(key)
+        continue
+      }
+      if (this.sceneAuditTasks.has(key) || pending?.changeToken === file.changeToken) continue
+      if (pending) clearTimeout(pending.timer)
+      const timer = setTimeout(() => {
+        this.sceneAuditTimers.delete(key)
+        if (this.disposed || !this.state(id).watched) return
+        const controller = new AbortController(), task = { controller }
+        this.sceneAuditTasks.set(key, task)
+        task.promise = (async () => {
+          try {
+            await this.inventory(id)
+            const current = this.state(id).inventory.localFiles.find((candidate) => candidate.id === fileId)
+            if (!current || current.changeToken !== file.changeToken) return
+            const audit = await this.runSceneAudit(current.localPath, { signal: controller.signal })
+            if (this.disposed || controller.signal.aborted || !this.state(id).watched) return
+            await this.request('scene-context', { projectId: id, fileId, audit })
+            this.sceneAuditErrors.delete(key)
+          } catch (error) {
+            if (!this.disposed) {
+              this.sceneAuditErrors.set(key, errorText(error))
+              this.event(id, 'scene-audit-error', 'Automatic scene resource analysis failed; local diagnostic and retry available')
+            }
+          } finally {
+            this.sceneAuditTasks.delete(key)
+            this.scheduleSceneAudits(id, this.sceneAuditErrors.has(key) ? this.config.storage.retryMs : this.config.watch.settleSeconds * 1000)
+          }
+        })()
+      }, delayMs)
+      this.sceneAuditTimers.set(key, { timer, changeToken: file.changeToken })
+      timer.unref()
+    }
+  }
+
+  // 14 October 2026: automatic backups of one project start at most once per `watch.backupMinIntervalSeconds`. Generated notes (feedback, file map,
+  // conversation index) used to trigger 460 one-or-two-file passes a day, each paying a full inventory and publication.
+  scheduleBackup(id, { continuation = false } = {}) {
+    if (this.disposed || !this.state(id).watched) return
+    if (this.pending.has(id)) { this.dirty.add(id); return }
+    const minimumMs = (this.config.watch.backupMinIntervalSeconds || 0) * 1000
+    const wait = continuation ? 0 : (this.lastBackupStartedAt.get(id) || 0) + minimumMs - Date.now()
+    if (wait > 0) {
+      if (!this.backupDelayTimers.has(id)) {
+        const timer = setTimeout(() => { this.backupDelayTimers.delete(id); this.scheduleBackup(id, { continuation: true }) }, wait)
+        timer.unref(); this.backupDelayTimers.set(id, timer)
+      }
+      return
+    }
+    this.lastBackupStartedAt.set(id, Date.now())
+    this.pending.add(id)
+    const response = this.enqueue(id, 'archive', (job, signal) => this.archiveNow(id, null, job, signal, { maxBatches: this.config.storage.autoBatchLimit || Infinity }), { background: true, requireWatched: true })
+    const completion = this.completions.get(response.jobId)
+    completion.finally(() => {
+      this.pending.delete(id)
+      const finished = this.jobs.get(response.jobId)
+      if (finished?.state === 'done' && finished.remainingCount > 0) { this.dirty.delete(id); this.scheduleBackup(id, { continuation: true }) }
+      else if (this.dirty.delete(id)) this.scheduleBackup(id)
+      else if (this.jobs.get(response.jobId)?.state === 'error' && this.state(id).watched && !this.disposed) {
+        const timer = setTimeout(() => { this.retryTimers?.delete(timer); this.scheduleBackup(id, { continuation: true }) }, this.config.storage.retryMs)
+        this.retryTimers ||= new Set(); this.retryTimers.add(timer); timer.unref()
+      }
+    }).catch(() => {})
+  }
+
+  scheduleWatchRetry(id, error) {
+    const key = `${id}:startup`
+    this.watchErrors.set(key, errorText(error))
+    this.event(id, 'watch-retry', 'Automatic watcher setup failed; retry scheduled')
+    if (this.disposed || !this.state(id).watched || this.watchRetryTimers.has(id)) return
+    const timer = setTimeout(async () => {
+      this.watchRetryTimers.delete(id)
+      if (this.disposed || !this.state(id).watched) return
+      try {
+        await this.setWatch(id, true)
+        this.watchErrors.delete(key)
+        this.scheduleBackup(id)
+      } catch (retryError) { this.scheduleWatchRetry(id, retryError) }
+    }, this.config.storage.retryMs)
+    this.watchRetryTimers.set(id, timer)
+    timer.unref?.()
+  }
+
+  async setWatch(id, enabled) {
+    const project = this.project(id), state = this.state(id)
+    const alreadyEnabled = state.watched
+    if (!enabled) {
+      const retry = this.watchRetryTimers.get(id)
+      if (retry) { clearTimeout(retry); this.watchRetryTimers.delete(id) }
+    }
+    const watcher = await this.createWatcher()
+    state.watched = !!enabled
+    if (!enabled) for (const key of this.watchErrors.keys()) if (key.startsWith(`${id}:`)) this.watchErrors.delete(key)
+    for (const source of project.sources) {
+      const key = `${id}:${source.id}`
+      if (enabled) {
+        // 8 October 2026, 20:05 CEST: a missing optional root is not a watcher failure; archive sweeps will discover it if it appears.
+        if (source.optional) {
+          try { await lstat(source.localPath) }
+          catch (error) {
+            if (error.code === 'ENOENT') { watcher.oublier(key); continue }
+            throw error
+          }
+        }
+        watcher.suivre(key, source.localPath)
+      } else watcher.oublier(key)
+    }
+    if (state.workspacePath) {
+      if (enabled) watcher.suivre(`${id}:workspace`, state.workspacePath); else watcher.oublier(`${id}:workspace`)
+    }
+    await this.save(id)
+    this.event(id, enabled ? 'watch-started' : 'watch-stopped')
+    if (enabled && !alreadyEnabled) this.scheduleBackup(id)
+    return this.snapshot(id)
+  }
+
+  async startWatching() {
+    const projects = [...this.states].sort((left, right) => (left[1].inventory?.localFiles || []).reduce((sum, file) => sum + file.size, 0) - (right[1].inventory?.localFiles || []).reduce((sum, file) => sum + file.size, 0))
+    for (const [id, state] of projects) if (state.watched || this.config.watch.enabledOnStart) {
+      try {
+        await this.setWatch(id, true)
+        this.scheduleBackup(id)
+      } catch (error) {
+        if (this.config.watch.enabledOnStart && !state.watched) {
+          state.watched = true
+          try { await this.save(id) } catch (saveError) { this.event(id, 'watch-state-error', errorText(saveError)) }
+        }
+        this.scheduleWatchRetry(id, error)
+      }
+    }
+  }
+
+  async request(action, payload = {}) {
+    if (action === 'conversations') {
+      const result = await this.conversationCatalog.list()
+      const library = this.projects.has(CONVERSATION_LIBRARY_ID) ? this.snapshot(CONVERSATION_LIBRARY_ID) : null
+      result.index = this.conversationIndexSync.status()
+      result.mirror = { staged: Object.keys(this.conversationMirror.state().entries).length, error: this.conversationMirror.state().error || null }
+      result.conversations = result.conversations.map(item => {
+        const record = this.conversationMirror.state().entries[item.id]
+        const copied = record?.copies?.map(copy => library?.files?.find(file => file.relativePath === copy.relativePath)).filter(Boolean) || []
+        const sourceCurrent = record && record.signature === item.sourceSignature
+        const verified = sourceCurrent && copied.length === record.copies.length && copied.length > 0 && copied.every(file => ['verified', 'backed-up'].includes(file.status))
+        return { ...item, title: item.title.startsWith('Conversation Gemini ') && record?.summary?.title ? record.summary.title : item.title, cloudPath: copied[0]?.cloudPath || null, backupState: verified ? 'verified-copy' : copied[0]?.cloudPath ? 'older-copy' : record ? 'staged' : 'not-confirmed' }
+      })
+      const retained = library?.conversations || []
+      const known = new Set(result.conversations.map(item => item.id))
+      result.conversations.push(...retained.filter(item => !known.has(item.id)))
+      result.conversations.sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0))
+      return result
+    }
+    if (action === 'conversation') {
+      const current = await this.request('conversations')
+      const fallback = current.conversations.find(item => item.id === payload.conversationId && item.archiveCopy)
+      const result = await this.conversationCatalog.read(payload.conversationId, payload.before, fallback)
+      result.conversation = current.conversations.find(item => item.id === payload.conversationId) || result.conversation
+      return result
+    }
+    const id = payload.projectId
+    if (action === 'global-index' || action === 'context') {
+      const index = payload.cloud ? buildGlobalProjectIndex([...this.projects.keys()].map((projectId) => this.snapshot(projectId, { cloud: true })), { cloud: true }) : await this.refreshContextIndex()
+      return action === 'context' ? { projectId: id, mapping: index.projects[id], markdown: renderProjectContext(index, id), issues: index.issues.filter((issue) => issue.projectId === id), checkedAt: index.generatedAt } : { index, checkedAt: index.generatedAt }
+    }
+    // 9 October 2026, 11:04 CEST: Keep opening Assets below a few hundred kilobytes by loading only the selected project's full snapshot.
+    if (action === 'workspace-catalogue') {
+      const projects = [...this.projects.keys()].map((projectId) => summarizeWorkspaceProject(this.snapshot(projectId)))
+      return { schemaVersion: this.config.schemaVersion, checkedAt: new Date().toISOString(), bridge: { connected: true, state: 'connected' }, projects }
+    }
+    // 9 October 2026, 11:04 CEST: Read the verified project index so evidence links remain distinct from primary bindings.
+    if (action === 'project-conversations') {
+      const project = this.project(id)
+      const memory = project.sources.find((source) => source.namespace === 'memory')
+      if (!memory) return { projectId: id, scannedAt: null, state: 'missing-source', conversations: [] }
+      const indexFile = path.join(memory.localPath, 'ConversationIndex.json')
+      let fileInfo
+      try { fileInfo = await lstat(indexFile) }
+      catch (error) { if (error.code === 'ENOENT') return { projectId: id, scannedAt: null, state: 'missing-index', conversations: [] }; throw error }
+      if (!fileInfo.isFile() || fileInfo.isSymbolicLink() || await realpath(indexFile) !== indexFile) throw new Error('Conversation index is not a regular project file')
+      const index = JSON.parse(await readFile(indexFile, 'utf8'))
+      if (index.projectId !== id || !Array.isArray(index.conversations) || typeof index.scannedAt !== 'string') throw new Error('Conversation index identity or shape is invalid')
+      return { projectId: id, scannedAt: index.scannedAt, state: 'ready', conversations: index.conversations }
+    }
+    // 3 October 2026, 04:15 CEST: accepting an audit requires an independently hashed, unchanged inventoried scene.
+    // 3 October 2026, 09:00 CEST: preparation plans use server-derived identities; a past restoration is not a new byte verification.
+    if (action === 'scene-preparation-plan') {
+      await this.inventory(id)
+      const context = this.sceneReferenceContexts(id).find((entry) => entry.sceneFileId === payload.fileId)
+      for (const dependency of context?.dependencies || []) await this.inventory(dependency)
+      const current = this.sceneReferenceContexts(id).find((entry) => entry.sceneFileId === payload.fileId)
+      const projects = [...this.projects.keys()].map((projectId) => this.snapshot(projectId))
+      const plan = buildScenePreparationPlan({ projectId: id, sceneFileId: payload.fileId, projects, audit: this.state(id).sceneAudits?.[payload.fileId]?.audit, context: current })
+      return { plan, checkedAt: new Date().toISOString() }
+    }
+    if (action === 'prepare-scene') {
+      if (!this.runScenePreparation) throw new Error('Houdini preparation service unavailable')
+      return this.enqueue(id, action, async (job, signal) => {
+        const { plan } = await this.request('scene-preparation-plan', { projectId: id, fileId: payload.fileId })
+        if (!plan.ready) throw new Error(`Load or archive the ${plan.loadRequirements.length} required scene and resource copies before preparation`)
+        const report = await this.runScenePreparation(plan, { signal })
+        if (report?.sceneSha256 !== plan.sceneSha256 || report.sceneOpened !== true || report.savedScene !== false || report.portabilityVerified !== false || report.resourceBytesVerified !== plan.resources.length || !Array.isArray(report.reboundInputs) || !Array.isArray(report.loadedLibraries) || report.loadedLibraries.some((library) => !Array.isArray(library.instancePaths))) throw new Error('Invalid scene preparation evidence')
+        const { plan: fresh } = await this.request('scene-preparation-plan', { projectId: id, fileId: payload.fileId })
+        const identity = (resource) => [resource.kind, resource.projectId, resource.fileId, resource.targetPath, resource.sha256, resource.parameterPath || null]
+        if (!fresh.ready || fresh.scenePath !== plan.scenePath || fresh.sceneSha256 !== plan.sceneSha256 || JSON.stringify(fresh.resources.map(identity)) !== JSON.stringify(plan.resources.map(identity))) throw new Error('Scene or resources changed during preparation; proof refused')
+        this.state(id).scenePreparations ||= {}
+        this.state(id).scenePreparations[payload.fileId] = { plan, report }
+        await this.save(id)
+        await this.refreshContextIndex()
+        this.scheduleBackup(id)
+        job.count = report.resourceBytesVerified
+        this.event(id, 'verify', `Scene opened with ${report.reboundInputs.length} verified input bindings and ${report.loadedLibraries.length} verified libraries; no scene save or render`)
+      })
+    }
+    if (action === 'scene-context') {
+      await this.inventory(id)
+      const file = this.state(id).inventory.localFiles.find((entry) => entry.id === payload.fileId)
+      if (!file || !/\.hip(?:lc|nc)?$/i.test(file.relativePath)) throw new Error('Inventoried Houdini scene required')
+      const source = this.project(id).sources.find((entry) => entry.id === file.sourceId)
+      const actual = await realpath(file.localPath)
+      if (actual !== file.localPath || !isInside(file.workingRoot || source.localPath, actual)) throw new Error('Unsafe scene path')
+      const descriptor = await open(actual, constants.O_RDONLY | constants.O_NOFOLLOW)
+      let sha256
+      try {
+        const before = await descriptor.stat()
+        if (!before.isFile() || changeToken(before) !== file.changeToken) throw new Error('Scene changed since inventory')
+        const hash = createHash('sha256')
+        for await (const chunk of descriptor.createReadStream({ autoClose: false })) hash.update(chunk)
+        if (changeToken(await descriptor.stat()) !== file.changeToken) throw new Error('Scene changed during audit verification')
+        sha256 = hash.digest('hex')
+      } finally { await descriptor.close() }
+      const projects = [...this.projects.values()].map((project) => ({ ...project, files: this.snapshot(project.id).files }))
+      mapSceneReferences({ projectId: id, sceneFileId: file.id, sceneSha256: sha256, audit: payload.audit, projects })
+      this.state(id).sceneAudits ||= {}
+      this.state(id).sceneAudits[file.id] = { changeToken: file.changeToken, audit: payload.audit }
+      await this.save(id)
+      await this.refreshContextIndex()
+      this.scheduleBackup(id)
+      return { scene: this.sceneReferenceContexts(id).find((entry) => entry.sceneFileId === file.id), checkedAt: new Date().toISOString() }
+    }
+    // 20 October 2026, 15:10 CEST: update only article metadata under the shared registry lock, preserving concurrent source edits.
+    if (action === 'set-article') {
+      const article = validateProjectArticle(payload.article)
+      const result = await this.request('preview-text', {projectId:id,fileId:article.fileId,format:'html'})
+      if (result.truncated || createHash('sha256').update(result.text).digest('hex') !== article.sha256) throw new Error('Reviewed article changed; metadata update refused')
+      const lock = await acquireDirectoryLock(path.join(this.config.storage.stateDir, 'registry.lock'), directoryLockOptions('court', 'Project article update'))
+      try {
+        const registry = JSON.parse(await readFile(path.join(this.config.storage.stateDir, 'Projects.json'), 'utf8'))
+        const current = registry.projects.find(project => project.id === id)
+        if (!current) throw new Error('Unknown article project')
+        const next = {...current,article}
+        registry.projects = registry.projects.map(project => project.id === id ? next : project)
+        await atomicJson(path.join(this.config.storage.stateDir, 'Projects.json'), registry)
+        this.projects.set(id,next)
+        this.event(id,'article-updated',article.title)
+      } finally { await lock.release() }
+      return {project:this.snapshot(id),checkedAt:new Date().toISOString()}
+    }
+    // 2 October 2026, 15:25 CEST: bounded text previews read only inventoried regular files and never execute them.
+    if (action === 'preview-text') {
+      const file = this.state(id).inventory?.localFiles.find((entry) => entry.id === payload.fileId)
+      if (!file || !isTextPreviewFile(file.relativePath)) throw new Error('Local text preview unavailable')
+      const source = this.project(id).sources.find((entry) => entry.id === file.sourceId)
+      const actual = await realpath(file.localPath)
+      if (actual !== file.localPath || !isInside(file.workingRoot || source.localPath, actual)) throw new Error('Unsafe preview path')
+      const descriptor = await open(actual, constants.O_RDONLY | constants.O_NOFOLLOW)
+      try {
+        const before = await descriptor.stat()
+        if (!before.isFile()) throw new Error('Preview requires a regular file')
+        // 20 October 2026, 15:15 CEST: an explicit HTML request has a separate bound; ordinary text keeps its original limit.
+        const article = payload.format === 'html'
+        if (article && !/\.html?$/i.test(file.relativePath)) throw new Error('HTML article required')
+        if (article && before.size > PROJECT_PREVIEW_CONFIG.articleMaxBytes) throw new Error('HTML article exceeds the 32 MiB limit')
+        const buffer = Buffer.alloc(Math.min(before.size, article ? PROJECT_PREVIEW_CONFIG.articleMaxBytes : PROJECT_PREVIEW_CONFIG.textMaxBytes))
+        const { bytesRead } = await descriptor.read(buffer, 0, buffer.length, 0)
+        const after = await descriptor.stat()
+        if (changeToken(before) !== changeToken(after)) throw new Error('Preview file changed during reading; retry')
+        if (buffer.subarray(0, bytesRead).includes(0)) throw new Error('Binary content has no text preview')
+        return { text: buffer.subarray(0, bytesRead).toString('utf8'), size: before.size, truncated: bytesRead < before.size, checkedAt: new Date().toISOString() }
+      } finally { await descriptor.close() }
+    }
+    if (action === 'preview-url') {
+      const file = this.state(id).inventory?.localFiles.find((entry) => entry.id === payload.fileId)
+      if (!file || !/\.(png|jpe?g|webp|avif|gif)$/i.test(file.relativePath)) throw new Error('Local image preview unavailable')
+      const expires = Date.now() + 600000
+      const token = createHmac('sha256', this.previewSecret).update(`${id}:${file.id}:${expires}`).digest('hex')
+      return { url: `http://127.0.0.1:${this.config.bridge.port}/api/assets-workspace-preview?projectId=${encodeURIComponent(id)}&fileId=${encodeURIComponent(file.id)}&expires=${expires}&token=${token}` }
+    }
+    if (action === 'bind-session') {
+      this.project(id)
+      if (payload.agent && !['claude', 'codex', 'gemini', 'antigravity'].includes(payload.agent)) throw new Error('Unsupported conversation agent')
+      if (typeof payload.sessionId !== 'string' || !/^[a-zA-Z0-9-]{8,128}$/.test(payload.sessionId)) throw new Error('Valid host session id required')
+      const file = path.join(this.config.storage.stateDir, 'SessionBindings.json')
+      // 2 October 2026: simultaneous project sessions must not lose each other's feedback binding.
+      const bindingLock = await acquireDirectoryLock(path.join(this.config.storage.stateDir, 'session-bindings.lock'), directoryLockOptions('court', 'Assets session bindings'))
+      try {
+        let bindings = {}
+        try { bindings = JSON.parse(await readFile(file, 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+        // 3 October 2026, 21:53 CEST: reject reassignment under the shared lock before writing or replaying any history.
+        if (bindings[payload.sessionId] && bindings[payload.sessionId] !== id) throw new Error('Session is already bound to a different project; existing history is preserved')
+        if (payload.agent) {
+          const metadataPath = path.join(this.config.storage.stateDir, 'SessionConversationMetadata.json')
+          let metadata = {}
+          try { metadata = JSON.parse(await readFile(metadataPath, 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+          const provider = payload.agent === 'antigravity' ? 'gemini' : payload.agent
+          if (metadata[payload.sessionId]?.provider && metadata[payload.sessionId].provider !== provider) throw new Error('Conversation agent identity cannot change')
+          await atomicJson(metadataPath, { ...metadata, [payload.sessionId]: { id: `${provider}:${payload.sessionId}`, provider, sessionId: payload.sessionId, title: metadata[payload.sessionId]?.title || payload.sessionId } })
+        }
+        await atomicJson(file, { ...bindings, [payload.sessionId]: id })
+      } finally { await bindingLock.release() }
+      await this.refreshContextIndex()
+      this.conversationIndexSync.request(id, { immediate: true })
+      let transcriptCapture = 'unavailable'
+      if (this.feedbackCapture) {
+        transcriptCapture = 'queued'
+        const recordDeferredCapture = () => {
+          try { this.event(id, 'feedback-capture-deferred', 'Project and session are ready; automatic transcript scanning will retry capture') } catch {}
+        }
+        try {
+          // 8 October 2026, 23:36 CEST: never await a transcript worker from the project startup request.
+          void Promise.resolve(this.feedbackCapture.replay(payload.sessionId)).then((result) => {
+            if (!result?.queued) recordDeferredCapture()
+          }, recordDeferredCapture)
+        } catch { recordDeferredCapture() }
+      }
+      return { projectId: id, sessionId: payload.sessionId, transcriptCapture, checkedAt: new Date().toISOString() }
+    }
+    if (action === 'start') {
+      const projectId = String(payload.id || '')
+      // 3 October 2026, 03:32 CEST: linked sources use the same complete initialization as an empty workshop.
+      const supplied = payload.project ? this.validateProject(payload.project) : null
+      if (supplied && supplied.id !== projectId) throw new Error('Project definition does not match its initialization identity')
+      if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || !/^[a-zA-Z0-9-]{8,128}$/.test(payload.sessionId))) throw new Error('Valid host session id required')
+      const temporary = path.join(this.config.roots.tmp, `tmp-${projectId}`)
+      const notes = path.join(this.config.roots.memory, 'Projects', projectId)
+      const base = this.validateProject({ id: projectId, name: payload.name || this.projects.get(projectId)?.name, category: payload.category || 'Projet',
+        feedbackPath: path.join(notes, 'FEEDBACK.md'), sources: [
+          { id: 'workshop', namespace: 'tmp', localPath: temporary },
+          { id: 'project-notes', namespace: 'memory', localPath: notes, keep: true },
+        ] })
+      // 2 October 2026: repeatable initialization preserves linked production sources and existing documents.
+      const lock = await acquireDirectoryLock(path.join(this.config.storage.stateDir, `start-${projectId}.lock`), directoryLockOptions('court', 'Assets project initialization'))
+      try {
+        const previous = this.projects.get(projectId)
+        const sources = [...(previous?.sources || [])]
+        for (const source of supplied?.sources || []) {
+          const position = sources.findIndex((entry) => entry.id === source.id)
+          if (position < 0) sources.push(source); else sources[position] = source
+        }
+        for (const source of base.sources) {
+          const exists = source.namespace === 'tmp' ? sources.some((entry) => entry.namespace === 'tmp') : sources.some((entry) => entry.namespace === 'memory' && entry.localPath === notes)
+          if (!exists) {
+            let sourceId = source.id
+            while (sources.some((entry) => entry.id === sourceId)) sourceId += '-canonical'
+            sources.push({ ...source, id: sourceId })
+          }
+        }
+        const definition = this.validateProject({ ...base, ...previous, ...supplied, feedbackPath: base.feedbackPath, sources })
+        const sourceWorkshopPath = sources.find((source) => source.namespace === 'tmp').localPath
+        const active = this.states.get(projectId)?.workspacePath || null
+        if (active && (path.dirname(active) !== path.join(this.config.storage.workspaceDir, projectId, 'loads') || await realpath(active) !== active)) throw new Error('Unsafe active workspace')
+        const workshop = projectWorkshopPath({ ...definition, workspace: { state: active ? 'loaded' : 'unloaded', path: active } })
+        for (const directory of [workshop, notes]) {
+          let parent = directory
+          while (true) {
+            try { if (await realpath(parent) !== parent) throw new Error('Project directory contains a symlink'); break }
+            catch (error) { if (error.code !== 'ENOENT') throw error; parent = path.dirname(parent) }
+          }
+          await mkdir(directory, { recursive: true })
+          if (await realpath(directory) !== directory) throw new Error('Unsafe project directory')
+        }
+        let createdAt = new Date().toISOString()
+        try {
+          const existing = JSON.parse(await readFile(path.join(notes, 'Project.json'), 'utf8'))
+          if (existing.projectId !== projectId) throw new Error('Project memory belongs to another project')
+          createdAt = existing.createdAt || createdAt
+        } catch (error) { if (error.code !== 'ENOENT') throw error }
+        try { const feedback = await lstat(definition.feedbackPath); if (!feedback.isFile() || feedback.isSymbolicLink()) throw new Error('Canonical feedback must be a regular file') }
+        catch (error) { if (error.code !== 'ENOENT') throw error }
+        const metadata = { schemaVersion: this.config.schemaVersion, projectId, workshopPath: workshop, sourceWorkshopPath, memoryPath: notes, memoryFile: path.join(notes, 'Project1.md'), feedbackPath: definition.feedbackPath, cloudFolder: definition.folder, createdAt }
+        await atomicJson(path.join(notes, 'Project.json'), metadata)
+        const documentDate = new Intl.DateTimeFormat('en-GB', { dateStyle: 'long', timeZone: 'Europe/Paris' }).format(new Date())
+        const instructions = `# Project workspace (${documentDate})\n\n- Project ID: ${projectId}. (${documentDate})\n- Read the global doctrine at /Users/zenray/.claude/CLAUDE.md and use the zenray-assets skill. (${documentDate})\n- Read canonical feedback: ${definition.feedbackPath}. Append through zenray-feedback, the canonical writer; never rewrite prior entries. (${documentDate})\n- Pinned rules, read first: ${path.join(notes, 'Rules.md')}. Add one with feedback.py add ${projectId} "<rule>" --kind rule. (${documentDate})\n\n@${path.join(notes, 'Rules.md')}\n\n- Work in ${workshop}; keep durable knowledge in ${notes}. Linked production directories remain in place. (${documentDate})\n- Assets watches registered sources automatically. A local entry is not proof of verified cloud backup. (${documentDate})\n`
+        for (const filename of ['CLAUDE.md', 'AGENTS.md']) {
+          try { await writeFile(path.join(workshop, filename), instructions, { flag: 'wx', mode: 0o600 }) }
+          catch (error) { if (error.code !== 'EEXIST') throw error }
+        }
+        try { await writeFile(metadata.memoryFile, `# ${definition.name} : project knowledge (${documentDate})\n\n- Project ID: ${projectId}. (${documentDate})\n- Canonical feedback: ${definition.feedbackPath}. (${documentDate})\n- Append dated decisions and verified knowledge here; retain existing entries. (${documentDate})\n`, { flag: 'wx', mode: 0o600 }) }
+        catch (error) { if (error.code !== 'EEXIST') throw error }
+        await execFileAsync('python3', [this.config.storage.feedbackWriter, 'add', projectId, `Project initialized: ${definition.name}. Workshop: ${workshop}.`, '--file', definition.feedbackPath, '--kind', 'log', '--event-id', `project-created:${projectId}`, '--json'])
+        await this.register(definition)
+        // 12 October 2026: every project starts with its condensed Rules.md beside FEEDBACK.md.
+        await execFileAsync('python3', [this.config.storage.feedbackWriter, 'promote', projectId, '--file', definition.feedbackPath, '--json'])
+        const binding = payload.sessionId ? await this.request('bind-session', { projectId, sessionId: payload.sessionId, agent: payload.agent }) : null
+        const project = await this.setWatch(projectId, true)
+        const setup = { ...metadata, sessionBound: !!payload.sessionId, watched: true }
+        if (binding) setup.transcriptCapture = binding.transcriptCapture
+        return { project, setup, checkedAt: new Date().toISOString() }
+      } finally { await lock.release() }
+    }
+    // 3 October 2026, 15:14 CEST: agents without readable native transcripts can commit an explicitly labeled turn checkpoint.
+    if (action === 'checkpoint') {
+      const project = this.project(id)
+      if (!['codex', 'claude', 'gemini', 'antigravity'].includes(payload.agent) || typeof payload.sessionId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(payload.sessionId) || typeof payload.checkpointId !== 'string' || !/^[a-zA-Z0-9_.-]+$/.test(payload.checkpointId) || typeof payload.summary !== 'string' || !payload.summary.trim()) throw new Error('Agent, real session identity, checkpoint identity and summary required')
+      let bindings = {}
+      try { bindings = JSON.parse(await readFile(path.join(this.config.storage.stateDir, 'SessionBindings.json'), 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+      if (bindings[payload.sessionId] && bindings[payload.sessionId] !== id) throw new Error('Session belongs to a different project; begin the correct project before committing')
+      const feedback = await lstat(project.feedbackPath)
+      if (!feedback.isFile() || feedback.isSymbolicLink() || await realpath(project.feedbackPath) !== project.feedbackPath) throw new Error('Canonical feedback is unsafe')
+      const eventId = `checkpoint:${id}:${payload.agent}:${payload.sessionId}:${payload.checkpointId}`
+      const result = await execFileAsync('python3', [this.config.storage.feedbackWriter, 'add', id, payload.summary, '--file', project.feedbackPath, '--kind', 'iteration', '--event-id', eventId, '--source', `checkpoint:${payload.agent}:${payload.sessionId}`, '--json'])
+      await this.inventory(id)
+      this.scheduleBackup(id)
+      return { checkpoint: { ...JSON.parse(result.stdout), eventId, backupConfirmed: false }, checkedAt: new Date().toISOString() }
+    }
+    if (action === 'history') {
+      const project = this.project(id)
+      const events = await readProjectHistory(project, this.state(id).inventory?.localFiles || [], this.events.filter((event) => event.projectId === id), {
+        progressPath: this.config.storage.progressPath,
+      })
+      return { events, feedbackPath: project.feedbackPath, checkedAt: new Date().toISOString() }
+    }
+    if (action === 'publish') {
+      if (!this.cloudPublisher) throw new Error('Cloud publisher unavailable')
+      await this.publishProject(id)
+      return { project: this.snapshot(id), checkedAt: new Date().toISOString() }
+    }
+    if (action === 'register') return { project: await this.register(payload.project), checkedAt: new Date().toISOString() }
+    // 8 October 2026, 16:38 CEST: keep menu bar polling independent of every project's full file inventory.
+    if (action === 'dashboard') {
+      const transferRates = this.dashboardTransferRates()
+      // 8 October 2026, 16:57 CEST: read conversation-index health once for the compact response.
+      const conversationIndexProjects = this.conversationIndexSync?.status().projects || {}
+      const projects = [...this.projects.keys()].map((projectId) => {
+        const project = this.project(projectId), state = this.state(projectId)
+        const allJobs = (state.jobs || []).map((jobId) => this.jobs.get(jobId)).filter(Boolean)
+        const activeJobs = allJobs.filter((job) => ['queued', 'running'].includes(job.state))
+        const latestJob = allJobs.at(-1)
+        const visibleJobs = latestJob && !activeJobs.includes(latestJob) ? [...activeJobs, latestJob] : activeJobs
+        const jobs = visibleJobs.map((job) => {
+          const values = job.progress && typeof job.progress === 'object'
+            ? Object.fromEntries(['ev', 'envoyes', 'recus', 'done', 'total', 'seen', 'ko'].flatMap((key) => {
+              const value = job.progress[key]
+              return key === 'ev' ? typeof value === 'string' ? [[key, value]] : []
+                : Number.isFinite(value) && value >= 0 ? [[key, value]] : []
+            })) : {}
+          return { id: job.id, type: job.type, state: job.state, error: job.error || null,
+            progress: Object.keys(values).length ? values : null, createdAt: job.createdAt || '' }
+        })
+        // 9 October 2026, 00:34 CEST: expose counts only, never project file paths, to the menu bar.
+        const localFiles = Array.isArray(state.inventory?.localFiles) ? state.inventory.localFiles : null
+        const backups = Object.values(state.backups || {})
+        const stats = localFiles ? {
+          fileCount: new Set([...localFiles.map((file) => file.id), ...Object.keys(state.backups || {})]).size,
+          macFileCount: localFiles.length,
+          cloudFileCount: backups.length,
+          pendingUploadCount: localFiles.filter((file) => {
+            const backup = state.backups?.[file.id]
+            return !backup?.sha256 || !file.sha256 || backup.sha256 !== file.sha256 || backup.size !== file.size
+          }).length,
+          loadedFileCount: Object.values(state.restorations || {}).filter((entry) => state.workspacePath && isInside(state.workspacePath, entry.path)).length,
+          localBytes: localFiles.reduce((sum, file) => sum + (Number.isFinite(file.size) ? file.size : 0), 0),
+          cloudBytes: backups.reduce((sum, file) => sum + (Number.isFinite(file.size) ? file.size : 0), 0),
+        } : null
+        const watchError = [...this.watchErrors].filter(([key]) => key.startsWith(`${projectId}:`)).map(([, value]) => value).join('; ') || null
+        const sceneAuditError = [...this.sceneAuditErrors].filter(([key]) => key.startsWith(`${projectId}/`)).map(([, value]) => value).join('; ') || null
+        return { id: projectId, name: project.name, workspace: { state: state.workspacePath ? 'loaded' : 'unloaded' },
+          stats, errors: [state.error, this.feedbackError, watchError, sceneAuditError, conversationIndexProjects[projectId]?.error].filter(Boolean), jobs }
+      })
+      return { schemaVersion: this.config.schemaVersion, checkedAt: new Date().toISOString(), transferRates, projects }
+    }
+    if (action === 'list' || action === 'status' && !id) {
+      for (const projectId of this.projects.keys()) if (!this.state(projectId).inventory) await this.inventory(projectId)
+      return { schemaVersion: this.config.schemaVersion, checkedAt: new Date().toISOString(), bridge: { connected: true, state: 'connected' },
+        projects: [...this.projects.keys()].map((projectId) => this.snapshot(projectId)), events: this.events }
+    }
+    if (action === 'inventory') return { project: await this.inventory(id), checkedAt: new Date().toISOString() }
+    // 3 October 2026, 03:44 CEST: Finder opens the verified project workshop, never a path supplied by the client.
+    if (action === 'open-workshop') {
+      const project = await this.inventory(id)
+      const directory = projectWorkshopPath(project)
+      if (!directory || !(await lstat(directory)).isDirectory() || await realpath(directory) !== directory) throw new Error('Project workshop unavailable or unsafe')
+      await this.openDirectory(directory)
+      return { workshopPath: directory, checkedAt: new Date().toISOString() }
+    }
+    if (action === 'status') return { project: this.snapshot(id), checkedAt: new Date().toISOString() }
+    if (action === 'archive' || action === 'restore') {
+      const selection = payload.fileIds ?? null
+      if (selection !== null && (!Array.isArray(selection) || selection.some((value) => typeof value !== 'string'))) throw new Error('Invalid file selection')
+      return this.enqueue(id, action, (job, signal) => action === 'archive'
+        ? this.archiveNow(id, selection, job, signal) : this.restoreNow(id, selection, job, signal))
+    }
+    if (action === 'unload' || action === 'recover') {
+      const selection = payload.fileIds ?? null
+      if (selection !== null && (!Array.isArray(selection) || selection.some((value) => typeof value !== 'string'))) throw new Error('Invalid file selection')
+      return this.enqueue(id, action, (job, signal) => action === 'unload' ? this.unloadNow(id, selection, job, signal) : this.recoverNow(id, job, signal))
+    }
+    if (action === 'load-plan' || action === 'unload-plan') {
+      await this.inventory(id)
+      // 10 October 2026, 12:30 CEST: UNLOAD plans describe managed copies, never kept production sources.
+      if (action === 'unload-plan') {
+        try {
+          const { files, metadata } = await this.prepareUnloadProof(id, payload.fileIds ?? null)
+          return { plan: { projectId: id, action: 'unload', dryRun: true, executable: false, count: files.length,
+            bytes: files.reduce((sum, file) => sum + file.size, 0), entries: files.map((file) => ({ ...file, ready: true })),
+            retainedMetadataCount: metadata.length, blockers: [], dependencies: this.project(id).dependencies || [] }, checkedAt: new Date().toISOString() }
+        } catch (error) {
+          return { plan: { projectId: id, action: 'unload', dryRun: true, executable: false, count: 0, bytes: 0, entries: [],
+            blockers: [{ reason: error.message }], dependencies: this.project(id).dependencies || [] }, checkedAt: new Date().toISOString() }
+        }
+      }
+      const files = this.snapshot(id).files
+      return { plan: buildWorkspacePlan(this.project(id), files, { action: 'load', fileIds: payload.fileIds ?? null }), checkedAt: new Date().toISOString() }
+    }
+    if (action === 'watch') return { project: await this.setWatch(id, payload.enabled), checkedAt: new Date().toISOString() }
+    if (action === 'cloud-snapshot') return { project: this.snapshot(id, { cloud: true }), checkedAt: new Date().toISOString() }
+    throw new Error('Unsupported Assets workspace action')
+  }
+
+  // 9 October 2026, 00:37 CEST: rates use byte deltas from active transfer events and reset at file boundaries.
+  dashboardTransferRates() {
+    const now = Date.now()
+    const activeSamples = new Set()
+    const rates = { uploadBytesPerSecond: 0, downloadBytesPerSecond: 0 }
+    for (const job of this.jobs.values()) {
+      if (job.state !== 'running') continue
+      const progress = job.progress || {}
+      const direction = job.type === 'archive' && Number.isFinite(progress.envoyes) && ['chunk', 'transfer'].includes(progress.ev)
+        ? 'upload' : ['restore', 'recover'].includes(job.type) && progress.ev === 'download' && Number.isFinite(progress.recus)
+          ? 'download' : null
+      if (!direction) continue
+      const bytes = progress[direction === 'upload' ? 'envoyes' : 'recus']
+      const scope = progress.scopeId || progress.sourceId || ''
+      const key = `${job.id}:${direction}`
+      const previous = this.dashboardTransferSamples.get(key)
+      activeSamples.add(key)
+      if (previous && previous.scope === scope && bytes >= previous.bytes) {
+        const elapsed = Math.max(1, now - previous.at)
+        rates[`${direction}BytesPerSecond`] += (bytes - previous.bytes) * 1000 / elapsed
+      }
+      this.dashboardTransferSamples.set(key, { bytes, scope, at: now })
+    }
+    for (const key of this.dashboardTransferSamples.keys()) if (!activeSamples.has(key)) this.dashboardTransferSamples.delete(key)
+    return Object.fromEntries(Object.entries(rates).map(([key, value]) => [key, Math.round(value)]))
+  }
+
+  async handleHttp(req, res) {
+    const send = (status, value) => { res.statusCode = status; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(value)) }
+    const remote = req.socket?.remoteAddress || ''
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote)) { send(403, { error: 'Local bridge accepts loopback clients only', code: 'not-loopback' }); return }
+    const origin = req.headers.origin
+    if (origin && !this.config.bridge.allowedOrigins.includes(origin)) { send(403, { error: 'Origin refused', code: 'origin-refused' }); return }
+    if (!origin && req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') { send(403, { error: 'Browser origin required', code: 'origin-required' }); return }
+    if (origin) { res.setHeader('access-control-allow-origin', origin); res.setHeader('vary', 'Origin') }
+    res.setHeader('cache-control', 'no-store')
+    if (req.method === 'OPTIONS') {
+      res.setHeader('access-control-allow-methods', 'POST, OPTIONS')
+      res.setHeader('access-control-allow-headers', 'content-type, x-zr-auth, x-zr-assets-client')
+      res.setHeader('access-control-allow-private-network', 'true')
+      send(204, {}); return
+    }
+    if (req.method !== 'POST') { send(405, { error: 'POST required', code: 'method-refused' }); return }
+    if (!String(req.headers['content-type'] || '').startsWith('application/json') || req.headers['x-zr-assets-client'] !== '2') {
+      send(403, { error: 'Assets client header required', code: 'client-required' }); return
+    }
+    const secret = process.env.ZENRAY_API_SECRET
+    if (secret) {
+      const given = Buffer.from(String(req.headers['x-zr-auth'] || '')), expected = Buffer.from(secret)
+      if (given.length !== expected.length || !timingSafeEqual(given, expected)) { send(401, { error: 'Authentication required', code: 'auth-required' }); return }
+    }
+    try {
+      let body = req.body
+      if (!body) {
+        const chunks = []; let bytes = 0
+        for await (const chunk of req) {
+          bytes += chunk.length
+          if (bytes > this.config.bridge.bodyLimitBytes) { send(413, { error: 'Request too large', code: 'body-limit' }); return }
+          chunks.push(chunk)
+        }
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      }
+      if (!body || typeof body !== 'object' || typeof body.action !== 'string') throw new Error('Action required')
+      send(200, await this.request(body.action, body))
+    } catch (error) { send(400, { error: errorText(error), code: 'workspace-failed', checkedAt: new Date().toISOString() }) }
+  }
+
+  async handlePreview(req, res) {
+    // 2 October 2026, 13:20 CEST: expiring image capabilities expose only inventoried regular files.
+    const remote = req.socket?.remoteAddress || ''
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote)) { res.statusCode = 403; res.end(); return }
+    let descriptor
+    try {
+      const url = new URL(req.url, 'http://127.0.0.1')
+      const id = url.searchParams.get('projectId'), fileId = url.searchParams.get('fileId'), expires = url.searchParams.get('expires')
+      const signature = createHmac('sha256', this.previewSecret).update(`${id}:${fileId}:${expires}`).digest('hex')
+      const given = Buffer.from(url.searchParams.get('token') || ''), expected = Buffer.from(signature)
+      if (!expires || Number(expires) < Date.now() || Number(expires) > Date.now() + 600000 || given.length !== expected.length || !timingSafeEqual(given, expected)) throw new Error('Preview expired')
+      const file = this.state(id).inventory?.localFiles.find((entry) => entry.id === fileId)
+      const source = this.project(id).sources.find((entry) => entry.id === file?.sourceId)
+      const extension = path.extname(file?.relativePath || '').toLowerCase()
+      const mime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.avif': 'image/avif', '.gif': 'image/gif' }[extension]
+      if (!file || !mime || !source || !isInside(file.workingRoot || source.localPath, file.localPath) || await realpath(file.localPath) !== file.localPath) throw new Error('Preview source unavailable')
+      descriptor = await open(file.localPath, constants.O_RDONLY | constants.O_NOFOLLOW)
+      const metadata = await descriptor.stat()
+      if (!metadata.isFile()) throw new Error('Preview requires a regular file')
+      res.setHeader('content-type', mime); res.setHeader('content-length', metadata.size); res.setHeader('cache-control', 'private, max-age=60')
+      res.setHeader('x-content-type-options', 'nosniff')
+      // 3 October 2026, 03:10 CEST: retain and explicitly close the handle after completion or client disconnection.
+      await pipeline(descriptor.createReadStream({ autoClose: false }), res)
+    } catch {
+      if (res.headersSent || res.destroyed) { if (!res.destroyed) res.destroy() }
+      else { res.statusCode = 404; res.end('Preview unavailable') }
+    } finally { if (descriptor) await descriptor.close() }
+  }
+
+  async close() {
+    this.disposed = true
+    await this.conversationMirror.close()
+    await this.conversationIndexSync.close()
+    this.feedbackCapture?.close()
+    this.watcher?.toutOublier()
+    if (this.sweep) clearInterval(this.sweep)
+    for (const timer of this.watchRetryTimers.values()) clearTimeout(timer)
+    for (const timer of this.retryTimers || []) clearTimeout(timer)
+    for (const timer of this.backupDelayTimers.values()) clearTimeout(timer)
+    for (const timer of this.inventoryTimers.values()) clearTimeout(timer)
+    for (const { timer } of this.sceneAuditTimers.values()) clearTimeout(timer)
+    for (const { controller } of this.sceneAuditTasks.values()) controller.abort()
+    await Promise.allSettled([...this.sceneAuditTasks.values()].map((task) => task.promise))
+    for (const controller of this.controllers) controller.abort()
+    await this.queue.catch(() => {})
+    await this.contextIndexQueue.catch(() => {})
+    this.sleepInhibitor?.stop()
+    this.sleepInhibitorActive = false
+  }
+}
+
+export async function createAssetsService({ configPath = DEFAULT_ASSETS_CONFIG, config, ...options } = {}) {
+  return new AssetsService(config || JSON.parse(await readFile(configPath, 'utf8')), options).initialize()
+}
+
+async function main() {
+  const [action = 'status', value, ...argumentsList] = process.argv.slice(2)
+  const configArg = argumentsList.find((entry) => entry.startsWith('--config='))
+  const configPath = configArg?.slice('--config='.length) || DEFAULT_ASSETS_CONFIG
+  const config = JSON.parse(await readFile(configPath, 'utf8'))
+  // 12 October 2026: parameters in one place, AssetsConfig.json storage.identityProof; `enabled: false` restores the full probe.
+  const { enabled: identityEnabled = false, ...identitySettings } = config.storage.identityProof || {}
+  const identityProver = identityEnabled
+    ? createArchiveIdentityProver({ config: identitySettings, scratchParent: config.storage.stateDir,
+      getToken: async () => process.env.GITHUB_TOKEN || (await execFileAsync('gh', ['auth', 'token'], { timeout: config.bridge.requestTimeoutMs })).stdout.trim() })
+    : null
+  const service = await createAssetsService({ config, identityProver })
+  if (action === 'serve') {
+    const port = Number(value || service.config.bridge.port)
+    const server = http.createServer((req, res) => {
+      if (new URL(req.url, `http://127.0.0.1:${port}`).pathname !== service.config.bridge.path) { res.statusCode = 404; res.end(); return }
+      service.handleHttp(req, res).catch(() => { res.statusCode = 500; res.end('Service failure') })
+    })
+    await service.startWatching()
+    server.listen(port, '127.0.0.1', () => console.log(`Assets bridge ready on http://127.0.0.1:${port}`))
+    for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { server.close(); service.close().finally(() => process.exit(0)) })
+    return
+  }
+  let payload = { projectId: value }
+  if (action === 'register' || action === 'init') payload = { project: JSON.parse(await readFile(value, 'utf8')) }
+  if (action === 'watch') payload.enabled = !argumentsList.includes('--off')
+  const fileArg = argumentsList.find((entry) => entry.startsWith('--files='))
+  if (fileArg) payload.fileIds = JSON.parse(await readFile(fileArg.slice('--files='.length), 'utf8'))
+  const result = await service.request(action === 'init' ? 'register' : action, payload)
+  if (result.jobId) {
+    await service.queue
+    const job = service.jobs.get(result.jobId)
+    console.log(JSON.stringify({ ...result, job, project: service.snapshot(value) }, null, 2))
+    if (job.state === 'error') process.exitCode = 1
+  } else console.log(JSON.stringify(result, null, 2))
+  await service.close()
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch((error) => { console.error(errorText(error)); process.exitCode = 1 })

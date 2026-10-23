@@ -1,0 +1,60 @@
+// 16 October 2026 14:10 Europe/Paris: source-compatible dictionary browsing, separate from assessed lessons.
+import { normalizeCorpusText } from './japaneseCorpusModel.js'
+export const REFERENCE_CONFIG = Object.freeze({ root: 'Memory/Japanese/Site/reference', pageSize: 48, levels: ['N5', 'N4', 'N3', 'N2', 'N1', 'unclassified'] })
+export function vocabularyForms(entry) {
+  return entry.bindings.map(([spelling, reading, senses]) => ({
+    spelling: spelling < 0 ? '' : entry.kanji[spelling].text,
+    reading: entry.kana[reading].text,
+    senses: senses.map(index => entry.senses[index]),
+  }))
+}
+export function filterReferences(entries, { kind, query = '', level = '', category = '', script = '', grade = '', missingOnly = false }) {
+  const text = normalizeCorpusText(query).trim()
+  return entries.filter(entry => {
+    if (level && !(entry.memberships?.includes(level) || (level === 'unclassified' && entry.level === level))) return false
+    if (category && entry.category !== category) return false
+    if (script && entry.script !== script && entry.script !== 'shared') return false
+    if (grade && String(entry.grade) !== grade) return false
+    if (missingOnly && entry.frenchStatus !== 'missing') return false
+    const searchable = kind === 'vocabulary' ? [entry.kanji.map(item => item.text), entry.kana.map(item => item.text), entry.senses.flatMap(sense => sense.gloss.map(gloss => gloss.text))]
+      : kind === 'joyo' ? [entry.character, entry.meaningsFr, entry.onReadings.map(item => item.value), entry.kunReadings.map(item => item.value)] : [entry.display, entry.reading, entry.note]
+    return !text || normalizeCorpusText(searchable.flat(Infinity).join(' ')).includes(text)
+  })
+}
+export function validReferenceEntry(entry, kind) {
+  const texts = values => Array.isArray(values) && values.every(value => typeof value === 'string')
+  const forms = values => Array.isArray(values) && values.every(value => typeof value?.text === 'string')
+  if (!entry || typeof entry.id !== 'string') return false
+  if (kind === 'kana') return typeof entry.display === 'string' && typeof entry.category === 'string' && typeof entry.script === 'string' && (entry.reading === null || typeof entry.reading === 'string')
+  if (kind === 'joyo') return typeof entry.character === 'string' && Number.isInteger(entry.order) && Number.isInteger(entry.strokeCount) && texts(entry.meaningsFr) && texts(entry.nanori) && [entry.onReadings,entry.kunReadings].every(values=>Array.isArray(values) && values.every(value=>typeof value?.value === 'string')) && typeof entry.strokeFile === 'string'
+  return forms(entry.kanji) && forms(entry.kana) && texts(entry.memberships) && Array.isArray(entry.senses) && entry.senses.every(sense => Array.isArray(sense.gloss) && sense.gloss.every(gloss => gloss.lang === 'fre' && typeof gloss.text === 'string'))
+    && Array.isArray(entry.bindings) && entry.bindings.length > 0 && entry.bindings.every(pair => Array.isArray(pair) && pair.length === 3 && Number.isInteger(pair[0]) && pair[0] >= -1 && pair[0] < entry.kanji.length && Number.isInteger(pair[1]) && pair[1] >= 0 && pair[1] < entry.kana.length && Array.isArray(pair[2]) && pair[2].every(index=>Number.isInteger(index) && index >= 0 && index < entry.senses.length))
+}
+async function matchesReferenceHash(value, expected) {
+  if (!expected) return true
+  const bytes = new TextEncoder().encode(JSON.stringify(value)+'\n')
+  const digest = await crypto.subtle.digest('SHA-256',bytes)
+  return Array.from(new Uint8Array(digest),byte=>byte.toString(16).padStart(2,'0')).join('') === expected
+}
+export function createReferenceClient(readJson) {
+  const cache = new Map()
+  async function read(path, validate) {
+    if (cache.has(path)) return cache.get(path)
+    const value = await readJson(path)
+    if (!await validate(value)) throw new Error('Références absentes ou invalides. Réessayer.')
+    cache.set(path, value)
+    return value
+  }
+  async function load(kind) {
+    if (kind !== 'vocabulary') return read(`${REFERENCE_CONFIG.root}/${kind}.json`, value => value?.schemaVersion === 1 && Array.isArray(value.entries) && value.entries.every(entry=>validReferenceEntry(entry,kind)))
+    const head = await read(`${REFERENCE_CONFIG.root}/vocabulary/catalogue.json`, value => value?.schemaVersion === 1 && Array.isArray(value.files))
+    const parts = []
+    for (const file of head.files) {
+      const value = await read(`${REFERENCE_CONFIG.root}/vocabulary/${file.path}`, async value => value?.schemaVersion === 1 && Array.isArray(value.entries) && value.entries.length === file.count && value.entries.every(entry=>validReferenceEntry(entry,'vocabulary')) && await matchesReferenceHash(value,file.sha256))
+      parts.push(...value.entries)
+    }
+    if (new Set(parts.map(item => item.id)).size !== head.totalEntries) throw new Error('Le vocabulaire est incomplet dans cette lecture. Réessayer.')
+    return { ...head, entries: parts }
+  }
+  return { load }
+}

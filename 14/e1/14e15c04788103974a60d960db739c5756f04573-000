@@ -1,0 +1,407 @@
+// cmaf-packaging.test.mjs (11 October 2026): the pure parts of the multi-audio CMAF packaging.
+// 12 October 2026 (D4): the bitrate ladder, the 4K class, the packet-scan prediction and the fallback, with real ffmpeg
+// runs on small synthetic videos for the agreement between the prediction and the real segment check.
+// FR : echelle de debits, classe 4K, prediction par balayage de paquets et repli ; ffmpeg reel sur de petites videos synthetiques.
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { CDN_CHUNK } from '../../src/config/chunkPolicy.js'
+import {
+  CMAF, findOversizedSegment, packageCmafDashHlsWatched, collectAudioTracks, audioArgs, adaptationSetsArg, mergeAudioGroups,
+  isFourKClass, ladderFor, rateControl, buildFfmpegArgs, validateCmafConfig, cmafConfigFromEnv,
+  parsePacketScan, predictSegmentSizes, predictPackagingMode, packageWithFallback, packageCmafDashHls, scanVideoPackets, probeStreams,
+  parseFfmpegProgress, progressPercent,
+} from './cmaf-packaging.mjs'
+
+const streams = [
+  { index: 0, codec_type: 'video', codec_name: 'h264' },
+  { index: 1, codec_type: 'audio', codec_name: 'aac', channels: 2, tags: { language: 'fre' } },
+  { index: 2, codec_type: 'audio', codec_name: 'flac', channels: 6, tags: { language: 'jpn', title: 'Japonais 5.1' } },
+  { index: 3, codec_type: 'subtitle', codec_name: 'subrip' },
+]
+
+describe('multi-audio packaging', () => {
+  it('lists every audio stream in file order with a player label', () => {
+    const tracks = collectAudioTracks(streams)
+    expect(tracks.map((t) => [t.index, t.lang, t.label, t.default])).toEqual([[1, 'fre', 'Français', true], [2, 'jpn', '日本語', false]])
+  })
+  it('labels by language, and tells two tracks of one language apart', () => {
+    const tracks = collectAudioTracks([
+      { index: 1, codec_type: 'audio', codec_name: 'aac', tags: { language: 'jpn', title: 'DTS-HD Master Audio 5.1' } },
+      { index: 2, codec_type: 'audio', codec_name: 'aac', tags: { language: 'fre' } },
+      { index: 3, codec_type: 'audio', codec_name: 'aac', tags: { language: 'fre', title: 'Audiodescription' } },
+      { index: 4, codec_type: 'audio', codec_name: 'aac', tags: { language: 'und' } },
+    ])
+    expect(tracks.map((t) => t.label)).toEqual(['日本語', 'Français 1', 'Français (Audiodescription)', 'Audio'])
+  })
+  it('maps each track, copying AAC and re-encoding the rest to stereo AAC', () => {
+    const args = audioArgs(collectAudioTracks(streams), 'copy4').join(' ')
+    expect(args).toContain('-map 0:1 -c:a:0 copy')
+    expect(args).toContain('-map 0:2 -c:a:1 aac -ac:a:1 2')
+    expect(args).toContain('-metadata:s:a:1 language=jpn')
+  })
+  it('gives each audio its own DASH adaptation set', () => {
+    expect(adaptationSetsArg(0)).toBe('id=0,streams=0')
+    expect(adaptationSetsArg(3)).toBe('id=0,streams=0 id=1,streams=1 id=2,streams=2 id=3,streams=3')
+  })
+  it('merges the HLS audio groups into one with language and default only on the first', () => {
+    const master = [
+      '#EXTM3U',
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="group_A1",NAME="audio_1",DEFAULT=YES,CHANNELS="2",URI="media_1.m3u8"',
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="group_A2",NAME="audio_2",DEFAULT=NO,CHANNELS="6",URI="media_2.m3u8"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO="group_A1"',
+      'media_0.m3u8',
+    ].join('\n')
+    const { text, audioRenditions } = mergeAudioGroups(master, collectAudioTracks(streams))
+    expect(audioRenditions).toBe(2)
+    expect(text.match(/GROUP-ID="audio"/g)).toHaveLength(2)
+    expect(text).toContain('LANGUAGE="jpn",DEFAULT=NO')
+    expect(text).toContain('NAME="Français",LANGUAGE="fre",DEFAULT=YES')
+    expect(text).toContain('AUDIO="audio"')
+  })
+})
+
+// ---- D4: ladder, 4K class, prediction, fallback ----
+const MiB = 1024 * 1024
+const video = (width, height, codec = 'h264') => ({ index: 0, codec_type: 'video', codec_name: codec, width, height })
+const probeOf = (v) => ({ video: v, audios: [], duration: 100 })
+
+describe('4K class and bitrate ladder', () => {
+  it('puts a 4K source on 16, 8, 4, 2 and any other source on 8, 4, 2', () => {
+    expect(ladderFor(video(3840, 2160))).toEqual({ sourceClass: 'fourK', rungsMbit: [16, 8, 4, 2] })
+    expect(ladderFor(video(1920, 1080))).toEqual({ sourceClass: 'other', rungsMbit: [8, 4, 2] })
+    expect(ladderFor(video(1280, 720)).rungsMbit[0]).toBe(8)
+  })
+  it('detects the 4K class from width OR height, scope 3840x1600 included, with the threshold edges', () => {
+    expect(isFourKClass(video(3840, 1600))).toBe(true)
+    expect(isFourKClass(video(4096, 1716))).toBe(true)
+    expect(isFourKClass(video(3000, 1000))).toBe(true)
+    expect(isFourKClass(video(2999, 1999))).toBe(false)
+    expect(isFourKClass(video(1500, 2000))).toBe(true)
+    expect(isFourKClass(video(1920, 1080))).toBe(false)
+    expect(isFourKClass(null)).toBe(false)
+    expect(isFourKClass({ width: 'n/a' })).toBe(false)
+  })
+  it('derives maxrate (1.45 x) and bufsize (2 x maxrate) from the rung', () => {
+    expect(rateControl(16)).toEqual({ bitrateKbit: 16000, maxrateKbit: 23200, bufsizeKbit: 46400 })
+    expect(rateControl(8)).toEqual({ bitrateKbit: 8000, maxrateKbit: 11600, bufsizeKbit: 23200 })
+    expect(rateControl(2)).toEqual({ bitrateKbit: 2000, maxrateKbit: 2900, bufsizeKbit: 5800 })
+  })
+  it('writes the rung into the ffmpeg arguments and keeps the old literals out of the source', () => {
+    const fourK = buildFfmpegArgs('in.mkv', probeOf(video(3840, 1600, 'vc1')), 'transcode').join(' ')
+    expect(fourK).toContain('-b:v 16000k -maxrate 23200k -bufsize 46400k')
+    const other = buildFfmpegArgs('in.mkv', probeOf(video(1920, 1080, 'vc1')), 'transcode').join(' ')
+    expect(other).toContain('-b:v 8000k -maxrate 11600k -bufsize 23200k')
+    const rung = buildFfmpegArgs('in.mkv', probeOf(video(3840, 2160)), 'transcode', { bitrateMbit: 4 }).join(' ')
+    expect(rung).toContain('-b:v 4000k -maxrate 5800k -bufsize 11600k')
+    const source = fs.readFileSync(path.join(process.cwd(), 'scripts/lib/cmaf-packaging.mjs'), 'utf8')
+    for (const literal of ['2200k', '3200k', '6400k']) expect(source).not.toContain(literal)
+  })
+  it('keeps the copy arguments of an HEVC source and uses the per-mode segment duration', () => {
+    const args = buildFfmpegArgs('in.mkv', probeOf(video(3840, 2160, 'hevc')), 'copy2').join(' ')
+    expect(args).toContain('-c:v copy -tag:v hvc1')
+    expect(args).toContain('-seg_duration 0.5')
+    expect(args).not.toContain('-b:v')
+    expect(buildFfmpegArgs('in.mkv', probeOf(video(1920, 1080)), 'copy4').join(' ')).toContain('-seg_duration 4')
+  })
+  it('lets the environment change the ladder and names the broken variable', () => {
+    const config = cmafConfigFromEnv({ ZR_CMAF_LADDER_4K: '20,10,5', ZR_CMAF_4K_MIN_WIDTH: '2500', ZR_CMAF_PREDICTION: '0' })
+    expect(config.bitrateLadderMbit.fourK).toEqual([20, 10, 5])
+    expect(config.fourKClass.minWidth).toBe(2500)
+    expect(config.prediction.enabled).toBe(false)
+    expect(CMAF.bitrateLadderMbit.fourK).toEqual([16, 8, 4, 2]) // the defaults are untouched
+    expect(() => cmafConfigFromEnv({ ZR_CMAF_LADDER_OTHER: '2,4' })).toThrow(/ZR_CMAF_LADDER_OTHER/)
+    expect(() => cmafConfigFromEnv({ ZR_CMAF_4K_MIN_HEIGHT: 'abc' })).toThrow(/ZR_CMAF_4K_MIN_HEIGHT/)
+    const broken = JSON.parse(JSON.stringify(CMAF))
+    delete broken.rateFactors.maxrate
+    expect(() => validateCmafConfig(broken)).toThrow(/rateFactors\.maxrate/)
+  })
+})
+
+// 25 fps packets of `seconds`, a key frame every `gop` seconds, `size` bytes each (a key frame weighs `keySize`).
+function syntheticPackets({ seconds, gop, size = 1000, keySize = 5000, fps = 25 }) {
+  const packets = []
+  for (let i = 0; i < seconds * fps; i += 1) {
+    const time = i / fps
+    const key = Math.abs(time / gop - Math.round(time / gop)) < 1e-9
+    packets.push({ time, size: key ? keySize : size, key })
+  }
+  return packets
+}
+
+describe('packet-scan prediction', () => {
+  it('parses ffprobe compact packet lines and falls back to the dts when the pts is missing', () => {
+    const packets = parsePacketScan('pts_time=0.000000|dts_time=-0.083|size=1234|flags=K__\npts_time=N/A|dts_time=0.5|size=10|flags=___\nbroken\n')
+    expect(packets).toEqual([{ time: 0, size: 1234, key: true }, { time: 0.5, size: 10, key: false }])
+  })
+  it('cuts at the first key frame at least one segment duration after the previous cut', () => {
+    // a key frame every 3 s and 4 s segments: the cuts fall at 6, 12, ... (6 s segments of 150 packets)
+    const packets = syntheticPackets({ seconds: 60, gop: 3 })
+    const sizes = predictSegmentSizes(packets, 4, { ...CMAF, prediction: { ...CMAF.prediction, perPacketOverheadBytes: 0, perSegmentOverheadBytes: 0 } })
+    expect(sizes.segments).toBe(10)
+    expect(sizes.maxBytes).toBe(2 * 5000 + 148 * 1000)
+    // 0.5 s segments cannot be shorter than the GOP: one segment per GOP
+    expect(predictSegmentSizes(packets, 0.5, CMAF).segments).toBe(20)
+  })
+  it('counts a leading run of non key packets in the first segment', () => {
+    const packets = [{ time: 0, size: 100, key: false }, { time: 1, size: 100, key: true }, { time: 2, size: 100, key: false }]
+    const sizes = predictSegmentSizes(packets, 4, { ...CMAF, prediction: { ...CMAF.prediction, perPacketOverheadBytes: 0, perSegmentOverheadBytes: 0 } })
+    expect(sizes).toEqual({ segments: 1, maxBytes: 300, totalBytes: 300 })
+  })
+  it('predicts copy4, copy2 or transcode with the strict reading, and skips only beyond the tolerance', () => {
+    const packets = syntheticPackets({ seconds: 60, gop: 3, size: 1000 })
+    const probe = probeOf(video(1920, 1080))
+    const m4 = predictSegmentSizes(packets, 4, CMAF).maxBytes
+    const m2 = predictSegmentSizes(packets, 0.5, CMAF).maxBytes
+    expect(m4).toBeGreaterThan(m2) // GOP of 3 s: copy4 cuts every 6 s, copy2 at every key frame (3 s)
+    expect(predictPackagingMode(packets, probe, { limitBytes: m4 + 1 }).predictedMode).toBe('copy4')
+    const strictOver = predictPackagingMode(packets, probe, { limitBytes: m4 - 1 })
+    expect(strictOver.predictedMode).toBe('copy2')
+    expect(strictOver.perMode.copy4.overLimit).toBe(true)
+    expect(strictOver.perMode.copy4.skip).toBe(false) // borderline: still tried for real
+    expect(predictPackagingMode(packets, probe, { limitBytes: m2 - 1 }).predictedMode).toBe('transcode')
+    expect(predictPackagingMode(packets, probe, { limitBytes: Math.floor(m4 / 2) }).perMode.copy4.skip).toBe(true)
+    expect(predictPackagingMode(packets, probeOf(video(1920, 1080, 'vc1')), { limitBytes: 1e9 })).toMatchObject({ predictedMode: 'transcode', perMode: { copy4: { applicable: false } } })
+  })
+})
+
+// A runner double: results by "mode" or "mode:bitrate", recording every call.
+function fakeRunner(outcomes) {
+  const calls = []
+  const runner = (_src, _dir, _probe, mode, options) => {
+    const key = mode === 'transcode' ? `transcode:${options.bitrateMbit}` : mode
+    calls.push(key)
+    const ok = outcomes[key] === true
+    return ok ? { ok: true, maxBytes: 1, totalBytes: 2, names: ['a.m4s'] } : { ok: false, reason: outcomes[key] || 'segment_too_large:x:1' }
+  }
+  return { runner, calls }
+}
+const noScan = { scanner: () => null }
+
+describe('fallback ladder', () => {
+  it('stays on copy4 when it passes, without touching the transcode', async () => {
+    const { runner, calls } = fakeRunner({ copy4: true })
+    const result = await packageWithFallback('in.mkv', 'w', probeOf(video(3840, 2160, 'hevc')), { runner, ...noScan })
+    expect(calls).toEqual(['copy4'])
+    expect(result).toMatchObject({ ok: true, mode: 'copy4', bitrateMbit: null, sourceClass: 'fourK' })
+  })
+  it('goes copy4, copy2, then 16, 8 on a 4K source and records the rung that passed', async () => {
+    const { runner, calls } = fakeRunner({ 'transcode:8': true })
+    const result = await packageWithFallback('in.mkv', 'w', probeOf(video(3840, 1600, 'hevc')), { runner, ...noScan })
+    expect(calls).toEqual(['copy4', 'copy2', 'transcode:16', 'transcode:8'])
+    expect(result).toMatchObject({ ok: true, mode: 'transcode', bitrateMbit: 8, sourceClass: 'fourK' })
+    expect(result.attempts.map((a) => [a.mode, a.bitrateMbit, a.ok])).toEqual([['copy4', null, false], ['copy2', null, false], ['transcode', 16, false], ['transcode', 8, true]])
+  })
+  it('starts a non 4K transcode at 8 and walks 8, 4, 2, then reports the last failure', async () => {
+    const { runner, calls } = fakeRunner({})
+    const result = await packageWithFallback('in.mkv', 'w', probeOf(video(1920, 1080, 'vc1')), { runner, ...noScan })
+    expect(calls).toEqual(['transcode:8', 'transcode:4', 'transcode:2'])
+    expect(result.ok).toBe(false)
+    expect(result.reason).toMatch(/all_modes_failed:transcode:segment_too_large/)
+    expect(result.skipped.map((s) => s.mode)).toEqual(['copy4', 'copy2'])
+  })
+  it('stops the ladder when a transcode fails for a reason other than segment size (13 October 2026)', async () => {
+    const { runner, calls } = fakeRunner({ 'transcode:16': 'ffmpeg_exit_1:boom', 'transcode:8': true })
+    const result = await packageWithFallback('in.mkv', 'w', probeOf(video(3840, 2160, 'vc1')), { runner, ...noScan })
+    expect(calls).toEqual(['transcode:16'])
+    expect(result.ok).toBe(false)
+    expect(result.reason).toMatch(/all_modes_failed:transcode:ffmpeg_exit_1/)
+    const missing = fakeRunner({ 'transcode:16': 'missing_manifests' })
+    await packageWithFallback('in.mkv', 'w', probeOf(video(3840, 2160, 'vc1')), { runner: missing.runner, ...noScan })
+    expect(missing.calls).toEqual(['transcode:16'])
+  })
+  it('still moves from a failed copy mode to the next mode whatever the reason', async () => {
+    const { runner, calls } = fakeRunner({ copy4: 'ffmpeg_exit_1:copy boom', 'transcode:16': true })
+    const result = await packageWithFallback('in.mkv', 'w', probeOf(video(3840, 2160, 'hevc')), { runner, ...noScan })
+    expect(calls).toEqual(['copy4', 'copy2', 'transcode:16'])
+    expect(result.ok).toBe(true)
+  })
+  it('never starts a transcode above the source bitrate (13 October 2026)', async () => {
+    const lowProbe = { ...probeOf(video(3840, 2160, 'vc1')), sourceBitrateBps: 5_000_000 }
+    expect(ladderFor(lowProbe.video, CMAF, 5_000_000).rungsMbit).toEqual([4, 2])
+    expect(ladderFor(video(1920, 1080), CMAF, 1_000_000).rungsMbit).toEqual([2])
+    expect(ladderFor(video(1920, 1080), CMAF, 0).rungsMbit).toEqual([8, 4, 2])
+    const { runner, calls } = fakeRunner({ 'transcode:4': true })
+    const result = await packageWithFallback('in.mkv', 'w', lowProbe, { runner, ...noScan })
+    expect(calls).toEqual(['transcode:4'])
+    expect(result.bitrateMbit).toBe(4)
+  })
+  it('skips a copy mode predicted far over the limit, but the real check still decides when the prediction is optimistic', async () => {
+    const limit = 10 * 1000 * 1000
+    // 200 s with a key frame every 100 s: 100 s of 2 MB per second = far over the limit in both copy modes
+    const huge = syntheticPackets({ seconds: 200, gop: 100, size: 100000, keySize: 500000, fps: 25 })
+    const probe = probeOf(video(1920, 1080, 'h264'))
+    const a = fakeRunner({ 'transcode:8': true })
+    const skipped = await packageWithFallback('in.mkv', 'w', probe, { runner: a.runner, scanner: () => huge, limitBytes: limit })
+    expect(a.calls).toEqual(['transcode:8'])
+    expect(skipped.predictedMode).toBe('transcode')
+    expect(skipped.skipped.map((s) => s.reason)).toEqual(['predicted_over_limit', 'predicted_over_limit'])
+    // an optimistic prediction (tiny packets) is not trusted: the real runner fails copy4 and the fallback continues
+    const tiny = syntheticPackets({ seconds: 60, gop: 3, size: 10, keySize: 10 })
+    const b = fakeRunner({ copy2: true })
+    const result = await packageWithFallback('in.mkv', 'w', probe, { runner: b.runner, scanner: () => tiny, limitBytes: limit })
+    expect(b.calls).toEqual(['copy4', 'copy2'])
+    expect(result).toMatchObject({ ok: true, mode: 'copy2', predictedMode: 'copy4' })
+  })
+  it('does not scan when the prediction is disabled', async () => {
+    let scans = 0
+    const { runner, calls } = fakeRunner({ copy4: true })
+    const config = cmafConfigFromEnv({ ZR_CMAF_PREDICTION: '0' })
+    const result = await packageWithFallback('in.mkv', 'w', probeOf(video(1920, 1080)), { runner, config, scanner: () => { scans += 1; return null } })
+    expect(scans).toBe(0)
+    expect(calls).toEqual(['copy4'])
+    expect(result.predictedMode).toBe(null)
+  })
+})
+
+// Real ffmpeg on small synthetic videos: the prediction and the real segment check must agree.
+const ffmpegHasX264 = (() => {
+  const res = spawnSync(CMAF.ffmpeg, ['-hide_banner', '-encoders'], { encoding: 'utf8' })
+  return res.status === 0 && /libx264/.test(res.stdout)
+})()
+
+describe.skipIf(!ffmpegHasX264)('prediction against the real segment check (ffmpeg)', () => {
+  let dir
+  const files = {}
+  const make = (name, seconds, extra) => {
+    const out = path.join(dir, name)
+    const res = spawnSync(CMAF.ffmpeg, ['-y', '-v', 'error', '-f', 'lavfi', '-i', `testsrc2=size=320x240:rate=25:duration=${seconds}`,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-bf', '3', '-pix_fmt', 'yuv420p', ...extra, out], { encoding: 'utf8' })
+    if (res.status !== 0) throw new Error(`synthetic video failed: ${res.stderr}`)
+    files[name] = out
+  }
+  beforeAll(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmaf-test-'))
+    make('regular.mp4', 40, ['-x264-params', 'keyint=75:min-keyint=75:scenecut=0'])
+    make('irregular.mp4', 40, ['-x264-params', 'keyint=250:min-keyint=1:scenecut=0', '-force_key_frames', '0,3.3,7.9,8.5,12,19,24.2,30,37.7'])
+  }, 60000)
+  afterAll(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  it('predicts the largest segment within 2 percent of what ffmpeg writes, in both copy modes', () => {
+    for (const name of ['regular.mp4', 'irregular.mp4']) {
+      const probe = probeStreams(files[name])
+      const packets = scanVideoPackets(files[name])
+      expect(packets.length).toBeGreaterThan(900)
+      for (const mode of ['copy4', 'copy2']) {
+        const work = path.join(dir, `w-${name}-${mode}`)
+        const real = packageCmafDashHls(files[name], work, probe, mode)
+        expect(real.ok).toBe(true)
+        const videoSegments = real.names.filter((n) => n.startsWith('chunk_0_'))
+        const realMax = Math.max(...videoSegments.map((n) => fs.statSync(path.join(work, n)).size))
+        const predicted = predictSegmentSizes(packets, CMAF.segmentSeconds[mode], CMAF)
+        expect(predicted.segments).toBe(videoSegments.length)
+        expect(Math.abs(predicted.maxBytes - realMax) / realMax).toBeLessThan(0.02)
+      }
+    }
+  }, 60000)
+
+  it('agrees with the real check on both sides of the limit, and a failing rung moves to the next mode', async () => {
+    const probe = probeStreams(files['irregular.mp4'])
+    const packets = scanVideoPackets(files['irregular.mp4'])
+    const m4 = predictSegmentSizes(packets, CMAF.segmentSeconds.copy4, CMAF).maxBytes
+    const m2 = predictSegmentSizes(packets, CMAF.segmentSeconds.copy2, CMAF).maxBytes
+    expect(m2).toBeLessThan(m4 * 0.97) // the irregular GOP makes copy2 strictly smaller than copy4
+    const limitBytes = Math.floor((m4 + m2) / 2)
+    const work = path.join(dir, 'w-fallback')
+    // prediction on: copy4 is predicted over the limit and never run
+    const predicted = await packageWithFallback(files['irregular.mp4'], work, probe, { limitBytes })
+    expect(predicted).toMatchObject({ ok: true, mode: 'copy2', predictedMode: 'copy2' })
+    expect(predicted.skipped.map((s) => s.mode)).toEqual(['copy4'])
+    // prediction off: the real check fails copy4 (segment_too_large) and the fallback lands on the SAME mode
+    const config = cmafConfigFromEnv({ ZR_CMAF_PREDICTION: '0' })
+    const real = await packageWithFallback(files['irregular.mp4'], work, probe, { limitBytes, config })
+    expect(real.attempts.map((a) => [a.mode, a.ok])).toEqual([['copy4', false], ['copy2', true]])
+    expect(real.attempts[0].reason).toMatch(/^segment_too_large/)
+    expect(real.mode).toBe(predicted.mode)
+    // limit above both: both agree on copy4
+    const loose = await packageWithFallback(files['irregular.mp4'], work, probe, { limitBytes: m4 * 2 })
+    expect(loose).toMatchObject({ ok: true, mode: 'copy4', predictedMode: 'copy4' })
+  }, 90000)
+})
+
+describe('13 October 2026 review fixes', () => {
+  it('takes the CDN limit from chunkPolicy.js, not a literal', () => {
+    expect(CMAF.cdnChunkBytes).toBe(CDN_CHUNK)
+  })
+  it('puts the leading B frames of an open GOP in the new segment (decode order, not pts order)', () => {
+    const p = (time, size, key) => ({ time, size, key })
+    const packets = [p(0, 1000, true), p(2, 400000, false), p(4, 1000, true), p(3.92, 500000, false), p(3.96, 500000, false), p(5, 1000, false), p(8, 1000, true)]
+    const config = { ...CMAF, prediction: { ...CMAF.prediction, perPacketOverheadBytes: 0, perSegmentOverheadBytes: 0 } }
+    const sizes = predictSegmentSizes(packets, 4, config)
+    expect(sizes.segments).toBe(3)
+    expect(sizes.totalBytes).toBe(1404000)
+    expect(sizes.maxBytes).toBe(1002000) // (pts order would give 1401000 for the first segment)
+    // second segment holds key + both B frames + one P
+  })
+  it('finds an oversized .m4s while the pass is still running', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmaf-watch-'))
+    fs.writeFileSync(path.join(dir, 'chunk_0_00001.m4s'), Buffer.alloc(10))
+    fs.writeFileSync(path.join(dir, 'notes.txt'), Buffer.alloc(100))
+    expect(findOversizedSegment(dir, 50)).toBe(null)
+    fs.writeFileSync(path.join(dir, 'chunk_0_00002.m4s'), Buffer.alloc(60))
+    expect(findOversizedSegment(dir, 50)).toMatchObject({ name: 'chunk_0_00002.m4s', size: 60 })
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  it('kills ffmpeg at the first oversized segment instead of waiting for the end of the film', async () => {
+    const config = { ...CMAF, watch: { pollMs: 10 } }
+    const killed = []
+    const fakeSpawner = (_bin, _args, opts) => {
+      const child = new EventEmitter()
+      child.stderr = new EventEmitter()
+      child.kill = (signal) => { killed.push(signal); setTimeout(() => child.emit('close', null), 1) }
+      setTimeout(() => fs.writeFileSync(path.join(opts.cwd, 'chunk_0_00001.m4s'), Buffer.alloc(200)), 20)
+      // never closes by itself: a whole-film encode that only the watcher can stop
+      return child
+    }
+    const dir = path.join(os.tmpdir(), `cmaf-early-${process.pid}`)
+    const result = await packageCmafDashHlsWatched('in.mkv', dir, probeOf(video(1920, 1080, 'vc1')), 'transcode', { config, limitBytes: 100, spawner: fakeSpawner })
+    expect(killed).toEqual(['SIGKILL'])
+    expect(result).toMatchObject({ ok: false, abortedEarly: true })
+    expect(result.reason).toMatch(/^segment_too_large:chunk_0_00001\.m4s:200/)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  it('rejects a config without the new parameters, naming them', () => {
+    const broken = JSON.parse(JSON.stringify(CMAF))
+    delete broken.watch
+    expect(() => validateCmafConfig(broken)).toThrow(/watch\.pollMs/)
+  })
+})
+
+// 14 October 2026: real time percentage of a packaging pass (ffmpeg -progress), shown in the Create upload queue.
+describe('packaging progress percentage', () => {
+  it('parses the last out_time_us, never reports 100 before progress=end, and is null without a duration (red controls)', () => {
+    const text = 'frame=10\nout_time_us=2500000\nprogress=continue\nframe=20\nout_time_us=5000000\nprogress=continue\n'
+    expect(parseFfmpegProgress(text)).toEqual({ outSeconds: 5, ended: false })
+    expect(progressPercent(parseFfmpegProgress(text), 10)).toBe(50)
+    expect(progressPercent({ outSeconds: 11, ended: false }, 10)).toBe(99)
+    expect(progressPercent(parseFfmpegProgress(`${text}progress=end\n`), 10)).toBe(100)
+    expect(progressPercent(parseFfmpegProgress('out_time_us=N/A\n'), 10)).toBeNull()
+    expect(progressPercent({ outSeconds: 5, ended: false }, 0)).toBeNull()
+  })
+  it('passes -progress and -nostats to ffmpeg only when a progress file is given', () => {
+    const probe = { video: { codec_name: 'h264' }, audios: [], duration: 10 }
+    expect(buildFfmpegArgs('in.mkv', probe, 'copy4', { progressFile: '/tmp/p.txt' })).toEqual(expect.arrayContaining(['-progress', '/tmp/p.txt', '-nostats']))
+    expect(buildFfmpegArgs('in.mkv', probe, 'copy4')).not.toContain('-progress')
+  })
+  it('the watched runner reports the percentage while ffmpeg runs (fake ffmpeg that writes its progress)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmaf-progress-'))
+    const progressFile = path.join(dir, 'ffmpeg-progress.txt')
+    const spawner = () => {
+      const child = new EventEmitter()
+      child.stderr = new EventEmitter()
+      setTimeout(() => fs.writeFileSync(progressFile, 'out_time_us=5000000\nprogress=continue\n'), 10)
+      setTimeout(() => { fs.mkdirSync(path.join(dir, 'w'), { recursive: true }); fs.writeFileSync(path.join(dir, 'w', 'chunk_0_00001.m4s'), 'x'); fs.writeFileSync(path.join(dir, 'w', 'manifest.mpd'), 'x'); fs.writeFileSync(path.join(dir, 'w', 'master.m3u8'), 'x'); fs.appendFileSync(progressFile, 'out_time_us=10000000\nprogress=end\n'); child.emit('close', 0) }, 350)
+      return child
+    }
+    const seen = []
+    const probe = { video: { codec_name: 'h264' }, audios: [], duration: 10 }
+    const config = { ...CMAF, watch: { ...CMAF.watch, pollMs: 40 } }
+    const result = await packageCmafDashHlsWatched('in.mkv', path.join(dir, 'w'), probe, 'copy4', { config, spawner, progressFile, onProgress: (p) => seen.push(p.percent) })
+    expect(result.ok).toBe(true)
+    expect(seen).toContain(50)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+})

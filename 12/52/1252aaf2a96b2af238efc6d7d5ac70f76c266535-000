@@ -1,0 +1,670 @@
+// 07 October 2026: Attachments for ZenRay Freelance studio offers.
+// Handles drag and drop of files and whole folders, upload of image, pdf, media, audio and video,
+// direct linking with existing nodes in Create, and bidirectional navigation.
+import React, { useCallback, useRef, useState } from 'react'
+import { UI } from '../../config/colors.js'
+import Icon from '../Icon.jsx'
+import { notify } from '../Notifications.jsx'
+import { filesFromDataTransfer, filesFromInput } from '../../guest/readDrop.js'
+import { captureFiles } from '../../capture/universalCapture.js'
+import { kindForName } from '../../lib/fileKinds.js'
+import { fileKind, fmtBytes } from '../../lib/fileKind.js'
+import { addAttachment, removeAttachment, isoDay, readableDate } from '../../lib/freelanceStudios.js'
+import { P, Button, glassStyle } from './ui.jsx'
+
+function sanitizeDirName(name) {
+  return String(name || 'studio')
+    .trim()
+    .replace(/[^\w\s\u00C0-\u017F-]/g, '')
+    .replace(/\s+/g, '_')
+}
+
+export default function FreelanceAttachments({ studio, onChange, t }) {
+  const [isDragging, setIsDragging] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploadStatus, setUploadStatus] = useState('')
+  const [showLinkInput, setShowLinkInput] = useState(false)
+  const [linkPath, setLinkPath] = useState('')
+  const [previewItem, setPreviewItem] = useState(null)
+
+  const fileInputRef = useRef(null)
+  const folderInputRef = useRef(null)
+  const dragCounterRef = useRef(0)
+
+  const attachments = Array.isArray(studio?.attachments) ? studio.attachments : []
+  const studioFolder = `pages/Freelance/Attachments/${sanitizeDirName(studio?.name)}`
+
+  // Ingest files via universalCapture and attach them to the studio
+  const handleIngest = useCallback(async (fileEntries) => {
+    if (!fileEntries || !fileEntries.length) return
+    setUploading(true)
+    setUploadProgress(0)
+    setUploadStatus(`Préparation de ${fileEntries.length} fichier(s)…`)
+
+    const filesToUpload = fileEntries.map((item) => item.file).filter(Boolean)
+    const relMap = new Map(fileEntries.map((item) => [item.file.name, item.rel || '']))
+
+    try {
+      setUploadStatus(`Enregistrement vers Create (${filesToUpload.length} fichier(s))…`)
+      const results = await captureFiles(filesToUpload, {
+        folder: studioFolder,
+        onProgress: (ratio) => {
+          setUploadProgress(Math.min(1, Math.max(0, ratio)))
+        },
+      })
+
+      let currentStudio = studio
+      let addedCount = 0
+
+      for (let i = 0; i < results.length; i++) {
+        const res = results[i]
+        const origFile = filesToUpload[i]
+        const rel = relMap.get(origFile.name) || ''
+
+        if (res && res.ok) {
+          const kind = kindForName(origFile.name)
+          const newAtt = {
+            id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            name: origFile.name,
+            size: origFile.size || 0,
+            type: origFile.type || '',
+            kind,
+            nodePath: res.nodePath || `${studioFolder}/${origFile.name}`,
+            addedAt: isoDay(),
+            rel,
+          }
+          currentStudio = addAttachment(currentStudio, newAtt)
+          addedCount++
+        } else if (res && !res.ok) {
+          console.warn('[FreelanceAttachments] Échec upload pour', origFile.name, res)
+        }
+      }
+
+      if (addedCount > 0) {
+        await onChange(currentStudio)
+        notify({
+          title: 'Pièces jointes enregistrées',
+          body: `${addedCount} fichier(s) synchronisés dans Create (${studioFolder}).`,
+        })
+      } else {
+        notify({
+          title: 'Aucun fichier enregistré',
+          body: 'Vérifie le format ou la connexion au serveur.',
+        })
+      }
+    } catch (err) {
+      console.error('[FreelanceAttachments] Erreur upload:', err)
+      notify({
+        title: 'Erreur lors de l’upload',
+        body: err && err.message ? err.message : String(err),
+      })
+    } finally {
+      setUploading(false)
+      setUploadProgress(0)
+      setUploadStatus('')
+    }
+  }, [studio, studioFolder, onChange])
+
+  // Drag and drop events
+  const onDragEnter = useCallback((e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounterRef.current += 1
+    if (e.dataTransfer && e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      setIsDragging(true)
+    }
+  }, [])
+
+  const onDragOver = useCallback((e) => {
+    e.preventDefault()
+    e.stopPropagation()
+  }, [])
+
+  const onDragLeave = useCallback((e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounterRef.current -= 1
+    if (dragCounterRef.current <= 0) {
+      dragCounterRef.current = 0
+      setIsDragging(false)
+    }
+  }, [])
+
+  const onDrop = useCallback(async (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounterRef.current = 0
+    setIsDragging(false)
+    if (!e.dataTransfer) return
+    const fileEntries = await filesFromDataTransfer(e.dataTransfer)
+    if (fileEntries.length > 0) {
+      await handleIngest(fileEntries)
+    }
+  }, [handleIngest])
+
+  // File pickers
+  const onFileChange = useCallback(async (e) => {
+    const entries = filesFromInput(e.target)
+    if (entries.length > 0) {
+      await handleIngest(entries)
+    }
+    e.target.value = ''
+  }, [handleIngest])
+
+  const onFolderChange = useCallback(async (e) => {
+    const entries = filesFromInput(e.target)
+    if (entries.length > 0) {
+      await handleIngest(entries)
+    }
+    e.target.value = ''
+  }, [handleIngest])
+
+  // Link existing Create node
+  const handleLinkSubmit = useCallback(async (e) => {
+    e.preventDefault()
+    const clean = String(linkPath || '').trim()
+    if (!clean) return
+
+    let normPath = clean
+    if (!normPath.startsWith('pages/')) {
+      normPath = `pages/${normPath.replace(/^\/+/, '')}`
+    }
+
+    const name = normPath.split('/').pop().replace(/\.(img|media)\.json$/, '')
+    const kind = kindForName(name)
+
+    const newAtt = {
+      id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name,
+      size: 0,
+      kind,
+      nodePath: normPath,
+      addedAt: isoDay(),
+      rel: '',
+    }
+
+    const nextStudio = addAttachment(studio, newAtt)
+    await onChange(nextStudio)
+    setLinkPath('')
+    setShowLinkInput(false)
+    notify({
+      title: 'Fichier Create associé',
+      body: `« ${name} » a été lié à l'offre.`,
+    })
+  }, [linkPath, studio, onChange])
+
+  // Navigation synergy with Create
+  const openInCreate = useCallback((att) => {
+    if (!att || !att.nodePath) return
+    try {
+      localStorage.setItem('zr:create:cur', att.nodePath)
+    } catch {}
+    const folder = att.nodePath.replace(/\/[^/]+$/, '')
+    window.dispatchEvent(new CustomEvent('zr:create-folder', { detail: { path: folder } }))
+    notify({
+      title: 'Ouverture dans Create',
+      body: `Affichage du dossier ${folder} dans Create.`,
+    })
+  }, [])
+
+  const openStudioFolderInCreate = useCallback(() => {
+    try {
+      localStorage.setItem('zr:create:cur', studioFolder)
+    } catch {}
+    window.dispatchEvent(new CustomEvent('zr:create-folder', { detail: { path: studioFolder } }))
+    notify({
+      title: 'Dossier Create ouvert',
+      body: `Navigation vers ${studioFolder}.`,
+    })
+  }, [studioFolder])
+
+  // Copy node link
+  const copyLink = useCallback((att) => {
+    const target = att.nodePath || att.url || att.name
+    try {
+      navigator.clipboard.writeText(target)
+      notify({ title: 'Chemin copié', body: target })
+    } catch {
+      notify({ title: 'Échec de copie', body: 'Presse-papier non disponible.' })
+    }
+  }, [])
+
+  // Remove attachment
+  const handleDelete = useCallback(async (attId, name) => {
+    const nextStudio = removeAttachment(studio, attId)
+    await onChange(nextStudio)
+    notify({ title: 'Pièce jointe retirée', body: `« ${name} » a été détaché de l'offre.` })
+  }, [studio, onChange])
+
+  return (
+    <div style={{ marginTop: 22, marginBottom: 28 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+          <h3 style={{ fontFamily: P.serif, fontWeight: P.serifWeight, fontSize: 20, letterSpacing: '-0.015em', margin: 0 }}>
+            Pièces jointes & Médias
+          </h3>
+          <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 13, color: t.textSecondary }}>
+            {attachments.length} {attachments.length > 1 ? 'fichiers' : 'fichier'}
+          </span>
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            onClick={openStudioFolderInCreate}
+            title={`Ouvrir le dossier ${studioFolder} dans Create`}
+            style={{
+              background: 'none',
+              border: `1px solid ${t.border}`,
+              borderRadius: P.radius,
+              padding: '5px 10px',
+              cursor: 'pointer',
+              color: t.textPrimary,
+              fontFamily: P.sans,
+              fontSize: 12,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+            }}
+          >
+            <Icon name="folder" size={14} />
+            <span>Ouvrir dans Create ↗</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setShowLinkInput((v) => !v)}
+            style={{
+              background: 'none',
+              border: `1px solid ${t.border}`,
+              borderRadius: P.radius,
+              padding: '5px 10px',
+              cursor: 'pointer',
+              color: showLinkInput ? UI.blue : t.textSecondary,
+              fontFamily: P.sans,
+              fontSize: 12,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+            }}
+          >
+            <Icon name="link" size={13} />
+            <span>{showLinkInput ? 'Annuler le lien' : 'Lier depuis Create'}</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Input to link existing Create path without re-upload */}
+      {showLinkInput && (
+        <form onSubmit={handleLinkSubmit} style={{ display: 'flex', gap: 8, marginBottom: 14, alignItems: 'center' }}>
+          <input
+            type="text"
+            value={linkPath}
+            onChange={(e) => setLinkPath(e.target.value)}
+            placeholder="Chemin Create existant (ex: pages/CV/CV_Matthieu.pdf)…"
+            style={{
+              flex: 1,
+              background: t.surface,
+              color: t.textPrimary,
+              border: `1px solid ${t.border}`,
+              borderRadius: P.radius,
+              padding: '8px 12px',
+              fontFamily: P.sans,
+              fontSize: 13,
+              outline: 'none',
+            }}
+          />
+          <Button t={t} primary small onClick={handleLinkSubmit}>Lier</Button>
+        </form>
+      )}
+
+      {/* Drag and Drop Zone */}
+      <div
+        onDragEnter={onDragEnter}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+        style={{
+          border: `2px dashed ${isDragging ? UI.blue : t.border}`,
+          borderRadius: P.radius,
+          background: isDragging ? 'rgba(10, 132, 255, 0.08)' : (t.surface || 'rgba(255, 255, 255, 0.02)'),
+          padding: '20px 18px',
+          textAlign: 'center',
+          transition: 'border-color 0.15s ease, background-color 0.15s ease',
+          marginBottom: 16,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 12,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: isDragging ? UI.blue : t.textSecondary }}>
+          <Icon name="paperclip" size={20} color={isDragging ? UI.blue : t.textSecondary} />
+          <span style={{ fontFamily: P.sans, fontSize: 13.5, fontWeight: isDragging ? 600 : 400 }}>
+            {isDragging ? 'Dépose les fichiers ou le dossier ici' : 'Glisse-dépose tes fichiers ou dossiers complets ici'}
+          </span>
+        </div>
+
+        <div style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>
+          Images, PDF, vidéos, pistes audio, modèles 3D : synchronisés directement avec Create
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'center' }}>
+          <Button t={t} small onClick={() => fileInputRef.current?.click()} disabled={uploading}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <Icon name="photo" size={13} />
+              <span>Choisir des fichiers</span>
+            </span>
+          </Button>
+
+          <Button t={t} small onClick={() => folderInputRef.current?.click()} disabled={uploading}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <Icon name="folder" size={13} />
+              <span>Choisir un dossier complet</span>
+            </span>
+          </Button>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            onChange={onFileChange}
+            style={{ display: 'none' }}
+          />
+
+          <input
+            ref={folderInputRef}
+            type="file"
+            multiple
+            webkitdirectory=""
+            directory=""
+            onChange={onFolderChange}
+            style={{ display: 'none' }}
+          />
+        </div>
+
+        {/* Upload progress indicator */}
+        {uploading && (
+          <div style={{ width: '100%', maxWidth: 380, marginTop: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: P.sans, fontSize: 12, color: t.textSecondary, marginBottom: 5 }}>
+              <span>{uploadStatus}</span>
+              <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight }}>{Math.round(uploadProgress * 100)} %</span>
+            </div>
+            <div style={{ width: '100%', height: 4, background: 'rgba(255, 255, 255, 0.1)', borderRadius: 2, overflow: 'hidden' }}>
+              <div
+                style={{
+                  width: `${Math.round(uploadProgress * 100)}%`,
+                  height: '100%',
+                  background: UI.blue,
+                  transition: 'width 0.2s ease',
+                }}
+              />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Attachments List */}
+      {attachments.length > 0 ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 280px), 1fr))', gap: 10 }}>
+          {attachments.map((att) => {
+            const kInfo = fileKind(att.name)
+            const streamUrl = att.nodePath ? `/api/stream?path=${encodeURIComponent(att.nodePath)}` : (att.url || '')
+            const isAudio = att.kind === 'audio'
+            const isVideo = att.kind === 'video'
+            const isImage = att.kind === 'image'
+            const isPdf = att.kind === 'pdf'
+
+            return (
+              <div
+                key={att.id}
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                  padding: '12px 14px',
+                  borderRadius: P.radius,
+                  background: t.surface,
+                  border: `1px solid ${t.border}`,
+                  minWidth: 0,
+                  position: 'relative',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+                  <span
+                    style={{
+                      width: 32,
+                      height: 32,
+                      borderRadius: 6,
+                      background: `${kInfo.color}22`,
+                      color: kInfo.color,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      flex: '0 0 auto',
+                    }}
+                  >
+                    {isAudio && <Icon name="music.note" size={17} />}
+                    {isVideo && <Icon name="film" size={17} />}
+                    {isImage && <Icon name="photo" size={17} />}
+                    {isPdf && <Icon name="doc.text" size={17} />}
+                    {!isAudio && !isVideo && !isImage && !isPdf && <Icon name="doc" size={17} />}
+                  </span>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1 }}>
+                    <span
+                      title={att.name}
+                      style={{
+                        fontFamily: P.sans,
+                        fontSize: 13,
+                        fontWeight: 500,
+                        color: t.textPrimary,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {att.name}
+                    </span>
+                    <span style={{ fontFamily: P.sans, fontSize: 11.5, color: t.textSecondary }}>
+                      {[fmtBytes(att.size), kInfo.label, att.rel ? `dossier ${att.rel.split('/')[0]}` : ''].filter(Boolean).join(' · ')}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleDelete(att.id, att.name)}
+                    title="Supprimer cette pièce jointe"
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      cursor: 'pointer',
+                      color: t.textSecondary,
+                      padding: 4,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <Icon name="xmark" size={14} />
+                  </button>
+                </div>
+
+                {/* Inline Audio Player */}
+                {isAudio && streamUrl && (
+                  <div style={{ marginTop: 4 }}>
+                    <audio
+                      controls
+                      src={streamUrl}
+                      preload="none"
+                      style={{ width: '100%', height: 32, outline: 'none' }}
+                    />
+                  </div>
+                )}
+
+                {/* Media preview trigger */}
+                {(isImage || isVideo || isPdf) && (
+                  <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewItem(att)}
+                      style={{
+                        background: 'rgba(255, 255, 255, 0.04)',
+                        border: `1px solid ${t.border}`,
+                        borderRadius: 6,
+                        padding: '4px 8px',
+                        cursor: 'pointer',
+                        color: t.textPrimary,
+                        fontFamily: P.sans,
+                        fontSize: 11.5,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 5,
+                      }}
+                    >
+                      <Icon name="eye" size={12} />
+                      <span>Aperçu rapide</span>
+                    </button>
+                  </div>
+                )}
+
+                {/* Bottom actions & metadata */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginTop: 4, paddingTop: 6, borderTop: `1px solid ${t.border}` }}>
+                  <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 11, color: t.textSecondary }}>
+                    {readableDate(att.addedAt)}
+                  </span>
+
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <button
+                      type="button"
+                      onClick={() => copyLink(att)}
+                      title="Copier le chemin Create"
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        cursor: 'pointer',
+                        color: t.textSecondary,
+                        fontSize: 11.5,
+                        fontFamily: P.sans,
+                        padding: 2,
+                      }}
+                    >
+                      copier
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => openInCreate(att)}
+                      title="Ouvrir le nœud dans Create"
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        cursor: 'pointer',
+                        color: UI.blue,
+                        fontSize: 11.5,
+                        fontFamily: P.sans,
+                        fontWeight: 500,
+                        padding: 2,
+                      }}
+                    >
+                      Create ↗
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      ) : (
+        <div style={{ fontFamily: P.sans, fontSize: 13, color: t.textSecondary, fontStyle: 'italic', padding: '6px 0' }}>
+          Aucune pièce jointe enregistrée pour cette offre. Dépose des fichiers pour préparer ton portfolio ou tes lettres.
+        </div>
+      )}
+
+      {/* Preview Modal */}
+      {previewItem && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.75)',
+            backdropFilter: 'blur(8px)',
+            WebkitBackdropFilter: 'blur(8px)',
+            zIndex: 1000,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 20,
+          }}
+          onClick={() => setPreviewItem(null)}
+        >
+          <div
+            style={{
+              position: 'relative',
+              maxWidth: '90vw',
+              maxHeight: '85vh',
+              background: t.surface || '#1c1c1e',
+              border: `1px solid ${t.border}`,
+              borderRadius: P.radius,
+              padding: 16,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 12,
+              boxShadow: '0 20px 40px rgba(0,0,0,0.5)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+              <span style={{ fontFamily: P.sans, fontSize: 14, fontWeight: 500, color: t.textPrimary }}>
+                {previewItem.name}
+              </span>
+              <button
+                type="button"
+                onClick={() => setPreviewItem(null)}
+                style={{ background: 'none', border: 'none', color: t.textSecondary, cursor: 'pointer', padding: 4 }}
+              >
+                <Icon name="xmark" size={16} />
+              </button>
+            </div>
+
+            <div style={{ maxWidth: '80vw', maxHeight: '70vh', overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              {previewItem.kind === 'image' && (
+                <img
+                  src={`/api/stream?path=${encodeURIComponent(previewItem.nodePath)}`}
+                  alt={previewItem.name}
+                  style={{ maxWidth: '100%', maxHeight: '65vh', objectFit: 'contain', borderRadius: 4 }}
+                />
+              )}
+              {previewItem.kind === 'video' && (
+                <video
+                  controls
+                  autoPlay
+                  src={`/api/stream?path=${encodeURIComponent(previewItem.nodePath)}`}
+                  style={{ maxWidth: '100%', maxHeight: '65vh', borderRadius: 4 }}
+                />
+              )}
+              {previewItem.kind === 'pdf' && (
+                <iframe
+                  src={`/api/stream?path=${encodeURIComponent(previewItem.nodePath)}`}
+                  title={previewItem.name}
+                  style={{ width: '70vw', height: '65vh', border: 'none', borderRadius: 4 }}
+                />
+              )}
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <Button t={t} small onClick={() => openInCreate(previewItem)}>
+                Ouvrir dans Create ↗
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

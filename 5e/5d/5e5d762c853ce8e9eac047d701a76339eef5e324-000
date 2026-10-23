@@ -1,0 +1,1281 @@
+#!/usr/bin/env python3
+# ProcessFilmsSequentially.py (10 October 2026) : traite un film x a la fois (archive cloud parts + streaming HLS/DASH + preuve SHA-256 + suppression locale x + mise a jour de FilmsIndexMapping.md).
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import WorkCategories as WORK_CATEGORIES  # 14 October 2026: category folder decided BEFORE the upload. FR : dossier decide avant l'envoi.
+
+ROOT = Path('/Users/zenray/.claude/tmp/tmp-films-series')
+# 14 October 2026: roots under which a local source may be unloaded (the unload refuses any source outside its root). Downloads is
+# one of them since the film batches can arrive there. ZR_UNLOAD_ROOTS adds more, separated by colons.
+# FR : racines sous lesquelles une source locale peut etre dechargee ; Downloads en fait partie.
+UNLOAD_ROOTS = [ROOT, Path('/Users/zenray/Downloads')] + [Path(x) for x in os.environ.get('ZR_UNLOAD_ROOTS', '').split(':') if x]
+
+
+def unload_root_for(source):
+    for candidate in UNLOAD_ROOTS:
+        try:
+            Path(source).resolve().relative_to(candidate.resolve())
+            return candidate
+        except ValueError:
+            continue
+    return ROOT
+BASE = Path('/Users/zenray/.claude/tmp/tmp-movies-series-upload')
+def _find_repo():
+    # 14 October 2026: ZR_PROGRESS_REPO, else the repository that contains this script, else the main checkout.
+    # FR : variable d'environnement, sinon le depot qui contient ce script, sinon le checkout principal.
+    given = os.environ.get('ZR_PROGRESS_REPO')
+    if given:
+        return Path(given)
+    here = Path(__file__).resolve().parents[2]
+    if (here / 'scripts' / 'AttachVideoCmafDashHls.mjs').exists():
+        return here
+    return Path('/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress')
+
+
+REPO = _find_repo()
+CLONE = BASE / 'ManifestClone'
+RECOVERY_DIR = BASE / 'RecoveryReceipts'
+UNLOAD_DIR = BASE / 'UnloadAudit'
+STAGE_DIR = BASE / 'FilteredStage'
+LIVE_STATUS = BASE / 'LiveTransferStatus.json'
+LOG_FILE = BASE / 'SequentialWorker.log'
+PAUSE_FILE = BASE / 'PAUSE'
+MIN_FREE_BYTES = 8 * 1024 ** 3
+
+RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+UNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+STAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+QUEUE = None  # 14 October 2026: per-file status (QueueStatus.py), created once the task list is known. FR : statut par fichier.
+
+
+def log(msg):
+    stamp = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
+    line = f'[{stamp}] {msg}\n'
+    if QUEUE is not None:
+        try:
+            QUEUE.on_log(msg)
+        except Exception:
+            pass  # the status file never breaks an upload
+    with LOG_FILE.open('a', encoding='utf-8') as f:
+        f.write(line)
+    print(line, end='', flush=True)
+
+
+def sha256_file(path_obj):
+    h = hashlib.sha256()
+    with path_obj.open('rb') as f:
+        while True:
+            chunk = f.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def stat_record(path_obj):
+    st = path_obj.stat()
+    return {
+        'bytes': st.st_size,
+        'mtimeMs': st.st_mtime * 1000.0,
+        'inode': st.st_ino,
+        'device': st.st_dev,
+        'mode': st.st_mode,
+    }
+
+
+def load_index_progress():
+    idx_file = BASE / 'FilmsIndexMapping.json'
+    if idx_file.exists():
+        try:
+            data = json.loads(idx_file.read_text())
+            return data.get('videoProgress') or {}
+        except Exception:
+            pass
+    return {}
+
+
+# 12 October 2026: ONE Git writer at a time on the shared manifest clone. The archive upload of film N+1 now runs while film N is
+# packaged and its subtitles are committed, so every writer (Node scripts and this worker) takes the same directory lock
+# <clone>.lock/owner.json that scripts/lib/clone-lock.mjs uses.
+# FR : un seul ecrivain Git a la fois sur le clone ; meme protocole sur disque que le verrou Node.
+import contextlib
+import uuid
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+@contextlib.contextmanager
+def clone_lock(label, wait_s=3600, poll_s=0.25):
+    lock_dir = os.path.realpath(str(CLONE)).rstrip('/') + '.lock'
+    owner_path = os.path.join(lock_dir, 'owner.json')
+    token = f'{os.getpid()}-{uuid.uuid4()}'
+    started = time.monotonic()
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            with open(owner_path, 'w') as handle:
+                json.dump({'pid': os.getpid(), 'token': token, 'at': datetime.now().astimezone().isoformat(), 'label': label}, handle)
+            break
+        except FileExistsError:
+            try:
+                owner = json.load(open(owner_path))
+                alive = _pid_alive(owner.get('pid'))
+            except Exception:
+                # directory exists but owner.json is not written yet (or is broken): give it 15 minutes
+                try:
+                    alive = (time.time() - os.path.getmtime(lock_dir)) < 900
+                except FileNotFoundError:
+                    continue
+            if not alive:
+                stale = f'{lock_dir}.stale-{token}'
+                try:
+                    os.rename(lock_dir, stale)
+                    shutil.rmtree(stale, ignore_errors=True)
+                except FileNotFoundError:
+                    pass
+                continue
+            if time.monotonic() - started > wait_s:
+                raise TimeoutError(f'{label}: clone lock held for more than {wait_s} s')
+            time.sleep(poll_s)
+    try:
+        yield
+    finally:
+        try:
+            if json.load(open(owner_path)).get('token') == token:
+                shutil.rmtree(lock_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+# 12 October 2026: GitHub answers "403 You have exceeded a secondary rate limit ... temporarily blocked from content creation"
+# when repos are created or pushed too fast (also by OTHER jobs of the same account). That is not a failure of the film: the
+# worker must wait, with a growing pause, and retry the SAME film, instead of burning 4 attempts and abandoning the whole queue
+# in a few minutes (what happened at 01:46 on 12 October 2026).
+# FR : un 403 "secondary rate limit" n'est pas une erreur du film : on attend (pause croissante) et on reessaie le MEME film.
+import re
+
+
+class GitHubThrottled(Exception):
+    pass
+
+
+THROTTLE_PATTERN = re.compile(r'HTTP 403|secondary rate limit|temporarily blocked|abuse detection|HTTP 429')
+
+
+def run_step(cmd, **kwargs):
+    """subprocess.run(check=True) that recognises a GitHub throttle in the output and raises GitHubThrottled."""
+    res = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    if res.stdout:
+        sys.stdout.write(res.stdout[-6000:])
+    if res.stderr:
+        sys.stderr.write(res.stderr[-3000:])
+    if res.returncode != 0:
+        blob = (res.stdout or '') + '\n' + (res.stderr or '')
+        if THROTTLE_PATTERN.search(blob):
+            raise GitHubThrottled(blob.strip()[-400:])
+        raise subprocess.CalledProcessError(res.returncode, cmd, res.stdout, res.stderr)
+    return res
+
+
+# 12 October 2026: two phases of a film use opposite directions of the line (upload uses the uplink, the SHA-256 check reads the
+# cloud back through the downlink). They now overlap: while film N is verified and unloaded in the background, film N+1 uploads.
+# FR : l'envoi (montee) du film N+1 chevauche la verification (descente) du film N. ZR_PIPELINE=0 remet l'ancien mode sequentiel.
+PIPELINE = os.environ.get('ZR_PIPELINE', '1') != '0'
+LANES = os.environ.get('ZR_PACKAGE_LANE', '1') != '0'  # 12 October 2026: packaging in its own lane (0 = previous behaviour)
+STATUS_LOCK = threading.Lock()
+MAPPING_LOCK = threading.Lock()  # one rebuild of FilmsIndexMapping at a time (12 October 2026)
+
+
+def write_live_status(status, current_item='', current_step='', bytes_per_second=0, extra=None):
+    with STATUS_LOCK:
+        _write_live_status(status, current_item, current_step, bytes_per_second, extra)
+
+
+def _write_live_status(status, current_item='', current_step='', bytes_per_second=0, extra=None):
+    prog = load_index_progress()
+    total_videos = 230  # (10 October 2026) 233 videos moins les 3 exceptions locales conservees sur disque
+    unloaded = int(prog.get('unloadedCount', 0))
+    freed_bytes = int(prog.get('freedBytes', 0))
+    total_bytes = 252 * 1024 ** 3
+    payload = {
+        'status': status,
+        'updatedAt': datetime.now().astimezone().isoformat(),
+        'currentItem': current_item,
+        'currentStep': current_step,
+        'bytesPerSecond': int(bytes_per_second or 0),
+        'completedUnits': unloaded,
+        'totalUnits': total_videos,
+        'completedBytes': freed_bytes,
+        'totalBytes': total_bytes,
+        'freedBytes': freed_bytes,
+        'freedGiB': round(freed_bytes / (1024 ** 3), 3),
+        'onDriveCount': int(prog.get('onDriveCount', 0)),
+        'hlsDashVerifiedCount': int(prog.get('hlsDashVerifiedCount', 0)),
+        'fullRecoveryVerifiedCount': int(prog.get('fullRecoveryVerifiedCount', 0)),
+        'freeDiskGiB': round(shutil.disk_usage('/Users/zenray').free / (1024 ** 3), 2),
+    }
+    if extra:
+        payload.update(extra)
+    tmp_path = LIVE_STATUS.with_suffix('.tmp')
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n')
+    tmp_path.replace(LIVE_STATUS)
+
+
+def wait_if_paused(current_item=''):
+    while PAUSE_FILE.exists():
+        write_live_status('paused', current_item=current_item, current_step='Pause demandee (fichier PAUSE actif)')
+        time.sleep(5)
+
+
+def load_unloaded_sources():
+    unloaded = set()
+    for unl_file in UNLOAD_DIR.glob('*.json'):
+        try:
+            data = json.loads(unl_file.read_text())
+            if data.get('unloaded') or data.get('status') == 'unloaded':
+                src = data.get('localPath') or data.get('source')
+                if src:
+                    unloaded.add(src)
+        except Exception:
+            pass
+    return unloaded
+
+
+def restore_tracked_changes(clone):
+    """Tracked files deleted or modified in the working tree go back to HEAD; untracked and staged files are left alone."""
+    raw = subprocess.run(['git', '-C', str(clone), 'status', '--porcelain', '-z'], capture_output=True, text=True).stdout
+    restored = []
+    for entry in raw.split('\0'):
+        if len(entry) > 3 and entry[0] == ' ' and entry[1] in ('D', 'M'):
+            res = subprocess.run(['git', '-C', str(clone), 'checkout', '--', entry[3:]], capture_output=True, text=True)
+            if res.returncode == 0:
+                restored.append(entry[3:])
+    return restored
+
+
+CATEGORY_TABLE = WORK_CATEGORIES.load_table(os.environ.get('ZR_WORK_CATEGORIES') or WORK_CATEGORIES.TABLE_PATH)
+NEEDS_CATEGORY_FILE = BASE / 'NeedsCategory.json'
+# 14 October 2026 (Matthieu): a file the table does not know is never guessed. Two questions, always asked together.
+# FR : un fichier que la table ne connait pas n'est jamais devine ; deux questions, toujours posees ensemble.
+NEEDS_CATEGORY_QUESTION = ("Dans quel dossier (Anime, Movies, Series, Documentaries, ou un autre dossier a nommer) ? "
+                           "Et streaming OU archive (jamais les deux par defaut) ?")
+
+
+def resolve_dest(name, declared=None):
+    """Destination folder of a film, decided from the known-works table BEFORE any upload (14 October 2026).
+    A declared destination already inside <base>/<Category> is kept. A legacy or flat declaration is replaced by the table.
+    Returns None when the work is unknown: the caller must ask Matthieu, then add the work to WorkCategories.json.
+    FR : dossier decide avant l'envoi depuis la table des oeuvres ; None = oeuvre inconnue, demander puis ajouter au JSON."""
+    base = CATEGORY_TABLE['base']
+    if declared and declared.startswith(base + '/'):
+        head = declared[len(base) + 1:].split('/', 1)[0]
+        if head in CATEGORY_TABLE['categories']:
+            return declared
+    return WORK_CATEGORIES.full_destination(name, CATEGORY_TABLE)
+
+
+def canonical_dest(dest):
+    """Folder case taken from the manifest clone. APFS ignores case and git does not: a destination spelled "House of the Dragon"
+    next to the tracked "House Of The Dragon" broke the commit of film S03E07 and deleted its manifest (12 October 2026).
+    FR : chaque dossier prend la casse du dossier deja present dans le clone des manifestes."""
+    current = CLONE
+    fixed = []
+    for part in Path(dest).parts:
+        match = part
+        if current.is_dir():
+            for entry in current.iterdir():
+                if entry.is_dir() and entry.name.casefold() == part.casefold():
+                    match = entry.name
+                    break
+        fixed.append(match)
+        current = current / match
+    return str(Path(*fixed))
+
+
+def build_queues():
+    # 14 October 2026: ZR_ONLY_PLAN=<plan.json> runs the FULL pipeline (archive, CMAF, subtitles, proof, unload) on that plan only,
+    # without the historical inventory. FR : ZR_ONLY_PLAN lance le pipeline complet sur ce seul plan.
+    only_plan = os.environ.get('ZR_ONLY_PLAN')
+    if only_plan:
+        inventory = {}
+        ready_list = json.loads(Path(only_plan).read_text())
+        filtered_list = []
+        dup_list = []
+    else:
+        inventory = {x['source']: x for x in json.loads((BASE / 'Inventory.json').read_text())}
+        ready_list = json.loads((BASE / 'ReadyUploadPlan.json').read_text())
+        filtered_list = json.loads((BASE / 'FullFilteredQueue.json').read_text())
+        dup_list = json.loads((BASE / 'DuplicateProof.json').read_text())
+
+    ready_by_src = {x['src']: x for x in ready_list}
+    filtered_by_src = {x['source']: x for x in filtered_list}
+
+    duplicates_of = {}
+    for item in dup_list:
+        members = [item['source']] + item['identicalCopies']
+        admitted = [p for p in members if p in ready_by_src or p in filtered_by_src]
+        if len(admitted) == 1:
+            adm = admitted[0]
+            duplicates_of[adm] = [m for m in members if m != adm]
+
+    tasks = []
+    needs_category = []
+    for src, item in ready_by_src.items():
+        name = item['name']
+        decided = resolve_dest(name, item.get('dest'))
+        if decided is None:
+            needs_category.append({'source': src, 'name': name, 'ask': NEEDS_CATEGORY_QUESTION})
+            continue
+        dest = canonical_dest(decided)
+        rel_manifest = f"{dest}/{Path(name).stem}{Path(src).suffix.lower()}.media.json"
+        abs_manifest = CLONE / rel_manifest
+        size_bytes = int(inventory.get(src, {}).get('sizeBytes') or (Path(src).stat().st_size if Path(src).exists() else 0))
+        tasks.append({
+            'kind': 'ready',
+            'source': src,
+            'name': name,
+            'dest': dest,
+            'relManifest': rel_manifest,
+            'absManifest': abs_manifest,
+            'sizeBytes': size_bytes,
+            'onDriveAlready': abs_manifest.exists(),
+            'duplicates': duplicates_of.get(src, []),
+            'languageMap': None,
+            # 14 October 2026: "cmaf": false in the plan is an EXPLICIT choice of Matthieu (archive only, no streaming); the default is CMAF.
+            # FR : "cmaf": false dans le plan est un choix explicite ; par defaut, CMAF.
+            'cmaf': item.get('cmaf', True) is not False,
+            # 14 October 2026 (policy streaming only): "mode" is "stream" (default) or "archive" (explicit, ONE of the two, never both by
+            # default); "unload": false keeps the source on disk (tests). FR : mode "stream" par defaut ou "archive" explicite ; unload:false garde la source.
+            'mode': item.get('mode'),
+            'unload': item.get('unload', True) is not False,
+        })
+
+    for src, item in filtered_by_src.items():
+        p = Path(src)
+        name = p.name
+        decided = resolve_dest(name)
+        if decided is None:
+            needs_category.append({'source': src, 'name': name, 'ask': NEEDS_CATEGORY_QUESTION})
+            continue
+        dest = canonical_dest(decided)
+        rel_manifest = f"{dest}/{p.stem}{p.suffix.lower()}.media.json"
+        abs_manifest = CLONE / rel_manifest
+        size_bytes = int(inventory.get(src, {}).get('sizeBytes') or (p.stat().st_size if p.exists() else 0))
+        tasks.append({
+            'kind': 'filtered',
+            'source': src,
+            'name': name,
+            'dest': dest,
+            'relManifest': rel_manifest,
+            'absManifest': abs_manifest,
+            'sizeBytes': size_bytes,
+            'onDriveAlready': abs_manifest.exists(),
+            'duplicates': duplicates_of.get(src, []),
+            'languageMap': item.get('languageMap'),
+            'mode': None,
+            'unload': True,
+        })
+
+    if needs_category:
+        NEEDS_CATEGORY_FILE.write_text(json.dumps(needs_category, ensure_ascii=False, indent=2), encoding='utf-8')
+        log(f'NEEDS CATEGORY AND MODE: {len(needs_category)} file(s) not uploaded, work unknown, ask Matthieu (see {NEEDS_CATEGORY_FILE}): '
+            + ', '.join(x['name'] for x in needs_category))
+    elif NEEDS_CATEGORY_FILE.exists():
+        NEEDS_CATEGORY_FILE.unlink()
+
+    # Priorite 1 : films deja presents sur le Drive (plus petits d'abord pour liberer vite), puis le reste par taille croissante (10 October 2026)
+    # 12 October 2026: ZR_QUEUE_ORDER = small-first (default, frees disk quickly) or large-first. The film sent last carries its whole
+    # packaging and read-back tail alone, so with a long queue of big films the largest ones go first and their tails sit under the
+    # uploads of the others. Films whose archive is already on the Drive always come first (only packaging and proof are left).
+    # FR : le dernier film envoye porte seul sa queue (empaquetage, relecture) ; les plus gros partent donc en premier.
+    large_first = os.environ.get('ZR_QUEUE_ORDER', 'small-first') == 'large-first'
+    tasks.sort(key=lambda t: (0 if t['onDriveAlready'] else 1,
+                              -t['sizeBytes'] if (large_first and not t['onDriveAlready']) else t['sizeBytes'], t['name']))
+    return tasks
+
+
+def unload_duplicate_if_present(dup_path_str, base_receipt_path, abs_manifest, env):
+    dup_path = Path(dup_path_str)
+    if not dup_path.exists():
+        return
+    dup_hash_id = hashlib.sha1(dup_path_str.encode('utf-8')).hexdigest()[:12]
+    dup_receipt_path = RECOVERY_DIR / f"{dup_path.name}.{dup_hash_id}.dup.recovery.json"
+    base_receipt = json.loads(base_receipt_path.read_text())
+    dup_receipt = dict(base_receipt)
+    dup_receipt['source'] = str(dup_path.resolve())
+    dup_receipt['sourceStat'] = stat_record(dup_path)
+    dup_receipt['identicalToManifest'] = True
+    if 'filteredSourceStat' in dup_receipt:
+        dup_receipt['filteredSourceStat'] = stat_record(dup_path)
+    dup_receipt_path.write_text(json.dumps(dup_receipt, indent=2) + '\n')
+
+    cmd = [
+        'node',
+        str(REPO / 'scripts/UnloadVideoCloud.mjs'),
+        str(dup_receipt_path),
+        str(ROOT),
+        str(UNLOAD_DIR),
+    ]
+    res = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True)
+    if res.returncode == 0:
+        log(f"  ✓ Copie identique dechargee: {dup_path.name}")
+    else:
+        log(f"  ⚠ Echec unload copie identique {dup_path.name}: {(res.stderr or res.stdout).strip()[:240]}")
+
+
+class WindowGate:
+    """Admission of films that are not unloaded yet: bounded by a count AND by the bytes they hold on the local disk.
+    A film always gets in when nothing else is in flight (a 19 GiB film must be able to run alone)."""
+
+    def __init__(self, slots, budget_bytes):
+        self.cv = threading.Condition()
+        self.slots, self.budget, self.count, self.bytes = slots, budget_bytes, 0, 0
+
+    def acquire(self, need, timeout=5):
+        with self.cv:
+            deadline = time.monotonic() + timeout
+            while not (self.count < self.slots and (self.count == 0 or self.bytes + need <= self.budget)):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self.cv.wait(left)
+            self.count += 1
+            self.bytes += need
+            return True
+
+    def release(self, need):
+        with self.cv:
+            self.count -= 1
+            self.bytes -= need
+            self.cv.notify_all()
+
+
+INDEX_SPOOL = Path(os.path.expanduser('~/.zr-archive-work-mapped/IndexAddSpool.txt'))
+INDEX_FLUSH_LOCK = threading.Lock()
+
+
+def flush_index_spool(env, minimum=1):
+    """One index-add for every path spooled by the uploads (REST: a few content-creating requests instead of 4 per film).
+    The spool is taken by an atomic rename: an upload appending meanwhile writes a fresh file, nothing is lost (12 October 2026).
+    FR : le fichier d'attente est pris par un renommage atomique ; un envoi qui ajoute pendant ce temps ecrit un nouveau fichier."""
+    with INDEX_FLUSH_LOCK:
+        batch = INDEX_SPOOL.with_suffix('.flushing.txt')
+        taken = INDEX_SPOOL.with_suffix('.taken.txt')
+        try:
+            if INDEX_SPOOL.exists() and not taken.exists():
+                INDEX_SPOOL.replace(taken)
+            if taken.exists():
+                with batch.open('a', encoding='utf-8') as out:
+                    out.write(taken.read_text())
+                taken.unlink()
+            lines = [line.strip() for line in batch.read_text().splitlines() if line.strip()] if batch.exists() else []
+        except Exception:
+            return
+        unique = sorted(set(lines))
+        if not unique or len(lines) < minimum:
+            return
+        listing = batch.with_suffix('.list.txt')
+        listing.write_text('\n'.join(unique) + '\n')
+        res = subprocess.run(['node', str(REPO / 'scripts/index-add-paths.mjs'), str(listing)], cwd=REPO, env=env, capture_output=True, text=True)
+        listing.unlink(missing_ok=True)
+        if res.returncode == 0:
+            batch.unlink(missing_ok=True)
+            log(f"  Index de recherche: {len(unique)} chemin(s) ajoute(s) en un seul lot")
+        else:
+            log(f"  ⚠ Index de recherche non mis a jour (sera retente): {(res.stderr or res.stdout).strip()[-160:]}")
+
+
+def ensure_manifest_online(abs_manifest, name):
+    """The local original is deleted only if the manifest that describes its cloud copy is ONLINE (origin/main), byte for byte.
+    At 07:27 Black Panther 2018 was unloaded while its three manifest commits had never been pushed (12 October 2026).
+    FR : l'original ne part que si son manifeste est en ligne, octet pour octet ; sinon on pousse, puis on leve une erreur."""
+    rel = os.path.relpath(os.path.realpath(abs_manifest), os.path.realpath(CLONE))
+    for attempt in range(1, 4):
+        with clone_lock(f'manifest online check {name}'):
+            subprocess.run(['git', '-C', str(CLONE), 'fetch', '-q', 'origin', 'main'], capture_output=True, text=True)
+            remote = subprocess.run(['git', '-C', str(CLONE), 'rev-parse', f'origin/main:{rel}'], capture_output=True, text=True)
+            local = subprocess.run(['git', '-C', str(CLONE), 'hash-object', str(abs_manifest)], capture_output=True, text=True)
+            if remote.returncode == 0 and local.returncode == 0 and remote.stdout.strip() == local.stdout.strip():
+                return
+            subprocess.run(['git', '-C', str(CLONE), 'pull', '--rebase', '-q', 'origin', 'main'], capture_output=True, text=True)
+            subprocess.run(['git', '-C', str(CLONE), 'push', '-q', 'origin', 'HEAD:main'], capture_output=True, text=True)
+        time.sleep(5 * attempt)
+    raise RuntimeError(f"manifest of {name} is not online (origin/main differs from the local file): the original stays on disk")
+
+
+def throttle_pause(throttled, text=''):
+    """Wait before retrying a throttled GitHub write: the ladder 60, 120, 240, 300 s (capped at 5 minutes, the blocks measured on
+    12 October 2026 lasted 15 to 30 minutes) unless GitHub names a longer delay in retry-after. FR : echelle plafonnee a 5 minutes."""
+    ladder = min(300, 60 * 2 ** (max(1, throttled) - 1))
+    match = re.search(r'retry-after=(\d+)s', text or '')
+    return max(ladder, int(match.group(1)) + 5) if match else ladder
+
+
+def task_need(task):
+    # worst case on the local disk while the film is in flight: the source, plus the filtered copy for the subtitle-filtered films
+    return int(task.get('sizeBytes') or 0) * (2 if task.get('kind') == 'filtered' else 1)
+
+
+def process_one_task(task, index, total, env, throughput_state, defer_finish=None, defer_package=None):
+    src_path = Path(task['source'])
+    name = task['name']
+    abs_manifest = task['absManifest']
+    unloaded_sources = load_unloaded_sources()
+
+    if str(src_path) in unloaded_sources and not src_path.exists():
+        # Verifier si des doublons restent a decharger (10 October 2026)
+        hash_id = hashlib.sha1(str(src_path).encode('utf-8')).hexdigest()[:12]
+        rec_candidates = [
+            RECOVERY_DIR / f"{name}.{hash_id}.recovery.json",
+            RECOVERY_DIR / f"{name}.recovery.json",
+        ]
+        rec_found = next((p for p in rec_candidates if p.exists()), None)
+        if rec_found:
+            for dup in task['duplicates']:
+                if Path(dup).exists():
+                    unload_duplicate_if_present(dup, rec_found, abs_manifest, env)
+        return False
+
+    if not src_path.exists():
+        log(f"Skip {name}: source absente localement")
+        return False
+
+    wait_if_paused(name)
+    t_start = time.monotonic()
+    size_bytes = src_path.stat().st_size
+    hash_id = hashlib.sha1(str(src_path).encode('utf-8')).hexdigest()[:12]
+    receipt_path = RECOVERY_DIR / f"{name}.{hash_id}.recovery.json"
+
+    upload_source = src_path
+    prepared_copy = None
+    completed = False
+    handed_off = False
+    finished_ok = [False]
+
+    try:
+        # Si le film fait partie des 25 avec filtrage de sous-titres (10 October 2026)
+        if task['kind'] == 'filtered':
+            existing_prep = BASE / 'Prepared' / name
+            staged_prep = STAGE_DIR / name
+            prepared_copy = existing_prep if existing_prep.exists() else staged_prep
+            if not prepared_copy.exists():
+                write_live_status('running', current_item=name, current_step=f"[{index}/{total}] Filtrage sous-titres ({size_bytes / 1024**2:.0f} Mio)", bytes_per_second=throughput_state['bps'])
+                prep_cmd = ['python3', str(BASE / 'Scripts/PrepareSubtitleCopy.py'), str(src_path), str(prepared_copy)]
+                if task.get('languageMap'):
+                    prep_cmd += ['--language-map', str(BASE / 'SubtitleInspection' / task['languageMap'])]
+                subprocess.run(prep_cmd, cwd=REPO, env=env, check=True)
+            upload_source = prepared_copy
+
+        # 11 October 2026: a push cut mid-way leaves the shard byte counter bumped in the clone; upload-mapped-git then
+        # refuses every later film ("clone is dirty"). Restore that single generated file before each film.
+        # FR : un push coupe laisse le compteur du shard modifie ; on le remet a la version commitee avant chaque film.
+        with clone_lock('worker pre-step: repair of a dirty or interrupted clone'):
+            dirty = subprocess.run(['git', '-C', str(CLONE), 'status', '--porcelain'], capture_output=True, text=True).stdout.split('\n')
+            dirty = [line[3:] for line in dirty if line.strip()]
+            # 12 October 2026: a rebase left unfinished in the manifest clone (two git writers at once) made every film fail with
+            # "already a rebase-merge directory" and the worker abandoned them one by one. Finish or abort it before anything else.
+            # FR : un rebase reste en suspens dans le clone ; on le termine (ou l'abandonne) avant tout upload.
+            if (CLONE / '.git' / 'rebase-merge').exists() or (CLONE / '.git' / 'rebase-apply').exists():
+                cont = subprocess.run(['git', '-C', str(CLONE), '-c', 'core.editor=true', 'rebase', '--continue'], capture_output=True, text=True)
+                if cont.returncode != 0:
+                    subprocess.run(['git', '-C', str(CLONE), 'rebase', '--abort'], capture_output=True, text=True)
+                    log("  Rebase en suspens abandonne dans le clone des manifestes")
+                else:
+                    log("  Rebase en suspens termine dans le clone des manifestes")
+                dirty = [line[3:] for line in subprocess.run(['git', '-C', str(CLONE), 'status', '--porcelain'], capture_output=True, text=True).stdout.splitlines()]
+            if dirty == ['pages/.zr-vid-drive.json']:
+                subprocess.run(['git', '-C', str(CLONE), 'checkout', '--', 'pages/.zr-vid-drive.json'], check=True)
+                log("  Compteur du shard public restaure (push precedent coupe)")
+            elif dirty:
+                # 12 October 2026: under the lock nothing is in flight, so a tracked manifest that is deleted or half written
+                # belongs to a writer that died: it goes back to the committed version. Untracked files are left alone.
+                # FR : sous le verrou plus rien n'est en cours ; un fichier suivi supprime ou modifie revient a la version commitee.
+                restored = restore_tracked_changes(CLONE)
+                if restored:
+                    log(f"  Fichiers suivis restaures a la version commitee: {restored[:5]}")
+                still = [line[3:] for line in subprocess.run(['git', '-C', str(CLONE), 'status', '--porcelain'], capture_output=True, text=True).stdout.splitlines() if line.strip()]
+                if still:
+                    log(f"  Clone sale non gere automatiquement: {still[:5]}")
+
+        # 14 October 2026 (policy of Matthieu, streaming only): ONE copy per film. "stream" (default) packages the CMAF and sends NO encrypted
+        # archive; "archive" is the explicit alternative (a film that is only kept, for example a screen recording that does not need to
+        # play). Archive plus streaming is never a default: it only happens when an archive manifest already exists on the drive.
+        # FR : une seule copie par film : "stream" (defaut) ou "archive" explicite ; jamais les deux par defaut.
+        task_mode = task.get('mode') or ('archive' if task.get('cmaf', True) is False else WORK_CATEGORIES.default_mode(CATEGORY_TABLE))
+        if task_mode not in ('stream', 'archive'):
+            raise ValueError(f"task mode must be stream or archive, got {task_mode!r} for {name}")
+        if task_mode == 'stream' and not abs_manifest.exists():
+            log(f"[{index}/{total}] Manifeste streaming seul (aucune archive): {name}")
+            run_step(['node', str(REPO / 'scripts/CreateStreamManifest.mjs'), '--source', str(upload_source), '--manifest', str(abs_manifest)], cwd=REPO, env=env)
+        # Etape 1 : Envoi de l'archive chiffree (parts AES-256-GCM) si pas encore sur le Drive (10 October 2026)
+        if task_mode == 'archive' and not abs_manifest.exists():
+            write_live_status('running', current_item=name, current_step=f"[{index}/{total}] Upload archive chiffree ({size_bytes / 1024**2:.0f} Mio)", bytes_per_second=throughput_state['bps'])
+            log(f"[{index}/{total}] Upload archive chiffree: {name} ({size_bytes / 1024**2:.1f} Mio)")
+            single_plan = BASE / f'CurrentSingleUpload-{hash_id}.json'  # one plan per film (ZR_UPLOAD_FLOWS uploads at once)
+            single_plan.write_text(json.dumps([{
+                'src': str(upload_source),
+                'dest': task['dest'],
+                'name': name,
+            }], ensure_ascii=False, indent=2) + '\n')
+            up_env = dict(env)
+            up_env['ZR_ZDATA_CLONE'] = str(CLONE)
+            up_env['ZR_MAPPED_BATCH'] = '1'
+            # 12 October 2026: the push batch is decided by the push batch policy of the upload script (scripts/lib/push-batch-policy.mjs:
+            # 8 parts at the start, up to 20 parts of 95 MiB, 3 failures of one batch fall back to 2 parts = 190 MiB). It used to be
+            # pinned here at 190 MiB. ZR_SHARD_PUSH_BATCH_MB, when it is set in the environment of this worker, still reaches the
+            # upload script through dict(env) and keeps its meaning: a FIXED batch, policy disabled.
+            # FR : le lot de poussee est decide par la politique ; ZR_SHARD_PUSH_BATCH_MB, s'il est defini, garde son sens (lot fixe).
+            up_env['ZR_DEFER_INDEX_ADD'] = os.environ.get('ZR_DEFER_INDEX_ADD', '1')
+            run_step(['node', str(REPO / 'scripts/upload-mapped-git.mjs'), str(single_plan)], cwd=REPO, env=up_env)
+
+        # Stage split (12 October 2026): steps 2 and 2b (packaging, transcode, subtitles) can run in their own lane while the
+        # next film uploads its archive; steps 3 to 5 in the read-back lane.
+        def package_stage():
+            # FMP4-SINGLE (14 October 2026): the archive (encrypted original) and this CMAF copy double the bytes. The experiment
+            # scripts/PackageMuxedFmp4.mjs builds ONE downloadable MP4 per film; if adopted, a per-film 'archive': false plan flag goes here.
+            # FR : l'archive et cette copie CMAF doublent les octets ; si le fMP4 unique est adopte, un drapeau 'archive': false par film va ici.
+            if not task.get('cmaf', True):
+                log(f"[{index}/{total}] Empaquetage CMAF ignore (choix explicite cmaf=false): {name}")
+                return
+            # Etape 2 : Empaquetage et attachement CMAF HLS (.m3u8) + DASH (.mpd) (10 October 2026)
+            wait_if_paused(name)
+            write_live_status('running', current_item=name, current_step=f"[{index}/{total}] Empaquetage HLS + DASH ({size_bytes / 1024**2:.0f} Mio)", bytes_per_second=throughput_state['bps'])
+            log(f"[{index}/{total}] Empaquetage CMAF HLS + DASH: {name}")
+            # one work directory per film: two films can be packaged (transcoded) at the same time in the packaging lane
+            film_work = BASE / 'HlsDashWork' / hash_id
+            # 14 October 2026: real time percentage of the packaging pass in the upload queue (see QueueStatus.watch_progress).
+            # FR : pourcentage en temps reel de l'empaquetage dans la file d'envoi.
+            progress_stop = threading.Event()
+            if QUEUE is not None:
+                from QueueStatus import watch_progress
+                threading.Thread(target=watch_progress, args=(QUEUE, name, film_work / 'progress.json', progress_stop), daemon=True).start()
+            try:
+                run_step([
+                    'node',
+                    str(REPO / 'scripts/AttachVideoCmafDashHls.mjs'),
+                    '--source', str(upload_source),
+                    '--manifest', str(abs_manifest),
+                    '--manifest-clone', str(CLONE),
+                    '--work-root', str(film_work),
+                ], cwd=REPO, env=env)
+            finally:
+                progress_stop.set()
+                shutil.rmtree(film_work, ignore_errors=True)
+
+            # Step 2b (11 October 2026): attach the original's text subtitle tracks INSIDE the manifest, BEFORE the cloud
+            # verification records the manifest SHA-256; read from the ORIGINAL, never the filtered copy. Non-fatal.
+            # FR : Etape 2b, sous-titres ranges dans le manifeste avant la verification ; un echec est journalise, pas bloquant.
+            wait_if_paused(name)
+            write_live_status('running', current_item=name, current_step=f"[{index}/{total}] Sous-titres dans le manifeste", bytes_per_second=throughput_state['bps'])
+            sub = subprocess.run([
+                'node',
+                str(REPO / 'scripts/AttachSubtitleTracks.mjs'),
+                '--source', str(src_path),
+                '--manifest', str(abs_manifest),
+                '--commit',
+            ], cwd=REPO, env=env, capture_output=True, text=True)
+            sub_line = (sub.stdout.strip().splitlines() or [''])[-1]
+            with open(BASE / 'SubtitleAttach.jsonl', 'a', encoding='utf-8') as report:
+                report.write(json.dumps({'at': datetime.now().astimezone().isoformat(), 'name': name, 'exit': sub.returncode,
+                                         'result': sub_line, 'error': sub.stderr.strip()[-400:]}, ensure_ascii=False) + '\n')
+            log(f"  Sous-titres: {sub_line if sub.returncode == 0 else 'ECHEC ' + sub.stderr.strip()[-200:]}")
+
+
+        # Stage split (12 October 2026): steps 3 to 5 can run in the background while the next film uploads.
+        def finish_stage():
+            try:
+                # Etape 2c (14 October 2026): the thumbnail is made PUBLIC before the proof records the manifest hash, whatever the path
+                # (streamed or archive only). An archive poster is served by /api/raw-proxy (private shard), black in production.
+                # FR : la miniature est rendue publique AVANT la preuve (qui fige le hash du manifeste), streame ou non.
+                wait_if_paused(name)
+                write_live_status('running', current_item=name, current_step=f"[{index}/{total}] Miniature publique", bytes_per_second=throughput_state['bps'])
+                repair = subprocess.run(['node', str(REPO / 'scripts/RepairFilmPosters.mjs'), '--manifests', str(CLONE),
+                                         '--only', str(abs_manifest), '--source', str(upload_source), '--work-root', str(BASE / 'PosterWork' / hash_id)],
+                                        cwd=REPO, env=env, capture_output=True, text=True)
+                if repair.returncode != 0:
+                    raise RuntimeError(f"RepairFilmPosters failed for {name}: {(repair.stderr or repair.stdout).strip()[-300:]}")
+                # Etape 3 : Verification complete SHA-256 depuis les shards cloud (VerifyVideoCloud.mjs) (10 October 2026)
+                wait_if_paused(name)
+                write_live_status('running', current_item=name, current_step=f"[{index}/{total}] Verification SHA-256 cloud ({size_bytes / 1024**2:.0f} Mio)", bytes_per_second=throughput_state['bps'])
+                if task_mode == 'archive':
+                    log(f"[{index}/{total}] Verification cloud SHA-256: {name}")
+                # 12 October 2026: ZR_VERIFY_MODE = full (read the cloud back, the historical proof), shadow (DEFAULT: both proofs run,
+                # only the full read-back gates the unload) or identity (the identity proof gates, except 1 film in
+                # ZR_VERIFY_FULL_EVERY which is read back in full). 13 October 2026: ONE authority. The worker passes --mode explicitly,
+                # so worker and library can never disagree, and the 1 in N counter lives only in the library (no second rule here).
+                # FR : une seule autorite : le worker transmet --mode, le compteur 1 sur N vit uniquement dans la bibliotheque.
+                verify_mode = os.environ.get('ZR_VERIFY_MODE', 'identity')
+                if verify_mode not in ('full', 'shadow', 'identity'):
+                    raise ValueError(f"ZR_VERIFY_MODE must be full, shadow or identity, got {verify_mode!r}")
+
+                def run_verify(script, receipt, mode):
+                    subprocess.run(['node', str(REPO / 'scripts' / script), str(abs_manifest), str(upload_source), str(receipt), f'--mode={mode}'],
+                                   cwd=REPO, env=env, check=True)
+
+                if task_mode == 'stream':
+                    # 14 October 2026: streaming only, the proof is the STREAMING proof (every rendition file in the repository tree with its
+                    # size, a sample read through the CDN, audio and subtitles of the source kept). FR : preuve du streaming, pas de l'archive.
+                    log(f"[{index}/{total}] Verification cloud streaming: {name}")
+                    subprocess.run(['node', str(REPO / 'scripts/VerifyStreamingCloud.mjs'), str(abs_manifest), str(upload_source), str(receipt_path),
+                                    '--manifest-clone', str(CLONE)], cwd=REPO, env=env, check=True)
+                else:
+                    run_verify('VerifyVideoCloud.mjs', receipt_path, verify_mode)
+
+                # Si le film a ete filtre pour les sous-titres, on relie la preuve a l'original et on libere la copie temporaire (10 October 2026)
+                if task['kind'] == 'filtered' and prepared_copy is not None:
+                    rec_data = json.loads(receipt_path.read_text())
+                    rec_data['uploadedFilteredCopy'] = str(prepared_copy)
+                    rec_data['source'] = str(src_path.resolve())
+                    rec_data['filteredSourceStat'] = stat_record(src_path)
+                    rec_data['filteredSourceSha256'] = sha256_file(src_path)
+                    receipt_path.write_text(json.dumps(rec_data, indent=2) + '\n')
+                    # 11 October 2026: the filtered copy is kept until the unload succeeds; mkvmerge is not byte-reproducible,
+                    # so a regenerated copy would never match the bytes already in the cloud.
+                    # FR : la copie filtree reste jusqu'au dechargement reussi, mkvmerge ne refait jamais les memes octets.
+
+                # Etape 4 : Suppression locale (UnloadVideoCloud.mjs) de x et de ses copies identiques (10 October 2026)
+                ensure_manifest_online(abs_manifest, name)
+                if not task.get('unload', True):
+                    # 14 October 2026: "unload": false in the plan keeps the source (a test the owner must confirm first).
+                    elapsed = max(0.5, time.monotonic() - t_start)
+                    log(f"✓ [{index}/{total}] Film streame et prouve, source CONSERVEE (unload=false): {name} ({int(size_bytes / elapsed) / 1024**2:.2f} Mio/s)")
+                    finished_ok[0] = True
+                    _release_prepared_copy(prepared_copy, True)
+                    return True
+                wait_if_paused(name)
+                write_live_status('running', current_item=name, current_step=f"[{index}/{total}] Suppression locale apres preuve SHA-256", bytes_per_second=throughput_state['bps'])
+                log(f"[{index}/{total}] Unload local apres preuve {'du streaming' if task_mode == 'stream' else 'SHA-256'}: {name}")
+                subprocess.run([
+                    'node',
+                    str(REPO / 'scripts/UnloadVideoCloud.mjs'),
+                    str(receipt_path),
+                    str(unload_root_for(task['source'])),
+                    str(UNLOAD_DIR),
+                ], cwd=REPO, env=({**env, 'ZR_UNLOAD_REQUIRE_STREAMING': '0'} if not task.get('cmaf', True) else env), check=True)
+
+                for dup in task['duplicates']:
+                    if Path(dup).exists():
+                        unload_duplicate_if_present(dup, receipt_path, abs_manifest, env)
+
+                elapsed = max(0.5, time.monotonic() - t_start)
+                measured_bps = int(size_bytes / elapsed)
+                throughput_state['bps'] = measured_bps
+
+                # Etape 5 : Mise a jour immediate de FilmsIndexMapping.md et FilmsIndexMapping.json (10 October 2026)
+                # 12 October 2026: the mapping is rebuilt at every film and at the end; a read racing a manifest write must not
+                # fail a film that is already verified and unloaded. FR : echec du mapping = journalise, jamais bloquant.
+                with MAPPING_LOCK:
+                    mapping = subprocess.run(['python3', str(BASE / 'Scripts/BuildFilmsIndexMapping.py')], cwd=REPO, env=env, capture_output=True, text=True)
+                if mapping.returncode != 0:
+                    log(f"  ⚠ Index mapping non rafraichi (sera refait): {(mapping.stderr or mapping.stdout).strip()[-160:]}")
+                write_live_status('running', current_item=name, current_step=f"[{index}/{total}] Termine et decharge ({size_bytes / 1024**2:.0f} Mio liberes)", bytes_per_second=measured_bps)
+                if task_mode == 'stream':
+                    log(f"✓ [{index}/{total}] Film streame (HLS/DASH, sans archive), prouve et decharge localement: {name} ({measured_bps / 1024**2:.2f} Mio/s)")
+                else:
+                    log(f"✓ [{index}/{total}] Film archive (parts + HLS/DASH), verifie SHA-256 et decharge localement: {name} ({measured_bps / 1024**2:.2f} Mio/s)")
+                finished_ok[0] = True
+                _release_prepared_copy(prepared_copy, True)
+                return True
+            finally:
+                if not finished_ok[0] and defer_finish is None and defer_package is None:
+                    _release_prepared_copy(prepared_copy, False)
+
+        # a failed background stage keeps the staged copy in place for its retries; the runner parks it if it gives up
+        finish_stage.park = lambda: _release_prepared_copy(prepared_copy, False)
+        package_stage.park = finish_stage.park
+        if defer_package is not None:
+            handed_off = True
+            defer_package(task, index, package_stage, finish_stage)
+            return True
+        package_stage()
+        if defer_finish is not None:
+            handed_off = True
+            defer_finish(task, index, finish_stage)
+            return True
+        return finish_stage()
+    finally:
+        if prepared_copy is not None and not handed_off:
+            _release_prepared_copy(prepared_copy, completed)
+
+
+def _release_prepared_copy(prepared_copy, completed):
+    # 11 October 2026: success frees the filtered copy; failure parks it in Prepared/ so the next attempt reuses the
+    # exact bytes that were uploaded. FR : succes = copie liberee ; echec = copie gardee dans Prepared/ pour la reprise.
+    if prepared_copy is None or not prepared_copy.exists():
+        return
+    try:
+        if completed:
+            prepared_copy.unlink()
+            log(f"  ✓ Copie temporaire filtree liberee: {prepared_copy.name}")
+        elif prepared_copy.parent == STAGE_DIR:
+            kept = BASE / 'Prepared' / prepared_copy.name
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            prepared_copy.replace(kept)
+            log(f"  Copie filtree gardee pour la reprise: {kept.name}")
+    except Exception:
+        pass
+
+
+def run_stream_batch(tasks, flows=None):
+    """Streaming-only plan of SEVERAL films (14 October 2026, decision of Matthieu: one entry point, the worker).
+    prepare  : manifest + CMAF packaging of every film, local, no network (AttachVideoCmafDashHls.mjs --stage-only)
+    publish  : PublishStagedBatch.mjs as soon as a repository bin (ZR_BATCH_FILMS films) is staged: ONE list per bin, pushes filled to the policy size
+    finish   : per film subtitles (a track too big for the manifest becomes a file next to the segments), streaming proof, then the
+               source is unloaded only if the proof is green and the manifest is online.
+    FR : plan streaming de plusieurs films ; empaquetage local, publication par depot en pushes remplis, puis sous-titres, preuve, dechargement.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    flows = flows or max(1, int(os.environ.get('ZR_PACKAGE_FLOWS', '2')))
+    batch_size = max(1, int(os.environ.get('ZR_BATCH_FILMS', '3')))
+    status_file = BASE / 'StreamBatchStatus.json'
+    lock = threading.Lock()
+    films = {}
+    progress_stop = threading.Event()
+
+    def set_status(name, status, error=None):
+        with lock:
+            films[name] = {'status': status, **({'error': error} if error else {})}
+            tmp = status_file.with_suffix('.tmp')
+            tmp.write_text(json.dumps({'updatedAt': time.strftime('%Y-%m-%dT%H:%M:%S'), 'films': films}, indent=2, ensure_ascii=False))
+            tmp.replace(status_file)
+        if QUEUE is not None:
+            try:
+                from StreamBatchBanner import stage_of, step_of
+                QUEUE.set_stage(name, stage_of(status))
+                write_live_status('running', current_item=name, current_step=step_of(status))
+            except Exception:
+                pass
+
+    def manifest_of(task):
+        return CLONE / task['dest'] / f"{task['name']}.media.json"
+
+    def node(script, *args):
+        result = subprocess.run(['node', str(REPO / 'scripts' / script), *map(str, args)], cwd=REPO, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"{script} exit {result.returncode}: {(result.stderr or result.stdout)[-400:]}")
+        return result
+
+    def done_already(task):
+        try:
+            data = json.loads(manifest_of(task).read_text())
+        except (OSError, ValueError):
+            return False
+        return bool(data.get('master') and data.get('hlsDashVerified') and data.get('subtitlesAttachedAt') and not Path(task['source']).exists())
+
+    todo = [t for t in tasks if not done_already(t)]
+    log(f'stream batch: {len(todo)} films of {len(tasks)}')
+
+    def stage(task):
+        name = task['name']
+        set_status(name, 'staging')
+        if QUEUE is not None:  # percentage of the packaging pass in the banner. FR : pourcentage de l'empaquetage.
+            from QueueStatus import watch_progress
+            stage_work = BASE / 'HlsDashWork' / f"stage-{hashlib.sha1(name.encode()).hexdigest()[:12]}"
+            threading.Thread(target=watch_progress, args=(QUEUE, name, stage_work / 'progress.json', progress_stop), daemon=True).start()
+        try:
+            node('CreateStreamManifest.mjs', '--source', task['source'], '--manifest', manifest_of(task))
+            node('AttachVideoCmafDashHls.mjs', '--source', task['source'], '--manifest', manifest_of(task), '--manifest-clone', CLONE,
+                 '--work-root', BASE / 'HlsDashWork' / f"stage-{hashlib.sha1(name.encode()).hexdigest()[:12]}", '--stage-only')
+            set_status(name, 'staged')
+            log(f'staged {name}')
+        except Exception as error:  # one film failing must not stop the others
+            set_status(name, 'stage-failed', str(error)[:300])
+            log(f'STAGE FAILED {name}: {error}')
+
+    def prepare():
+        with ThreadPoolExecutor(max_workers=flows) as pool:
+            list(pool.map(stage, todo))
+
+    worker = threading.Thread(target=prepare)
+    worker.start()
+    published = set()
+    while True:
+        alive = worker.is_alive()
+        ready = [t for t in todo if films.get(t['name'], {}).get('status') == 'staged' and t['name'] not in published]
+        if len(ready) >= batch_size or (ready and not alive):
+            batch = ready[:batch_size] if alive else ready
+            plan_file = BASE / 'StreamBatchPublishPlan.json'
+            plan_file.write_text(json.dumps([{'src': t['source'], 'name': t['name'], 'dest': t['dest']} for t in batch], ensure_ascii=False))
+            published.update(t['name'] for t in batch)
+            result = subprocess.run(['node', str(REPO / 'scripts/PublishStagedBatch.mjs'), '--plan', str(plan_file)], cwd=REPO, capture_output=True, text=True)
+            try:
+                for item in json.loads(result.stdout[result.stdout.rindex('{\n  "results"'):])['results']:
+                    set_status(item['name'], 'published' if item['ok'] else 'publish-failed', item.get('error'))
+            except ValueError:
+                log(f'publish output: {(result.stdout + result.stderr)[-500:]}')
+            continue
+        if not alive and not ready:
+            break
+        time.sleep(10)
+    worker.join()
+
+    # 14 October 2026: the finish steps of ONE film (subtitles, proof, unload) are independent of the other films and mostly wait on the
+    # network, so they run ZR_FINISH_FLOWS (default 4) at a time. The shared manifest clone stays protected by its lock inside
+    # AttachSubtitleTracks.mjs and ensure_manifest_online. Measured on the 20 Bleach episodes: 18 minutes one after the other.
+    # FR : les etapes finales d'un film (sous-titres, preuve, dechargement) ne dependent pas des autres ; 4 a la fois.
+    def finish(task):
+        name = task['name']
+        if films.get(name, {}).get('status') != 'published':
+            return
+        manifest = manifest_of(task)
+        receipt = RECOVERY_DIR / f"{name}.stream.recovery.json"
+        try:
+            sub = subprocess.run(['node', str(REPO / 'scripts/AttachSubtitleTracks.mjs'), '--source', task['source'], '--manifest', str(manifest), '--commit'],
+                                 cwd=REPO, capture_output=True, text=True)
+            log(f"subtitles {name}: {(sub.stdout.strip().splitlines() or [''])[-1][:200]}")
+            proof = subprocess.run(['node', str(REPO / 'scripts/VerifyStreamingCloud.mjs'), str(manifest), task['source'], str(receipt), '--manifest-clone', str(CLONE)],
+                                   cwd=REPO, capture_output=True, text=True)
+            if proof.returncode != 0:
+                red = [line for line in proof.stderr.splitlines() if line.startswith('RED')]
+                set_status(name, 'proof-red', ' | '.join(red)[:300])
+                log(f'PROOF RED {name}: {red}')
+                return
+            if not task.get('unload', True):
+                set_status(name, 'proved-source-kept')
+                return
+            ensure_manifest_online(manifest, name)
+            node('UnloadVideoCloud.mjs', receipt, unload_root_for(task['source']), UNLOAD_DIR)
+            set_status(name, 'unloaded')
+            log(f'unloaded {name}')
+        except Exception as error:
+            set_status(name, 'finish-failed', str(error)[:300])
+            log(f'FINISH FAILED {name}: {error}')
+
+    finish_flows = max(1, int(os.environ.get('ZR_FINISH_FLOWS', '4')))
+    with ThreadPoolExecutor(max_workers=finish_flows) as pool:
+        list(pool.map(finish, todo))
+    log('stream batch done: ' + json.dumps({k: v['status'] for k, v in films.items()}, ensure_ascii=False))
+
+
+def main():
+    env = dict(os.environ)
+    env['GITHUB_TOKEN'] = subprocess.check_output(['gh', 'auth', 'token'], text=True).strip()
+    # 12 October 2026: one upload process per film restarts the push ramp at 8 parts; the state file carries the learned level (and a
+    # fallback after a flaky line) from one film to the next, and the metrics file records every push attempt (throughput, wait,
+    # pack bytes) for the panel. Both are defaults only: an operator value in the environment wins.
+    # FR : un processus par film repartait a 8 parts ; le fichier d'etat porte le niveau appris d'un film au suivant.
+    env.setdefault('ZR_PUSH_STATE_FILE', str(BASE / 'PushPolicyState.json'))
+    env.setdefault('ZR_PUSH_METRICS_FILE', str(BASE / 'PushPolicyMetrics.jsonl'))
+
+    if not os.environ.get('ZR_ONLY_PLAN'):  # 14 October 2026: the historical inventory does not know a plan-only run. FR : inventaire historique ignore un lot dedie.
+        subprocess.run(['python3', str(BASE / 'Scripts/BuildFilmsIndexMapping.py')], cwd=REPO, env=env, check=True)
+    tasks = build_queues()
+    # 11 October 2026: Natsume's Book of Friends was deleted by Matthieu (English dub, no subtitles, non-Japanese audio).
+    # FR : supprime sur decision de Matthieu ; le worker ne doit jamais le reprendre.
+    tasks = [t for t in tasks if 'natsume' not in str(t).lower()]
+    print(f"Files after Natsume exclusion: {len(tasks)}", flush=True)
+
+    # 12 October 2026: the local name IS the cloud name. The gate now covers EVERY queued file (the filtered queue was never
+    # checked: "The Dark Knight (2008) 2160p HDR10.mkv" went up under its release name) and is on by default;
+    # ZR_REQUIRE_CLEAN_NAMES=0 lets a batch keep its names, to be cleaned in the cloud afterwards by RenameCloudMedia.mjs.
+    # FR : la porte couvre toute la file (la file filtree n'etait jamais controlee) et est active par defaut.
+    if os.environ.get('ZR_REQUIRE_CLEAN_NAMES', '1') != '0':
+        names_plan = BASE / 'NamesToCheck.json'
+        names_plan.write_text(json.dumps([{'src': t['source'], 'name': t['name'], 'dest': t['dest']} for t in tasks], ensure_ascii=False))
+        gate = subprocess.run(['node', str(REPO / 'scripts' / 'MediaRename.mjs'), 'check', '--upload-plan', str(names_plan)],
+                              capture_output=True, text=True)
+        print(gate.stdout.strip(), flush=True)
+        if gate.returncode != 0:
+            print('REFUSED: names are not clean. Run scripts/MediaRename.mjs plan, get Matthieu validation, then apply (or ZR_REQUIRE_CLEAN_NAMES=0).', flush=True)
+            sys.exit(2)
+    total = len(tasks)
+    global QUEUE
+    # 14 October 2026: a plan made only of streaming films runs as ONE batch (staged packaging, filled pushes, proof, unload).
+    # FR : un plan fait uniquement de films en streaming tourne en un seul lot.
+    if tasks and all((t.get('mode') or 'stream') == 'stream' for t in tasks) and os.environ.get('ZR_STREAM_BATCH', '1') != '0':
+        # 17 October 2026: the banner of Create read the stale status of an older run because a batch wrote neither file. FR : la banniere lisait un ancien lot.
+        sys.path.insert(0, str(REPO / 'scripts' / 'Films'))
+        from QueueStatus import UploadQueue
+        import atexit
+        QUEUE = UploadQueue(BASE, [t['name'] for t in tasks])
+        atexit.register(QUEUE.close)
+        from StreamBatchBanner import follow as banner_heartbeat
+        threading.Thread(target=banner_heartbeat, kwargs={'pid': os.getpid(), 'names': [t['name'] for t in tasks], 'queue': QUEUE,
+                         'work_hash': {t['name']: 'stage-' + hashlib.sha1(t['name'].encode()).hexdigest()[:12] for t in tasks}}, daemon=True).start()
+        run_stream_batch(tasks)
+        return
+    sys.path.insert(0, str(REPO / 'scripts' / 'Films'))
+    from QueueStatus import UploadQueue
+    QUEUE = UploadQueue(BASE, [t['name'] for t in tasks])
+    import atexit
+    atexit.register(QUEUE.close)
+    throughput_state = {'bps': 0}
+
+    log(f"Demarrage de ProcessFilmsSequentially.py sur {total} films principaux (+ 22 doublons).")
+    write_live_status('running', current_item='Initialisation', current_step='Demarrage de la file sequentielle')
+
+    # 12 October 2026: verification + unload of film N run in ONE background thread while film N+1 uploads.
+    # 12 October 2026 (research of the pipeline lens): the read-back is limited PER git fetch flow (1.3 to 1.7 MB/s measured at
+    # 01:40) while the line carries 11 MB/s, and a single-slot barrier made the uplink wait for it (cycle 1219 s, slower than the
+    # sequential 517 s). N read-backs in flight, and a window of films admitted and not yet unloaded bounded by WINDOW.
+    # FR : la relecture est limitee PAR flux ; N relectures de front et une fenetre bornee remplacent la barriere a une place.
+    # 12 October 2026 (measured at 02:51): with 3 read-backs and a window of 4, the window was full of films waiting for their
+    # read-back (17 minutes each at 1.4 MB/s per flow) and the uplink sat idle. More flows, a larger window bounded by BYTES.
+    # FR : la fenetre pleine de films en attente de relecture laissait la montee vide ; plus de flux, fenetre bornee en octets.
+    verify_flows = max(1, int(os.environ.get('ZR_VERIFY_FILMS', '2')))
+    window_size = max(verify_flows, int(os.environ.get('ZR_WINDOW', '8')))
+    window_gib = float(os.environ.get('ZR_WINDOW_GIB', '45'))
+    finish_pool = ThreadPoolExecutor(max_workers=verify_flows) if PIPELINE else None
+    window = WindowGate(window_size, int(window_gib * 2 ** 30))
+    pending = {'futures': []}
+    pending_lock = threading.Lock()  # the main thread and the packaging lane both add futures
+
+    # 12 October 2026: every abandon is remembered. The queue ends only after three rounds of retries (5, 15 and 45 minutes) and
+    # says so when films are left: on 12 October 2026 the worker wrote "terminee" with five films untouched and then sat idle for
+    # 129 minutes. FR : tout abandon est garde ; trois reprises avant de conclure, et un statut honnete.
+    parked = {}
+    breaker = {'events': [], 'until': 0.0, 'lock': threading.Lock()}
+
+    def park(idx, task):
+        parked[task['name']] = (idx, task)
+
+    def circuit_breaker(task_name, exc):
+        """Two different films failing with the same signature within 10 minutes is a shared cause (a dirty clone, a revoked
+        token): pause 5 minutes once and repair the clone, without burning the attempts of the films."""
+        if isinstance(exc, subprocess.CalledProcessError) and exc.cmd:
+            cmd = [str(c) for c in exc.cmd]
+            signature = f"{Path(cmd[1]).name if len(cmd) > 1 else cmd[0]}:{exc.returncode}"
+        else:
+            signature = f"{type(exc).__name__}:{str(exc)[:40]}"
+        now = time.monotonic()
+        with breaker['lock']:
+            breaker['events'] = [e for e in breaker['events'] if now - e[0] < 600] + [(now, signature, task_name)]
+            same_cause = {name for _, sig, name in breaker['events'] if sig == signature}
+            tripped = len(same_cause) >= 2 and now >= breaker['until']
+            if tripped:
+                breaker['until'] = now + 300
+        return tripped
+
+    def run_finish(task, idx, fn):
+        try:
+            _run_finish(task, idx, fn)
+        finally:
+            window.release(task_need(task))
+
+    def _run_finish(task, idx, fn):
+        for attempt in range(1, 5):
+            try:
+                fn()
+                return
+            except Exception as exc:
+                log(f"⚠ Erreur de verification/dechargement sur {task['name']} (tentative {attempt}/4): {exc}")
+                write_live_status('retrying', current_item=task['name'], current_step=f"Nouvel essai {attempt}/4 de la verification: {str(exc)[:120]}", bytes_per_second=throughput_state['bps'])
+                if attempt == 4:
+                    log(f"✗ Abandon de la verification de {task['name']} apres 4 tentatives (le film reste sur disque et sur le Drive).")
+                    park(idx, task)
+                    parker = getattr(fn, 'park', None)
+                    if parker:
+                        parker()
+                else:
+                    time.sleep(10 * attempt)
+
+    def defer_finish(task, idx, fn):
+        # blocks only when WINDOW films are already waiting for their read-back/unload (bounded local disk)
+        while not window.acquire(task_need(task), timeout=5):
+            wait_if_paused(task['name'])
+        with pending_lock:
+            pending['futures'] = [f for f in pending['futures'] if not f.done()]
+            pending['futures'].append(finish_pool.submit(run_finish, task, idx, fn))
+
+    # 12 October 2026 (lanes): the packaging lane. ONE packaging thread (a transcode of a 4K film lasts 20 to 40 minutes and
+    # must not hold the uplink idle): film N is packaged and its subtitles attached while film N+1 uploads its archive, then
+    # film N goes to the read-back lanes. The window slot is taken when the archive is done and given back after the unload.
+    # ZR_PACKAGE_FLOWS (2) films may be packaged at once: ffmpeg work is parallel, the publish step is serialised by a shard lock.
+    # FR : voie d'empaquetage : le transcodage d'un film 4K ne bloque plus l'envoi de l'archive du film suivant.
+    package_flows = max(1, int(os.environ.get('ZR_PACKAGE_FLOWS', '2')))
+    package_pool = ThreadPoolExecutor(max_workers=package_flows) if (PIPELINE and LANES) else None
+
+    def run_stage_retrying(label, task, fn):
+        # same rules as the main loop: a GitHub throttle waits (not counted), any other error gets 4 attempts
+        attempt, throttled = 0, 0
+        while attempt < 4:
+            attempt += 1
+            wait_if_paused(task['name'])
+            try:
+                fn()
+                return True
+            except GitHubThrottled as exc:
+                attempt -= 1
+                throttled += 1
+                pause = throttle_pause(throttled, str(exc))
+                log(f"⏳ GitHub limite les ecritures ({label}) sur {task['name']}: pause {pause} s. {str(exc)[:200]}")
+                write_live_status('throttled', current_item=task['name'], current_step=f"GitHub limite temporairement les ecritures: nouvelle tentative dans {pause} s", bytes_per_second=0)
+                waited = 0
+                while waited < pause:
+                    wait_if_paused(task['name'])
+                    time.sleep(5)
+                    waited += 5
+            except Exception as exc:
+                log(f"⚠ Erreur {label} sur {task['name']} (tentative {attempt}/4): {exc}")
+                write_live_status('retrying', current_item=task['name'], current_step=f"Nouvel essai {attempt}/4 ({label}): {str(exc)[:120]}", bytes_per_second=throughput_state['bps'])
+                if attempt < 4:
+                    time.sleep(10 * attempt)
+        log(f"✗ Abandon ({label}) de {task['name']} apres 4 tentatives (le film reste sur disque et sur le Drive).")
+        parker = getattr(fn, 'park', None)
+        if parker:
+            parker()
+        return False
+
+    def run_package(task, idx, package_fn, finish_fn):
+        ok = run_stage_retrying('empaquetage', task, package_fn)
+        if not ok:
+            park(idx, task)
+            window.release(task_need(task))
+            return
+        with pending_lock:
+            pending['futures'].append(finish_pool.submit(run_finish_retrying, task, idx, finish_fn))
+
+    def run_finish_retrying(task, idx, fn):
+        try:
+            if not run_stage_retrying('verification', task, fn):
+                park(idx, task)
+        finally:
+            window.release(task_need(task))
+
+    def defer_package(task, idx, package_fn, finish_fn):
+        while not window.acquire(task_need(task), timeout=5):
+            wait_if_paused(task['name'])
+        with pending_lock:
+            pending['futures'] = [f for f in pending['futures'] if not f.done()]
+            pending['futures'].append(package_pool.submit(run_package, task, idx, package_fn, finish_fn))
+
+    def run_task(idx, task, stagger=True):
+        # 12 October 2026: two flows that start together hash and wait for the server at the same moment and leave the uplink idle
+        # together (measured: 11 MB/s for 44 s, then 22 s of silence). The second one starts half a cycle later and the two then
+        # alternate. FR : le second envoi demarre un demi-cycle plus tard ; les deux alternent ensuite au lieu de se taire ensemble.
+        if stagger and idx == 2 and int(os.environ.get('ZR_UPLOAD_FLOWS', '2')) > 1:
+            time.sleep(max(0.0, float(os.environ.get('ZR_UPLOAD_STAGGER_S', '20'))))
+        attempt = 0
+        throttled = 0
+        tripped_for_task = 0
+        succeeded = False
+        while attempt < 4:
+            attempt += 1
+            try:
+                process_one_task(task, idx, total, env, throughput_state, defer_finish if PIPELINE else None, defer_package if (PIPELINE and LANES) else None)
+                succeeded = True
+                break
+            except GitHubThrottled as exc:
+                # not a failure of the film: wait with a growing pause (1, 2, 4 ... 15 min), same film, same attempt number
+                attempt -= 1
+                throttled += 1
+                pause = throttle_pause(throttled, str(exc))
+                log(f"⏳ GitHub limite la creation de contenu (secondary rate limit) sur {task['name']}: pause {pause} s (essai de limite {throttled}). {str(exc)[:200]}")
+                write_live_status('throttled', current_item=task['name'], current_step=f"GitHub limite temporairement les ecritures: nouvelle tentative dans {pause} s", bytes_per_second=0)
+                waited = 0
+                while waited < pause:
+                    wait_if_paused(task['name'])
+                    time.sleep(5)
+                    waited += 5
+                continue
+            except Exception as exc:
+                log(f"⚠ Erreur sur {task['name']} (tentative {attempt}/4): {exc}")
+                write_live_status('retrying', current_item=task['name'], current_step=f"Nouvel essai {attempt}/4 apres erreur: {str(exc)[:120]}", bytes_per_second=throughput_state['bps'])
+                if tripped_for_task < 2 and circuit_breaker(task['name'], exc):
+                    tripped_for_task += 1
+                    attempt -= 1
+                    log("⚡ Disjoncteur : deux films echouent avec la meme cause en moins de 10 minutes ; pause de 300 s et reparation du clone.")
+                    try:
+                        with clone_lock('circuit breaker: repair of the manifest clone'):
+                            restored = restore_tracked_changes(CLONE)
+                        if restored:
+                            log(f"  Fichiers suivis restaures a la version commitee: {restored[:5]}")
+                    except Exception as repair_exc:
+                        log(f"  ⚠ Reparation du clone impossible: {repair_exc}")
+                    waited = 0
+                    while waited < 300:
+                        wait_if_paused(task['name'])
+                        time.sleep(5)
+                        waited += 5
+                    continue
+                if attempt == 4:
+                    log(f"✗ Abandon sur {task['name']} apres 4 tentatives, passage au film suivant.")
+                else:
+                    time.sleep(10 * attempt)
+
+        if not succeeded:
+            park(idx, task)
+        flush_index_spool(env, minimum=8)
+        return succeeded
+
+    # 12 October 2026: ZR_UPLOAD_FLOWS archive uploads at once. One upload alone leaves the uplink idle about half of the time
+    # (measured 09:44: 14 s of push at 15 MB/s, then 15 s of hashing and server-side processing); a second one fills the gaps.
+    # FR : N envois d'archive de front ; un seul laisse la montee vide pres de la moitie du temps (preparation, attente serveur).
+    upload_flows = max(1, int(os.environ.get('ZR_UPLOAD_FLOWS', '2')))
+    if upload_flows == 1:
+        for idx, task in enumerate(tasks, start=1):
+            run_task(idx, task)
+    else:
+        with ThreadPoolExecutor(max_workers=upload_flows) as upload_pool:
+            for _ in upload_pool.map(lambda pair: run_task(*pair), enumerate(tasks, start=1)):
+                pass
+
+    def drain():
+        # packaging futures may append read-back futures while we wait: drain until nothing is pending
+        while True:
+            with pending_lock:
+                waiting = [f for f in pending['futures'] if not f.done()]
+            if not waiting:
+                break
+            for future in waiting:
+                future.result()
+
+    drain()
+    retry_waits = [float(x) for x in os.environ.get('ZR_RETRY_WAITS_S', '300,900,2700').split(',') if x.strip()]
+    for round_no, wait_s in enumerate(retry_waits, start=1):
+        if not parked:
+            break
+        names = ', '.join(sorted(parked))
+        log(f"↻ Reprise {round_no}/{len(retry_waits)} dans {int(wait_s)} s pour {len(parked)} film(s) parque(s): {names[:300]}")
+        write_live_status('retrying', current_item='', current_step=f"Reprise {round_no}/{len(retry_waits)} dans {int(wait_s)} s: {len(parked)} film(s) parque(s)", bytes_per_second=0)
+        waited = 0.0
+        while waited < wait_s:
+            wait_if_paused('')
+            time.sleep(min(5.0, wait_s - waited))
+            waited += 5.0
+        todo = sorted(parked.values(), key=lambda pair: pair[0])
+        parked.clear()
+        for idx, task in todo:
+            run_task(idx, task, stagger=False)
+        drain()
+    if package_pool is not None:
+        package_pool.shutdown(wait=True)
+    if finish_pool is not None:
+        finish_pool.shutdown(wait=True)
+    flush_index_spool(env, minimum=1)
+    if not os.environ.get('ZR_ONLY_PLAN'):  # 14 October 2026: the historical inventory does not know a plan-only run. FR : inventaire historique ignore un lot dedie.
+        subprocess.run(['python3', str(BASE / 'Scripts/BuildFilmsIndexMapping.py')], cwd=REPO, env=env, check=True)
+    if parked:
+        names = ', '.join(sorted(parked))
+        write_live_status('incomplete', current_item='', current_step=f"{len(parked)} film(s) non traites: {names[:200]}", bytes_per_second=0)
+        log(f"✗✗ File terminee INCOMPLETE : {len(parked)} film(s) restent sur disque apres {len(retry_waits)} reprises: {names}")
+        sys.exit(3)
+    write_live_status('completed', current_item='', current_step='Tous les films ont ete traites et decharges.', bytes_per_second=0)
+    log("✓✓ File sequentielle terminee.")
+
+
+if __name__ == '__main__':
+    main()

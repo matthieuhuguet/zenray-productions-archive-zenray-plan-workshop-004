@@ -1,0 +1,59 @@
+// 8 October 2026, 14:10 CEST: Guard Git and curl authentication against process-argument exposure.
+// @vitest-environment node
+import { spawn, spawnSync } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
+import http from 'node:http'
+import { once } from 'node:events'
+import { fileURLToPath } from 'node:url'
+import { describe, expect, it } from 'vitest'
+
+const askpassPath = fileURLToPath(new URL('./lib/GitHubAskpass.sh', import.meta.url))
+const archivePath = fileURLToPath(new URL('./archive-folder.mjs', import.meta.url))
+
+describe('archive credentials', () => {
+  it('supplies Git credentials through askpass without putting the token in arguments', async () => {
+    const token = 'test-token-never-used-outside-this-process'
+    const args = ['credential', 'fill']
+    const credentials = spawnSync('git', args, { encoding: 'utf8', input: 'protocol=https\nhost=github.com\n\n',
+      env: { PATH: process.env.PATH, GITHUB_TOKEN: token, GIT_ASKPASS: askpassPath, GIT_TERMINAL_PROMPT: '0' } })
+    const source = await readFile(archivePath, 'utf8')
+
+    expect(credentials.status).toBe(0)
+    expect(credentials.stdout).toContain('username=x-access-token')
+    expect(credentials.stdout).toContain(`password=${token}`)
+    expect(args.join(' ')).not.toContain(token)
+    expect(source).toContain("GIT_ASKPASS: path.join(REPO_ROOT, 'scripts/lib/GitHubAskpass.sh')")
+    expect(source).not.toContain('x-access-token:${TOKEN}@')
+    expect(source).toContain("'-H', '@-'")
+    expect(source).toContain('input: `Authorization: Bearer ${TOKEN}\\n`')
+    expect(source).not.toContain("'-H', `Authorization: Bearer ${TOKEN}`")
+  })
+
+  it('reads a curl authorization header from stdin instead of its arguments', async () => {
+    const token = 'test-token-never-used-outside-this-process'
+    let authorization = null
+    const server = http.createServer((req, res) => {
+      authorization = req.headers.authorization
+      res.end('ok')
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    try {
+      const address = server.address()
+      const args = ['-sS', '--max-time', '5', '-H', '@-', `http://127.0.0.1:${address.port}`]
+      const child = spawn('curl', args, { stdio: ['pipe', 'pipe', 'pipe'] })
+      let stdout = '', stderr = ''
+      child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk })
+      child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk })
+      child.stdin.end(`Authorization: Bearer ${token}\n`)
+      const [code] = await once(child, 'close')
+
+      expect(code, stderr).toBe(0)
+      expect(stdout).toBe('ok')
+      expect(authorization).toBe(`Bearer ${token}`)
+      expect(args.join(' ')).not.toContain(token)
+    } finally {
+      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    }
+  })
+})

@@ -1,0 +1,1716 @@
+// Pages ZenRay (coeur type Notion) : CRUD de fichiers markdown dans un repo GitHub dedie = drive permanente.
+// Env Vercel : GITHUB_TOKEN (scope repo). CONTENT_REPO (defaut matthieuhuguet/zenray-data), CONTENT_BRANCH (main).
+import { createHash } from 'node:crypto'
+import { instrument } from './cmdlog.js'
+import { isExposedTreeNode } from './nodeTreeFilter.js'
+import { collectSubtreeBlobPaths } from './repoSubtree.js'
+import { deplacerDansRegistre, deplacerPlusieurs } from './eagleRegistry.js'
+import { authorizeShareAccess } from './share-token.js'
+import { readFreshText } from './githubGraphql.js'
+import { commitGitTree, saveGitDataText } from './gitDataCommit.js'
+import { reserveEagleFolderTarget, reserveEagleLeafTarget } from './eagleBatch.js'
+import { sansAccent as cheminSansAccent } from './sansAccent.js'
+import { RE_NOEUD, nodeFilePairsForMove } from './extensionsNoeuds.js'
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const ASSETS_WORKSPACE_REGISTRY_PATH = 'pages/.zr-assets-workspaces.json'
+
+// Wrapper fetch brut sur le repo content. Instrumenté ci-dessous : chaque écriture (PUT/POST/DELETE)
+// est journalisée dans le Repo Commands log (les GET ne le sont pas).
+const ghRaw = (token, path, init = {}) =>
+  fetch(`https://api.github.com/repos/${REPO}/${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) },
+  })
+const gh = instrument(ghRaw, {
+  repoOf: () => REPO,
+  pathOf: (args) => args[1],
+  initOf: (args) => args[2] || {},
+})
+const b64e = (s) => Buffer.from(s, 'utf8').toString('base64')
+const b64d = (s) => Buffer.from(s, 'base64').toString('utf8')
+// ═══ UN FICHIER DE PLUS D'1 MIO REND UN CORPS VIDE PAR L'API CONTENTS (2026-10-04) ═══════════════
+//
+// BUG MESURE : GET /contents/<fichier> renvoie `content: ""` et `encoding: "none"` au-dessus de 1 Mio,
+// avec un sha pourtant VALIDE. Un client qui lit « vide » et sauvegarde ensuite avec ce sha valide
+// ecrase le fichier entier sans une erreur. Le fichier des studios de ZenRay Freelance a franchi ce
+// seuil (1 093 861 octets) et le site l'a lu vide pendant quelques minutes.
+//
+// La parade est de relire le contenu par son blob (`git/blobs/<sha>`), qui sert jusqu'a 100 Mio, et de
+// LEVER une erreur plutot que de rendre un corps vide si ce second chemin echoue aussi.
+const contentsText = async (token, j) => {
+  if (j && typeof j.content === 'string' && j.content !== '' && j.encoding !== 'none') return b64d(j.content)
+  if (!j || !j.sha) throw new Error('contents-without-sha')
+  const blob = await gh(token, `git/blobs/${j.sha}`)
+  if (!blob.ok) throw new Error(`blob-${blob.status}`)
+  return b64d((await blob.json()).content)
+}
+const EAGLE_LINK_TYPE = 'zenray-eagle-link/v1'
+const EAGLE_FOLDER_LINK_TYPE = 'zenray-eagle-folder-link/v1'
+const EAGLE_FOLDER_LINK_FILE = '.zreagle-folder.json'
+const EAGLE_FOLDER_RESOURCE_FILE = '.zreagle-resource.json'
+const EAGLE_RESOURCE_DIR = 'pages/.zr-resources'
+const EAGLE_LINK_RE = /\.(img|media|file|canvas|ref|embed|db)\.json$/
+const isEagleLink = (value) => !!(value && value.type === EAGLE_LINK_TYPE && typeof value.resourceId === 'string')
+const resourcePathOf = (id) => `${EAGLE_RESOURCE_DIR}/${id}.json`
+const resourceIdOf = () => `zr_${globalThis.crypto.randomUUID().replace(/-/g, '')}`
+const jsonBlob = async (token, value) => {
+  const r = await gh(token, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: b64e(JSON.stringify(value, null, 2)), encoding: 'base64' }) })
+  if (!r.ok) return null
+  return (await r.json()).sha
+}
+// ═══ UN CHEMIN SE NORMALISE EN NFC AVANT DE PARTIR SUR LE RÉSEAU (2026-08-31) ═══════════════════
+//
+// BUG RÉEL, mesuré : le même chemin rend 200 en forme COMPOSÉE et 404 en forme DÉCOMPOSÉE.
+//
+//   .../29%20Ao%C3%BBt%202026/…      -> 200
+//   .../29%20Aou%CC%82t%202026/…     -> 404
+//
+// macOS écrit les accents décomposés (« û » = « u » + accent combinant), GitHub les stocke composés.
+// Les deux s'affichent à l'identique et ne sont PAS la même chaîne d'octets, donc pas la même URL.
+// Un chemin passé par le système de fichiers du Mac, un presse-papier ou un glisser-déposer peut
+// arriver ici décomposé, et la lecture échoue alors sur un fichier qui existe pourtant.
+//
+// Ce que ça coûtait : « 0/13 lien(s) créé(s) » sur un dossier nommé « 29 Août 2026 », avec l'erreur
+// `invalid-source` — un manifeste déclaré illisible alors qu'il se lit parfaitement.
+//
+// La normalisation est SANS RISQUE : sur un chemin sans accent, NFC ne change rien.
+const nfc = (p) => typeof p === 'string' ? p.normalize('NFC') : p
+
+// Lecture d'un JSON du dépôt. Par défaut : `raw` SEUL, gratuit et hors quota REST.
+//
+// ═══ LE REPLI SUR L'API EST EXPLICITE, ET C'EST UNE RÈGLE DE QUOTA ══════════════════════════════
+//
+// INCIDENT PAYÉ le 2026-08-31 à 03h03 : quota GitHub à 0 sur 5000, et « Lien média indisponible » sur
+// des images qui existent. Ma faute, quelques heures plus tôt.
+//
+// J'avais ajouté un repli sur l'API `contents` quand `raw` échoue, pour distinguer « absent » de
+// « pas encore propagé ». Mais je le déclenchais AUSSI sur un 404 — or le 404 est le cas NORMAL,
+// massivement : `resolveEagleFolderDir` sonde `.zreagle-folder.json` sur CHAQUE ancêtre de CHAQUE
+// chemin, cinq par fichier, et aucun de ces fichiers n'existe. Chaque sonde consommait donc une
+// requête de quota. Un lot de treize fichiers en brûlait soixante-cinq, pour rien.
+//
+// LE 404 DE `raw` EST FIABLE POUR UNE SONDE D'EXISTENCE : si le fichier n'a jamais été écrit, il
+// n'est ni dans le CDN ni dans l'arbre, et les deux voies répondent la même chose. Le repli n'a de
+// sens que pour un fichier qu'on vient d'ÉCRIRE et qu'on relit aussitôt — là, et seulement là, le
+// cache du CDN peut mentir.
+//
+// D'où `{ replierSur404: true }`, à passer UNIQUEMENT sur ces lectures-là. Le défaut ne coûte rien.
+const rawJsonAt = async (token, path, { replierSur404 = false } = {}) => {
+  const chemin = nfc(path)
+  const parRaw = async () => {
+    try {
+      const r = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(chemin)}`, { cache: 'no-store', headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' } })
+      if (r.ok) return { lu: true, valeur: await r.json() }
+      return { lu: false, statut: r.status }
+    } catch { return { lu: false, statut: 0 } }
+  }
+  const parApi = async () => {
+    try {
+      const c = await gh(token, `contents/${encodeURI(chemin)}?ref=${BRANCH}`)
+      if (!c.ok) return { lu: false }
+      const j = await c.json()
+      if (!j || typeof j.content !== 'string') return { lu: false }
+      return { lu: true, valeur: JSON.parse(b64d(j.content)) }
+    } catch { return { lu: false } }
+  }
+
+  let r = await parRaw()
+  if (r.lu) return r.valeur
+
+  // Un 404 sur une sonde d'existence est une réponse, pas une panne : on s'arrête là.
+  if (r.statut === 404 && !replierSur404) return null
+
+  // PAS DE RETENTE, et c'est un chiffre qui l'impose. Un Worker Cloudflare a droit à CINQUANTE
+  // sous-requêtes, et un seul fichier d'un lot en consomme déjà treize : cinq sondes d'ancêtres pour
+  // la source, cinq pour la cible, le manifeste, le registre, le dossier. Une retente les DOUBLE, à
+  // vingt-six — deux fichiers suffisaient alors à faire tuer le Worker, qui ne rend plus rien du
+  // tout. C'est le « Aucun élément créé · inconnu » signalé à 03h39 : pas un code d'erreur, une
+  // absence de réponse.
+  //
+  // Le repli sur l'API, lui, reste : il ne se déclenche que sur les lectures marquées, et une
+  // sous-requête vaut mieux qu'un lot annulé.
+  const a = await parApi()
+  return a.lu ? a.valeur : null
+}
+
+// ═══ UNE LECTURE QU'ON VA RÉÉCRIRE NE PASSE JAMAIS PAR RAW (2026-09-05) ═════════════════════════
+//
+// SYMPTÔME : Matthieu trie deux fois la même image dans le même dossier de tri et obtient DEUX
+// raccourcis, « IMG_6454.3hdh7r » et « IMG_6454.3hdh7r 2 », pointant deux ressources distinctes,
+// pendant que le manifeste canonique ne garde que la dernière identité.
+//
+// CAUSE : le cache CDN de raw ne sert pas seulement des 404 sur les fichiers neufs, il sert aussi
+// des 200 PÉRIMÉS sur les fichiers qu'on vient de réécrire. Le second tri relisait donc un canonique
+// d'avant le premier, n'y voyait aucun `resourceId`, et en frappait un neuf. Rien ne le signalait :
+// la réponse était un succès, seulement vieille.
+//
+// LA RÈGLE QUI EN SORT : une lecture d'AFFICHAGE peut être vieille de quelques minutes sans dommage,
+// et raw reste alors le bon choix, gratuit en quota. Une lecture qu'on va MODIFIER PUIS RÉÉCRIRE ne
+// le peut pas : elle doit venir de l'API, seule immédiatement cohérente, sans quoi l'écriture forke
+// silencieusement la donnée.
+//
+// CE QUE CELA COÛTE : une sous-requête, et seulement quand raw prétend qu'il n'y a pas encore
+// d'identité — c'est-à-dire au premier tri d'une image, jamais aux suivants.
+const apiJsonAt = async (token, path) => {
+  try {
+    const c = await gh(token, `contents/${encodeURI(nfc(path))}?ref=${BRANCH}`)
+    if (!c.ok) return null
+    const j = await c.json()
+    if (!j || typeof j.content !== 'string') return null
+    return JSON.parse(b64d(j.content))
+  } catch { return null }
+}
+// Resolve a logical directory through the nearest Eagle folder placement. The
+// marker points to a stable resourceId; the registry owns the movable sourceDir.
+// ═══ LES SONDES D'ANCÊTRES NE SE REFONT PAS POUR CHAQUE FICHIER D'UN MÊME LOT ═══════════════════
+//
+// `resolveEagleFolderDir` interroge `.zreagle-folder.json` sur chaque ancêtre du chemin — cinq pour
+// un chemin ordinaire, et aucun de ces fichiers n'existe. Or les treize fichiers d'un lot vivent
+// dans le MÊME dossier : sans mémoire, ce sont soixante-cinq appels pour cinq réponses.
+//
+// La mémoire vit le temps d'UNE invocation du Worker (`globalThis`, remis à zéro entre deux requêtes
+// froides), ce qui est exactement la bonne durée : assez longue pour couvrir un lot entier, trop
+// courte pour servir une réponse périmée à la requête suivante.
+const memoireDossiers = () => {
+  const g = globalThis
+  if (!g.__zrDossiersEagle) g.__zrDossiersEagle = new Map()
+  return g.__zrDossiersEagle
+}
+export function oublierMemoireDossiers() { try { delete globalThis.__zrDossiersEagle; delete globalThis.__zrSondesEagle } catch {} }
+
+async function resolveEagleFolderDir(token, logicalDir) {
+  const memo = memoireDossiers()
+  if (memo.has(logicalDir)) return memo.get(logicalDir)
+  const p = resolveEagleFolderDirBrut(token, logicalDir)
+  memo.set(logicalDir, p)
+  return p
+}
+
+// LA SONDE D UN ANCETRE SE MEMOISE, PAS SEULEMENT LE CHEMIN COMPLET (2026-08-31).
+//
+// La memoire posee cette nuit portait sur le chemin logique ENTIER, ce qui evitait bien de resonder
+// pour chacun des treize fichiers d un meme dossier. Mais une source et sa cible partagent leurs
+// ancetres : resoudre `pages/A/B/C` puis `pages/A/B/C/tri` sondait deux fois `C`, deux fois `B`,
+// deux fois `A`. Mesure du test : sept sondes pour quatre chemins distincts.
+//
+// Ce surcout etait INVISIBLE jusqu'ici parce que le test ne savait pas commiter : il mesurait le
+// chemin d ECHEC, qui s arrete plus tot. C est exactement ce que le constat #17 de l audit annoncait.
+const memoireSondes = () => {
+  const g = globalThis
+  if (!g.__zrSondesEagle) g.__zrSondesEagle = new Map()
+  return g.__zrSondesEagle
+}
+
+function sonderMarqueur(token, root) {
+  const memo = memoireSondes()
+  const cle = `${root}/${EAGLE_FOLDER_LINK_FILE}`
+  if (memo.has(cle)) return memo.get(cle)
+  const p = rawJsonAt(token, cle)
+  memo.set(cle, p)
+  return p
+}
+
+async function resolveEagleFolderDirBrut(token, logicalDir) {
+  const segs = logicalDir.split('/')
+  for (let i = segs.length; i >= 2; i--) {
+    const root = segs.slice(0, i).join('/')
+    const marker = await sonderMarqueur(token, root)
+    if (!marker || marker.type !== EAGLE_FOLDER_LINK_TYPE || typeof marker.resourceId !== 'string') continue
+    const registry = await rawJsonAt(token, resourcePathOf(marker.resourceId))
+    if (!registry || registry.resourceId !== marker.resourceId || typeof registry.sourceDir !== 'string') return { error: 'orphan-folder-link' }
+    const suffix = segs.slice(i).join('/')
+    return { logicalRoot: root, sourceRoot: registry.sourceDir, physicalDir: suffix ? `${registry.sourceDir}/${suffix}` : registry.sourceDir, resourceId: marker.resourceId }
+  }
+  return { physicalDir: logicalDir }
+}
+async function resolveEagleFilePath(token, logicalPath) {
+  const slash = logicalPath.lastIndexOf('/')
+  if (slash < 0) return { physicalPath: logicalPath }
+  const folder = await resolveEagleFolderDir(token, logicalPath.slice(0, slash))
+  if (folder.error) return folder
+  return {
+    ...folder,
+    physicalPath: `${folder.physicalDir}/${logicalPath.slice(slash + 1)}`,
+  }
+}
+
+// .plan.json (ZenRay Plan, 2026-07-20) ajouté ici -- même piège que server/nodeTreeFilter.js : un noeud
+// absent de cette regex reste invisible à l'indexation, même s'il existe bel et bien sur GitHub.
+// SOURCE UNIQUE (2026-08-31) : cette liste oubliait `zmedia.json`, si bien qu un document
+// ZenRayMedia deplace n etait pas reindexe et disparaissait de la recherche. Le commentaire juste
+// en dessous decrivait deja ce piege — il etait ecrit a cote de la copie, ce qui ne l a pas empeche.
+const INDEX_NODE_RE = RE_NOEUD
+
+// UN DOSSIER PRÉCIS SE LIT PAR SON PROPRE SOUS-ARBRE, jamais par l'arbre entier du dépôt filtré
+// ensuite. Généralisé le 2026-08-29 : la même fonction servait déjà l'indexation d'un déplacement
+// (isNode = INDEX_NODE_RE) ; `action=tree&dir=…` en avait besoin aussi et faisait l'inverse — un seul
+// `git/trees/${BRANCH}?recursive=1` SANS BORNE, filtré après coup par préfixe. Sur ce dépôt, cet appel
+// est TRONQUÉ (mesuré le 2026-08-05, 44 015 entrées sur 135 588) et un dossier entier peut disparaître
+// sans un mot dès que ses fichiers tombent après la coupure. Bug réel, payé le 2026-08-29 sur un lien
+// de partage : `pages/Photos/DJI/29 Août 2026` rendait « Empty folder » alors que les 749 manifestes
+// étaient bien commités, parce que TOUT le sous-arbre `pages/Photos/DJI` tombait après la troncature.
+//
+// Le prédicat est un paramètre et non figé sur INDEX_NODE_RE, pour que l'appelant décide ce qui compte
+// comme nœud visible : l'indexation d'un déplacement ignore les marqueurs de dossier vide
+// (.zrfolder.json) à dessein, alors que `action=tree` doit les garder (`isExposedTreeNode`), sans quoi
+// un dossier vide fraîchement créé redeviendrait invisible — exactement la régression du 2026-07-12
+// que `isExposedTreeNode` avait déjà corrigée.
+// La mécanique elle-même (sous-arbre, repli, garde de troncature) vit dans `repoSubtree.js`, qui la
+// teste sans réseau et la partage avec `share-og.js`, atteint du même bug le même jour.
+async function scopedNodePathsUnder(token, root, isNode) {
+  const readTreeish = async (dir) => {
+    const r = await gh(token, `git/trees/${encodeURIComponent(BRANCH + ':' + dir)}?recursive=1`)
+    if (!r.ok) return { ok: false }
+    const json = await r.json()
+    return { ok: true, tree: json.tree || [], truncated: !!json.truncated }
+  }
+  const readDirContents = async (dir) => {
+    const response = await gh(token, `contents/${encodeURI(dir)}?ref=${BRANCH}`)
+    if (!response.ok) return []
+    const value = await response.json()
+    return Array.isArray(value) ? value : []
+  }
+  const { paths } = await collectSubtreeBlobPaths(readTreeish, readDirContents, root, isNode, (dir) => dir.startsWith(EAGLE_RESOURCE_DIR + '/'))
+  return paths.map((p) => `${root}/${p}`)
+}
+// A folder placement indexes the logical mirror of every visible node in its physical bundle —
+// marqueurs de dossier exclus à dessein, une indexation de recherche n'a rien à faire d'un dossier vide.
+const indexedNodePathsUnder = (token, root) => scopedNodePathsUnder(token, root, (p) => INDEX_NODE_RE.test(p))
+
+async function directDirectoryEntries(token, dir) {
+  const response = await gh(token, `git/trees/${encodeURIComponent(BRANCH + ':' + dir)}`)
+  if (!response.ok) return null
+  const value = await response.json()
+  return Array.isArray(value.tree) ? value.tree : []
+}
+
+// MEMORY LIVE (2026-07-16) : vue "Skills" + navigation Create>Memory>… lisent EN DIRECT le repo Memory
+// (déjà auto-commit+push en continu par ~/.claude/autoupdate.mjs, 60s de debounce — jamais de copie
+// manuelle à relancer). Repo PRIVÉ -> jamais via jsDelivr (CDN public only), lecture/écriture ici REST
+// authentifiée comme pour REPO ci-dessus, mais lecture SEULE (pas de save/delete/move sur ce repo).
+const MEMORY_REPO = process.env.MEMORY_REPO || 'matthieuhuguet/Memory'
+const ghMemory = (token, path, init = {}) =>
+  fetch(`https://api.github.com/repos/${MEMORY_REPO}/${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) },
+  })
+// Cache mémoire (best-effort, perdu au cold-start Vercel comme g.__zrIndex) : évite un aller-retour API
+// par navigation répétée dans le MÊME dossier Memory sous 60s (fenêtre de fraîcheur = le debounce
+// autoupdate.mjs lui-même, inutile de revalider plus souvent que la source ne peut changer).
+const MEMORY_TTL_MS = 60000
+function memoryCacheGet(key) {
+  const g = globalThis
+  const hit = g.__zrMemChildren && g.__zrMemChildren[key]
+  return (hit && (Date.now() - hit.at) < MEMORY_TTL_MS) ? hit.entries : null
+}
+function memoryCacheSet(key, entries) {
+  const g = globalThis
+  g.__zrMemChildren = g.__zrMemChildren || {}
+  g.__zrMemChildren[key] = { at: Date.now(), entries }
+}
+
+// ── INDEX DE RECHERCHE : delta PUBLIC chiffré (zenray-index-public/delta.json) ───────────────────────
+// Au lieu de réécrire le gros index privé (47 Mo) à CHAQUE ajout de nœud (drop, archive, push), on append
+// les nouveaux chemins à un PETIT delta chiffré sur le repo public. Le client fusionne shards + delta ->
+// tout fichier ajouté est cherchable IMMÉDIATEMENT, sans quota API et sans coût O(taille totale). Le prochain
+// rebuild complet (build-search-index.mjs) replie le delta dans les shards et le remet à zéro.
+const IREPO = 'matthieuhuguet/zenray-index-public'
+const ghI = (token, path, init = {}) => fetch(`https://api.github.com/repos/${IREPO}/${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) } })
+async function importMediaKeyCK() { const { loadMediaKey } = await import('./media-key.js'); const raw = Uint8Array.from(Buffer.from(loadMediaKey(), 'base64')); return globalThis.crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']) }
+async function encSrv(key, str) { const iv = globalThis.crypto.getRandomValues(new Uint8Array(12)); const ct = new Uint8Array(await globalThis.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(str))); return { iv: Buffer.from(iv).toString('base64'), ct: Buffer.from(ct).toString('base64') } }
+async function decSrv(key, blob) { const ct = Uint8Array.from(Buffer.from(blob.ct, 'base64')); const iv = Uint8Array.from(Buffer.from(blob.iv, 'base64')); return new TextDecoder().decode(new Uint8Array(await globalThis.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct))) }
+// RETRY FAST-FORWARD (2026-07-14, même patron que commitTree ci-dessus) : à l'origine cette fonction ne
+// tentait qu'UNE fois — un appel isolé (drop/Ctrl-V in-app) ne se heurte quasiment jamais à un ref qui a
+// bougé entre-temps, donc le bug ne se voyait pas. Mais un rattrapage EN LOT (scripts/index-add-paths.mjs,
+// plusieurs dizaines d'appels séquentiels rapprochés sur le MÊME petit repo) le révèle : le taux d'échec
+// variait d'un run à l'autre sur les MÊMES lots (bug constaté 2026-07-14, ~15-25% de rejets non-fast-forward
+// à chaque run). Chaque tentative RELIT delta.json + le ref FRAIS (jamais la copie périmée d'avant) : un
+// autre écrivain concurrent ne fait donc jamais perdre de chemins, juste retarder cette tentative-ci.
+// 21 October 2026: why the last append failed. Every failure used to be a silent `return false`, so the service could only report
+// "Asset engine failed (1)" while GitHub was answering 403 "Repository is above its size quota". A refusal that retrying cannot change
+// (403 quota, 422) now stops at once instead of re-reading the 37 MB delta four more times (34 s measured).
+let lastPublicDeltaError = ''
+const publicDeltaLastError = () => lastPublicDeltaError
+async function refusalOf(response, step) {
+  let detail = ''
+  try { detail = String((await response.json())?.message || '').slice(0, 160) } catch { /* no body */ }
+  return `${step} ${response.status}${detail ? ` ${detail}` : ''}`
+}
+async function appendPublicDelta(token, addPaths, addThumbs, rmPaths = [], tries = 5) {
+  lastPublicDeltaError = ''
+  for (let a = 0; a < tries; a++) {
+    try {
+      const key = await importMediaKeyCK()
+      // 2026-09-11 Read the delta AT the ref we are about to fast-forward, through the API, never through
+      // raw.githubusercontent (5 min cache). The cached read made four index-adds run minutes apart each
+      // start from the same stale delta, so the last one erased the three before it (ZenRay Assets).
+      // FR : lire le delta AU ref qu'on va avancer, par l'API, jamais par le cache raw de 5 min.
+      const ref0 = await ghI(token, 'git/ref/heads/main'); if (!ref0.ok) { await sleep(300 * (a + 1)); continue }
+      const baseSha = (await ref0.json()).object.sha
+      let cur = { paths: [], thumbs: {}, rm: [] }
+      const rr = await ghI(token, `contents/delta.json?ref=${baseSha}`, { headers: { Accept: 'application/vnd.github.raw' } })
+      if (rr.ok) { const blob = await rr.json(); if (blob && blob.ct) cur = JSON.parse(await decSrv(key, blob)) }
+      else if (rr.status !== 404) { await sleep(300 * (a + 1)); continue }
+      const rmSet = new Set(cur.rm || [])
+      const set = new Set(cur.paths || []); let changed = 0
+      // Recréer un chemin précédemment supprimé doit aussi annuler son tombstone.
+      // Sinon il est présent dans `paths` puis immédiatement retiré par `rm` côté client.
+      for (const p of addPaths) {
+        if (rmSet.delete(p)) changed++
+        if (!set.has(p)) { set.add(p); changed++ }
+      }
+      // rm = chemins disparus (déplacement) : retirés du delta ET listés pour que le client les ôte des shards.
+      for (const p of (rmPaths || [])) { rmSet.add(p); set.delete(p); changed++ }
+      const thumbs = (cur.thumbs && typeof cur.thumbs === 'object') ? cur.thumbs : {}
+      // 21 October 2026: a delta that changes nothing is NOT rewritten. Every call used to commit a new 37 MB encrypted blob (a fresh random IV
+      // makes each one different, so Git cannot deduplicate): "index delta +0" commits alone grew zenray-index-public to 105 GB and GitHub then
+      // refused every write ("Repository is above its size quota").
+      const thumbChanged = Object.entries(addThumbs || {}).some(([p, t]) => JSON.stringify(thumbs[p]) !== JSON.stringify(t))
+      if (changed === 0 && !thumbChanged) return true
+      Object.assign(thumbs, addThumbs || {})
+      for (const p of rmSet) delete thumbs[p]
+      const enc = await encSrv(key, JSON.stringify({ paths: [...set], thumbs, rm: [...rmSet] }))
+      const json = JSON.stringify({ v: 1, builtAt: new Date().toISOString(), ...enc })
+      const headSha = baseSha // commit on the exact state we read; a moved ref fails fast-forward and retries
+      const hc = await ghI(token, `git/commits/${headSha}`); if (!hc.ok) { await sleep(300 * (a + 1)); continue }
+      const baseTree = (await hc.json()).tree.sha
+      const blob = await ghI(token, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: Buffer.from(json, 'utf8').toString('base64'), encoding: 'base64' }) }); if (!blob.ok) { lastPublicDeltaError = await refusalOf(blob, 'blob'); if ([403, 422].includes(blob.status)) return false; await sleep(300 * (a + 1)); continue }
+      const blobSha = (await blob.json()).sha
+      const tree = await ghI(token, 'git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree: [{ path: 'delta.json', mode: '100644', type: 'blob', sha: blobSha }] }) }); if (!tree.ok) { lastPublicDeltaError = await refusalOf(tree, 'tree'); if ([403, 422].includes(tree.status)) return false; await sleep(300 * (a + 1)); continue }
+      const commit = await ghI(token, 'git/commits', { method: 'POST', body: JSON.stringify({ message: `index delta +${changed}`, tree: (await tree.json()).sha, parents: [headSha] }) }); if (!commit.ok) { lastPublicDeltaError = await refusalOf(commit, 'commit'); if ([403, 422].includes(commit.status)) return false; await sleep(300 * (a + 1)); continue }
+      const upd = await ghI(token, 'git/refs/heads/main', { method: 'PATCH', body: JSON.stringify({ sha: (await commit.json()).sha, force: false }) })
+      if (upd.ok) return true
+      lastPublicDeltaError = await refusalOf(upd, 'ref update')
+      await sleep(300 * (a + 1)) // ref-update rejeté (non-fast-forward) -> RECOMMENCER sur un ref frais
+    } catch (error) { lastPublicDeltaError = String(error?.message || error).slice(0, 160); await sleep(300 * (a + 1)) }
+  }
+  return false
+}
+// INDEX A LINK PLACEMENT = copy the source's thumbnail onto the target path, then append both to the public delta.
+// Extracted on 2 October 2026 so link creation can leave it OUT of the create request: the delta step costs about
+// eight sub-requests plus a read-decrypt-rewrite of a delta that only ever grows, and it is the part that made
+// sorting die « after a while ». The client now calls it in a second, independent request (`index-links`).
+async function indexLinkPairs(token, pairs) {
+  const indexPaths = [...new Set(pairs.map(([target]) => target))]
+  const sourceThumbs = await thumbsForPaths(token, [...new Set(pairs.map(([, source]) => source))])
+  const targetThumbs = {}
+  for (const [target, source] of pairs) if (sourceThumbs[source]) targetThumbs[target] = sourceThumbs[source]
+  return appendPublicDelta(token, indexPaths, targetThumbs)
+}
+// Ré-exportés (2026-07-14) pour scripts/index-add-paths.mjs : TOUT upload CLI en masse (upload-img-list*.mjs,
+// upload-vidraw-list.mjs, series-frame-references) doit appeler ce même appendPublicDelta après son commit
+// zenray-data, sinon les fichiers restent invisibles à la recherche jusqu'au prochain rebuild manuel — bug
+// trouvé le 2026-07-14 : AUCUN script CLI n'appelait `action=index-add` (mécanisme jusque-là réservé au drop/
+// Ctrl-V in-app via universalCapture.js). Named exports en plus du handler par défaut ; zéro changement de
+// comportement pour le serveur Vercel.
+export { appendPublicDelta, publicDeltaLastError, thumbsForPaths, importMediaKeyCK }
+
+// VIGNETTE depuis un manifeste .img.json (vis-aware, MIROIR de build-search-index / ImageNodeViewer). Module-level
+// pour être réutilisée par index-add ET move/move-tree (sinon un média RENOMMÉ perd sa vignette dans l'index -> gris).
+const _toWebp = (p) => (typeof p === 'string' ? p.replace(/\.[^./]+$/, '.webp') : null)
+const thumbEntryOf = (m) => {
+  if (!m || typeof m !== 'object') return null
+  // Gate élargi (2026-07-07) : accepte l'ancien schéma mono-fichier (cdnPath) ET le nouveau découpé en
+  // morceaux ≤19 Mo (cdnChunks[]) — la vignette n'est jamais chunkée, seul ce test de « manifeste public
+  // valide » doit reconnaître les deux formes, sinon une image récente perd sa vignette dans l'index.
+  const hasChunks = Array.isArray(m.cdnChunks) && m.cdnChunks.length > 0
+  if (m.vis === 'public' && m.cdnRepo && (m.cdnPath || hasChunks) && m.cdnCommit) {
+    // La vignette a son PROPRE hash (≠ cdnPath = hash de l'original). m.thumb porte l'URL correcte -> l'utiliser.
+    // Repli calcul legacy uniquement possible côté cdnPath (une image cdnChunks sans thumb n'a pas de vignette).
+    const tp = m.cdnPath ? _toWebp(m.cdnPath) : null
+    const u = m.thumb || (tp ? `https://cdn.jsdelivr.net/gh/matthieuhuguet/${m.cdnRepo}@${m.cdnCommit}/${tp}` : null)
+    if (!u) return null
+    return (m.thumbIv && m.alg) ? { u, iv: m.thumbIv } : { u }
+  }
+  if (m.repo) { const tp = _toWebp(m.path); if (tp) return { r: m.repo, p: tp } }
+  // Archive universelle .file.json (zenray-productions-archive, chunked) : schéma DIFFÉRENT de .img.json,
+  // mais porte directement une URL de vignette prête à l'emploi quand le fichier est une image (bug réel
+  // trouvé le 2026-07-19 en testant un lien Eagle vers ce type de nœud : le lien créé perdait sa vignette
+  // et retombait sur l'icône générique, alors que la source l'affichait correctement).
+  if (m.type === 'file' && typeof m.thumb === 'string' && m.thumb) return { u: m.thumb }
+  return null
+}
+// Lit les .img.json et .file.json donnés (raw, hors quota) -> carte chemin->vignette. Pour que le delta
+// porte la vignette des chemins ajoutés/renommés/liés (sinon l'image renommée ou liée apparaît grise
+// jusqu'au prochain rebuild complet).
+// `max` est BORNÉ PAR LES SOUS-REQUÊTES, pas par le goût (2026-08-05). Une invocation Worker sur le
+// plan gratuit en a droit à cinquante en tout, et chaque vignette lue en coûte une. Deux cents,
+// valeur d'origine, dépassait donc déjà le budget dès qu'un lot devenait gros. L'appelant qui bouge
+// beaucoup de fichiers passe un maximum bas : les vignettes non résolues ici ne sont pas perdues,
+// `ImgNodeThumb` retombe sur la lecture paresseuse du manifeste, et le prochain rebuild complet les
+// réinscrit. Une vignette qui arrive une seconde plus tard vaut mieux qu'un déplacement refusé.
+async function thumbsForPaths(token, paths, max = 200) {
+  const out = {}
+  const imgs = (paths || []).filter((p) => p.endsWith('.img.json') || p.endsWith('.file.json')).slice(0, max)
+  await Promise.all(imgs.map(async (p) => {
+    try { const rr = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(p)}`, { headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' } }); if (rr.ok) { const v = thumbEntryOf(JSON.parse(await rr.text())); if (v) out[p] = v } } catch {}
+  }))
+  return out
+}
+// ═══ LES SHA D'UN DOSSIER, EN UNE POIGNÉE D'APPELS AU LIEU D'UN PAR FICHIER (2026-08-05) ═════════
+//
+// LE PROBLÈME QUE ÇA RÉSOUT, et il est dur, pas cosmétique. Une invocation de Worker a droit à
+// CINQUANTE sous-requêtes sur le plan gratuit. Lire mille `.img.json` un par un via `contents/`
+// en demanderait mille : le déplacement échouerait net, et pas au bout d'un moment — tout de suite.
+//
+// DEUX VOIES ÉCARTÉES, mesurées plutôt que supposées :
+//   `git/trees/main?recursive=1` est TRONQUÉ sur ce dépôt — mesuré le 2026-08-05 : 44 015 entrées
+//   rendues sur 135 588, et `truncated: true`, pour 14 Mo de réponse. Un fichier absent de la
+//   troncature serait déclaré introuvable alors qu'il existe.
+//   `contents/<dossier>` plafonne à mille entrées par dossier, silencieusement. Un dossier de
+//   1 200 photos en perdrait deux cents sans un mot.
+//
+// LA VOIE RETENUE descend l'arbre segment par segment, sans récursivité : la racine, puis `pages`,
+// puis `Photos`… Chaque appel rend un arbre NON récursif, donc petit, et le dernier donne tous les
+// blobs du dossier visé sans plafond de mille. Coût : un appel par segment, soit cinq ou six pour
+// un chemin ordinaire, QUEL QUE SOIT le nombre de fichiers dedans.
+//
+// Le cache est porté par l'appelant et partagé entre dossiers frères : déplacer depuis trois
+// dossiers d'un même parent ne repaie pas trois fois la descente commune.
+async function dirBlobShas(token, dir, cache) {
+  const segments = String(dir).split('/').filter(Boolean)
+  let cle = ''
+  let sha = BRANCH
+  for (const segment of segments) {
+    const parent = cle
+    cle = cle ? `${cle}/${segment}` : segment
+    if (cache.has(cle)) { sha = cache.get(cle); if (sha === null) return null; continue }
+    const r = await gh(token, `git/trees/${encodeURIComponent(sha)}`)
+    if (!r.ok) { cache.set(cle, null); return null }
+    const arbre = await r.json()
+    const noeud = (arbre.tree || []).find((x) => x.type === 'tree' && x.path === segment)
+    if (!noeud) { cache.set(cle, null); return null }
+    cache.set(cle, noeud.sha)
+    sha = noeud.sha
+    void parent
+  }
+  const rf = await gh(token, `git/trees/${encodeURIComponent(sha)}`)
+  if (!rf.ok) return null
+  const feuille = await rf.json()
+  // Un dossier tronqué se dit plutôt que de mentir : à 100 000 entrées, GitHub coupe. Aucun dossier
+  // du projet n'en approche, mais un silence ici coûterait des fichiers perdus.
+  if (feuille.truncated) return null
+  const out = new Map()
+  for (const x of (feuille.tree || [])) if (x.type === 'blob') out.set(x.path, x.sha)
+  return out
+}
+
+// D — 403 GRACIEUX : détecte un rate-limit GitHub sur une réponse non-ok.
+// GitHub renvoie 403 (limite primaire, x-ratelimit-remaining=0) ou 429 (limite secondaire).
+// On expose au client { rateLimited:true, resetAt } (millisecondes epoch) pour qu'il affiche
+// un bandeau exact et reprogramme UN seul re-fetch à l'heure de reset, au lieu de spinner/boucler.
+// Sur tout autre non-ok, renvoie {} (rien) -> comportement existant inchangé.
+const rlInfo = (r) => {
+  const rem = r.headers && r.headers.get('x-ratelimit-remaining')
+  const limited = r.status === 429 || (r.status === 403 && rem === '0')
+  if (!limited) return {}
+  const reset = r.headers && r.headers.get('x-ratelimit-reset')
+  const resetAt = reset ? Number(reset) * 1000 : (Date.now() + 60000)
+  return { rateLimited: true, resetAt }
+}
+// 23 October 2026 : knowledge/ (ZenRay Knowledge) ajouté, même règle .md/.json.
+// .md/.json partout (existant) + parts de média : media/<id>/NNN.bin (branche dédiée, reste strict ailleurs).
+const safe = (p) => typeof p === 'string' && !p.includes('..') && (
+  ((p.startsWith('pages/') || p.startsWith('build/') || p.startsWith('databases/') || p.startsWith('gallery/') || p.startsWith('references/') || p.startsWith('audio/') || p.startsWith('sfx/') || p.startsWith('articles/') || p.startsWith('freelance/') || p.startsWith('knowledge/') || p.startsWith('shelf/') || p.startsWith('trash/') || p.startsWith('media/')) && /\.(md|json)$/.test(p))
+  || /^media\/[A-Za-z0-9._-]+\/\d{3}\.bin$/.test(p)
+  // Fichiers auxiliaires HLS (playlist + clé AES) écrits par le pipeline vidéo sous pages/ : autorisés en
+  // lecture/suppression pour permettre la purge définitive d'une vidéo (master.m3u8, stream_*.m3u8, .hlskey.bin).
+  || ((p.startsWith('pages/') || p.startsWith('trash/')) && /\.(m3u8)$/.test(p))
+  || ((p.startsWith('pages/') || p.startsWith('trash/')) && /\.hlskey\.bin$/.test(p))
+)
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// 8 October 2026, 10:45 CEST: route existing Pages commits through the shared Git Data writer.
+async function commitTree(token, entries, message, tries = 5, beforeCommit = null) {
+  return commitGitTree({ request: (path, init) => gh(token, path, init), branch: BRANCH, entries, message, tries, beforeCommit, sleepImpl: sleep })
+}
+
+async function saveLargeContent(token, path, markdown, expectedSha) {
+  return saveGitDataText({ request: (requestPath, init) => gh(token, requestPath, init), branch: BRANCH, path, markdown, expectedSha, sleepImpl: sleep })
+}
+
+// Reecriture des refs de chemin (from->to) dans les fichiers texte (playlists HLS, manifeste media), AVEC garde
+// de FRONTIERE : on ne remplace qu'a la limite '/' (ou '%2F' en URL-encode), donc deplacer `pages/A` ne corrompt
+// JAMAIS `pages/AB`. Couvre le brut, l'encode-complet (?path=) et l'encode-partiel.
+function rewriteTreePaths(txt, from, to) {
+  const variants = [
+    [from + '/', to + '/'],
+    [encodeURIComponent(from) + '%2F', encodeURIComponent(to) + '%2F'],
+    [encodeURI(from) + '/', encodeURI(to) + '/'],
+  ]
+  for (const [a, b] of variants) if (a !== b) txt = txt.split(a).join(b)
+  return txt
+}
+
+export { contentsText, saveLargeContent }
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(200).json({ error: 'no-token' })
+  res.setHeader('Cache-Control', 'no-store')
+
+  // ═══ LA MEMOIRE DE RESOLUTION NE SURVIT PAS A LA REQUETE (2026-08-31) ══════════════════════════
+  //
+  // CE QUE J AVAIS RATE EN LA POSANT, la nuit precedente. Elle vit dans `globalThis`, et une isolate
+  // Cloudflare est REUTILISEE entre plusieurs requetes, parfois pendant des minutes. Une resolution
+  // mémorisée avant la creation d un dossier survivait donc apres, et le serveur repondait
+  // « ce dossier n existe pas » a propos d un dossier qui venait d etre cree.
+  //
+  // Symptome exact rapporte par Matthieu : « creer des dossiers, le temps de la notif parfois ils
+  // disparaissent », et des deplacements qui echouent sans raison apparente. Le pire etait
+  // l intermittence : la memoire se vidait toute seule quand l isolate etait recyclee, si bien que
+  // le meme geste marchait une fois sur deux.
+  //
+  // LA MEMOISATION GARDE TOUT SON INTERET, qui etait de dedupliquer DANS une requete : un lot de
+  // treize liens sondait cinq ancetres treize fois, soit 169 sous-requetes, ramenees a 37. Ce gain
+  // est intact. Ce qui disparait, c est seulement la memoire ENTRE deux requetes, qui n apportait
+  // rien et pouvait mentir.
+  oublierMemoireDossiers()
+
+  try {
+    if (req.method === 'GET') {
+      const action = (req.query.action || 'list').toString()
+      if (action === 'ratelimit') {
+        // Compteur de quota LIVE : l'endpoint GitHub /rate_limit NE CONSOMME PAS le quota REST -> gratuit à
+        // interroger. On renvoie le coeur (core) : restantes / plafond / heure de reset (epoch secondes).
+        const r = await fetch('https://api.github.com/rate_limit', { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress' } })
+        if (!r.ok) return res.status(200).json({ error: 'github' })
+        const j = await r.json()
+        const c = (j.resources && j.resources.core) || j.rate || {}
+        const g = (j.resources && j.resources.graphql) || {}
+        return res.status(200).json({ remaining: c.remaining, limit: c.limit, reset: c.reset, graphql: { remaining: g.remaining, limit: g.limit, reset: g.reset } })
+      }
+      if (action === 'list') {
+        const dir = (req.query.dir || 'pages').toString()
+        if (!['pages', 'databases', 'build'].includes(dir)) return res.status(400).json({ error: 'bad-dir' })
+        const ext = dir === 'pages' ? '.md' : '.json'
+        const r = await gh(token, `contents/${dir}?ref=${BRANCH}`)
+        if (r.status === 404) return res.status(200).json({ pages: [], items: [] })
+        if (!r.ok) return res.status(200).json({ pages: [], items: [], error: 'github', ...rlInfo(r) })
+        const arr = await r.json()
+        const items = (Array.isArray(arr) ? arr : []).filter((x) => x.type === 'file' && x.name.endsWith(ext) && x.name !== '.keep.md' && x.name !== '.keep')
+          .map((x) => ({ path: x.path, name: x.name.slice(0, -ext.length), sha: x.sha }))
+        return res.status(200).json({ pages: items, items })
+      }
+      // Enfants DIRECTS d'un dossier. FIX 1000 (2026-06-11) : l'API Contents PLAFONNE à 1000 entrées par dossier
+      // (limite GitHub dure, non paginable) -> les gros dossiers tronquaient et les vidéos (noms en fin de tri)
+      // disparaissaient. On passe par git/trees NON récursif sur le tree-ish `branche:chemin` : TOUTES les entrées
+      // du dossier (limite ~100k/dossier). Fallback Contents conservé si le tree-ish échoue.
+      if (action === 'children') {
+        const dir = (req.query.dir || 'pages').toString().replace(/\/+$/, '')
+        // Memory (dossier LIVE, repo distinct, lecture seule) : arbre filesystem PLAT, aucun filtre
+        // d'extension (contrairement à NODE_RE ci-dessous, pensé pour les nœuds Notion de zenray-data) —
+        // Memory contient des fichiers de toute nature (.md/.py/.pdf/.json/sans extension…), tous affichés tels quels.
+        if (dir === 'Memory' || dir.startsWith('Memory/')) {
+          if (dir.includes('..')) return res.status(400).json({ error: 'bad-dir' })
+          const sub = dir === 'Memory' ? '' : dir.slice('Memory/'.length)
+          const cacheKey = 'children:' + dir
+          const cached = memoryCacheGet(cacheKey)
+          if (cached) return res.status(200).json({ entries: cached, complete: true, cached: true })
+          const rt = await ghMemory(token, `git/trees/${encodeURIComponent('main:' + sub)}`)
+          if (rt.status === 404) return res.status(200).json({ entries: [] })
+          if (!rt.ok) return res.status(200).json({ entries: [], error: 'github', ...rlInfo(rt) })
+          const jt = await rt.json()
+          const entries = (jt.tree || [])
+            .map((x) => ({ name: x.path, path: `${dir}/${x.path}`, type: x.type === 'tree' ? 'dir' : 'file' }))
+          memoryCacheSet(cacheKey, entries)
+          return res.status(200).json({ entries, complete: true, truncated: !!jt.truncated })
+        }
+        if (!/^(pages|build|databases)(\/|$)/.test(dir) || dir.includes('..')) return res.status(400).json({ error: 'bad-dir' })
+        const folderResolution = await resolveEagleFolderDir(token, dir)
+        if (folderResolution.error) return res.status(200).json({ entries: [], error: folderResolution.error })
+        const physicalDir = folderResolution.physicalDir
+        const share = (req.query.share || '').toString()
+        if (share && physicalDir !== dir && !(await authorizeShareAccess(share, physicalDir))) return res.status(403).json({ entries: [], error: 'link-outside-share' })
+        // CETTE LISTE A ETE OUBLIEE DEUX FOIS, ce qui a fini par regler la question (2026-08-31).
+        // Le commentaire d origine disait deja tout : « 4e occurrence de cette meme liste trouvee dans
+        // ce fichier, la 1ere fois j avais seulement corrige INDEX_NODE_RE, en manquant celle-ci ».
+        // Elle a ete manquee une seconde fois, sur `zmedia.json`, et un document ZenRayMedia restait
+        // donc invisible dans le Finder alors qu il existait bel et bien.
+        //
+        // Un commentaire ecrit A COTE d une copie ne l empeche pas de diverger : il faut supprimer la
+        // copie. La liste vit desormais dans server/extensionsNoeuds.js, et un test compare toutes
+        // celles du depot a celle-la.
+        const NODE_RE = RE_NOEUD
+        const rt = await gh(token, `git/trees/${encodeURIComponent(BRANCH + ':' + physicalDir)}`)
+        if (rt.ok) {
+          const jt = await rt.json()
+          const entries = (jt.tree || [])
+            .filter((x) => x.path !== '.zr-resources' && (x.type === 'tree' || (x.type === 'blob' && NODE_RE.test(x.path))))
+            .map((x) => ({ name: x.path, path: `${dir}/${x.path}`, type: x.type === 'tree' ? 'dir' : 'file' }))
+          return res.status(200).json({ entries, complete: true, truncated: !!jt.truncated, ...(physicalDir !== dir ? { eagleSource: physicalDir } : {}) })
+        }
+        if (rt.status === 404) return res.status(200).json({ entries: [] })
+        const r = await gh(token, `contents/${encodeURI(physicalDir)}?ref=${BRANCH}`)
+        if (r.status === 404) return res.status(200).json({ entries: [] })
+        if (!r.ok) return res.status(200).json({ entries: [], error: 'github', ...rlInfo(r) })
+        const arr = await r.json()
+        const entries = (Array.isArray(arr) ? arr : [])
+          .filter((x) => x.name !== '.zr-resources' && (x.type === 'dir' || (x.type === 'file' && NODE_RE.test(x.name))))
+          .map((x) => ({ name: x.name, path: `${dir}/${x.name}`, type: x.type }))
+        return res.status(200).json({ entries })
+      }
+      if (action === 'tree') {
+        const dir = (req.query.dir || 'pages').toString()
+        const folderResolution = await resolveEagleFolderDir(token, dir)
+        if (folderResolution.error) return res.status(200).json({ paths: [], error: folderResolution.error })
+        const physicalDir = folderResolution.physicalDir
+        const share = (req.query.share || '').toString()
+        if (share && physicalDir !== dir && !(await authorizeShareAccess(share, physicalDir))) return res.status(403).json({ paths: [], error: 'link-outside-share' })
+
+        // UN DOSSIER PRÉCIS PREND SON PROPRE SOUS-ARBRE, jamais l'arbre entier du dépôt filtré après
+        // coup. Bug réel, payé le 2026-08-29 : un lien de partage sur `pages/Photos/DJI/29 Août 2026`
+        // rendait « Empty folder » alors que les 749 manifestes venaient d'être commités — la cause
+        // n'était pas ce dossier, elle était globale : `git/trees/${BRANCH}?recursive=1` est TRONQUÉ sur
+        // ce dépôt (mesuré le 2026-08-05, 44 015 entrées sur 135 588), et TOUT `pages/Photos/DJI`
+        // tombait après la coupure. Le partage d'un dossier, la vue `trash` (App.jsx, `dir=trash`) et
+        // tout futur appelant qui précise `dir` héritaient donc silencieusement du même risque.
+        //
+        // `dir === 'pages'` (la valeur par défaut, sans dossier précisé) garde l'ancien chemin en
+        // dessous : ces appels globaux savent déjà qu'ils sont best-effort et se complètent côté
+        // client par l'union avec l'index de recherche CDN, exhaustif lui (searchIndexClient.js).
+        // Changer cette moitié-là n'était pas demandé et n'aurait rien réparé de plus.
+        if (dir !== 'pages') {
+          let racine = physicalDir
+          let scoped = await scopedNodePathsUnder(token, racine, isExposedTreeNode)
+          // REPLI SANS ACCENT, et seulement quand le dossier demande n'a RIEN rendu : les liens de
+          // partage emis avant le renommage du 2026-08-31 portent « 29 Août 2026 » alors que le
+          // dossier s'appelle desormais « 29 Aout 2026 ». Sans ce repli, la galerie publique affiche
+          // « Empty folder » a tous ces liens, sans une erreur — c'est arrive en production, sur un
+          // lien deja envoye a quelqu'un. Le cout est nul dans le cas normal : on ne reessaie que si
+          // le premier essai est vide ET que le chemin porte reellement un accent.
+          if (!scoped.length) {
+            const sans = cheminSansAccent(racine)
+            if (sans !== racine) {
+              const secours = await scopedNodePathsUnder(token, sans, isExposedTreeNode)
+              if (secours.length) { racine = sans; scoped = secours }
+            }
+          }
+          const paths = scoped.map((p) => dir + p.slice(racine.length))
+          const body = JSON.stringify({ paths, truncated: false })
+          const etag = 'W/"' + createHash('sha1').update(body).digest('base64url') + '"'
+          res.setHeader('ETag', etag)
+          res.setHeader('Cache-Control', 'no-cache')
+          if (req.headers['if-none-match'] === etag) return res.status(304).end()
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          return res.status(200).send(body)
+        }
+
+        const r = await gh(token, `git/trees/${BRANCH}?recursive=1`)
+        if (!r.ok) { const rl = rlInfo(r); return res.status(200).json({ paths: [], ...(rl.rateLimited ? { error: 'github', ...rl } : {}) }) }
+        const j = await r.json()
+        // Phase 1 OS : exposer tous les types de nœuds (page/db/media/image/canvas/embed) + marqueurs de
+        // dossier (.zrfolder.json, .zrmusic.json). Prédicat testé dans server/nodeTreeFilter.js — voir ce
+        // fichier pour l'historique des deux régressions déjà trouvées ici (dossier vide 2026-07-12,
+        // routage Music 2026-07-16).
+        const paths = (j.tree || []).filter((x) => x.type === 'blob' && x.path.startsWith(physicalDir + '/') && isExposedTreeNode(x.path)).map((x) => dir + x.path.slice(physicalDir.length))
+
+        // ETAG, ET C'EST UN CORRECTIF DE FACTURE, PAS UNE OPTIMISATION DE CONFORT.
+        //
+        // Mesuré le 2026-07-30 : cette réponse pèse 3,02 Mo, et le client la redemande toutes les
+        // 25 secondes (App.jsx, `setInterval(loadPaths, 25000)`). Cela fait 435 Mo par heure de
+        // session, soit les 32,53 Go de « Fast Origin Transfer » qui ont fait dépasser le plan
+        // Vercel de 3,25 fois et bloqué tout déploiement pendant quatre jours.
+        //
+        // Le compteur touché est celui de l'ORIGINE, pas celui du CDN, parce qu'une réponse de
+        // fonction en `no-store` ne peut jamais être servie depuis le cache : chaque appel traverse
+        // l'origine intégralement. Un `Cache-Control: no-store` interdit même au navigateur de
+        // garder de quoi revalider, donc il ne peut pas envoyer `If-None-Match` et le 304 devient
+        // structurellement impossible. `no-cache` dit tout autre chose : garde-le, mais demande-moi
+        // avant de t'en servir. C'est exactement ce qu'il nous faut.
+        //
+        // L'appel à GitHub reste payé (il faut bien calculer l'empreinte), mais les 3 Mo ne
+        // repartent plus sur le réseau quand l'arbre n'a pas bougé, et c'est le cas presque tout
+        // le temps.
+        const body = JSON.stringify({ paths, truncated: !!j.truncated })
+        const etag = 'W/"' + createHash('sha1').update(body).digest('base64url') + '"'
+        res.setHeader('ETag', etag)
+        res.setHeader('Cache-Control', 'no-cache')
+        if (req.headers['if-none-match'] === etag) return res.status(304).end()
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        return res.status(200).send(body)
+      }
+      // T6 : index COMPLET renvoyé d'un bloc { paths, builtAt, count } pour cache client (IndexedDB).
+      // Le client charge l'index UNE fois, le persiste localement, et score chaque frappe en local
+      // (zéro aller-retour réseau par caractère). On expose builtAt pour que le client sache s'il doit
+      // recharger (l'index a changé) ou réutiliser sa copie locale. Réutilise le cache mémoire g.__zrIndex.
+      if (action === 'index') {
+        const g = globalThis
+        let idx = g.__zrIndex
+        if (!idx || (Date.now() - idx.at) > 120000) {
+          const r = await gh(token, `contents/${encodeURI('pages/.zr-search-index.json')}?ref=${BRANCH}`, { headers: { Accept: 'application/vnd.github.raw' } })
+          if (!r.ok) return res.status(200).json({ paths: [], builtAt: null, source: 'no-index' })
+          // E (vignette dans l'index v2) : on parse et garde AUSSI `thumbs` (carte chemin->{u}|{r,p})
+          // et `v`. Rétro-compat v1 : un index sans thumbs -> thumbs={} (le client retombe sur la
+          // lecture paresseuse du manifeste, comportement actuel inchangé).
+          // v3 : on garde AUSSI `content` (carte chemin->texte plein-texte) pour la recherche par mot-clé dans
+          // le corps des markdowns/tables. Absent (v1/v2) -> content={} (recherche par nom/chemin inchangée).
+          try { const parsed = JSON.parse(await r.text()); idx = g.__zrIndex = { at: Date.now(), v: parsed.v || 1, paths: parsed.paths || [], builtAt: parsed.builtAt || null, thumbs: (parsed.thumbs && typeof parsed.thumbs === 'object') ? parsed.thumbs : {}, content: (parsed.content && typeof parsed.content === 'object') ? parsed.content : {} } }
+          catch { return res.status(200).json({ paths: [], builtAt: null, source: 'index-parse-error' }) }
+        }
+        // search-6 : mode TÊTE (head=1) -> renvoie seulement builtAt+count (quelques octets), pas les
+        // ~11-28 Mo de paths+thumbs. Le client l'appelle en rafraîchissement opportuniste : il ne re-tire
+        // le corps complet que si builtAt a changé. Premier chargement = appel complet (sans head).
+        if (req.query.head) return res.status(200).json({ v: idx.v || 1, builtAt: idx.builtAt || null, count: idx.paths.length })
+        return res.status(200).json({ v: idx.v || 1, paths: idx.paths, thumbs: idx.thumbs || {}, content: idx.content || {}, builtAt: idx.builtAt || null, count: idx.paths.length })
+      }
+      if (action === 'read') {
+        const requestedPath = (req.query.path || '').toString()
+        // Memory : lecture SEULE, toujours via raw.githubusercontent (repo privé mais accepté avec le
+        // Bearer token, testé le 2026-07-16 — HORS quota REST comme le mode raw=1 ci-dessous). Jamais de
+        // sha renvoyé : ce chemin n'a pas de pendant save/delete/move, une édition n'a aucun sens ici.
+        if (requestedPath === 'Memory' || requestedPath.startsWith('Memory/')) {
+          if (requestedPath.includes('..')) return res.status(400).json({ error: 'bad-path' })
+          const sub = requestedPath.slice('Memory/'.length)
+          try {
+            const rr = await fetch(`https://raw.githubusercontent.com/${MEMORY_REPO}/main/${encodeURI(sub)}`, { headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' } })
+            if (rr.status === 404) return res.status(200).json({ markdown: '', sha: null, missing: true })
+            if (rr.ok) return res.status(200).json({ markdown: await rr.text(), sha: null, path: requestedPath, raw: true })
+            return res.status(200).json({ error: 'github' })
+          } catch { return res.status(200).json({ error: 'github' }) }
+        }
+        if (!safe(requestedPath)) return res.status(400).json({ error: 'bad-path' })
+        const fileResolution = await resolveEagleFilePath(token, requestedPath)
+        if (fileResolution.error) return res.status(200).json({ error: fileResolution.error, missing: true })
+        const path = fileResolution.physicalPath
+        const share = (req.query.share || '').toString()
+        if (share && path !== requestedPath && !(await authorizeShareAccess(share, path))) return res.status(403).json({ error: 'link-outside-share' })
+        // LECTURE D'AFFICHAGE HORS QUOTA (raw=1) : pour les lectures qui n'ont PAS besoin du sha (manifests
+        // .img.json des vignettes, .props/.comments en lecture seule, .md pour détecter une couverture), on sert
+        // via raw.githubusercontent.com qui NE COMPTE PAS dans la limite REST 5000/h. C'est le gros volume (1 par
+        // image affichée) -> parcourir des milliers d'images ne consomme plus le quota. Repli API contents si raw KO.
+        // Les lectures D'ÉDITION (qui sauvegardent ensuite) n'envoient PAS raw=1 et gardent le sha via l'API.
+        // REPLI SANS ACCENT, pose le 2026-08-31. Les liens de partage emis avant le renommage de
+        // pages/Photos portent « 29 Août 2026 » alors que le dossier s'appelle desormais
+        // « 29 Aout 2026 ». Le listing sait deja retomber sur la bonne racine, mais il rend les
+        // chemins tels que le client les a demandes : chaque manifeste etait donc lu sous son ancien
+        // nom et repondait `missing: true`. Symptome vu par Matthieu : le dossier partage s'affiche,
+        // et TOUTES les vignettes restent vides.
+        //
+        // On ne paie ce repli que lorsque le chemin porte reellement un accent, et le resultat est
+        // memoise pour la duree de l'invocation : une galerie de 833 images ne refait pas 833 fois
+        // la meme decouverte.
+        const cheminSecours = (() => {
+          const sans = cheminSansAccent(path)
+          return sans !== path ? sans : null
+        })()
+
+        if (req.query.raw) {
+          try {
+            // `fresh=1` est réservé aux petits états vivants, notamment ZenRay Plan (24 Ko mesurés) :
+            // le paramètre unique contourne le cache de raw.githubusercontent, tandis que `raw=1` garde
+            // la lecture hors quota REST GitHub. Sans lui, un poll fréquent pourrait relire la même
+            // ancienne réponse CDN pendant plusieurs minutes et écraser visuellement un changement externe.
+            const fresh = req.query.fresh ? `?zr=${Date.now()}` : ''
+            const rr = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(path)}${fresh}`, { cache: req.query.fresh ? 'no-store' : undefined, headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' } })
+            if (rr.ok) return res.status(200).json({ markdown: await rr.text(), sha: null, path: requestedPath, resolvedPath: path, raw: true })
+            if (rr.status === 404) {
+              // Avant de declarer le fichier absent, on tente sa variante sans accent : un lien
+              // partage avant le renommage vise encore l'ancien nom.
+              if (cheminSecours) {
+                const r2 = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(cheminSecours)}${fresh}`, { headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' } })
+                if (r2.ok) return res.status(200).json({ markdown: await r2.text(), sha: null, path: requestedPath, resolvedPath: cheminSecours, raw: true })
+              }
+              // A file written minutes ago (a guest's photo) is not on raw.githubusercontent.com yet. For a SHARE visitor, ask GraphQL
+              // (its own quota bucket) instead of answering « missing », which the browser would remember for the whole session.
+              if (req.query.share) {
+                const fresh = await readFreshText(token, path) || (cheminSecours ? await readFreshText(token, cheminSecours) : null)
+                if (fresh != null) return res.status(200).json({ markdown: fresh, sha: null, path: requestedPath, resolvedPath: path, raw: true, fresh: true })
+              }
+              return res.status(200).json({ markdown: '', sha: null, missing: true })
+            }
+          } catch {}
+          // raw KO (rare) -> on retombe sur l'API contents ci-dessous.
+        }
+        const r = await gh(token, `contents/${encodeURI(path)}?ref=${BRANCH}`)
+        if (r.status === 404) return res.status(200).json({ markdown: '', sha: null, missing: true })
+        if (!r.ok) return res.status(200).json({ error: 'github', ...rlInfo(r) })
+        const j = await r.json()
+        let markdown
+        try { markdown = await contentsText(token, j) } catch { return res.status(200).json({ error: 'github' }) }
+        return res.status(200).json({ markdown, sha: j.sha, path: requestedPath, resolvedPath: path })
+      }
+      // Resolve an Eagle placement once, before any viewer is chosen.  Links are
+      // flattened at creation, but the bounded loop also keeps old/corrupt data
+      // harmless instead of allowing a recursive viewer fetch.
+      if (action === 'resolve-link') {
+        const requested = (req.query.path || '').toString()
+        if (!safe(requested) || !EAGLE_LINK_RE.test(requested)) return res.status(400).json({ ok: false, error: 'bad-path' })
+        const fileResolution = await resolveEagleFilePath(token, requested)
+        if (fileResolution.error) return res.status(200).json({ ok: false, error: fileResolution.error })
+        let path = fileResolution.physicalPath
+        const share = (req.query.share || '').toString()
+        if (share && path !== requested && !(await authorizeShareAccess(share, path))) return res.status(200).json({ ok: false, error: 'link-outside-share' })
+        // ═══ DEUX LECTURES DE FICHIER NE DOIVENT RIEN COÛTER AU QUOTA (2026-08-31) ═══════════════
+        //
+        // INCIDENT : Matthieu à 3000 requêtes consommées sur 5000, uniquement en triant et en
+        // affichant des liens. Cette route en brûlait DEUX par lien — et elle est appelée pour
+        // CHAQUE lien affiché dans une grille, par `readImgManifestCached`.
+        //
+        // Or les deux choses lues ici sont de simples fichiers JSON : le manifeste et le registre.
+        // `raw.githubusercontent.com` les sert avec le même jeton, hors quota REST, et c'est
+        // exactement ce que `rawJsonAt` fait depuis toujours. L'API `contents` n'apportait rien
+        // qu'on utilise : ni le sha, ni la taille, seulement le contenu décodé.
+        //
+        // Un dossier de tri de treize liens passe donc de vingt-six requêtes de quota à ZÉRO.
+        // ═══ UN 404 SUR RAW N'EST PAS UNE ABSENCE (2026-09-05) ════════════════════════════════
+        //
+        // SYMPTÔME : on trie une image, la barre annonce « 1 lien(s) créé(s) et indexé(s) ✓ », et
+        // la tuile reste blanche avec « Lien média indisponible. ». Un rechargement la répare.
+        //
+        // CAUSE : raw.githubusercontent.com sert derrière un cache CDN qui met quelques minutes à
+        // voir un fichier neuf, et répond 404 en attendant. `rawJsonAt` prend ce 404 pour une
+        // réponse définitive, si bien qu'on répondait `missing` ou `orphan-link` — deux mots que le
+        // client range dans les absences RÉELLES et mémorise pour toute la session. L'échec durait
+        // donc infiniment plus longtemps que sa cause.
+        //
+        // POURQUOI `replierSur404` NE REPAIE PAS LE QUOTA : le repli ne s'ouvre QUE sur un 404,
+        // c'est-à-dire jamais dans le cas normal d'un lien déjà en place. Une grille de huit cents
+        // raccourcis coûte toujours zéro requête de quota ; seul un lien de moins de cinq minutes
+        // en coûte une, et c'est exactement celui qu'il faut savoir montrer.
+        for (let depth = 0; depth < 4; depth++) {
+          const manifest = await rawJsonAt(token, path, { replierSur404: true })
+          if (!manifest) return res.status(200).json({ ok: false, error: 'missing' })
+          if (!isEagleLink(manifest)) return res.status(200).json({ ok: true, path, linked: path !== requested })
+          const rp = resourcePathOf(manifest.resourceId)
+          const resource = await rawJsonAt(token, rp, { replierSur404: true })
+          if (!resource) return res.status(200).json({ ok: false, error: 'orphan-link', resourceId: manifest.resourceId })
+          if (!resource || resource.resourceId !== manifest.resourceId || !safe(resource.sourcePath)) return res.status(200).json({ ok: false, error: 'invalid-resource' })
+          // A public folder link never becomes a capability for a private target.
+          // The route gate has already authorised `requested`; this second check
+          // proves that the canonical resource remains in exactly that scope.
+          // DEPTH 0 = the link the visitor asked for: the route gate has already proven it sits inside the share, and it
+          // names this very resource, so its target is reachable (2 October 2026: this check refused every gallery of
+          // links, whose targets live outside the shared folder). Deeper hops (link of a link) keep the strict scope.
+          if (share && depth > 0 && !(await authorizeShareAccess(share, resource.sourcePath))) return res.status(200).json({ ok: false, error: 'link-outside-share' })
+          path = resource.sourcePath
+        }
+        return res.status(200).json({ ok: false, error: 'link-cycle' })
+      }
+      if (action === 'eagle-locations') {
+        const requestedPath = (req.query.path || '').toString()
+        const requestedDir = (req.query.dir || '').toString().replace(/\/+$/, '')
+        let resourceId = null
+        let fallback = null
+        if (requestedDir) {
+          if (!/^(pages|build|databases)(\/|$)/.test(requestedDir) || requestedDir.includes('..')) return res.status(400).json({ error: 'bad-dir' })
+          fallback = requestedDir
+          const [placement, identity] = await Promise.all([rawJsonAt(token, `${requestedDir}/${EAGLE_FOLDER_LINK_FILE}`), rawJsonAt(token, `${requestedDir}/${EAGLE_FOLDER_RESOURCE_FILE}`)])
+          resourceId = placement?.resourceId || identity?.resourceId || null
+        } else {
+          if (!safe(requestedPath) || !EAGLE_LINK_RE.test(requestedPath)) return res.status(400).json({ error: 'bad-path' })
+          fallback = requestedPath
+          const resolved = await resolveEagleFilePath(token, requestedPath)
+          const manifest = resolved.error ? null : await rawJsonAt(token, resolved.physicalPath)
+          resourceId = manifest?.resourceId || null
+          // A plain child inside a linked asset bundle has no leaf registry of
+          // its own. Derive all logical locations from the folder resource.
+          if (!resourceId && resolved.resourceId && resolved.sourceRoot && resolved.logicalRoot) {
+            const folderRegistry = await rawJsonAt(token, resourcePathOf(resolved.resourceId))
+            if (folderRegistry?.resourceId === resolved.resourceId && folderRegistry.kind === 'folder') {
+              const suffix = requestedPath.slice(resolved.logicalRoot.length)
+              const roots = [...new Set((Array.isArray(folderRegistry.placements) ? folderRegistry.placements : [folderRegistry.sourceDir]).filter(Boolean))]
+              const placements = roots.map((root) => root + suffix)
+              return res.status(200).json({ ok: true, resourceId: resolved.resourceId, placements, count: placements.length, sourcePath: folderRegistry.sourceDir + suffix, kind: 'folder-child' })
+            }
+          }
+        }
+        if (!resourceId) return res.status(200).json({ ok: true, resourceId: null, placements: fallback ? [fallback] : [], count: fallback ? 1 : 0 })
+        const registry = await rawJsonAt(token, resourcePathOf(resourceId))
+        if (!registry || registry.resourceId !== resourceId) return res.status(200).json({ error: 'orphan-link', resourceId })
+        const placements = [...new Set((Array.isArray(registry.placements) ? registry.placements : [registry.sourcePath || registry.sourceDir]).filter(Boolean))]
+        return res.status(200).json({ ok: true, resourceId, placements, count: placements.length, sourcePath: registry.sourcePath || registry.sourceDir || null, kind: registry.kind || null })
+      }
+      return res.status(400).json({ error: 'bad-action' })
+    }
+
+    if (req.method === 'POST') {
+      let body = req.body
+      if (typeof body === 'string') { try { body = JSON.parse(body) } catch { body = {} } }
+      const action = body.action
+
+      // One request, one content commit and one index update for the whole selection.
+      // Git tree entries accept inline `content`, so even 100+ placements do not
+      // create 100 sequential save commits (or 300 blob-write requests).
+      if (action === 'create-eagle-links-batch') {
+        // Les chemins reçus sont normalisés AVANT tout : un `sourcePath` décomposé ne se lit pas, et
+        // un `targetPath` décomposé créerait un dossier en double, identique à l'œil et distinct
+        // pour git. Voir le commentaire de `nfc` en tête de fichier.
+        const requestedItems = (Array.isArray(body.items) ? body.items.slice(0, 1000) : []).map((it) => it && typeof it === 'object'
+          ? { ...it, sourcePath: nfc(it.sourcePath), targetPath: nfc(it.targetPath), sourceDir: nfc(it.sourceDir), targetDir: nfc(it.targetDir) }
+          : it)
+        if (!requestedItems.length || requestedItems.length !== (body.items || []).length) return res.status(400).json({ error: 'bad-items' })
+        const cleanDir = (value) => typeof value === 'string' ? value.replace(/\/+$/, '') : ''
+        const validDir = (value) => /^(pages|build|databases)(\/|$)/.test(value) && !value.includes('..')
+        const files = new Set()
+        const occupiedBases = new Set()
+        // Collision checks are scoped to the actual destination directories.
+        // This remains exact even when GitHub truncates the repository-wide tree.
+        const targetParents = [...new Set(requestedItems.map((item) => {
+          const target = cleanDir(item?.kind === 'folder' ? item.targetDir : item?.targetPath)
+          return target.slice(0, target.lastIndexOf('/'))
+        }).filter(validDir))]
+        const destinationListings = await Promise.all(targetParents.map(async (dir) => [dir, await directDirectoryEntries(token, dir)]))
+        if (destinationListings.some(([, entries]) => entries == null)) return res.status(200).json({ error: 'github', detail: 'target-tree' })
+        for (const [dir, entries] of destinationListings) for (const x of entries) {
+          const path = `${dir}/${x.path}`
+          if (x.type === 'tree') occupiedBases.add(path)
+          else if (x.type === 'blob') {
+            files.add(path)
+            if (isExposedTreeNode(path)) occupiedBases.add(path.replace(/\.(db|media|img|canvas|ref|embed|file)\.json$/, '').replace(/\.md$/, '').replace(/\/(\.zrfolder|\.zrmusic|\.zreagle-folder)\.json$/, ''))
+          }
+        }
+        const planned = []
+        for (let index = 0; index < requestedItems.length; index++) {
+          const item = requestedItems[index] || {}
+          if (item.kind === 'leaf') {
+            const sourcePath = String(item.sourcePath || '')
+            const requestedTarget = String(item.targetPath || '')
+            const sourceExt = sourcePath.match(EAGLE_LINK_RE)?.[0]
+            if (!safe(sourcePath) || !safe(requestedTarget) || !sourceExt || sourceExt !== requestedTarget.match(EAGLE_LINK_RE)?.[0] || sourcePath === requestedTarget) return res.status(200).json({ error: 'preflight', results: requestedItems.map((_, i) => ({ index: i, ok: false, error: i === index ? 'bad-path' : 'batch-aborted' })) })
+            planned.push({ index, kind: 'leaf', sourcePath, targetPath: reserveEagleLeafTarget(requestedTarget, sourceExt, files, occupiedBases), title: typeof item.title === 'string' ? item.title.slice(0, 240) : null })
+          } else if (item.kind === 'folder') {
+            const sourceDir = cleanDir(item.sourceDir)
+            const requestedTarget = cleanDir(item.targetDir)
+            if (!validDir(sourceDir) || !validDir(requestedTarget) || sourceDir === requestedTarget || requestedTarget.startsWith(sourceDir + '/')) return res.status(200).json({ error: 'preflight', results: requestedItems.map((_, i) => ({ index: i, ok: false, error: i === index ? 'bad-dir' : 'batch-aborted' })) })
+            planned.push({ index, kind: 'folder', sourceDir, targetDir: reserveEagleFolderTarget(requestedTarget, files, occupiedBases, EAGLE_FOLDER_LINK_FILE), title: typeof item.title === 'string' ? item.title.slice(0, 240) : null })
+          } else return res.status(200).json({ error: 'preflight', results: requestedItems.map((_, i) => ({ index: i, ok: false, error: i === index ? 'bad-kind' : 'batch-aborted' })) })
+        }
+
+        // Resolve every source before writing anything. Any orphan/invalid item
+        // aborts the entire batch, so the UI never receives a false partial success.
+        const prepared = await Promise.all(planned.map(async (item) => {
+          const targetParent = (item.kind === 'folder' ? item.targetDir : item.targetPath).slice(0, (item.kind === 'folder' ? item.targetDir : item.targetPath).lastIndexOf('/'))
+          const targetResolution = await resolveEagleFolderDir(token, targetParent)
+          if (targetResolution.error || targetResolution.physicalDir !== targetParent) return { ...item, error: targetResolution.error || 'virtual-target-readonly' }
+          if (item.kind === 'folder') {
+            const flattened = await resolveEagleFolderDir(token, item.sourceDir)
+            if (flattened.error) return { ...item, error: flattened.error }
+            const sourceDir = flattened.physicalDir
+            if (await directDirectoryEntries(token, sourceDir) == null) return { ...item, error: 'missing-source' }
+            const identity = await rawJsonAt(token, `${sourceDir}/${EAGLE_FOLDER_RESOURCE_FILE}`)
+            return { ...item, sourceDir, identity, resourceId: identity?.resourceId || null }
+          }
+          const sourceResolution = await resolveEagleFilePath(token, item.sourcePath)
+          if (sourceResolution.error) return { ...item, error: sourceResolution.error }
+          let canonicalPath = sourceResolution.physicalPath
+          // Le manifeste source vient peut-être d'être réécrit par un lot précédent : ici le repli
+          // se justifie, un faux « absent » annulerait tout le lot.
+          let canonical = await rawJsonAt(token, canonicalPath, { replierSur404: true })
+          if (!canonical) return { ...item, error: 'invalid-source' }
+          let resourceId = canonical.resourceId || null
+          if (isEagleLink(canonical)) {
+            resourceId = canonical.resourceId
+            const registry = await rawJsonAt(token, resourcePathOf(resourceId), { replierSur404: true })
+            if (!registry || !safe(registry.sourcePath)) return { ...item, error: 'orphan-link' }
+            canonicalPath = registry.sourcePath
+            canonical = await rawJsonAt(token, canonicalPath, { replierSur404: true })
+            if (!canonical) return { ...item, error: 'missing-source' }
+          }
+          // Raw peut servir une copie d'AVANT le tri précédent, où l'identité n'existait pas encore.
+          // On ne frappe donc jamais une identité neuve sur la foi d'une absence lue par raw : on la
+          // fait confirmer par l'API, qui, elle, voit le drive tel qu'il est.
+          if (!resourceId) {
+            const frais = await apiJsonAt(token, canonicalPath)
+            if (frais && typeof frais.resourceId === 'string') { canonical = frais; resourceId = frais.resourceId }
+          }
+          return { ...item, canonicalPath, canonical, resourceId }
+        }))
+        const bad = prepared.find((x) => x.error)
+        if (bad) return res.status(200).json({ error: 'preflight', results: planned.map((x) => ({ index: x.index, ok: false, error: x.index === bad.index ? bad.error : 'batch-aborted' })) })
+
+        const now = new Date().toISOString()
+        const idsByResource = new Map()
+        for (const item of prepared) {
+          const key = `${item.kind}:${item.kind === 'folder' ? item.sourceDir : item.canonicalPath}`
+          if (!idsByResource.has(key)) idsByResource.set(key, item.resourceId || resourceIdOf())
+          item.resourceId = idsByResource.get(key)
+        }
+        const uniqueIds = [...new Set(prepared.map((x) => x.resourceId))]
+        const registries = new Map(await Promise.all(uniqueIds.map(async (id) => [id, await rawJsonAt(token, resourcePathOf(id))])))
+        const writes = new Map()
+        const resourceRecords = new Map()
+        const putJson = (path, value) => writes.set(path, { path, mode: '100644', type: 'blob', content: JSON.stringify(value, null, 2) })
+        for (const item of prepared) {
+          let record = resourceRecords.get(item.resourceId)
+          if (!record) {
+            const previous = registries.get(item.resourceId)
+            record = { ...(previous && previous.resourceId === item.resourceId ? previous : {}), v: 1, type: 'zenray-eagle-resource/v1', resourceId: item.resourceId, createdAt: previous?.createdAt || now, placements: new Set(Array.isArray(previous?.placements) ? previous.placements : []) }
+            resourceRecords.set(item.resourceId, record)
+          }
+          if (item.kind === 'folder') {
+            record.kind = 'folder'; record.sourceDir = item.sourceDir; record.placements.add(item.sourceDir); record.placements.add(item.targetDir)
+            putJson(`${item.sourceDir}/${EAGLE_FOLDER_RESOURCE_FILE}`, { v: 1, type: 'zenray-eagle-folder-resource/v1', resourceId: item.resourceId })
+            putJson(`${item.targetDir}/${EAGLE_FOLDER_LINK_FILE}`, { v: 1, type: EAGLE_FOLDER_LINK_TYPE, resourceId: item.resourceId, title: item.title, createdAt: now })
+          } else {
+            record.kind = item.canonicalPath.match(EAGLE_LINK_RE)?.[1] || 'file'; record.sourcePath = item.canonicalPath; record.placements.add(item.canonicalPath); record.placements.add(item.targetPath)
+            // Rewrite the canonical manifest ONLY when it has no identity yet (2 October 2026): the copy we read may be a
+            // stale raw-CDN one, so rewriting it on every sort could silently revert a newer edit and it widened the diff.
+            if (item.canonical.resourceId !== item.resourceId) putJson(item.canonicalPath, { ...item.canonical, resourceId: item.resourceId })
+            putJson(item.targetPath, { v: 1, type: EAGLE_LINK_TYPE, resourceId: item.resourceId, title: item.title, createdAt: now })
+          }
+        }
+        for (const record of resourceRecords.values()) {
+          record.updatedAt = now; record.placements = [...record.placements]
+          putJson(resourcePathOf(record.resourceId), record)
+        }
+        const commit = await commitTree(token, [...writes.values()], `create ${prepared.length} Eagle link(s)`)
+        if (!commit.ok) return res.status(200).json({ error: 'github', detail: commit.error, results: planned.map((x) => ({ index: x.index, ok: false, error: 'commit' })) })
+
+        // Every visible leaf placement is searchable immediately. Folder links
+        // contribute their whole logical tree while keeping one physical bundle.
+        const indexPairs = []
+        const deferIndex = body.skipIndex === true && prepared.every((item) => item.kind === 'leaf')
+        for (const item of prepared) {
+          if (item.kind === 'leaf') indexPairs.push([item.targetPath, item.canonicalPath])
+          else for (const source of await indexedNodePathsUnder(token, item.sourceDir)) indexPairs.push([item.targetDir + source.slice(item.sourceDir.length), source])
+        }
+        const indexPaths = [...new Set(indexPairs.map(([target]) => target))]
+        let indexed = false
+        // `skipIndex` (leaf-only batches, 2 October 2026): the links are committed and we answer NOW; the caller indexes
+        // them through `index-links`. A dead index step can no longer turn a finished commit into « no response ».
+        if (!deferIndex) {
+          try { indexed = await indexLinkPairs(token, indexPairs) } catch { indexed = false }
+        }
+        const g = globalThis; if (g.__zrIndex) g.__zrIndex = null
+        return res.status(200).json({ ok: true, created: prepared.length, indexed, ...(deferIndex ? { indexPairs } : {}), indexedCount: indexPaths.length, indexedPaths: indexPaths, commit: commit.commit, results: prepared.map((x) => ({ index: x.index, ok: true, kind: x.kind, resourceId: x.resourceId, ...(x.kind === 'folder' ? { targetDir: x.targetDir, sourceDir: x.sourceDir } : { targetPath: x.targetPath, sourcePath: x.canonicalPath }) })) })
+      }
+
+      if (action === 'create-eagle-folder-link') {
+        const cleanDir = (value) => typeof value === 'string' ? value.replace(/\/+$/, '') : ''
+        const requestedSource = cleanDir(body.sourceDir)
+        const targetDir = cleanDir(body.targetDir)
+        const validDir = (value) => /^(pages|build|databases)(\/|$)/.test(value) && !value.includes('..')
+        if (!validDir(requestedSource) || !validDir(targetDir) || requestedSource === targetDir || targetDir.startsWith(requestedSource + '/')) return res.status(400).json({ error: 'bad-dir' })
+        const flattened = await resolveEagleFolderDir(token, requestedSource)
+        if (flattened.error) return res.status(200).json({ error: flattened.error })
+        const sourceDir = flattened.physicalDir
+        const sourceExists = await gh(token, `git/trees/${encodeURIComponent(BRANCH + ':' + sourceDir)}`)
+        if (!sourceExists.ok) return res.status(200).json({ error: 'missing-source' })
+        const targetExists = await gh(token, `contents/${encodeURI(targetDir)}?ref=${BRANCH}`)
+        if (targetExists.ok) return res.status(200).json({ error: 'exists' })
+        if (targetExists.status !== 404) return res.status(200).json({ error: 'github' })
+
+        const existingIdentity = await rawJsonAt(token, `${sourceDir}/${EAGLE_FOLDER_RESOURCE_FILE}`)
+        const resourceId = (existingIdentity && typeof existingIdentity.resourceId === 'string') ? existingIdentity.resourceId : resourceIdOf()
+        const now = new Date().toISOString()
+        const identity = { v: 1, type: 'zenray-eagle-folder-resource/v1', resourceId }
+        const previousRegistry = await rawJsonAt(token, resourcePathOf(resourceId))
+        const placements = new Set(Array.isArray(previousRegistry?.placements) ? previousRegistry.placements : [sourceDir])
+        placements.add(sourceDir); placements.add(targetDir)
+        const registry = { ...(previousRegistry || {}), v: 1, type: 'zenray-eagle-resource/v1', resourceId, sourceDir, kind: 'folder', placements: [...placements], createdAt: previousRegistry?.createdAt || now, updatedAt: now }
+        const placement = { v: 1, type: EAGLE_FOLDER_LINK_TYPE, resourceId, title: typeof body.title === 'string' ? body.title.slice(0, 240) : null, createdAt: now }
+        const [identityBlob, registryBlob, placementBlob] = await Promise.all([jsonBlob(token, identity), jsonBlob(token, registry), jsonBlob(token, placement)])
+        if (!identityBlob || !registryBlob || !placementBlob) return res.status(200).json({ error: 'github' })
+        const commit = await commitTree(token, [
+          { path: `${sourceDir}/${EAGLE_FOLDER_RESOURCE_FILE}`, mode: '100644', type: 'blob', sha: identityBlob },
+          { path: resourcePathOf(resourceId), mode: '100644', type: 'blob', sha: registryBlob },
+          { path: `${targetDir}/${EAGLE_FOLDER_LINK_FILE}`, mode: '100644', type: 'blob', sha: placementBlob },
+        ], 'create Eagle folder link')
+        if (!commit.ok) return res.status(200).json({ error: 'github', detail: commit.error })
+        return res.status(200).json({ ok: true, targetDir, sourceDir, resourceId, commit: commit.commit })
+      }
+
+      // Eagle link = a new visible placement, never a new ZenRayShards upload.
+      // The source gets a stable resourceId once; the registry survives placement
+      // moves and lets every consumer resolve to the one real manifest.
+      if (action === 'create-eagle-link') {
+        const { sourcePath, targetPath, title } = body
+        if (!safe(sourcePath) || !safe(targetPath) || !EAGLE_LINK_RE.test(sourcePath) || !EAGLE_LINK_RE.test(targetPath) || sourcePath === targetPath) return res.status(400).json({ error: 'bad-path' })
+        const sourceExt = sourcePath.match(EAGLE_LINK_RE)?.[0]
+        if (!sourceExt || sourceExt !== targetPath.match(EAGLE_LINK_RE)?.[0]) return res.status(400).json({ error: 'kind-mismatch' })
+        const exists = await gh(token, `contents/${encodeURI(targetPath)}?ref=${BRANCH}`)
+        if (exists.ok) return res.status(200).json({ error: 'exists' })
+        if (!exists.ok && exists.status !== 404) return res.status(200).json({ error: 'github' })
+
+        const readJson = async (path) => {
+          const r = await gh(token, `contents/${encodeURI(path)}?ref=${BRANCH}`)
+          if (!r.ok) return null
+          const j = await r.json()
+          try { return { value: JSON.parse(b64d(j.content)), sha: j.sha } } catch { return null }
+        }
+        let source = await readJson(sourcePath)
+        if (!source) return res.status(200).json({ error: 'invalid-source' })
+        let canonicalPath = sourcePath
+        let canonical = source.value
+        let resourceId = canonical.resourceId
+        // Link-to-link is flattened at write time. There are never chains in new data.
+        if (isEagleLink(canonical)) {
+          resourceId = canonical.resourceId
+          const resource = await readJson(resourcePathOf(resourceId))
+          if (!resource || !safe(resource.value.sourcePath)) return res.status(200).json({ error: 'orphan-link' })
+          canonicalPath = resource.value.sourcePath
+          source = await readJson(canonicalPath)
+          if (!source) return res.status(200).json({ error: 'missing-source' })
+          canonical = source.value
+        }
+        resourceId = resourceId || canonical.resourceId || resourceIdOf()
+        canonical.resourceId = resourceId
+        const previousRegistry = await readJson(resourcePathOf(resourceId))
+        const placements = new Set(Array.isArray(previousRegistry?.value?.placements) ? previousRegistry.value.placements : [canonicalPath])
+        placements.add(canonicalPath); placements.add(targetPath)
+        const registry = { ...(previousRegistry?.value || {}), v: 1, type: 'zenray-eagle-resource/v1', resourceId, sourcePath: canonicalPath, kind: sourceExt.slice(1), placements: [...placements], createdAt: previousRegistry?.value?.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() }
+        const link = { v: 1, type: EAGLE_LINK_TYPE, resourceId, title: typeof title === 'string' ? title.slice(0, 240) : null, createdAt: new Date().toISOString() }
+        const [canonicalBlob, registryBlob, linkBlob] = await Promise.all([jsonBlob(token, canonical), jsonBlob(token, registry), jsonBlob(token, link)])
+        if (!canonicalBlob || !registryBlob || !linkBlob) return res.status(200).json({ error: 'github' })
+        const entries = [
+          { path: canonicalPath, mode: '100644', type: 'blob', sha: canonicalBlob },
+          { path: resourcePathOf(resourceId), mode: '100644', type: 'blob', sha: registryBlob },
+          { path: targetPath, mode: '100644', type: 'blob', sha: linkBlob },
+        ]
+        const commit = await commitTree(token, entries, 'create Eagle media link')
+        if (!commit.ok) return res.status(200).json({ error: 'github', detail: commit.error })
+        try { const thumbs = await thumbsForPaths(token, [canonicalPath]); await appendPublicDelta(token, [targetPath], { [targetPath]: thumbs[canonicalPath] }) } catch {}
+        const g = globalThis; if (g.__zrIndex) g.__zrIndex = null
+        return res.status(200).json({ ok: true, path: targetPath, resourceId, sourcePath: canonicalPath, commit: commit.commit })
+      }
+
+      if (action === 'save') {
+        const { path, markdown, sha } = body
+        if (!safe(path)) return res.status(400).json({ error: 'bad-path' })
+        const fileResolution = await resolveEagleFilePath(token, path)
+        if (fileResolution.error || fileResolution.physicalPath !== path) return res.status(200).json({ error: fileResolution.error || 'virtual-folder-readonly' })
+        if (path === ASSETS_WORKSPACE_REGISTRY_PATH) {
+          const saved = await saveLargeContent(token, path, markdown, sha)
+          if (saved.conflict) {
+            let cur = null
+            try { const current = await gh(token, `contents/${encodeURI(path)}?ref=${BRANCH}`); if (current.ok) { const entry = await current.json(); cur = { sha: entry.sha, markdown: await contentsText(token, entry) } } } catch {}
+            return res.status(200).json({ error: 'conflict', conflict: true, ...(cur || {}) })
+          }
+          if (!saved.ok) return res.status(200).json({ error: 'github', detail: saved.error || 'large-content-save-failed' })
+          return res.status(200).json({ ok: true, sha: saved.sha, path })
+        }
+        const payload = { message: 'content save', content: b64e(markdown || ''), branch: BRANCH }
+        if (sha) payload.sha = sha
+        const r = await gh(token, `contents/${encodeURI(path)}`, { method: 'PUT', body: JSON.stringify(payload) })
+        // CONFLIT (sha périmé = 409, ou sha absent sur un fichier qui existe déjà = 422) : on ne laisse JAMAIS
+        // l'écriture se perdre en silence. On renvoie le sha + le contenu COURANT du drive pour que le client
+        // ré-applique son intention (read-modify-write) puis re-save. Voir saveJsonWithRetry côté client.
+        if (r.status === 409 || r.status === 422) {
+          let cur = null
+          try { const g = await gh(token, `contents/${encodeURI(path)}?ref=${BRANCH}`); if (g.ok) { const cj = await g.json(); cur = { sha: cj.sha, markdown: await contentsText(token, cj) } } } catch {}
+          return res.status(200).json({ error: 'conflict', conflict: true, ...(cur || {}) })
+        }
+        if (!r.ok) { const t = await r.text(); return res.status(200).json({ error: 'github', detail: t.slice(0, 160) }) }
+        const j = await r.json()
+        return res.status(200).json({ ok: true, sha: j.content && j.content.sha, path })
+      }
+
+      // Mise à jour INCRÉMENTALE de l'index de recherche après un ajout de nœud (drop / Ctrl-V).
+      // Sans ça, l'index complet (pages/.zr-search-index.json) ne se reconstruisait qu'à la main
+      // via scripts/build-search-index.mjs : les fichiers fraîchement déposés restaient introuvables
+      // par la recherche jusqu'au prochain rebuild. Ici on AJOUTE seulement les chemins manquants
+      // (jamais de suppression), via la Git Data API (blob + tree base_tree + commit + ref force:false),
+      // exactement comme l'importeur, donc aucun risque d'effacer les autres nœuds. Best-effort,
+      // déclenché en arrière-plan par universalCapture : un échec ne bloque jamais l'upload.
+      // AUTO-INDEXATION UNIVERSELLE (drop/Ctrl-V, archive clonée, push Claude, vidéo HLS...) : tout nouveau nœud
+      // est appendé au DELTA public chiffré -> cherchable immédiatement, sans réécrire le gros index, sans quota.
+      if (action === 'index-links') {
+        const pairs = (Array.isArray(body.pairs) ? body.pairs : []).slice(0, 200)
+          .map((pair) => Array.isArray(pair) ? [nfc(pair[0]), nfc(pair[1])] : null)
+          .filter((pair) => pair && safe(pair[0]) && safe(pair[1]))
+        if (!pairs.length) return res.status(200).json({ ok: true, added: 0 })
+        let delta = false
+        try { delta = await indexLinkPairs(token, pairs) } catch { delta = false }
+        const g = globalThis; if (g.__zrIndex) g.__zrIndex = null
+        return res.status(200).json({ ok: true, added: pairs.length, delta })
+      }
+
+      if (action === 'index-add') {
+        const add = (Array.isArray(body.paths) ? body.paths : [])
+          .filter((p) => typeof p === 'string' && p && !p.includes('..') && !p.endsWith('.zr-search-index.json'))
+        if (!add.length) return res.status(200).json({ ok: true, added: 0 })
+        const newThumbs = await thumbsForPaths(token, add)
+        const ok = await appendPublicDelta(token, add, newThumbs)
+        const g = globalThis; if (g.__zrIndex) g.__zrIndex = null
+        return res.status(200).json({ ok: true, added: add.length, delta: ok })
+      }
+
+      if (action === 'delete') {
+        const { path, sha } = body
+        if (!safe(path) || !sha) return res.status(400).json({ error: 'bad-path' })
+        const fileResolution = await resolveEagleFilePath(token, path)
+        if (fileResolution.error || fileResolution.physicalPath !== path) return res.status(200).json({ error: fileResolution.error || 'virtual-folder-readonly' })
+        // Deleting a placement only removes that placement. Deleting the former
+        // canonical path while other placements exist promotes the descriptor to
+        // hidden infrastructure first, so Quick Look and downloads keep working.
+        if (EAGLE_LINK_RE.test(path)) {
+          try {
+            const currentR = await gh(token, `contents/${encodeURI(path)}?ref=${BRANCH}`)
+            if (currentR.ok) {
+              const current = JSON.parse(b64d((await currentR.json()).content))
+              if (typeof current.resourceId === 'string') {
+                const rp = resourcePathOf(current.resourceId)
+                const registryR = await gh(token, `contents/${encodeURI(rp)}?ref=${BRANCH}`)
+                if (registryR.ok) {
+                  const registry = JSON.parse(b64d((await registryR.json()).content))
+                  const placements = new Set(Array.isArray(registry.placements) ? registry.placements : [registry.sourcePath || path])
+                  placements.delete(path)
+                  if (isEagleLink(current)) {
+                    registry.placements = [...placements]; registry.updatedAt = new Date().toISOString()
+                    const rb = await jsonBlob(token, registry)
+                    if (!rb) return res.status(200).json({ error: 'github' })
+                    const removed = await commitTree(token, [{ path, mode: '100644', type: 'blob', sha: null }, { path: rp, mode: '100644', type: 'blob', sha: rb }], 'delete Eagle placement')
+                    return res.status(200).json(removed.ok ? { ok: true, placementOnly: true } : { error: 'github', detail: removed.error })
+                  }
+                  if (registry.sourcePath === path && placements.size > 0) {
+                    const ext = path.match(EAGLE_LINK_RE)?.[0]
+                    const hiddenPath = `${EAGLE_RESOURCE_DIR}/canonical/${current.resourceId}${ext}`
+                    registry.sourcePath = hiddenPath; registry.placements = [...placements]; registry.updatedAt = new Date().toISOString()
+                    const [manifestBlob, registryBlob] = await Promise.all([jsonBlob(token, current), jsonBlob(token, registry)])
+                    if (!manifestBlob || !registryBlob) return res.status(200).json({ error: 'github' })
+                    const promoted = await commitTree(token, [
+                      { path: hiddenPath, mode: '100644', type: 'blob', sha: manifestBlob },
+                      { path: rp, mode: '100644', type: 'blob', sha: registryBlob },
+                      { path, mode: '100644', type: 'blob', sha: null },
+                    ], 'preserve linked Eagle resource')
+                    return res.status(200).json(promoted.ok ? { ok: true, preserved: true, sourcePath: hiddenPath } : { error: 'github', detail: promoted.error })
+                  }
+                }
+              }
+            }
+          } catch {}
+        }
+        // Média chunké : purger d'abord toutes les parts du dossier, puis le manifest.
+        if (path.endsWith('.media.json')) {
+          let dir = null
+          try { const mr = await gh(token, `contents/${encodeURI(path)}?ref=${BRANCH}`); if (mr.ok) dir = JSON.parse(b64d((await mr.json()).content)).dir } catch {}
+          if (dir && /^media\/[A-Za-z0-9._-]+$/.test(dir)) {
+            // LE SOUS-ARBRE DU DOSSIER DE PARTS, pas l'arbre entier du dépôt (2026-08-29). L'ancien
+            // appel `git/trees/${BRANCH}?recursive=1` est TRONQUÉ par GitHub sur ce dépôt : les parts
+            // tombées après la coupure n'étaient jamais supprimées et restaient orphelines pour
+            // toujours, sans le moindre signal. Ici on demande `media/<id>`, qui tient largement.
+            const tr = await gh(token, `git/trees/${encodeURIComponent(BRANCH + ':' + dir)}?recursive=1`)
+            if (tr.ok) {
+              const tree = (await tr.json()).tree || []
+              for (const x of tree) {
+                if (x.type === 'blob') {
+                  await gh(token, `contents/${encodeURI(dir + '/' + x.path)}`, { method: 'DELETE', body: JSON.stringify({ message: 'content delete part', sha: x.sha, branch: BRANCH }) })
+                }
+              }
+            }
+          }
+        }
+        const r = await gh(token, `contents/${encodeURI(path)}`, { method: 'DELETE', body: JSON.stringify({ message: 'content delete', sha, branch: BRANCH }) })
+        if (!r.ok) return res.status(200).json({ error: 'github' })
+        return res.status(200).json({ ok: true })
+      }
+
+      // 9 October 2026 08:07 CEST: Move each registered node type through the shared suffix and twin contract.
+      if (action === 'move') {
+        const { from, to } = body
+        if (typeof from !== 'string' || typeof to !== 'string') return res.status(400).json({ error: 'bad-path' })
+        const movePairs = nodeFilePairsForMove(from, to)
+        if (!safe(from) || !safe(to) || !movePairs) return res.status(400).json({ error: 'bad-path' })
+        if (from === to) return res.status(200).json({ error: 'same-path' })
+        const [fromResolution, toResolution] = await Promise.all([resolveEagleFilePath(token, from), resolveEagleFilePath(token, to)])
+        if (fromResolution.error || toResolution.error || fromResolution.physicalPath !== from || toResolution.physicalPath !== to) return res.status(200).json({ error: 'virtual-folder-readonly' })
+        const isDb = from.endsWith('.db.json') && to.endsWith('.db.json')
+        const isMedia = from.endsWith('.media.json') && to.endsWith('.media.json')
+        const isImg = from.endsWith('.img.json') && to.endsWith('.img.json')
+        // Ref (plan §6 Phase 0 task 3) : board .canvas.json et carte .embed.json sont des fichiers JSON AUTONOMES
+        // (aucun jumeau, aucun binaire externe à suivre) -> même déplacement atomique que .db.json : on bouge
+        // juste le descripteur. Non destructif : créer la cible PUIS supprimer la source.
+        const isBoardExt = (p) => p.endsWith('.canvas.json') || p.endsWith('.ref.json')
+        const isCanvas = isBoardExt(from) && isBoardExt(to)
+        const isEmbed = from.endsWith('.embed.json') && to.endsWith('.embed.json')
+        // .file.json (blob-raw / archive) : descripteur JSON autonome référençant les parts par hash,
+        // exactement comme .db.json/.canvas.json/.embed.json -> même déplacement atomique (BUG trouvé
+        // 2026-07-01 : absent d'isSolo, donc tout drag-and-drop d'un fichier brut/archive échouait en
+        // 400 bad-path côté serveur, silencieusement absorbé par le catch client -> tuile qui semblait
+        // "ne rien faire").
+        const isFile = from.endsWith('.file.json') && to.endsWith('.file.json')
+        // .plan.json (ZenRay Plan, 2026-07-20) : même schéma autonome que .db.json/.canvas.json/.embed.json/
+        // .file.json (aucun jumeau, aucun binaire externe) -- BUG RÉEL trouvé le 2026-07-20, EXACTEMENT le
+        // même piège que .file.json le 2026-07-01 (voir commentaire ci-dessus) : absent d'isSolo, tout
+        // déplacement/renommage d'un plan échouait en 400 bad-path, silencieusement absorbé côté client.
+        const isPlan = from.endsWith('.plan.json') && to.endsWith('.plan.json')
+        const isSolo = isDb || isCanvas || isEmbed || isFile || isPlan
+        // refuse si la cible existe déjà
+        const exists = await gh(token, `contents/${encodeURI(to)}?ref=${BRANCH}`)
+        if (exists.ok) return res.status(200).json({ error: 'exists' })
+        // ATOMIQUE : on collecte tous les fichiers a deplacer (1 descripteur pour media/image/solo ; .md + 3
+        // jumeaux pour une page), on construit les entrees d'arbre (cree a la cible en REUTILISANT le blob
+        // existant par sha + supprime la source) et on commit le TOUT en une fois avec retry. Les binaires
+        // (parts media, vignettes d'image) ne bougent jamais (references par hash absolu). Plus de noeud scinde.
+        const srcs = movePairs
+        // P7 (perf) : les lectures des fichiers-jumeaux sont indépendantes -> Promise.all au lieu d'une file
+        // indienne de GET (jusqu'à 4 séquentiels pour une page : .md + .blocknote/.comments/.props.json). Même
+        // pattern que move-tree juste en dessous. Comportement identique : 404 = ignoré, 1ère lecture en échec =
+        // même erreur 'github read <src>', ordre des entrées préservé (l'ordre dans un tree commit est sans effet).
+        const reads = await Promise.all(srcs.map(async ([src, dst]) => {
+          const rr = await gh(token, `contents/${encodeURI(src)}?ref=${BRANCH}`)
+          if (rr.status === 404) return { skip: true }
+          if (!rr.ok) return { error: 'read ' + src }
+          const jj = await rr.json()
+          return { src, dst, sha: jj.sha, markdown: b64d(jj.content) }
+        }))
+        const bad = reads.find((r) => r.error)
+        if (bad) return res.status(200).json({ error: 'github', detail: bad.error })
+        const entries = []
+        const moved = []
+        for (const r of reads) {
+          if (r.skip) continue
+          entries.push({ path: r.dst, mode: '100644', type: 'blob', sha: r.sha })
+          entries.push({ path: r.src, mode: '100644', type: 'blob', sha: null })
+          moved.push(r.dst)
+        }
+        // Keep the path list exact for both a canonical placement and a lightweight
+        // placement. Only the former is allowed to move registry.sourcePath.
+        const primary = reads.find((r) => !r.skip && r.src === from)
+        if (primary && (isMedia || isImg || isSolo)) {
+          try {
+            const manifest = JSON.parse(primary.markdown)
+            if (typeof manifest.resourceId === 'string') {
+              const rp = resourcePathOf(manifest.resourceId)
+              const rr = await gh(token, `contents/${encodeURI(rp)}?ref=${BRANCH}`)
+              if (rr.ok) {
+                const registry = JSON.parse(b64d((await rr.json()).content))
+                // La règle vit dans `eagleRegistry.js`, en UNE définition testée. Elle était écrite
+                // ici ET dans `move-tree`, avec des variantes : le 2026-08-31 un grep borné m'a fait
+                // lire la moitié qui ne la contenait pas et annoncer un trou qui n'existait pas.
+                const suivant = deplacerDansRegistre(registry, {
+                  resourceId: manifest.resourceId, from, to, canonical: !isEagleLink(manifest),
+                })
+                if (suivant) {
+                  const rb = await jsonBlob(token, suivant)
+                  if (rb) entries.push({ path: rp, mode: '100644', type: 'blob', sha: rb })
+                }
+              }
+            }
+          } catch {}
+        }
+        if (!entries.length) return res.status(200).json({ error: 'empty' })
+        const mv = await commitTree(token, entries, 'content move')
+        if (!mv.ok) return res.status(200).json({ error: 'github', detail: mv.error })
+        // Auto-index : nouveau chemin du nœud ajouté au delta, ancien chemin marqué rm (sinon recherche stale).
+        // .plan.json ajouté le 2026-07-20 -- sinon un plan déplacé/renommé (via un déplacement de dossier
+        // parent) garde son ANCIEN chemin dans l'index de recherche (stale) au lieu d'être mis à jour.
+        // SOURCE UNIQUE (2026-08-31). Cette expression etait recopiee TROIS fois dans ce fichier,
+        // et les trois copies avaient oublie `ref.json` et `zmedia.json` : un board Ref deplace
+        // n etait pas reindexe, donc il disparaissait de la recherche sans que rien ne le signale.
+        // Voir server/extensionsNoeuds.js ; un test compare toutes les listes du depot a celle-la.
+        const newN = moved.filter((p) => RE_NOEUD.test(p))
+        const oldN = reads.filter((r) => !r.skip && RE_NOEUD.test(r.src)).map((r) => r.src)
+        // Vignettes des nœuds DÉPLACÉS/RENOMMÉS : sinon l'image renommée perd sa vignette dans l'index (gris/introuvable).
+        if (newN.length || oldN.length) { try { const th = await thumbsForPaths(token, newN, 20); await appendPublicDelta(token, newN, th, oldN) } catch {} const g = globalThis; if (g.__zrIndex) g.__zrIndex = null }
+        return res.status(200).json({ ok: true, moved, to })
+      }
+      // ═══ DÉPLACEMENT PAR LOT : N NŒUDS, UN SEUL COMMIT (2026-08-05) ═══════════════════════════
+      //
+      // POURQUOI IL FALLAIT L'ÉCRIRE. `move` ci-dessus est atomique POUR UN NŒUD, et le client en
+      // faisait une boucle : déplacer trente-six images lançait trente-six commits sur la même
+      // branche, chacun relisant la référence puis la repoussant. Deux commits qui se croisent, et
+      // le second part d'une référence périmée : GitHub le refuse, `commitTree` réessaie, parfois
+      // en vain. C'est la cause des « trop d'échecs quand je renomme des fichiers » -- pas un bogue
+      // de logique, une contention sur une seule référence Git.
+      //
+      // ICI : on lit tous les blobs en parallèle, on construit UNE liste d'entrées, on pousse UN
+      // commit, et on écrit UN seul delta d'index. Trente-six déplacements coûtent donc une seule
+      // course au lieu de trente-six, et le lot passe ou échoue d'un bloc — jamais à moitié.
+      //
+      // AUCUN BINAIRE NE TRANSITE, et c'est le point que Matthieu a bien vu : un `.img.json` est un
+      // pointeur de quelques centaines d'octets vers une image déjà stockée ailleurs par son hash.
+      // Déplacer trente-six photos de vingt mégaoctets ne déplace pas un seul pixel : on réutilise
+      // le SHA du blob existant, exactement comme le fait `move`.
+      if (action === 'move-batch') {
+        const items = Array.isArray(body.items) ? body.items : []
+        if (!items.length) return res.status(400).json({ error: 'bad-path' })
+        // MILLE PAR LOT. La borne ne vient pas de GitHub mais de la charge d'une invocation : mille
+        // fichiers font deux mille entrées d'arbre, soit environ 260 ko de corps de requête, ce qui
+        // passe largement. Au-delà, le client découpe — un lot de dix mille ferait un commit dont
+        // l'échec coûterait tout, alors que dix lots de mille échouent au pire un par un.
+        if (items.length > 1000) return res.status(400).json({ error: 'too-many' })
+
+        const filePairsByItem = []
+        for (const it of items) {
+          if (!it || typeof it.from !== 'string' || typeof it.to !== 'string') return res.status(400).json({ error: 'bad-path' })
+          const filePairs = nodeFilePairsForMove(it.from, it.to)
+          if (!safe(it.from) || !safe(it.to) || !filePairs) return res.status(400).json({ error: 'bad-path', detail: it.from })
+          filePairsByItem.push(filePairs)
+        }
+
+        // Un lot dont deux entrées visent la même destination écraserait silencieusement l'une des
+        // deux : on refuse AVANT d'écrire quoi que ce soit plutôt que de découvrir la perte après.
+        const cibles = new Set()
+        for (const it of items) {
+          if (cibles.has(it.to)) return res.status(200).json({ error: 'duplicate-target', detail: it.to })
+          cibles.add(it.to)
+        }
+
+        // Toutes les lectures en parallèle : c'est ce qui rend le lot rapide. Un 404 sur un jumeau
+        // est normal (une page n'a pas toujours de commentaires) et se saute sans bruit ; un 404
+        // sur le nœud PRINCIPAL est en revanche une vraie absence, qu'on remonte.
+        const aLire = filePairsByItem.flatMap((filePairs) => filePairs.map(([src, dst], i) => ({ src, dst, principal: i === 0 })))
+
+        // ON LIT LES DOSSIERS, PAS LES FICHIERS. Une lecture par fichier coûterait mille
+        // sous-requêtes pour mille photos, quand une invocation en a cinquante ; une lecture par
+        // dossier en coûte cinq ou six, quel que soit le nombre de fichiers dedans. C'est ce qui
+        // rend un lot de mille possible, et non seulement rapide.
+        const cacheArbres = new Map()
+        const dossiers = [...new Set(aLire.map((r) => r.src.slice(0, r.src.lastIndexOf('/'))))]
+        // Chaque dossier distinct coûte sa descente ; au-delà d'une douzaine on sortirait du budget
+        // de sous-requêtes. Le client déplace depuis un dossier à la fois, donc le cas est théorique,
+        // mais mieux vaut un refus clair qu'un « Too many subrequests » illisible.
+        if (dossiers.length > 12) return res.status(400).json({ error: 'too-many-dirs', detail: String(dossiers.length) })
+        const shasParDossier = new Map()
+        for (const d of dossiers) {
+          const m = await dirBlobShas(token, d, cacheArbres)
+          if (!m) return res.status(200).json({ error: 'github', detail: 'lecture du dossier ' + d })
+          shasParDossier.set(d, m)
+        }
+
+        const lus = aLire.map((r) => {
+          const d = r.src.slice(0, r.src.lastIndexOf('/'))
+          const nom = r.src.slice(d.length + 1)
+          const sha = shasParDossier.get(d)?.get(nom)
+          return sha ? { ...r, sha } : { ...r, skip: true }
+        })
+        const manquant = lus.find((r) => r.skip && r.principal)
+        if (manquant) return res.status(200).json({ error: 'missing', detail: manquant.src })
+
+        const entries = []
+        const moved = []
+        for (const r of lus) {
+          if (r.skip) continue
+          entries.push({ path: r.dst, mode: '100644', type: 'blob', sha: r.sha })   // même blob, zéro octet transféré
+          entries.push({ path: r.src, mode: '100644', type: 'blob', sha: null })    // sha:null = suppression
+          moved.push(r.dst)
+        }
+        if (!entries.length) return res.status(200).json({ error: 'empty' })
+
+        const mv = await commitTree(token, entries, `content move (lot de ${items.length})`)
+        if (!mv.ok) return res.status(200).json({ error: 'github', detail: mv.error })
+
+        // UN SEUL delta d'index pour tout le lot, au lieu d'un par fichier : c'est l'autre moitié du
+        // gain, `appendPublicDelta` relisant et rechiffrant le delta entier à chaque appel.
+        const neufs = moved.filter((p) => RE_NOEUD.test(p))
+        const anciens = lus.filter((r) => !r.skip && RE_NOEUD.test(r.src)).map((r) => r.src)
+        if (neufs.length || anciens.length) {
+          // Vingt vignettes au plus : le reste du budget de sous-requêtes est déjà pris par la
+          // descente des dossiers et par le commit. Les autres se résolvent paresseusement côté
+          // client, puis définitivement au prochain rebuild d'index.
+          try { const th = await thumbsForPaths(token, neufs, 20); await appendPublicDelta(token, neufs, th, anciens) } catch {}
+          const g = globalThis; if (g.__zrIndex) g.__zrIndex = null
+        }
+        // CE QUE CE LOT NE FAIT PAS, dit franchement plutôt que laissé à découvrir. `move` repointe
+        // aussi le REGISTRE DE RESSOURCES (`sourcePath`, `placements`) du nœud déplacé ; ici c'est
+        // impossible, cela coûterait trois sous-requêtes par fichier là où une invocation en a
+        // cinquante. Le client route donc les petits déplacements vers `move`, qui garde la
+        // sémantique complète, et n'emploie le lot qu'à partir de cinq éléments. Mesuré le
+        // 2026-08-05 : le registre compte UNE entrée sur 135 588 nœuds.
+        return res.status(200).json({ ok: true, moved, count: items.length, registryUntouched: true })
+      }
+      // Déplacement RÉCURSIF d'un DOSSIER : bouge TOUS les blobs sous `from/` vers `to/` en UN commit
+      // (Git Data API). Réécrit les références de chemin internes (.m3u8/.media.json) from->to pour ne pas
+      // casser la lecture HLS (master/keyUri pointent par chemin). Les binaires (hash) gardent leur sha.
+      if (action === 'move-tree') {
+        const { from, to } = body
+        const okDir = (p) => typeof p === 'string' && !p.includes('..') && /^(pages|build|databases|gallery|references|audio|sfx|articles|freelance|trash)(\/|$)/.test(p)
+        if (!okDir(from) || !okDir(to) || from === to) return res.status(400).json({ error: 'bad-path' })
+        if ((to + '/').startsWith(from + '/')) return res.status(200).json({ error: 'into-self' })
+        const [fromResolution, toResolution, exactPlacement] = await Promise.all([resolveEagleFolderDir(token, from), resolveEagleFolderDir(token, to), rawJsonAt(token, `${from}/${EAGLE_FOLDER_LINK_FILE}`)])
+        if (toResolution.error || toResolution.physicalDir !== to || fromResolution.error || (fromResolution.physicalDir !== from && exactPlacement?.type !== EAGLE_FOLDER_LINK_TYPE)) return res.status(200).json({ error: 'virtual-folder-readonly' })
+        // (HEAD/base_tree sont lus DANS commitTree, sur le HEAD frais, avec retry fast-forward.)
+        // Le git tree recursif est TRONQUÉ sur un gros repo -> on parcourt le SOUS-DOSSIER via l'API contents
+        // (borné au sous-arbre déplacé, fiable). Collecte tous les blobs {path, sha, mode}.
+        // PARALLÉLISÉ : parcours BFS niveau par niveau, tous les dossiers d'un même niveau lus EN PARALLÈLE
+        // (les listings de dossiers frères sont indépendants). Avant : un seul listing à la fois (séquentiel),
+        // le vrai goulot sur un sous-arbre profond. Borne de sécurité conservée (guard 5000).
+        const movers = []
+        let frontier = [from]
+        let guard = 0
+        while (frontier.length && guard < 5000) {
+          guard += frontier.length
+          const results = await Promise.all(frontier.map(async (d) => {
+            const r = await gh(token, `contents/${encodeURI(d)}?ref=${BRANCH}`)
+            if (!r.ok) return []
+            const arr = await r.json()
+            return Array.isArray(arr) ? arr : []
+          }))
+          const nextFrontier = []
+          for (const arr of results) {
+            for (const x of arr) {
+              if (x.type === 'dir') nextFrontier.push(x.path)
+              // Registry files are infrastructure, not visible placements. Moving
+              // `pages/` to Trash must not move the resource directory with it.
+              else if (x.type === 'file' && !x.path.startsWith(EAGLE_RESOURCE_DIR + '/')) movers.push({ path: x.path, sha: x.sha, mode: '100644' })
+            }
+          }
+          frontier = nextFrontier
+        }
+        if (!movers.length) return res.status(200).json({ error: 'empty' })
+
+        // ═══ UN DEPLACEMENT TROP GROS SE REFUSE, IL NE MEURT PAS EN SILENCE (2026-08-31) ═══════
+        //
+        // Chaque fichier a reecrire coute une lecture de blob (`git/blobs/<sha>`), et une Function
+        // Cloudflare Pages est bornee en sous-requetes par invocation. Au-dela, elle est TUEE sans
+        // reponse : le navigateur voit une requete qui n aboutit pas, et l interface affiche
+        // « inconnu, cause non repertoriee ». Matthieu a vu ce message le 2026-08-30.
+        //
+        // Le pire n est pas la limite, c est le silence : un deplacement partiel de plusieurs
+        // centaines de fichiers est exactement ce qu on ne veut jamais decouvrir apres coup. On
+        // refuse donc AVANT d avoir touche quoi que ce soit, et on dit quoi faire.
+        //
+        // CE N EST PAS LA CORRECTION DEFINITIVE, et il ne faut pas la prendre pour telle : traiter
+        // un gros dossier demanderait de decouper en plusieurs commits, ce qui est un vrai chantier
+        // sur un chemin qui deplace des donnees. En attendant, l echec est VISIBLE et le dossier
+        // reste intact, ce qui vaut infiniment mieux qu un demi-deplacement muet. Le renommage en
+        // masse passe aujourd hui par git (clone, commit, push), qui n a pas cette limite.
+        // ═══ CE QUI COÛTE VRAIMENT, ET CE QUI NE COÛTE RIEN (corrigé le 2026-08-31) ═══════════════
+        //
+        // BUG CRITIQUE payé le jour même : un dossier ne contenant QUE des raccourcis Eagle refusait
+        // de se déplacer (« 0 déplacé, 1 échec », retour en arrière). La cause était double, et les
+        // deux tenaient à une mauvaise idée de ce qui coûte une sous-requête.
+        //
+        // Un raccourci Eagle (.img.json de 170 octets) se déplace GRATUITEMENT : git réutilise son
+        // sha, aucun octet ne transite, aucune lecture de blob. Seuls les fichiers TEXTE qui portent
+        // des chemins INTERNES (playlists HLS .m3u8, manifestes .media.json) doivent être relus et
+        // réécrits, et ceux-là sont rares dans un dossier d'images. Le garde ne compte donc plus que
+        // ces réécritures obligatoires, jamais les raccourcis.
+        //
+        // La mise à jour du REGISTRE de chaque raccourci (son tableau `placements`) est reportée hors
+        // de ce commit : elle se fait par lots, dans des requêtes séparées, parce que déplacer vingt
+        // registres d'un coup dépassait la limite de cinquante sous-requêtes du Worker, qui mourait
+        // alors sans réponse. Un raccourci déplacé RÉSOUT toujours sans ce report (il pointe vers son
+        // resourceId, donc vers la source canonique, inchangée) ; seul le tableau `placements` reste
+        // provisoirement obsolète, ce que la synchro de fond corrige.
+        const aReecrire = movers.filter((m) => /\.(m3u8|media\.json)$/.test(m.path)).length
+        const BUDGET_REECRITURE = 15   // chaque réécriture coûte deux sous-requêtes (lire + réécrire)
+        if (aReecrire > BUDGET_REECRITURE) {
+          return res.status(200).json({
+            error: 'trop-de-fichiers',
+            fichiers: movers.length,
+            aReecrire,
+            budget: BUDGET_REECRITURE,
+            message: `Ce dossier contient ${aReecrire} fichiers média à réécrire, au-delà de ce qu une seule opération peut traiter. RIEN n a été déplacé. Déplace par sous-dossiers.`,
+          })
+        }
+        // PARALLÉLISÉ : la réécriture des refs (lecture blob + ré-encodage) est indépendante par fichier.
+        // Promise.all sur tous les movers -> les blobs HLS/manifestes sont traités en parallèle, pas en file.
+        const registryMoves = []
+        const placementSync = []   // raccourcis dont le registre se met a jour EN FOND, par lots
+        const dual = await Promise.all(movers.map(async (m) => {
+          const np = to + m.path.slice(from.length)
+          let sha = m.sha
+          let rawText = null
+          // Réécrire les refs de chemin dans les fichiers TEXTE qui les portent (playlists HLS + manifeste média).
+          if (/\.(m3u8|media\.json)$/.test(m.path)) {
+            const raw = await gh(token, `git/blobs/${m.sha}`)
+            if (raw.ok) {
+              let txt = rawText = b64d((await raw.json()).content)
+              txt = rewriteTreePaths(txt, from, to) // remplacement A FRONTIERE (jamais pages/A -> casse pages/AB)
+              const nb = await gh(token, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: Buffer.from(txt, 'utf8').toString('base64'), encoding: 'base64' }) })
+              if (nb.ok) sha = (await nb.json()).sha
+            }
+          }
+          const out = [
+            { path: np, mode: m.mode, type: 'blob', sha },
+            { path: m.path, mode: m.mode, type: 'blob', sha: null }, // supprime l'ancien chemin
+          ]
+          // Collect registry mutations, then coalesce them after Promise.all.
+          // Multiple placements of one resource can move in the same tree; writing
+          // the registry here would cause last-writer-wins data loss.
+          // RACCOURCI D IMAGE / MEDIA : il se deplace par son sha (deja produit dans `out`), on ne
+          // lit PAS son blob ici. Son registre (tableau placements) se met a jour EN FOND, par lots
+          // separes, via l action `sync-placements`. Un raccourci deplace resout deja sans ca : il
+          // pointe vers son resourceId, donc vers la source canonique, inchangee.
+          if (EAGLE_LINK_RE.test(m.path)) {
+            placementSync.push({ from: m.path, to: np })
+          }
+          if (m.path.endsWith('/' + EAGLE_FOLDER_RESOURCE_FILE)) {
+            try {
+              if (rawText == null) { const raw = await gh(token, `git/blobs/${m.sha}`); if (raw.ok) rawText = b64d((await raw.json()).content) }
+              const identity = JSON.parse(rawText || '')
+              if (typeof identity.resourceId === 'string') registryMoves.push({ resourceId: identity.resourceId, from: m.path.slice(0, -('/' + EAGLE_FOLDER_RESOURCE_FILE).length), to: np.slice(0, -('/' + EAGLE_FOLDER_RESOURCE_FILE).length), canonical: true, kind: 'folder' })
+            } catch {}
+          }
+          if (m.path.endsWith('/' + EAGLE_FOLDER_LINK_FILE)) {
+            try {
+              if (rawText == null) { const raw = await gh(token, `git/blobs/${m.sha}`); if (raw.ok) rawText = b64d((await raw.json()).content) }
+              const placement = JSON.parse(rawText || '')
+              if (placement.type === EAGLE_FOLDER_LINK_TYPE && typeof placement.resourceId === 'string') registryMoves.push({ resourceId: placement.resourceId, from: m.path.slice(0, -('/' + EAGLE_FOLDER_LINK_FILE).length), to: np.slice(0, -('/' + EAGLE_FOLDER_LINK_FILE).length), canonical: false, kind: 'folder' })
+            } catch {}
+          }
+          return out
+        }))
+        const registryEntries = await Promise.all([...new Set(registryMoves.map((x) => x.resourceId))].map(async (resourceId) => {
+          try {
+            const rp = resourcePathOf(resourceId)
+            const rr = await gh(token, `contents/${encodeURI(rp)}?ref=${BRANCH}`)
+            if (!rr.ok) return null
+            const registry = JSON.parse(b64d((await rr.json()).content))
+            if (registry?.resourceId !== resourceId) return null
+            // MÊME définition que `move` : voir `eagleRegistry.js`. `deplacerPlusieurs` applique tous
+            // les mouvements d'une ressource en une passe, ce qui est le point délicat ici — écrire
+            // le registre après chaque mouvement ferait perdre toutes les mutations sauf la
+            // dernière, sans le moindre bruit.
+            const moves = registryMoves.filter((x) => x.resourceId === resourceId)
+            const suivant = deplacerPlusieurs(registry, moves)
+            if (!suivant) return null
+            // CONTENU INLINE plutot que blob cree a part : git create-tree accepte `content`, ce qui
+            // economise une sous-requete par registre. Sur un dossier de vingt raccourcis, c est vingt
+            // sous-requetes de moins, la difference entre tenir sous la limite du Worker et mourir.
+            return { path: rp, mode: '100644', type: 'blob', content: JSON.stringify(suivant, null, 2) }
+          } catch { return null }
+        }))
+        const entries = dual.flat().concat(registryEntries.filter(Boolean))
+        const mt = await commitTree(token, entries, 'content move-tree')
+        if (!mt.ok) return res.status(200).json({ error: 'github', detail: mt.error })
+        // Auto-index du déplacement de dossier : nouveaux chemins de nœuds ajoutés, anciens marqués rm.
+        // .plan.json ajouté le 2026-07-20 -- sinon un plan déplacé/renommé (via un déplacement de dossier
+        // parent) garde son ANCIEN chemin dans l'index de recherche (stale) au lieu d'être mis à jour.
+        const newN = dual.map((d) => d[0].path).filter((p) => RE_NOEUD.test(p))
+        const oldN = dual.map((d) => d[1].path).filter((p) => RE_NOEUD.test(p))
+        if (newN.length || oldN.length) { try { const th = await thumbsForPaths(token, newN); await appendPublicDelta(token, newN, th, oldN) } catch {} const g = globalThis; if (g.__zrIndex) g.__zrIndex = null }
+        // `placementSync` : les raccourcis a synchroniser EN FOND. Le client les traite par lots,
+        // sans bloquer l affichage, puisque le deplacement est deja acquis et resout deja.
+        return res.status(200).json({ ok: true, moved: movers.length, to, placementSync })
+      }
+      if (action === 'sync-placements') {
+        // ═══ MISE A JOUR DES REGISTRES APRES UN DEPLACEMENT DE DOSSIER, PAR LOT BORNE ═════════════
+        //
+        // `move-tree` deplace les raccourcis par leur sha, sans lire leur blob : c est ce qui rend le
+        // deplacement d un dossier de vingt raccourcis possible sous la limite de cinquante
+        // sous-requetes du Worker. Le tableau `placements` de chaque registre reste alors provisoirement
+        // obsolete. Cette action le met a jour, par lots que le client enchaine jusqu a epuisement.
+        //
+        // Chaque lot lit les raccourcis a leur NOUVELLE place (API git, immediatement coherente, pas le
+        // CDN raw qui traine), en deduit le resourceId, groupe par ressource, relit chaque registre et
+        // applique tous les mouvements d un coup (deplacerPlusieurs, sinon la derniere ecriture ecrase
+        // les autres). Les registres repartent en contenu inline, zero blob cree.
+        const liens = Array.isArray(body.links) ? body.links.slice(0, 15) : []
+        if (!liens.length) return res.status(200).json({ ok: true, done: 0 })
+        const moves = []
+        await Promise.all(liens.map(async (lien) => {
+          if (!safe(lien.to) || !safe(lien.from) || !EAGLE_LINK_RE.test(lien.to)) return
+          const manifest = await rawJsonAt(token, lien.to)
+          if (manifest && typeof manifest.resourceId === 'string') moves.push({ resourceId: manifest.resourceId, from: lien.from, to: lien.to, canonical: !isEagleLink(manifest), kind: 'leaf' })
+        }))
+        if (!moves.length) return res.status(200).json({ ok: true, done: liens.length })
+        const registryEntries = (await Promise.all([...new Set(moves.map((x) => x.resourceId))].map(async (resourceId) => {
+          try {
+            const rp = resourcePathOf(resourceId)
+            const registry = await rawJsonAt(token, rp)
+            if (!registry || registry.resourceId !== resourceId) return null
+            const suivant = deplacerPlusieurs(registry, moves.filter((x) => x.resourceId === resourceId))
+            if (!suivant) return null
+            return { path: rp, mode: '100644', type: 'blob', content: JSON.stringify(suivant, null, 2) }
+          } catch { return null }
+        }))).filter(Boolean)
+        if (!registryEntries.length) return res.status(200).json({ ok: true, done: liens.length })
+        const cm = await commitTree(token, registryEntries, `sync placements (${registryEntries.length} registre(s))`)
+        if (!cm.ok) return res.status(200).json({ ok: false, error: 'github', detail: cm.error })
+        return res.status(200).json({ ok: true, done: liens.length, registres: registryEntries.length })
+      }
+      return res.status(400).json({ error: 'bad-action' })
+    }
+
+    res.setHeader('Allow', 'GET, POST')
+    return res.status(405).end()
+  } catch (e) {
+    if (process.env.ZR_TEST_TRACE) console.log('  EXCEPTION :', e && e.stack ? e.stack.split('\n').slice(0, 4).join('\n') : e)
+    return res.status(200).json({ error: 'fetch' })
+  }
+}

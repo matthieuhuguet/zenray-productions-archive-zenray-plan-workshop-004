@@ -1,0 +1,152 @@
+// CACHE IMAGE PERSISTANT (IndexedDB) — survit au RELOAD de l'onglet.
+//
+// EN CLAIR POUR TOUS : le cache RAM (imageCache.js) oublie tout dès qu'on recharge la page.
+// Ici on garde les octets bruts des vignettes déjà vues dans une petite base locale du navigateur
+// (IndexedDB). Au prochain reload, une image déjà rencontrée est relue depuis le disque local,
+// sans aucun aller-retour vers GitHub. Comme Eagle qui rouvre instantanément ta grille.
+//
+// TECHNIQUE : un store clé->Blob (clé = URL de la vignette, valeur = Blob des octets). Les chemins
+// média sont hashés donc IMMUABLES : une URL pointe toujours le même contenu, le cache ne périme jamais.
+//
+// BEST-EFFORT : toute opération échoue en silence (no-op) si IndexedDB est indisponible, en navigation
+// privée, ou si le quota disque est plein. Jamais d'exception qui casserait l'affichage.
+
+const DB_NAME = 'zr-img-cache'
+const STORE = 'blobs'
+let dbPromise = null
+
+function openDB() {
+  if (dbPromise) return dbPromise
+  dbPromise = new Promise((resolve) => {
+    try {
+      if (typeof indexedDB === 'undefined') return resolve(null)
+      const req = indexedDB.open(DB_NAME, 1)
+      req.onupgradeneeded = () => {
+        try { const db = req.result; if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE) } catch {}
+      }
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => resolve(null)
+    } catch { resolve(null) }
+  })
+  return dbPromise
+}
+
+// Vide TOUT le cache image persistant (après migration : les URLs privées proxy sont remplacées par
+// des URLs CDN ; on jette les blobs en cache pour éviter de servir l'ancien). Best-effort.
+export async function clearImageCacheIDB() {
+  try {
+    const db = await openDB()
+    if (!db) return
+    await new Promise((resolve) => { try { const tx = db.transaction(STORE, 'readwrite'); tx.objectStore(STORE).clear(); tx.oncomplete = resolve; tx.onerror = resolve } catch { resolve() } })
+  } catch {}
+}
+
+// serving-quota-9 : on stocke désormais { blob, at } pour pouvoir évincer par ANCIENNETÉ. RÉTRO-COMPAT :
+// idbGet accepte l'ancien format (Blob nu) ET le nouveau ({ blob }) -> aucun cache existant invalidé.
+const unwrap = (v) => (v instanceof Blob ? v : (v && v.blob instanceof Blob ? v.blob : null))
+
+// Lit un Blob depuis IndexedDB (ou null si absent / indispo).
+export async function idbGet(url) {
+  try {
+    const db = await openDB()
+    if (!db) return null
+    return await new Promise((resolve) => {
+      try {
+        const tx = db.transaction(STORE, 'readonly')
+        const rq = tx.objectStore(STORE).get(url)
+        rq.onsuccess = () => resolve(unwrap(rq.result))
+        rq.onerror = () => resolve(null)
+      } catch { resolve(null) }
+    })
+  } catch { return null }
+}
+
+// serving-quota-9 : éviction graduelle par ancienneté. Sans bornage, le store croît sans limite sur une
+// très grosse bibliothèque parcourue dans le temps jusqu'à saturer le quota navigateur (idbPut échoue alors
+// en silence -> plus aucune nouvelle vignette persistée -> reload de plus en plus lent). Toutes les EVICT_EVERY
+// écritures, on compte les entrées ; au-delà de MAX_ENTRIES, on supprime les plus anciennes par curseur.
+// Best-effort total, ne bloque jamais l'affichage. (Les anciennes entrées Blob nu n'ont pas de `at` -> elles
+// sont évincées en premier, ce qui est sain : ce sont les plus anciennes par construction.)
+const MAX_ENTRIES = 20000
+const EVICT_EVERY = 200
+let _putCount = 0
+async function maybeEvict(db) {
+  try {
+    const total = await new Promise((resolve) => {
+      try { const rq = db.transaction(STORE, 'readonly').objectStore(STORE).count(); rq.onsuccess = () => resolve(rq.result || 0); rq.onerror = () => resolve(0) } catch { resolve(0) }
+    })
+    if (total <= MAX_ENTRIES) return
+    // Collecte (clé, at) puis suppression du surplus le plus ancien. at absent (ancien format) = 0 (évincé d'abord).
+    const rows = await new Promise((resolve) => {
+      const acc = []
+      try {
+        const cur = db.transaction(STORE, 'readonly').objectStore(STORE).openCursor()
+        cur.onsuccess = (e) => { const c = e.target.result; if (!c) return resolve(acc); const v = c.value; acc.push([c.primaryKey, (v && typeof v.at === 'number') ? v.at : 0]); c.continue() }
+        cur.onerror = () => resolve(acc)
+      } catch { resolve(acc) }
+    })
+    rows.sort((a, b) => a[1] - b[1])
+    const drop = rows.slice(0, total - MAX_ENTRIES).map((r) => r[0])
+    if (drop.length) { try { const tx = db.transaction(STORE, 'readwrite'); const st = tx.objectStore(STORE); for (const k of drop) st.delete(k) } catch {} }
+  } catch {}
+}
+
+// Écrit un Blob dans IndexedDB (fire-and-forget, best-effort).
+export async function idbPut(url, blob) {
+  try {
+    if (!(blob instanceof Blob)) return
+    const db = await openDB()
+    if (!db) return
+    const tx = db.transaction(STORE, 'readwrite')
+    tx.objectStore(STORE).put({ blob, at: Date.now() }, url)
+    if ((++_putCount % EVICT_EVERY) === 0) maybeEvict(db)
+  } catch {}
+}
+
+// PERSISTANCE BEST-EFFORT D'UNE URL (objectif C — cache permanent).
+//
+// EN CLAIR : « assure-toi que les octets de cette image sont sur le disque local, peu importe
+// comment elle a été décodée à l'écran ». Point d'entrée UNIQUE pour persister une vignette vue,
+// même quand le chemin de décodage normal (createImageBitmap) a échoué (ex. AVIF non décodable en
+// Blob selon le navigateur) ou n'a jamais alimenté IndexedDB (image affichée via un <img> de secours).
+//
+// IDEMPOTENT : si l'URL est déjà en cache (idbGet), on ne refait rien (zéro réseau). Sinon on tire
+// les octets UNE fois et on les écrit (idbPut). Le fetch est servi par le cache HTTP immuable du
+// navigateur (api/shard Cache-Control immutable, CDN jsDelivr pinné) -> hors quota REST GitHub.
+//
+// FIRE-AND-FORGET : ne jamais attendre, ne jamais throw. La moindre anicroche = no-op silencieux.
+export function persistUrl(url) {
+  if (!url || typeof fetch !== 'function') return
+  ;(async () => {
+    try {
+      const have = await idbGet(url)
+      if (have instanceof Blob) return // déjà persisté -> rien à faire
+      const res = await fetch(url)
+      if (res && res.ok) { const blob = await res.blob(); idbPut(url, blob) }
+    } catch { /* best-effort : IDB indispo, quota plein, réseau coupé -> on laisse tomber */ }
+  })()
+}
+
+// APERÇU PLEIN ÉCRAN INSTANTANÉ (Espace façon Eagle).
+// Rend une URL AFFICHABLE pour <img src=...> à partir du cache persistant :
+//   - si l'image plein-format est déjà dans IndexedDB (vue/préchargée) -> objectURL local, ZÉRO réseau ;
+//   - sinon on tire l'image une fois, on la PERSISTE dans IndexedDB, et on renvoie un objectURL.
+// Renvoie { src, revoke } ; appeler revoke() à la fermeture pour libérer l'objectURL (pas de fuite).
+// Best-effort : la moindre anicroche -> { src: url, revoke: noop } (l'<img> retombe sur le réseau via
+// /api/shard, dont le Cache-Control immutable couvre déjà les visites suivantes dans la même session).
+const _noop = () => {}
+export async function resolveDisplayUrl(url) {
+  if (!url) return { src: null, revoke: _noop }
+  try {
+    let blob = await idbGet(url)
+    if (!blob && typeof fetch === 'function') {
+      const res = await fetch(url)
+      if (res && res.ok) { blob = await res.blob(); idbPut(url, blob) }
+    }
+    if (blob instanceof Blob && typeof URL !== 'undefined' && URL.createObjectURL) {
+      const obj = URL.createObjectURL(blob)
+      return { src: obj, revoke: () => { try { URL.revokeObjectURL(obj) } catch {} } }
+    }
+  } catch {}
+  return { src: url, revoke: _noop }
+}

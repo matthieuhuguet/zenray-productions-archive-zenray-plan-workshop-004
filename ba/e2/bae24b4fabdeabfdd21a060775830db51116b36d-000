@@ -1,0 +1,117 @@
+// 10 October 2026, 23:27 CEST: the script adds links first, keeps items written by others, retries a conflicting save, and never prints the code.
+// FR : le script ajoute les liens en tête, garde les éléments écrits par d'autres, réessaie une sauvegarde en conflit et n'affiche jamais le code.
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
+import { spawn } from 'node:child_process'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'AddDesignLinks.mjs')
+const CODE = 'test-code-only-for-the-mock'
+const GALLERY = 'pages/Design/design.json'
+const oldItem = { id: 'g-old', kind: 'image', path: 'uploads/old.webp', name: 'Old', title: 'Old', url: 'https://old.example/', note: '', w: 16, h: 9, addedAt: '2026-10-01T00:00:00.000Z' }
+const colleagueItem = { ...oldItem, id: 'g-other', path: 'uploads/other.webp', url: 'https://other.example/' }
+
+// A stand-in for the drive API: it enforces the code, answers one conflict, then accepts the retry.
+// FR : un faux drive : il exige le code, répond un conflit une seule fois, puis accepte la reprise.
+async function startDrive({ code = CODE } = {}) {
+  const drive = { stored: { v: 1, items: [oldItem] }, saves: [], uploads: 0, conflictPending: true }
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1')
+    const reply = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)) }
+    if (url.pathname === '/api/unfurl') {
+      const target = new URL(url.searchParams.get('url'))
+      return reply(200, { url: target.href, title: `Title of ${target.hostname}`, description: 'A short note', image: `https://img.example/${target.hostname}.png` })
+    }
+    let raw = ''
+    for await (const chunk of req) raw += chunk
+    if (req.headers['x-zr-auth'] !== code) return reply(401, { error: 'unauthorized' })
+    if (url.pathname === '/api/page' && req.method === 'GET') return reply(200, { sha: 'sha-1', markdown: JSON.stringify(drive.stored) })
+    if (url.pathname === '/api/img') { drive.uploads += 1; return reply(200, { url: '/api/img?path=uploads/new.webp', path: 'uploads/new.webp' }) }
+    if (url.pathname === '/api/page' && req.method === 'POST') {
+      const body = JSON.parse(raw)
+      drive.saves.push(body)
+      if (drive.conflictPending) {
+        drive.conflictPending = false
+        return reply(200, { conflict: true, sha: 'sha-2', markdown: JSON.stringify({ v: 1, items: [oldItem, colleagueItem] }) })
+      }
+      if (body.sha !== 'sha-2') return reply(200, { conflict: true, sha: 'sha-2', markdown: JSON.stringify(drive.stored) })
+      drive.stored = JSON.parse(body.markdown)
+      return reply(200, { ok: true, sha: 'sha-3' })
+    }
+    return reply(404, { error: 'not-found' })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return { drive, base: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((resolve) => server.close(resolve)) }
+}
+
+// Runs the script as the person would, with the code in the environment or without it.
+// FR : lance le script comme le ferait Matthieu, avec le code dans l'environnement ou sans lui.
+function run(base, args, { withCode = true } = {}) {
+  const env = { ...process.env, ZENRAY_BASE_URL: base }
+  delete env.ZENRAY_DRIVE_CODE
+  if (withCode) env.ZENRAY_DRIVE_CODE = CODE
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [script, ...args], { env })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.on('close', (code) => resolve({ code, stdout, stderr }))
+  })
+}
+
+test('adds the link first, keeps items written by others, retries a conflicting save, never prints the code', async () => {
+  const { drive, base, close } = await startDrive()
+  try {
+    const result = await run(base, [GALLERY, 'https://new.example/', 'https://old.example/'])
+    assert.equal(result.code, 0, result.stderr)
+    assert.ok(!result.stdout.includes(CODE) && !result.stderr.includes(CODE))
+    assert.deepEqual(drive.stored.items.map((item) => item.url), ['https://new.example/', 'https://old.example/', 'https://other.example/'])
+    assert.equal(drive.stored.items[0].path, 'uploads/new.webp')
+    assert.equal(drive.stored.items[0].title, 'Title of new.example')
+    assert.equal(drive.uploads, 1, 'the link already in the gallery must not be uploaded again')
+    assert.equal(drive.saves.length, 2, 'one conflict, then one accepted retry')
+  } finally {
+    await close()
+  }
+})
+
+test('a refused code stops before any upload or save', async () => {
+  const { drive, base, close } = await startDrive({ code: 'the-real-code' })
+  try {
+    const result = await run(base, [GALLERY, 'https://new.example/'])
+    assert.equal(result.code, 1)
+    assert.match(result.stderr, /refusé/)
+    assert.equal(drive.uploads, 0)
+    assert.equal(drive.saves.length, 0)
+  } finally {
+    await close()
+  }
+})
+
+test('the dry run needs no code and writes nothing', async () => {
+  const { drive, base, close } = await startDrive()
+  try {
+    const result = await run(base, ['--dry-run', GALLERY, 'https://new.example/'], { withCode: false })
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stdout, /new\.example/)
+    assert.equal(drive.uploads, 0)
+    assert.equal(drive.saves.length, 0)
+  } finally {
+    await close()
+  }
+})
+
+test('only a gallery JSON under pages/ can be written', async () => {
+  const { drive, base, close } = await startDrive()
+  try {
+    const result = await run(base, ['../secrets.json', 'https://new.example/'])
+    assert.equal(result.code, 2)
+    assert.match(result.stderr, /chemin refusé/)
+    assert.equal(drive.saves.length, 0)
+  } finally {
+    await close()
+  }
+})

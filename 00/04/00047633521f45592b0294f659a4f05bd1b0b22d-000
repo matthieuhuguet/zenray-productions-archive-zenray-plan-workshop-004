@@ -1,0 +1,59 @@
+// vidraw-progress.mjs — lit un log d'upload-vidraw-list.mjs et calcule une progression EN OCTETS RÉELS
+// (pas juste "vidéo i/N", qui ment dès qu'une vidéo est 5x plus grosse qu'une autre). Créé le 2026-07-05
+// (Matthieu : "je ne sais pas et ne peux pas savoir où il en est") — jusqu'ici, seul un `tail` du log
+// donnait un aperçu, sans pourcentage ni ETA.
+//
+// Usage : node scripts/vidraw-progress.mjs [chemin/du/log]   (sans argument -> log le plus récent dans ~/.zr-runs/)
+//
+// Le log a un format FIXE (voir upload-vidraw-list.mjs) :
+//   "  N. MM:SS  X Mo  <nom>"                      -> liste de départ, taille de CHAQUE vidéo
+//   "      part x/y (a.aa/b.bb Go)"                -> progression EN COURS de la vidéo active
+//   "✓ EN LIGNE [i/N] <nom> · ..."                  -> une vidéo est TERMINÉE (compte pour 100% de sa taille)
+//   "✓✓ BATCH VIDRAW COMPLET"                        -> tout le lot est fini
+import { readFileSync, readdirSync, statSync } from 'node:fs'
+import path from 'node:path'
+
+function findLatestLog() {
+  const dir = path.join(process.env.HOME, '.zr-runs')
+  const files = readdirSync(dir).filter((f) => f.startsWith('vidraw-') && f.endsWith('.log'))
+  if (!files.length) return null
+  return files.map((f) => path.join(dir, f)).sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0]
+}
+
+const logPath = process.argv[2] || findLatestLog()
+if (!logPath) { console.error('aucun log trouvé (~/.zr-runs/vidraw-*.log) et aucun chemin fourni'); process.exit(1) }
+const text = readFileSync(logPath, 'utf8')
+const lines = text.split('\n')
+
+// 1) liste de départ -> taille (Mo) de chaque vidéo, dans l'ordre d'upload (déjà trié court->long par le script)
+const sizes = [] // Mo, index 0 = 1re vidéo à uploader
+for (const l of lines) {
+  const m = /^\s*\d+\.\s+\d+:\d+\s+(\d+)\s*Mo\s+(.+?)\s*$/.exec(l)
+  if (m) sizes.push({ mo: Number(m[1]), name: m[2] })
+  if (sizes.length && /^\s*$/.test(l) && sizes.length > 0 && !/^\s*\d+\./.test(l)) { /* fin de liste, rien à faire */ }
+}
+const totalMo = sizes.reduce((a, s) => a + s.mo, 0)
+if (!totalMo) { console.error('log illisible : aucune vidéo trouvée dans la liste de départ'); process.exit(1) }
+
+// 2) parcours chronologique : accumule les vidéos TERMINÉES (taille pleine) + la progression EN COURS
+let doneMo = 0, doneCount = 0, curName = null, curMo = 0, curTotalMo = 0, finished = false, failed = 0
+for (const l of lines) {
+  const done = /✓ EN LIGNE \[(\d+)\/(\d+)\] (.+?) ·/.exec(l)
+  if (done) { doneCount = Number(done[1]); const idx = doneCount - 1; if (sizes[idx]) doneMo += sizes[idx].mo; curName = null; curMo = 0; continue }
+  const fail = /✗ ÉCHEC/.exec(l)
+  if (fail) failed++
+  const part = /part (\d+)\/(\d+) \(([\d.]+)\/([\d.]+) Go\)/.exec(l)
+  if (part) { curMo = Number(part[3]) * 1024; curTotalMo = Number(part[4]) * 1024; continue }
+  const header = /^\s{4}(.+?) — ([\d.]+) Go, /.exec(l)
+  if (header) { curName = header[1]; curTotalMo = Number(header[2]) * 1024; curMo = 0 }
+  if (/BATCH VIDRAW COMPLET/.test(l)) finished = true
+}
+
+const totalDoneMo = doneMo + curMo
+const pct = Math.min(100, (totalDoneMo / totalMo) * 100)
+const fmtGo = (mo) => (mo / 1024).toFixed(2)
+
+console.log(`\n=== Progression ${path.basename(logPath)} ===`)
+console.log(`${finished ? '✓✓ TERMINÉ' : pct.toFixed(1) + ' %'}  —  ${fmtGo(totalDoneMo)} / ${fmtGo(totalMo)} Go  —  ${doneCount}/${sizes.length} vidéos en ligne${failed ? `  —  ⚠ ${failed} échec(s)` : ''}`)
+if (!finished && curName) console.log(`  en cours : ${curName} (${fmtGo(curMo)}/${fmtGo(curTotalMo)} Go de cette vidéo)`)
+if (!finished && !curName && doneCount < sizes.length) console.log(`  en cours : ${sizes[doneCount] ? sizes[doneCount].name : '?'} (démarrage, pas encore de part poussée)`)

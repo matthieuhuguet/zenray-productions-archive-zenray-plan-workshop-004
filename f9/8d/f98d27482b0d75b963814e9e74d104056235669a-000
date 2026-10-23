@@ -1,0 +1,182 @@
+// streaming-proof.mjs (14 October 2026): the proof that a STREAMED film is complete in the cloud, without an encrypted archive.
+// Policy of 14 October 2026 (Matthieu): one copy per film, the CMAF stream. The unload authority is therefore this proof:
+//   1 the manifest names master, mpd, a public poster, the public repository and its commit, the segment count and bytes;
+//   2 the playlists of the manifest clone parse, and every URL of every rendition points into that repository and commit;
+//   3 the repository tree at that commit holds EVERY file of EVERY rendition, with a size, and their sum is the manifest bytes;
+//   4 a sample of segments (first, last, spread) is read through jsDelivr with retries (also warms the CDN cache);
+//   5 the manifest agrees with the source: duration, number of audio tracks, text subtitle tracks kept.
+// The result is a receipt (kind streaming-v1) that unloadStreamedVideo() (video-cloud-recovery.mjs) accepts.
+// FR : preuve qu'un film streame est complet dans le cloud, sans archive chiffree ; le recu autorise le dechargement.
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { parseMaster, parseMedia, rawFallbackUrl } from '../../src/lib/streamFiles.js'
+import { isPublicPosterUrl } from './film-poster.mjs'
+import { sourceStatRecord } from './video-cloud-recovery.mjs'
+
+export const STREAMING_PROOF = Object.freeze({
+  kind: 'streaming-v1',
+  sampleCount: 8,            // segments read through the CDN (first, last and a spread in between)
+  durationToleranceSec: 1.5, // manifest duration against the source duration
+  retryAttempts: 24,         // a cold jsDelivr answers 403/404 for a few seconds, then 200
+  retryDelayMs: 2500,
+  owner: 'matthieuhuguet',
+})
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+export function sha256File(file) {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256')
+    fs.createReadStream(file).on('data', (c) => h.update(c)).on('end', () => resolve(h.digest('hex'))).on('error', reject)
+  })
+}
+
+/** Every URL a rendition playlist needs, init first. */
+export function playlistUrls(text) {
+  const m = parseMedia(text)
+  return [m.initUrl, ...m.segments].filter(Boolean)
+}
+
+/** jsDelivr URL -> { owner, repo, commit, path } or null. */
+export function parseCdnUrl(url) {
+  const m = /^https:\/\/cdn\.jsdelivr\.net\/gh\/([^/@]+)\/([^/@]+)@([0-9a-f]{7,40})\/(.+)$/.exec(String(url))
+  return m ? { owner: m[1], repo: m[2], commit: m[3], path: decodeURIComponent(m[4]) } : null
+}
+
+/** Tree of a public repository at a commit: Map(path -> bytes). Falls back to a blobless clone when the API truncates. */
+export async function remoteTreeSizes({ owner, repo, commit, prefix, token, fetchImpl = fetch, clone = cloneTree }) {
+  const res = await fetchImpl(`https://api.github.com/repos/${owner}/${repo}/git/trees/${commit}?recursive=1`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress' },
+  })
+  if (res.ok) {
+    const j = await res.json()
+    if (!j.truncated) {
+      const map = new Map()
+      for (const e of j.tree || []) if (e.type === 'blob' && e.path.startsWith(prefix)) map.set(e.path, e.size)
+      return { map, via: 'api' }
+    }
+  }
+  return { map: await clone({ owner, repo, commit, prefix, token }), via: 'clone' }
+}
+
+function cloneTree({ owner, repo, commit, prefix, token }) {
+  const dir = fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'zr-tree-'))
+  try {
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.extraheader',
+      GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}` }
+    const run = (args) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8', env, maxBuffer: 256 * 1024 * 1024 })
+    run(['init', '-q'])
+    run(['remote', 'add', 'origin', `https://github.com/${owner}/${repo}.git`])
+    const f = run(['fetch', '-q', '--depth=1', '--filter=blob:none', 'origin', commit])
+    if (f.status !== 0) throw new Error(`tree fetch failed: ${f.stderr.slice(-200)}`)
+    const l = run(['ls-tree', '-r', '-l', 'FETCH_HEAD', prefix])
+    const map = new Map()
+    for (const line of l.stdout.split('\n')) {
+      const m = /^\d+ blob [0-9a-f]+\s+(\d+)\t(.+)$/.exec(line)
+      if (m) map.set(m[2], Number(m[1]))
+    }
+    return map
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+}
+
+async function readThroughCdn(url, expectedBytes, { fetchImpl, attempts, delayMs }) {
+  let last = ''
+  const raw = rawFallbackUrl(url)
+  for (let n = 1; n <= attempts; n += 1) {
+    // 14 October 2026: the CDN first; when it refuses (cold 403/404 on a large repository) GitHub raw serves the SAME bytes of the same
+    // commit, and the proof records which one answered. FR : le CDN d'abord, puis GitHub raw (memes octets du meme commit).
+    const via = n % 2 === 0 && raw ? 'raw' : 'cdn'
+    try {
+      const res = await fetchImpl(via === 'raw' ? raw : url)
+      if (res.ok) {
+        const got = (await res.arrayBuffer()).byteLength
+        if (got === expectedBytes) return { ok: true, tries: n, via }
+        last = `size ${got} instead of ${expectedBytes}`
+      } else last = `HTTP ${res.status}`
+    } catch (e) { last = String(e?.message || e) }
+    await sleep(delayMs)
+  }
+  return { ok: false, reason: last, tries: attempts }
+}
+
+function spread(list, n) {
+  if (list.length <= n) return [...list]
+  const out = new Set([0, list.length - 1])
+  for (let i = 1; out.size < n; i += 1) out.add(Math.floor((i * (list.length - 1)) / (n - 1)))
+  return [...out].sort((a, b) => a - b).map((i) => list[i])
+}
+
+/**
+ * @returns {{ok:boolean, checks:{name:string, ok:boolean, detail?:string}[], receipt?:object}}
+ * Never throws for a failed check: a RED proof is a value the worker reads before it unloads anything.
+ */
+export async function verifyStreaming({ manifestPath, manifestClone, source, probe, token, fetchImpl = fetch, config = STREAMING_PROOF, clone = cloneTree, localSha256 = null }) {
+  const checks = []
+  const add = (name, ok, detail = '') => { checks.push({ name, ok: Boolean(ok), detail: String(detail) }); return Boolean(ok) }
+  const manifestBytes = fs.readFileSync(manifestPath)
+  const manifest = JSON.parse(manifestBytes.toString('utf8'))
+
+  add('manifest names master and mpd', typeof manifest.master === 'string' && manifest.master && typeof manifest.mpd === 'string' && manifest.mpd)
+  add('public poster', isPublicPosterUrl(manifest.poster), manifest.poster || 'none')
+  add('public repository and commit', manifest.publicRepo && /^[0-9a-f]{40}$/.test(manifest.commitPublic || ''), `${manifest.publicRepo}@${manifest.commitPublic}`)
+  add('segment count and bytes recorded', Number(manifest.cmafSegmentCount) > 0 && Number(manifest.cmafBytes) > 0)
+  add('no archive and no parts (streaming only)', !(Array.isArray(manifest.parts) && manifest.parts.length) || manifest.streamOnly !== true, 'a streaming only manifest carries no parts')
+  const audioLabels = (manifest.audio || []).map((a) => String(a.label || ''))
+  add('every audio track has a clear name', audioLabels.length > 0 && audioLabels.every((l) => l && !/^audio[_ -]?\d*$/i.test(l)), audioLabels.join(', '))
+  if (!checks.every((c) => c.ok)) return { ok: false, checks }
+
+  const read = (rel) => fs.readFileSync(path.join(manifestClone, rel), 'utf8')
+  let master; const renditions = {}
+  try {
+    master = parseMaster(read(manifest.master))
+    for (const item of [...master.videos, ...master.audios]) renditions[item.uri] = playlistUrls(read(item.uri))
+  } catch (e) { add('playlists readable in the manifest clone', false, e.message); return { ok: false, checks } }
+  add('playlists readable in the manifest clone', Object.keys(renditions).length > 0, `${Object.keys(renditions).length} renditions`)
+  add('one rendition per audio track', master.audios.length === (manifest.audio || []).length, `${master.audios.length} playlists, ${(manifest.audio || []).length} in the manifest`)
+
+  const urls = [...new Set(Object.values(renditions).flat())]
+  const parsed = urls.map(parseCdnUrl)
+  const allInRepo = parsed.every((p) => p && p.repo === manifest.publicRepo && p.commit === manifest.commitPublic)
+  add('every URL points into the manifest repository and commit', allInRepo, `${urls.length} URLs`)
+  if (!allInRepo) return { ok: false, checks }
+
+  const prefix = parsed[0].path.split('/')[0] + '/'
+  const { map, via } = await remoteTreeSizes({ owner: parsed[0].owner, repo: manifest.publicRepo, commit: manifest.commitPublic, prefix, token, fetchImpl, clone })
+  const missing = parsed.filter((p) => !(map.get(p.path) > 0))
+  add('every file of every rendition exists in the repository tree', missing.length === 0, missing.length ? `${missing.length} missing, first ${missing[0].path}` : `${parsed.length} files via ${via}`)
+  const bytes = parsed.reduce((s, p) => s + (map.get(p.path) || 0), 0)
+  add('summed file sizes equal the manifest bytes', bytes === Number(manifest.cmafBytes), `${bytes} / ${manifest.cmafBytes}`)
+  // cmafSegmentCount is the number of FILES the packager produced (init segments and media segments of every rendition).
+  // FR : cmafSegmentCount = nombre de fichiers produits (segments d'initialisation et segments media de toutes les pistes).
+  add('file count equals the manifest', parsed.length === Number(manifest.cmafSegmentCount), `${parsed.length} / ${manifest.cmafSegmentCount}`)
+
+  const sample = spread(parsed.filter((p) => map.get(p.path) > 0), config.sampleCount)
+  const reads = []
+  for (const p of sample) {
+    const r = await readThroughCdn(`https://cdn.jsdelivr.net/gh/${p.owner}/${p.repo}@${p.commit}/${p.path.split('/').map(encodeURIComponent).join('/')}`, map.get(p.path),
+      { fetchImpl, attempts: config.retryAttempts, delayMs: config.retryDelayMs })
+    reads.push({ path: p.path, ...r })
+  }
+  add('sampled segments are served by the CDN with the right size', reads.every((r) => r.ok), reads.filter((r) => !r.ok).map((r) => `${r.path}: ${r.reason}`).join(' ; ') || `${reads.length} read`)
+
+  if (probe) {
+    add('duration agrees with the source', Math.abs(Number(manifest.duration) - probe.duration) <= config.durationToleranceSec, `${manifest.duration} / ${probe.duration}`)
+    add('every audio track of the source is kept', (manifest.audio || []).length === probe.audio.length, `${(manifest.audio || []).length} / ${probe.audio.length}`)
+    const textSubs = probe.subtitles.filter((s) => !/pgs|dvd|hdmv|vobsub|dvb/i.test(s.codec_name || ''))
+    add('every text subtitle track of the source is in the manifest', (manifest.subtitles || []).length >= textSubs.length, `${(manifest.subtitles || []).length} / ${textSubs.length}`)
+  }
+  const ok = checks.every((c) => c.ok)
+  if (!ok) return { ok, checks }
+  const stat = fs.statSync(source)
+  const receipt = {
+    kind: config.kind, verificationMode: config.kind, completeStreamingVerified: true, verifiedAt: new Date().toISOString(),
+    source: fs.realpathSync(source), sourceStat: sourceStatRecord(stat),
+    bytes: stat.size, localSha256: localSha256 || await sha256File(source),
+    manifestPath: path.resolve(manifestPath), manifestSha256: crypto.createHash('sha256').update(manifestBytes).digest('hex'),
+    publicRepo: manifest.publicRepo, commitPublic: manifest.commitPublic, treeVia: via, files: parsed.length, cmafBytes: bytes,
+    sampled: reads, checks,
+  }
+  return { ok: true, checks, receipt }
+}

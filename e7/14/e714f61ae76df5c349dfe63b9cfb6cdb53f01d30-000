@@ -1,0 +1,123 @@
+// 12 October 2026, 13:00 CEST: the local montage view (R06 section 9.6). It exists only when the motion service of the
+// Mac answers: pick motions (latest version of each) and local clips by absolute path, choose the formats (16:9, 9:16,
+// 1:1) and the framing, then the service assembles ONE HyperFrames composition per format (zrmd.emit.montage) and
+// renders it; the results play from signed local URLs, nothing goes to the cloud.
+// FR : la vue montage locale : choisir des motions et des clips, les formats et le cadrage ; rendu sur le Mac.
+import React, { useEffect, useRef, useState } from 'react'
+import { MOTION } from '../config/motion.js'
+import MotionCard from './MotionCard.jsx'
+import { MotionState } from './MotionGallery.jsx'
+
+const FINAL = new Set(['done', 'error', 'refused', 'cancelled', 'interrupted'])
+const slug = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'montage'
+
+/** The spec the service validates (zrmd montage contract). Pure, exported for tests. */
+export function buildMontageSpec({ name, sequence, formats, fit }) {
+  return {
+    id: slug(name),
+    formats: formats.length ? formats : ['16x9'],
+    fit,
+    clips: sequence.map((c) => (c.kind === 'motion' ? { kind: 'motion', motion: c.motion, ...(c.version ? { version: c.version } : {}) } : { kind: 'file', path: c.path })),
+  }
+}
+
+export default function MotionMontage({ cards, bridge, bridgeUp, tr, lang }) {
+  const [sequence, setSequence] = useState([])
+  const [formats, setFormats] = useState(['16x9', '9x16'])
+  const [fit, setFit] = useState(MOTION.fits[0])
+  const [name, setName] = useState('montage')
+  const [file, setFile] = useState('')
+  const [state, setState] = useState({ phase: 'idle' })
+  const alive = useRef(true)
+  useEffect(() => () => { alive.current = false }, [])
+
+  useEffect(() => {
+    if (state.phase !== 'running' || !state.job?.id) return undefined
+    let timer = null
+    const tick = async () => {
+      if (document.visibilityState === 'hidden') { timer = setTimeout(tick, MOTION.pollJobMs); return }
+      try {
+        const { job } = await bridge.job(state.job.id)
+        if (!alive.current) return
+        if (FINAL.has(job.state)) { setState({ phase: job.state === 'done' ? 'done' : 'failed', job }); return }
+        setState((s) => ({ ...s, job }))
+      } catch (error) { if (alive.current) setState({ phase: 'failed', error: error.message }); return }
+      timer = setTimeout(tick, MOTION.pollJobMs)
+    }
+    timer = setTimeout(tick, MOTION.pollJobMs)
+    return () => clearTimeout(timer)
+  }, [state.phase, state.job?.id, bridge])
+
+  if (!bridgeUp) return <MotionState testId="motion-montage-away" title={tr('motion.state.bridgeAway')} hint={tr('motion.montage.needsMac')} />
+
+  const toggleMotion = (card) => setSequence((s) => (s.some((c) => c.kind === 'motion' && c.motion === card.id)
+    ? s.filter((c) => !(c.kind === 'motion' && c.motion === card.id))
+    : [...s, { kind: 'motion', motion: card.id, version: card.version, label: card.title }]))
+  const addFile = () => { const p = file.trim(); if (p) { setSequence((s) => [...s, { kind: 'file', path: p, label: p.split('/').pop() }]); setFile('') } }
+
+  async function render() {
+    if (!sequence.length) { setState({ phase: 'failed', error: tr('motion.montage.empty') }); return }
+    setState({ phase: 'sending' })
+    try {
+      const { job } = await bridge.montage(buildMontageSpec({ name, sequence, formats, fit }), true)
+      setState({ phase: FINAL.has(job.state) ? (job.state === 'done' ? 'done' : 'failed') : 'running', job })
+    } catch (error) { setState({ phase: 'failed', error: error.message }) }
+  }
+
+  const labels = { versions: tr('motion.card.versions'), local: tr('motion.rail.local') }
+  const busy = state.phase === 'sending' || state.phase === 'running'
+  return (
+    <div className="zrm-montage" data-testid="motion-montage">
+      <div>
+        <div className="zrm-param-cat">{tr('motion.montage.pick')}</div>
+        <div className="zrm-pick">
+          {cards.map((card) => (
+            <MotionCard key={card.id} card={card} lang={lang} labels={labels} onOpen={toggleMotion}
+              selected={sequence.some((c) => c.kind === 'motion' && c.motion === card.id)} />
+          ))}
+        </div>
+      </div>
+      <div className="zrm-panel">
+        <label className="zrm-params"><span className="zrm-param-cat">{tr('motion.montage.name')}</span>
+          <input className="zrm-field" value={name} onChange={(e) => setName(e.target.value)} data-testid="motion-montage-name" /></label>
+        <div className="zrm-param-cat" style={{ marginTop: 12 }}>{tr('motion.montage.sequence')}</div>
+        <ol className="zrm-sequence" data-testid="motion-montage-sequence">
+          {sequence.map((c, i) => (
+            <li key={`${c.kind}-${c.motion || c.path}-${i}`} className="zrm-seq-item">
+              <span className="zrm-num">{i + 1}</span><span>{c.label}</span>
+              <button type="button" className="zrm-btn" onClick={() => setSequence((s) => s.filter((_, j) => j !== i))}>{tr('motion.montage.remove')}</button>
+            </li>
+          ))}
+        </ol>
+        <div className="zrm-actions">
+          <input className="zrm-field zrm-mono" value={file} onChange={(e) => setFile(e.target.value)} placeholder={tr('motion.montage.addFile')} />
+          <button type="button" className="zrm-btn" onClick={addFile}>{tr('motion.montage.add')}</button>
+        </div>
+        <div className="zrm-param-cat">{tr('motion.montage.format')}</div>
+        <div className="zrm-actions">
+          {MOTION.formats.map((f) => (
+            <button key={f} type="button" className={`zrm-chip${formats.includes(f) ? ' is-on' : ''}`} data-testid={`motion-montage-format-${f}`}
+              onClick={() => setFormats((s) => (s.includes(f) ? s.filter((x) => x !== f) : [...s, f]))}>{f.replace('x', ':')}</button>
+          ))}
+        </div>
+        <div className="zrm-param-cat">{tr('motion.montage.fit')}</div>
+        <div className="zrm-actions">
+          {MOTION.fits.map((f) => <button key={f} type="button" className={`zrm-chip${fit === f ? ' is-on' : ''}`} onClick={() => setFit(f)}>{tr(`motion.iter.fit.${f}`)}</button>)}
+        </div>
+        <div className="zrm-actions">
+          <button type="button" className="zrm-btn is-primary" disabled={busy} onClick={render} data-testid="motion-montage-render">{busy ? tr('motion.montage.rendering') : tr('motion.montage.render')}</button>
+        </div>
+        <div aria-live="polite" data-testid="motion-montage-state">
+          {state.phase === 'failed' && <p>{tr('motion.iter.failed')} : {state.job?.error || state.error}</p>}
+          {state.job?.steps?.length > 0 && <ol className="zrm-steps">{state.job.steps.map((s, i) => <li key={`${s.name}-${i}`}>{s.name}</li>)}</ol>}
+          {state.phase === 'done' && (state.job.result?.outputs || []).map((o) => (
+            <div key={o.format} style={{ marginTop: 10 }}>
+              <div className="zrm-mono">{o.format.replace('x', ':')}</div>
+              {o.url ? <video className="zrm-result" src={o.url} controls playsInline /> : <span className="zrm-mono">{o.project}</span>}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}

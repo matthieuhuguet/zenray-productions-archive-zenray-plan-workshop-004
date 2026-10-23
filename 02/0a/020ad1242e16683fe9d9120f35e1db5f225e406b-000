@@ -1,0 +1,154 @@
+// V (méthode git push) — importe les AVIF Eagle SANS l'API REST (donc sans limite secondaire / sans ban).
+// On clone localement les repos (shards privés + zenray-content), on copie les fichiers, on commit, on PUSH.
+// Un push transfère des milliers d'objets en UNE opération git -> borné par la bande passante, pas par GitHub.
+//   - binaire AVIF -> shard privé zenray-media-NN, nom anonymisé ab/cd/<sha1>.avif
+//   - noeud .img.json -> zenray-content sous pages/References/<arbo Eagle>/
+//   - tracking scripts/.eagle-import.json (reprise), bascule de shard à ~4,5 Go
+// Usage : GITHUB_TOKEN=$(gh auth token) node scripts/eagle-import-git.mjs [--limit N|--half|--all] [--flush 4000]
+import { readFile, writeFile, readdir, mkdir, cp } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import path from 'node:path'
+
+const LIB = process.env.EAGLE_LIB || '/Users/zenray/Create/Media/References/References.library'
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const TOKEN = process.env.GITHUB_TOKEN
+const WORK = '/tmp/zr_eagle_git'
+const SHARD_CAP = 4.5 * 1024 * 1024 * 1024
+const SCRIPT_DIR = path.dirname(new URL(import.meta.url).pathname)
+const TRACK = path.join(SCRIPT_DIR, '.eagle-import.json')
+if (!TOKEN) { console.error('no GITHUB_TOKEN'); process.exit(1) }
+
+const args = process.argv.slice(2)
+const getArg = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d }
+const MODE = args.includes('--all') ? 'all' : args.includes('--half') ? 'half' : 'limit'
+const LIMIT = MODE === 'limit' ? parseInt(getArg('--limit', '500'), 10) : Infinity
+const FLUSH = parseInt(getArg('--flush', '4000'), 10) // commit+push tous les N fichiers
+
+const remote = (name) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${name}.git`
+const git = (dir, ...a) => execFileSync('git', ['-C', dir, ...a], { stdio: ['ignore', 'pipe', 'pipe'] }).toString()
+const redact = (value) => String(value || '').split(TOKEN).join('***')
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const hash = (s) => createHash('sha1').update(s).digest('hex')
+const sanitize = (s) => String(s || '').replace(/[^\p{L}\p{N} ._-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 80) || '_'
+
+function buildFolderPaths(folders, prefix, map) {
+  for (const f of folders || []) {
+    const p = prefix ? `${prefix}/${sanitize(f.name)}` : sanitize(f.name)
+    map.set(f.id, p); if (f.children?.length) buildFolderPaths(f.children, p, map)
+  }
+  return map
+}
+async function loadTrack() { try { return JSON.parse(await readFile(TRACK, 'utf8')) } catch { return { done: {}, shards: {}, started: new Date().toISOString() } } }
+async function saveTrack(t) { await writeFile(TRACK, JSON.stringify(t, null, 2)) }
+
+// Crée le shard privé s'il manque (1 appel API). Peut être bloqué si la limite API primaire est épuisée.
+function createRepo(name) {
+  try { execFileSync('gh', ['repo', 'create', `${OWNER}/${name}`, '--private', '--description', 'ZenRay drive — shard media (images hashées)'], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GH_TOKEN: TOKEN } }); return true }
+  catch (e) { console.error(`\n⚠️  création ${name} impossible (limite API ?) : ${String(e.stderr || e).slice(0, 140)}`); return false }
+}
+async function cloneShallow(name, dir) {
+  if (existsSync(dir)) {
+    // clone déjà présent (run précédent) : resync sur le remote, sinon push rejeté si un autre process
+    // (ex: backfill vignettes) a avancé la branche entre-temps. Tree propre après flush -> reset sans perte.
+    try { git(dir, 'fetch', '-q', '--depth', '1', 'origin', 'main'); git(dir, 'reset', '-q', '--hard', 'origin/main'); git(dir, 'clean', '-qfd') } catch {}
+    return
+  }
+  // blobless : récupère l'historique SANS les binaires déjà présents (push n'enverra que les nouveaux objets)
+  try { execFileSync('git', ['clone', '--depth', '1', '--filter=blob:none', remote(name), dir], { stdio: ['ignore', 'pipe', 'pipe'] }) }
+  catch {
+    // repo absent -> on tente de le créer, sinon init local vide (le 1er push créera la branche)
+    createRepo(name)
+    await mkdir(dir, { recursive: true }); git(dir, 'init', '-q'); git(dir, 'remote', 'add', 'origin', remote(name)); git(dir, 'checkout', '-q', '-b', 'main')
+  }
+  git(dir, 'config', 'user.email', 'import@zenray'); git(dir, 'config', 'user.name', 'zenray-import')
+}
+async function flush(dir, message) {
+  git(dir, 'add', '-A')
+  try { git(dir, 'commit', '-q', '-m', message) } catch { return false } // rien à commit
+  const attempts = 8
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      git(dir, 'push', '-q', ...(attempt === 1 ? ['origin', 'HEAD:main'] : ['-u', 'origin', 'HEAD:main']))
+      return true
+    } catch (error) {
+      const detail = redact(error?.stderr || error?.stdout || error?.message).replace(/\s+/g, ' ').slice(-180)
+      if (attempt === attempts) throw new Error(`git push abandonné après ${attempts} essais : ${detail}`)
+      // Si un autre import a avancé main, un simple retry ne peut jamais réussir : rebase avant l'essai suivant.
+      try { git(dir, 'fetch', '-q', 'origin', 'main'); git(dir, 'rebase', '-q', 'origin/main') }
+      catch { try { git(dir, 'rebase', '--abort') } catch {} }
+      const waitMs = Math.min(30000, 1500 * (2 ** (attempt - 1)))
+      console.warn(`push retry ${attempt}/${attempts} dans ${Math.round(waitMs / 1000)} s (${detail || 'erreur git'})`)
+      await sleep(waitMs)
+    }
+  }
+  return false
+}
+
+// ---- MAIN ----
+await mkdir(WORK, { recursive: true })
+const meta = JSON.parse(await readFile(path.join(LIB, 'metadata.json'), 'utf8'))
+const folderPaths = buildFolderPaths(meta.folders, '', new Map())
+const track = await loadTrack()
+
+const contentDir = path.join(WORK, 'zenray-content')
+await cloneShallow('zenray-content', contentDir)
+console.log('zenray-content cloné')
+
+const dirs = (await readdir(path.join(LIB, 'images'))).filter((d) => d.endsWith('.info'))
+const items = []
+for (const d of dirs) {
+  const id = d.replace(/\.info$/, '')
+  if (track.done[id]) continue
+  let m; try { m = JSON.parse(await readFile(path.join(LIB, 'images', d, 'metadata.json'), 'utf8')) } catch { continue }
+  if ((m.ext || '').toLowerCase() !== 'avif') continue
+  items.push({ id, dir: d, name: m.name, w: m.width, h: m.height, size: m.size || 0, tags: m.tags || [], folders: m.folders || [], btime: m.btime || 0 })
+  if (MODE === 'limit' && items.length >= LIMIT) break
+}
+const target = MODE === 'half' ? Math.ceil(items.length / 2) : MODE === 'all' ? items.length : Math.min(LIMIT, items.length)
+const work = items.slice(0, target)
+console.log(`AVIF à importer cette passe: ${work.length} (mode ${MODE}), flush tous les ${FLUSH}`)
+
+let shardNum = track.curShard || 1
+let shardName = `zenray-media-${String(shardNum).padStart(2, '0')}`
+let shardBytes = track.shards[shardName]?.bytes || 0
+let shardDir = path.join(WORK, shardName)
+await cloneShallow(shardName, shardDir)
+
+const t0 = performance.now()
+let n = 0, sinceFlush = 0, bytes = 0
+for (const it of work) {
+  if (shardBytes >= SHARD_CAP) { // bascule de shard
+    await flush(shardDir, `import ${sinceFlush} images`); await flush(contentDir, `import ${sinceFlush} noeuds`)
+    shardNum++; shardName = `zenray-media-${String(shardNum).padStart(2, '0')}`; shardBytes = 0
+    shardDir = path.join(WORK, shardName); await cloneShallow(shardName, shardDir); sinceFlush = 0
+  }
+  const buf = await readFile(path.join(LIB, 'images', it.dir, `${it.name}.avif`)).catch(() => null)
+  if (!buf) continue
+  const h = hash(it.id)
+  const shardPath = `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.avif`
+  const abs = path.join(shardDir, shardPath)
+  await mkdir(path.dirname(abs), { recursive: true }); await writeFile(abs, buf)
+  const folderPath = it.folders.length ? (folderPaths.get(it.folders[0]) || '_Unsorted') : '_Unsorted'
+  const nodePath = `pages/References/${folderPath}/${sanitize(it.name)}.${it.id}.img.json`
+  const nodeAbs = path.join(contentDir, nodePath)
+  await mkdir(path.dirname(nodeAbs), { recursive: true })
+  await writeFile(nodeAbs, JSON.stringify({ type: 'image', v: 1, repo: shardName, path: shardPath, name: it.name, ext: 'avif', w: it.w, h: it.h, size: it.size, tags: it.tags, addedAt: it.btime, eagleId: it.id }))
+  track.done[it.id] = { shard: shardName, path: shardPath, node: nodePath }
+  shardBytes += buf.length; bytes += buf.length; n++; sinceFlush++
+
+  if (sinceFlush >= FLUSH) {
+    await flush(shardDir, `import ${sinceFlush} images`); await flush(contentDir, `import ${sinceFlush} noeuds`)
+    track.shards[shardName] = { bytes: shardBytes }; track.curShard = shardNum; await saveTrack(track)
+    const rate = n / ((performance.now() - t0) / 1000)
+    console.log(`pushé ${n}/${work.length} — ${(bytes / 1073741824).toFixed(2)} Go — ${rate.toFixed(0)} img/s — ${shardName} ${(shardBytes / 1073741824).toFixed(2)} Go`)
+    sinceFlush = 0
+  }
+}
+// flush final
+await flush(shardDir, `import ${sinceFlush} images`); await flush(contentDir, `import ${sinceFlush} noeuds`)
+track.shards[shardName] = { bytes: shardBytes }; track.curShard = shardNum; await saveTrack(track)
+const secs = (performance.now() - t0) / 1000
+console.log(`\nterminé: ${n} images en ${secs.toFixed(0)}s (${(n / secs).toFixed(0)} img/s, ${(bytes / 1048576 / secs).toFixed(1)} Mo/s upload)`)
+console.log(`done total: ${Object.keys(track.done).length} — tracking: ${TRACK}`)

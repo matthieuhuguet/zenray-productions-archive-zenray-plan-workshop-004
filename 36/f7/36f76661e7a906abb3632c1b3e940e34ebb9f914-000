@@ -1,0 +1,190 @@
+#!/usr/bin/env node
+// ═══ DÉPRÉCIÉ (2026-07-15) — MODÈLE INSECURE, NE PLUS UTILISER ═════════════════════════════
+// Ce flux copie des images privées en clair vers un repo public. Il est remplacé par
+// scripts/migrate-encrypt-public.mjs (AES-GCM + chemins anonymisés). Conservé uniquement pour l'historique.
+if (!process.env.ZR_RUN_DEPRECATED) {
+  console.error('DÉPRÉCIÉ ET INSECURE : utilise scripts/migrate-encrypt-public.mjs. (ZR_RUN_DEPRECATED=1 pour forcer, fortement déconseillé.)')
+  process.exit(1)
+}
+
+// MIGRATION MÉDIA EN MODE GIT (pas l'API REST) — déplace des images PRIVÉES vers le repo PUBLIC (jsDelivr).
+//
+// POURQUOI GIT ET PAS L'API : l'API REST GitHub plafonne à 5000 requêtes/heure. Migrer des milliers
+// d'images via l'API (1 lecture + 1 écriture par fichier) crame le quota en une passe ET gèle l'app
+// (plus aucune lecture possible). Le TRANSPORT GIT (clone/push) n'est PAS soumis à cette limite :
+// on clone les repos sur le disque, on fait les opérations en local (gratuit, parallèle), et on
+// pousse en 1 commit par repo. Quelques opérations git au lieu de milliers d'appels API.
+//
+// CE QUE FAIT LE SCRIPT :
+//   1. Clone zenray-data (manifests + marqueurs .zrvis.json) en local.
+//   2. Détermine la visibilité EFFECTIVE de chaque dossier (.zrvis.json hérité du parent ; défaut privé).
+//   3. Liste les manifests .img.json sous les dossiers PUBLICS qui sont encore privés (vis != 'public').
+//   4. [APPLY] Clone les shards privés source concernés + le repo public cible ; copie binaire + vignette
+//      .webp (chemins HASHÉS ab/cd/<sha>.<ext>) vers le cible ; push ; récupère le commit (pin jsDelivr).
+//   5. [APPLY] Réécrit les manifests (vis:'public', cdnRepo, cdnPath, cdnCommit) ; push zenray-data.
+//
+// SÉCURITÉ : DRY-RUN par défaut (ne clone QUE zenray-data en shallow, ne pousse RIEN). --apply pour exécuter.
+// ANTI-FUITE P0 : aucun nom de média humain ne part sur le repo public (chemins hashés) ni dans les commits.
+// NON DESTRUCTIF : ne supprime PAS les binaires privés source (ils deviennent orphelins, purge séparée plus tard).
+//
+// USAGE :
+//   GITHUB_TOKEN=$(gh auth token) node scripts/migrate-media-git.mjs                  # dry-run, tous les dossiers publics
+//   GITHUB_TOKEN=$(gh auth token) node scripts/migrate-media-git.mjs --folders=pages/References/Games
+//   GITHUB_TOKEN=$(gh auth token) node scripts/migrate-media-git.mjs --apply --folders=pages/References/Games
+//   options : --target=zenray-img-public-01  --workdir=.migrate-tmp
+
+import { execFileSync } from 'node:child_process'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, copyFileSync, rmSync } from 'node:fs'
+import path from 'node:path'
+
+// ---- config / args --------------------------------------------------------
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN manquant (GITHUB_TOKEN=$(gh auth token) ...)'); process.exit(1) }
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const CONTENT_REPO = (process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data').split('/').pop()
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+const args = Object.fromEntries(process.argv.slice(2).map((a) => {
+  const m = a.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [a, true]
+}))
+const APPLY = !!args.apply
+const TARGET = (args.target || 'zenray-img-public-01').toString()
+const WORK = path.resolve(args.workdir || '.migrate-tmp')
+const ONLY_FOLDERS = args.folders ? String(args.folders).split(',').map((s) => s.replace(/\/+$/, '')) : null
+
+const cloneUrl = (repo) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`
+const redact = (s) => String(s).split(TOKEN).join('***') // ne jamais logger le token
+const git = (cwd, ...a) => { try { return execFileSync('git', a, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() } catch (e) { throw new Error('git ' + a[0] + ': ' + redact((e.stderr || e.stdout || e.message).toString().slice(0, 300))) } }
+const human = (b) => b < 1024 ? b + ' o' : b < 1048576 ? (b / 1024).toFixed(0) + ' Ko' : b < 1073741824 ? (b / 1048576).toFixed(1) + ' Mo' : (b / 1073741824).toFixed(2) + ' Go'
+
+// ---- 1. clone zenray-data (manifests) -------------------------------------
+mkdirSync(WORK, { recursive: true })
+const dataDir = path.join(WORK, CONTENT_REPO)
+if (existsSync(path.join(dataDir, '.git'))) { console.log('• zenray-data déjà cloné, fetch…'); git(dataDir, 'fetch', '--depth', '1', 'origin', BRANCH); git(dataDir, 'reset', '--hard', 'origin/' + BRANCH) }
+else { console.log('• clone zenray-data (shallow)…'); git(WORK, 'clone', '--depth', '1', '--branch', BRANCH, cloneUrl(CONTENT_REPO), CONTENT_REPO) }
+
+// ---- 2. visibilité effective par dossier (.zrvis.json hérité) -------------
+const pagesDir = path.join(dataDir, 'pages')
+const visCache = new Map() // dirRel ('pages/...') -> 'public'|'private'
+function folderVis(dirRel) {
+  if (visCache.has(dirRel)) return visCache.get(dirRel)
+  const marker = path.join(dataDir, dirRel, '.zrvis.json')
+  let vis = null
+  if (existsSync(marker)) { try { vis = JSON.parse(readFileSync(marker, 'utf8')).vis || null } catch {} }
+  if (!vis) { // hérite du parent ; racine = privé par défaut
+    vis = dirRel === 'pages' || !dirRel.includes('/') ? 'private' : folderVis(dirRel.split('/').slice(0, -1).join('/'))
+  }
+  visCache.set(dirRel, vis)
+  return vis
+}
+
+// ---- 3. collecte des .img.json à migrer (dossiers publics, encore privés) --
+const candidates = [] // { manifestAbs, manifestRel, dirRel, m }
+function walk(absDir, relDir) {
+  let entries = []
+  try { entries = readdirSync(absDir, { withFileTypes: true }) } catch { return }
+  const vis = folderVis(relDir)
+  for (const e of entries) {
+    const abs = path.join(absDir, e.name)
+    const rel = relDir + '/' + e.name
+    if (e.isDirectory()) {
+      if (ONLY_FOLDERS && !ONLY_FOLDERS.some((f) => rel === f || rel.startsWith(f + '/') || f.startsWith(rel + '/'))) continue
+      walk(abs, rel)
+    } else if (e.name.endsWith('.img.json')) {
+      if (vis !== 'public') continue
+      if (ONLY_FOLDERS && !ONLY_FOLDERS.some((f) => relDir === f || relDir.startsWith(f + '/'))) continue
+      let m = null; try { m = JSON.parse(readFileSync(abs, 'utf8')) } catch {}
+      if (!m) continue
+      if (m.vis === 'public') continue // déjà migré
+      if (!m.repo || !m.path) continue // pas de source binaire connue
+      candidates.push({ manifestAbs: abs, manifestRel: rel, dirRel: relDir, m })
+    }
+  }
+}
+walk(pagesDir, 'pages')
+
+// ---- plan ------------------------------------------------------------------
+const bySource = new Map() // sourceRepo -> { count, bytes }
+let totalBytes = 0
+for (const c of candidates) {
+  const s = bySource.get(c.m.repo) || { count: 0, bytes: 0 }
+  s.count++; s.bytes += Number(c.m.size) || 0; totalBytes += Number(c.m.size) || 0
+  bySource.set(c.m.repo, s)
+}
+console.log('\n=== PLAN MIGRATION (' + (APPLY ? 'APPLY' : 'DRY-RUN') + ') ===')
+console.log('Dossiers ciblés       :', ONLY_FOLDERS ? ONLY_FOLDERS.join(', ') : 'tous les dossiers publics')
+console.log('Images à migrer       :', candidates.length)
+console.log('Octets binaires       :', human(totalBytes), '(images source ; +vignettes .webp en plus)')
+console.log('Repo public cible      :', OWNER + '/' + TARGET)
+console.log('Shards privés source   :')
+for (const [repo, s] of bySource) console.log('   -', repo, ':', s.count, 'img,', human(s.bytes))
+if (!candidates.length) { console.log('\nRien à migrer. Marque des dossiers en PUBLIC dans Create (bouton globe) puis relance.'); process.exit(0) }
+if (totalBytes > 4.5 * 1073741824) console.log('\n⚠️  > 4,5 Go : prévoir un rollover (zenray-img-public-02). v1 pousse tout sur', TARGET, '— surveiller la taille.')
+
+if (!APPLY) {
+  console.log('\nDRY-RUN : aucun clone de binaire, aucun push. Relance avec --apply pour exécuter.')
+  console.log('Après --apply : penser à VIDER LE CACHE Create (bouton "Vider le cache") pour voir les URLs CDN.')
+  process.exit(0)
+}
+
+// ---- 4. APPLY : repo public + clone shards source + copie binaires ---------
+function repoExists(repo) { try { execFileSync('gh', ['repo', 'view', OWNER + '/' + repo], { stdio: 'ignore' }); return true } catch { return false } }
+if (!repoExists(TARGET)) {
+  console.log('• création du repo public', TARGET, '…')
+  execFileSync('gh', ['repo', 'create', OWNER + '/' + TARGET, '--public', '--description', 'ZenRay drive — shard image PUBLIC (binaires hashes, servis via jsDelivr)'], { stdio: 'inherit' })
+}
+const targetDir = path.join(WORK, TARGET)
+if (existsSync(path.join(targetDir, '.git'))) { git(targetDir, 'fetch', 'origin'); try { git(targetDir, 'reset', '--hard', 'origin/main') } catch {} }
+else { console.log('• clone repo public cible…'); git(WORK, 'clone', cloneUrl(TARGET), TARGET) }
+// s'assurer d'une branche main avec au moins 1 commit
+try { git(targetDir, 'rev-parse', 'HEAD') } catch {
+  writeFileSync(path.join(targetDir, 'README.md'), '# ZenRay public image shard\n\nBinaires hashes (ab/cd/<sha>.<ext>) + vignettes .webp, servis via jsDelivr. Aucun nom humain.\n')
+  git(targetDir, 'add', '-A'); git(targetDir, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-m', 'init public image shard'); git(targetDir, 'branch', '-M', 'main')
+}
+
+// clone des shards privés source nécessaires
+const shardDirs = new Map()
+for (const repo of bySource.keys()) {
+  const d = path.join(WORK, repo)
+  if (existsSync(path.join(d, '.git'))) { git(d, 'fetch', 'origin'); try { git(d, 'reset', '--hard', 'origin/main') } catch {} }
+  else { console.log('• clone shard source', repo, '… (peut être volumineux)'); git(WORK, 'clone', cloneUrl(repo), repo) }
+  shardDirs.set(repo, d)
+}
+
+// copie binaire + vignette .webp (chemins hashés identiques) vers le cible
+let copied = 0, missing = 0
+for (const c of candidates) {
+  const src = shardDirs.get(c.m.repo)
+  const binRel = c.m.path                         // ab/cd/<sha>.<ext>
+  const thumbRel = binRel.replace(/\.[^./]+$/, '.webp')
+  for (const rel of [binRel, thumbRel]) {
+    const from = path.join(src, rel), to = path.join(targetDir, rel)
+    if (!existsSync(from)) { if (rel === binRel) { missing++; } continue }
+    mkdirSync(path.dirname(to), { recursive: true })
+    if (!existsSync(to)) copyFileSync(from, to)
+  }
+  copied++
+}
+console.log('• binaires copiés :', copied, '| binaires source introuvables :', missing)
+
+// push du repo public, puis pin du commit
+git(targetDir, 'add', '-A')
+const targetDirty = git(targetDir, 'status', '--porcelain')
+if (targetDirty) { git(targetDir, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-m', 'add ' + copied + ' hashed image blobs'); console.log('• push repo public…'); git(targetDir, 'push', 'origin', 'HEAD:main') }
+const commitSha = git(targetDir, 'rev-parse', 'HEAD')
+console.log('• commit public pin =', commitSha)
+
+// ---- 5. réécriture des manifests + push zenray-data ------------------------
+let rewritten = 0
+for (const c of candidates) {
+  const next = { ...c.m, vis: 'public', cdnRepo: TARGET, cdnPath: c.m.path, cdnCommit: commitSha }
+  writeFileSync(c.manifestAbs, JSON.stringify(next))
+  rewritten++
+}
+git(dataDir, 'add', '-A')
+const dataDirty = git(dataDir, 'status', '--porcelain')
+if (dataDirty) { git(dataDir, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-m', 'reindex ' + rewritten + ' image manifests -> public CDN'); console.log('• push zenray-data…'); git(dataDir, 'push', 'origin', 'HEAD:' + BRANCH) }
+
+console.log('\n✅ MIGRATION TERMINÉE :', rewritten, 'manifests -> public, commit', commitSha)
+console.log('⚠️  VIDE LE CACHE Create (bouton "Vider le cache") puis recharge : sinon l\'app sert les anciennes URLs en cache.')
+console.log('ℹ️  Les binaires privés source ne sont PAS supprimés (orphelins). Purge séparée possible plus tard.')

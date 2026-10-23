@@ -1,0 +1,55 @@
+// 2026-09-23 19:20 : the source must grow by appends, verify the hash, and fall back to remote.
+import { describe, it, expect } from 'vitest'
+import { createJournalSource, sha256Hex } from './journalSource.js'
+
+const enc = (s) => new TextEncoder().encode(s)
+
+function remoteServer(files) {
+  let current = files[0]
+  const fetchImpl = async (url, init = {}) => {
+    const u = new URL(url, 'http://x')
+    if (u.hostname === '127.0.0.1') throw new Error('no relay')
+    const body = enc(current.text)
+    const sha = await sha256Hex(body)
+    const headers = { 'X-Journal-Size': String(body.length), 'X-Journal-Sha256': current.lie ? 'bad' : sha, 'X-Journal-Commit': current.commit }
+    if (u.searchParams.get('meta')) {
+      if (init.headers && init.headers['If-None-Match'] === `"${current.commit}"`) return new Response(null, { status: 304 })
+      return new Response(JSON.stringify({ commit: current.commit, size: body.length, sha256: sha }), { status: 200, headers })
+    }
+    const since = Number(u.searchParams.get('since') || 0)
+    return new Response(body.subarray(since), { status: 200, headers: { ...headers, 'X-Journal-From': String(since) } })
+  }
+  return { fetchImpl, set: (i) => { current = files[i] } }
+}
+
+describe('journal source', () => {
+  it('loads the whole journal remotely and verifies its hash', async () => {
+    const srv = remoteServer([{ text: 'a\n', commit: 'c1' }])
+    let last = null
+    const src = createJournalSource({ fetchImpl: srv.fetchImpl, EventSourceImpl: null, onChange: (x) => { last = x } })
+    await src.start(); src.stop()
+    expect(last.state.mode).toBe('remote')
+    expect(new TextDecoder().decode(last.bytes)).toBe('a\n')
+    expect(last.state.verified).toBe(true)
+  })
+
+  it('appends only the new bytes on the next commit', async () => {
+    const srv = remoteServer([{ text: 'a\n', commit: 'c1' }, { text: 'a\nb\n', commit: 'c2' }])
+    let last = null
+    const src = createJournalSource({ fetchImpl: srv.fetchImpl, EventSourceImpl: null, onChange: (x) => { last = x } })
+    await src.start(); src.stop()
+    srv.set(1)
+    await src.refresh()
+    expect(new TextDecoder().decode(last.bytes)).toBe('a\nb\n')
+    expect(last.state.commit).toBe('c2')
+    expect(last.state.verified).toBe(true)
+  })
+
+  it('reports a hash mismatch instead of pretending the data is verified', async () => {
+    const srv = remoteServer([{ text: 'a\n', commit: 'c1', lie: true }])
+    let last = null
+    const src = createJournalSource({ fetchImpl: srv.fetchImpl, EventSourceImpl: null, onChange: (x) => { last = x } })
+    await src.start(); src.stop()
+    expect(last.state.verified).toBe(false)
+  })
+})

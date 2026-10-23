@@ -1,0 +1,221 @@
+import React, { useEffect, useState, useRef } from 'react'
+import '@blocknote/mantine/style.css'
+import { useCreateBlockNote } from '@blocknote/react'
+import { BlockNoteView } from '@blocknote/mantine'
+import { PALETTE, RADII } from '../theme.js'
+import { fileToWebp } from '../api.js'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+import { PUBLISH, liveUrlFor, slugify as cfgSlugify } from '../config/publish.js'
+
+// C91/C92/C93/C95/C99 — éditeur d'articles (Word+InDesign+Notion) + brouillons + publication sur ZenRayWebsite (branche only).
+const FONTS = { serif: "var(--zr-police-serif)", sans: "var(--zr-police-sans)" }
+const INDEX = 'articles/index.json'
+const THEMES = { dark: { bg: '#121212', fg: '#fff', sub: '#aaa' }, grey: { bg: '#2b2b2b', fg: '#f0f0f0', sub: '#bbb' }, white: { bg: '#ffffff', fg: '#1a1a1a', sub: '#666' } }
+const FONT_OPTS = [['serif', 'Serif'], ['sans', 'Sans'], ['mono', 'Mono']]
+const RATIOS = [['free', 'Libre', null], ['1:1', '1:1', '1/1'], ['4:5', '4:5', '4/5'], ['16:9', '16:9', '16/9'], ['9:16', '9:16', '9/16']]
+const slugify = cfgSlugify
+const rd = (path) => fetch(`/api/page?action=read&path=${encodeURIComponent(path)}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+const wr = (path, md, sha) => fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'save', path, markdown: md, sha }) }).then((r) => r.json()).catch(() => null)
+
+export default function Articles({ t, onPublished }) {
+  const [index, setIndex] = useState(null)
+  const idxSha = useRef(null)
+  const [editId, setEditId] = useState(null)
+  const loadIndex = () => rd(INDEX).then((j) => { if (j && j.markdown && !j.missing) { idxSha.current = j.sha; try { setIndex(JSON.parse(j.markdown).items || []) } catch { setIndex([]) } } else setIndex([]) })
+  useEffect(() => { loadIndex() }, [])
+  // ANTI-PERTE : saveIndex prend une MUTATION sur la liste d'items (par id), ré-appliquée sur l'index FRAIS du
+  // drive en cas de conflit (retry). Plus d'écrasement de l'index par un onglet concurrent.
+  const saveIndex = async (mutateItems) => {
+    const res = await saveJsonWithRetry(INDEX, (cur) => ({ ...cur, items: mutateItems(cur.items || []) }), { sha: idxSha.current, data: { items: index || [] } })
+    if (res.ok) { idxSha.current = res.sha; setIndex(res.data.items) }
+  }
+  const newArticle = () => { const id = 'a' + Date.now().toString(36); const item = { id, title: 'Nouvel article', slug: '', status: 'draft', updatedAt: Date.now() }; setIndex([item, ...(index || [])]); saveIndex((items) => [item, ...items.filter((x) => x.id !== id)]); setEditId(id) }
+
+  if (editId) return <ArticleEditor t={t} id={editId} onPublished={onPublished} onBack={() => { setEditId(null); loadIndex() }} onMeta={(meta) => saveIndex((items) => items.some((x) => x.id === meta.id) ? items.map((x) => x.id === meta.id ? { ...x, ...meta } : x) : [{ ...meta }, ...items])} />
+
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+        <span style={{ fontFamily: FONTS.serif, fontSize: 22, fontWeight: 700, color: t.textPrimary }}>Articles</span>
+        <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)', color: t.textSecondary }}>brouillons · publication sur matthieuhuguet.com/reels</span>
+        <button onClick={newArticle} style={{ marginLeft: 'auto', background: PALETTE.primary, color: '#fff', border: 'none', borderRadius: RADII.sm, padding: '7px 16px', cursor: 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)', fontWeight: 600 }}>+ Nouvel article</button>
+      </div>
+      {index === null && <div style={{ color: t.textSecondary }}>chargement…</div>}
+      {index && index.length === 0 && <div style={{ color: t.textSecondary, padding: 20 }}>Aucun article. Crée le premier.</div>}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(220px,1fr))', gap: 12 }}>
+        {(index || []).map((a) => (
+          <div key={a.id} onClick={() => setEditId(a.id)} style={{ background: t.cardBg, border: `1px solid ${t.border}`, borderRadius: RADII.lg, padding: 14, cursor: 'pointer' }}>
+            <div style={{ fontFamily: FONTS.serif, fontWeight: 600, fontSize: 'var(--zr-ui-xl)', color: t.textPrimary, marginBottom: 4 }}>{a.title}</div>
+            <div style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)', color: a.status === 'live' ? PALETTE.green : (a.status && a.status !== 'draft') ? PALETTE.primary : t.textSecondary }}>{statusLabel(a.status, a.slug)}</div>
+          </div>
+        ))}
+      </div>
+    </>
+  )
+}
+
+function ArticleEditor({ t, id, onBack, onMeta, onPublished }) {
+  const path = `articles/${id}.article.json`
+  const sha = useRef(null)
+  const [meta, setMeta] = useState({ title: '', slug: '', theme: 'white', font: 'serif', size: 17, ratio: 'free', status: 'draft' })
+  const metaRef = useRef(meta)
+  const liveRef = useRef(true)
+  const saveTimer = useRef(null)
+  const pendingExtra = useRef(null)
+  const saveChain = useRef(Promise.resolve())
+  const saveSeq = useRef(0)
+  const [status, setStatus] = useState('chargement…')
+  const [ready, setReady] = useState(false)
+  const editor = useCreateBlockNote({
+    uploadFile: async (file) => { const webp = await fileToWebp(file, 0.95, Infinity).catch(() => null); const j = await fetch('/api/img', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ dataUrl: webp }) }).then((r) => r.json()).catch(() => null); return (j && j.url) || webp },
+  })
+  useEffect(() => { metaRef.current = meta }, [meta])
+  useEffect(() => {
+    let live = true
+    let readyTimer = null
+    liveRef.current = true
+    setReady(false)
+    setStatus('chargement…')
+    ;(async () => {
+    const j = await rd(path)
+    if (!live) return
+    if (j && j.markdown && !j.missing) {
+      sha.current = j.sha
+      try {
+        const d = JSON.parse(j.markdown)
+        if (!live) return
+        const nextMeta = { ...metaRef.current, ...d, status: d.status || 'draft' }
+        metaRef.current = nextMeta
+        setMeta(nextMeta)
+        if (Array.isArray(d.blocks) && d.blocks.length) editor.replaceBlocks(editor.document, d.blocks)
+      } catch {}
+    }
+    if (!live) return
+    setStatus('')
+    readyTimer = setTimeout(() => { if (live) setReady(true) }, 300)
+    })()
+    return () => {
+      live = false
+      liveRef.current = false
+      if (readyTimer) clearTimeout(readyTimer)
+      if (saveTimer.current) {
+        clearTimeout(saveTimer.current)
+        saveTimer.current = null
+        const patch = pendingExtra.current || {}
+        pendingExtra.current = null
+        save(patch, { quiet: true })
+      }
+    }
+  }, [id, path, editor])
+  const save = async (extra = {}, { quiet = false } = {}) => {
+    const seq = ++saveSeq.current
+    if (!quiet && liveRef.current) setStatus('enregistrement…')
+    const data = { ...metaRef.current, ...extra, blocks: editor.document, updatedAt: Date.now() }
+    // Doc à éditeur unique : on REMPLACE, avec retry sur conflit (sha frais) -> l'enregistrement réussit au lieu
+    // d'échouer en silence. (Le merge multi-éditeur d'un même article reste un chantier à part.)
+    const task = saveChain.current.then(() => saveJsonWithRetry(path, () => data, { sha: sha.current, tries: 3 }))
+    saveChain.current = task.catch(() => null)
+    const res = await task.catch(() => ({ ok: false }))
+    if (res.ok) {
+      sha.current = res.sha
+      // L'index parent doit rester synchronisé même si l'éditeur vient d'être fermé pendant le POST.
+      onMeta({ id, title: data.title, slug: data.slug, status: data.status })
+      if (liveRef.current) {
+        if (seq === saveSeq.current) setStatus('enregistré ✓')
+      }
+    } else if (liveRef.current && seq === saveSeq.current) setStatus('erreur')
+    return res
+  }
+  const scheduleSave = (extra = {}) => {
+    pendingExtra.current = { ...(pendingExtra.current || {}), ...extra }
+    if (saveTimer.current) clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(() => {
+      saveTimer.current = null
+      const patch = pendingExtra.current || {}
+      pendingExtra.current = null
+      save(patch)
+    }, 750)
+  }
+  const flushSave = () => {
+    // Une sauvegarde sérialisée peut encore être en vol même si le timer a déjà
+    // été consommé. Publication/navigation doivent attendre cette chaîne aussi.
+    if (!saveTimer.current) return saveChain.current
+    clearTimeout(saveTimer.current)
+    saveTimer.current = null
+    const patch = pendingExtra.current || {}
+    pendingExtra.current = null
+    return save(patch, { quiet: true })
+  }
+  const onChange = () => { if (ready) scheduleSave() }
+  const setM = (patch) => {
+    setMeta((m) => {
+      const next = { ...m, ...patch }
+      metaRef.current = next
+      return next
+    })
+    scheduleSave(patch)
+  }
+  const exportJson = () => { const data = { ...meta, blocks: editor.document }; const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = (meta.slug || slugify(meta.title)) + '.article.json'; a.click() }
+  const publish = async () => {
+    await flushSave()
+    const slug = meta.slug || slugify(meta.title)
+    setStatus('publication…')
+    // On envoie le brouillon COMPLET (mediaRefs inclus) : le serveur résout/promeut les médias privés.
+    const article = { ...meta, id, slug, blocks: editor.document }
+    const j = await fetch('/api/publish', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ article }) }).then((r) => r.json()).catch(() => null)
+    if (j && j.ok) {
+      const st = j.status || 'published_to_branch' // statut RÉEL renvoyé par le serveur (branche / preview)
+      setMeta((m) => { const next = { ...m, slug, status: st }; metaRef.current = next; return next })
+      save({ slug, status: st })
+      const warn = (j.warnings && j.warnings.length) ? ` (à vérifier : ${j.warnings.join(', ')})` : ''
+      setStatus(`${st === 'preview' ? 'PR/preview prête' : 'poussé sur branche'} ${j.branch} · ${j.assets} asset(s)${warn} ✓`)
+      window.open(j.prUrl || j.compareUrl, '_blank')
+      onPublished && onPublished({ title: meta.title, slug, url: j.liveUrl, branch: j.branch, status: st })
+    } else if (j && j.error === 'validation') setStatus('publication refusée : ' + (j.errors || []).join(', '))
+    else setStatus('erreur publish ' + ((j && (j.error || j.detail)) || ''))
+  }
+  // « live » seulement quand le fichier est sur master (confirmé via /api/publish status). Jamais avant merge.
+  const liveUrl = meta.status === 'live' && meta.slug ? liveUrlFor(meta.slug) : null
+  const isPublished = meta.status && meta.status !== 'draft'
+  const share = (net) => { const u = encodeURIComponent(liveUrl); const tx = encodeURIComponent(meta.title || ''); window.open(net === 'tw' ? `https://twitter.com/intent/tweet?text=${tx}&url=${u}` : `https://www.linkedin.com/sharing/share-offsite?url=${u}`, '_blank') }
+  const th = THEMES[meta.theme]
+  const ratioVal = (RATIOS.find((r) => r[0] === meta.ratio) || [])[2]
+  const seg = (val, opts, key) => <div style={{ display: 'inline-flex', gap: 2, border: `1px solid ${t.border}`, borderRadius: RADII.sm, padding: 2 }}>{opts.map(([v, l]) => <button key={v} onClick={() => setM({ [key]: v })} style={{ padding: '3px 9px', borderRadius: 4, border: 'none', cursor: 'pointer', background: val === v ? PALETTE.primarySoft : 'transparent', color: val === v ? PALETTE.primary : t.textSecondary, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', fontWeight: val === v ? 600 : 500 }}>{l}</button>)}</div>
+
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+        <button onClick={() => { flushSave(); onBack() }} style={{ background: 'transparent', border: `1px solid ${t.border}`, borderRadius: RADII.sm, color: t.textSecondary, cursor: 'pointer', padding: '3px 10px' }}>‹ Articles</button>
+        {seg(meta.theme, [['dark', 'Dark'], ['grey', 'Grey'], ['white', 'White']], 'theme')}
+        {seg(meta.font, FONT_OPTS, 'font')}
+        <button onClick={() => setM({ size: Math.max(13, meta.size - 1) })} style={{ ...mini(t) }}>A−</button>
+        <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>{meta.size}px</span>
+        <button onClick={() => setM({ size: Math.min(28, meta.size + 1) })} style={{ ...mini(t) }}>A+</button>
+        {seg(meta.ratio, RATIOS.map((r) => [r[0], r[1]]), 'ratio')}
+        <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)', color: t.textSecondary }}>{status}</span>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          {liveUrl && <button onClick={() => share('tw')} style={{ ...mini(t) }} title="Partager sur X/Twitter">𝕏 Partager</button>}
+          {liveUrl && <button onClick={() => share('li')} style={{ ...mini(t) }} title="Partager sur LinkedIn">in Partager</button>}
+          {liveUrl && <button onClick={() => window.open(liveUrl, '_blank')} style={{ ...mini(t) }}>Voir en ligne ↗</button>}
+          <button onClick={exportJson} style={{ ...mini(t) }}>Export JSON</button>
+          <button onClick={publish} style={{ background: PALETTE.primary, color: '#fff', border: 'none', borderRadius: RADII.sm, padding: '5px 14px', cursor: 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', fontWeight: 600 }}>Publier</button>
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+        <input value={meta.title} onChange={(e) => setM({ title: e.target.value })} placeholder="Titre de l'article" style={{ flex: 1, minWidth: 200, background: 'transparent', border: `1px solid ${t.border}`, borderRadius: RADII.sm, color: t.textPrimary, fontFamily: FONTS.serif, fontSize: 'var(--zr-ui-3xl)', fontWeight: 600, padding: '8px 12px', outline: 'none' }} />
+        <input value={meta.slug} onChange={(e) => setM({ slug: slugify(e.target.value) })} placeholder="url-perso (optionnel)" style={{ flex: '0 0 220px', background: t.surface, border: `1px solid ${t.border}`, borderRadius: RADII.sm, color: t.textSecondary, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', padding: '8px 10px', outline: 'none' }} />
+      </div>
+      <div style={{ background: th.bg, color: th.fg, borderRadius: 12, padding: '24px clamp(16px,4vw,48px)', maxWidth: ratioVal ? 720 : '100%', margin: ratioVal ? '0 auto' : 0, aspectRatio: ratioVal || 'auto', minHeight: 320, overflow: 'auto', '--bn-font-family': FONTS[meta.font], fontSize: meta.size }}>
+        <div style={{ fontFamily: FONTS[meta.font], fontSize: meta.size + 18, fontWeight: 800, lineHeight: 1.1, marginBottom: 14 }}>{meta.title || 'Titre'}</div>
+        <BlockNoteView editor={editor} theme={meta.theme === 'white' ? 'light' : 'dark'} onChange={onChange} />
+      </div>
+    </>
+  )
+}
+function statusLabel(s, slug) {
+  if (s === 'live') return `live · ${PUBLISH.routeBase}/${slug}`
+  if (s === 'preview') return `preview · ${PUBLISH.routeBase}/${slug}`
+  if (s === 'published_to_branch' || s === 'published') return `sur branche · ${slug}`
+  return 'brouillon'
+}
+function mini(t) { return { background: 'transparent', border: `1px solid ${t.border}`, borderRadius: RADII.sm, color: t.textSecondary, cursor: 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', padding: '4px 9px' } }

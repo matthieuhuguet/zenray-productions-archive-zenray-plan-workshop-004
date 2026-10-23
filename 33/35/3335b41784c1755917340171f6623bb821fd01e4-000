@@ -1,0 +1,244 @@
+// @vitest-environment node
+// 3 October 2026, 03:47 CEST: one damaged transcript must not stop other projects from capturing their prompts.
+import { afterEach, expect, it } from 'vitest'
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createFeedbackCapture } from './AssetsFeedbackCapture.mjs'
+
+const cleanup = []
+afterEach(async () => { for (const action of cleanup.splice(0).reverse()) await action() })
+
+it.each(['corrupt', 'shrunk'])('continues capturing another session when a transcript is %s', async (failure) => {
+  const home = await mkdtemp(path.join(tmpdir(), 'assets-feedback-'))
+  cleanup.push(() => rm(home, { recursive: true, force: true }))
+  const stateDir = path.join(home, 'state'), sessions = path.join(home, '.codex', 'sessions')
+  await mkdir(stateDir); await mkdir(sessions, { recursive: true })
+  const writer = path.join(home, 'writer.py'), feedbackPath = path.join(home, 'FEEDBACK.md')
+  await writeFile(writer, 'import sys\nfrom pathlib import Path\nargs = sys.argv\nwith Path(args[args.index("--file") + 1]).open("a") as f:\n f.write(args[3] + "\\n")\n')
+  const meta = (id) => JSON.stringify({ type: 'session_meta', payload: { id, cwd: home } }) + '\n'
+  const broken = path.join(sessions, 'a-broken.jsonl')
+  await writeFile(broken, meta('broken-session') + (failure === 'corrupt' ? '{"type":"user","message":\n' : ''))
+  const savedCursor = failure === 'shrunk' ? { [broken]: { offset: 9999, cwd: home, sessionId: 'broken-session' } } : {}
+  await writeFile(path.join(stateDir, 'TranscriptCursors.json'), JSON.stringify(savedCursor))
+  await writeFile(path.join(stateDir, 'SessionBindings.json'), JSON.stringify({ 'broken-session': 'project', 'healthy-session': 'project' }))
+  const prompt = { type: 'response_item', timestamp: '2026-10-03T01:47:00Z', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Keep tracking my new texture.' }] } }
+  const healthy = path.join(sessions, 'b-healthy.jsonl')
+  await writeFile(healthy, meta('healthy-session') + JSON.stringify(prompt) + '\n')
+  const errors = []
+  const statuses = []
+  const capture = await createFeedbackCapture({ config: { storage: { stateDir, feedbackWriter: writer } }, home,
+    projects: () => [{ id: 'project', feedbackPath, sources: [] }], atomicJson: (file, value) => writeFile(file, JSON.stringify(value)), onError: (error) => errors.push(error), onStatus: (status) => statuses.push(status) })
+  cleanup.push(() => capture.close())
+  await capture.drain()
+  expect(errors).toHaveLength(1)
+  expect(await readFile(feedbackPath, 'utf8')).toBe('Keep tracking my new texture.\n')
+  const cursors = JSON.parse(await readFile(path.join(stateDir, 'TranscriptCursors.json'), 'utf8'))
+  expect(cursors[healthy].offset).toBe(Buffer.byteLength(meta('healthy-session') + JSON.stringify(prompt) + '\n'))
+  if (failure === 'shrunk') expect(cursors[broken].offset).toBe(9999)
+  await capture.drain()
+  expect(await readFile(feedbackPath, 'utf8')).toBe('Keep tracking my new texture.\n')
+  expect(statuses.at(-1).error).toContain(broken)
+  await rm(broken)
+  await capture.drain()
+  expect(statuses.at(-1).error).toBeNull()
+})
+
+// 3 October 2026, 22:23 CEST: parent-linked sidechains and sessions linked after their first scan retain exact native messages.
+it('captures a bound Claude sidechain as delegated work and preserves unread unbound prompts until binding', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'assets-sidechain-'));cleanup.push(() => rm(home, { recursive: true, force: true }))
+  const stateDir = path.join(home, 'state'), sidechains = path.join(home, '.claude/projects/project/session/subagents')
+  await mkdir(stateDir); await mkdir(sidechains, { recursive: true })
+  const writer = path.join(home, 'writer.py'), feedbackPath = path.join(home, 'FEEDBACK.md')
+  await writeFile(writer, 'import sys,json\nfrom pathlib import Path\na=sys.argv\nwith Path(a[a.index("--file")+1]).open("a") as f: f.write(json.dumps({"text":a[3],"kind":a[a.index("--kind")+1],"source":a[a.index("--source")+1]})+"\\n")\n')
+  const filename = path.join(sidechains, 'agent-actual-agent.jsonl'), bindingsPath = path.join(stateDir, 'SessionBindings.json')
+  await writeFile(bindingsPath, '{}')
+  const record = { type: 'user', isSidechain: true, agentId: 'actual-agent', sessionId: 'actual-parent-session', timestamp: '2026-10-03T20:23:00Z', cwd: home, message: { role: 'user', content: 'Audit the scene resources.' } }
+  await writeFile(filename, JSON.stringify(record)+'\n')
+  const capture = await createFeedbackCapture({ config: { storage: { stateDir, feedbackWriter: writer } }, home, projects: () => [{ id: 'project', feedbackPath, sources: [] }], atomicJson: (file,value) => writeFile(file,JSON.stringify(value)) });cleanup.push(() => capture.close())
+  await capture.drain()
+  expect(JSON.parse(await readFile(path.join(stateDir,'TranscriptCursors.json'),'utf8'))[filename].offset).toBe(0)
+  await writeFile(bindingsPath, JSON.stringify({ 'actual-parent-session': 'project' }))
+  await capture.drain()
+  const saved = await readFile(feedbackPath,'utf8'), entry = JSON.parse(saved.trim())
+  expect(entry).toEqual({ text: 'Audit the scene resources.', kind: 'order', source: filename })
+  await capture.drain()
+  expect(await readFile(feedbackPath,'utf8')).toBe(saved)
+})
+
+// 7 October 2026, 23:01 CEST: the canonical writer preserves original prompts through late binding and replay without duplication.
+it('uses the canonical feedback writer for bound capture and idempotent replay', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'assets-canonical-feedback-'))
+  cleanup.push(() => rm(home, { recursive: true, force: true }))
+  const stateDir = path.join(home, 'state'), sessions = path.join(home, '.codex', 'sessions')
+  await mkdir(stateDir); await mkdir(sessions, { recursive: true })
+  const configured = JSON.parse(await readFile(new URL('./AssetsConfig.json', import.meta.url), 'utf8'))
+  const feedbackPath = path.join(home, 'FEEDBACK.md'), bindingsPath = path.join(stateDir, 'SessionBindings.json')
+  const original = '# Existing knowledge\nJapanese: 日本語.\n'
+  await writeFile(feedbackPath, original); await writeFile(bindingsPath, '{}')
+  const filename = path.join(sessions, 'canonical-session.jsonl'), sessionId = 'actual-canonical-session'
+  const record = (role, text, phase, timestamp = '2026-10-07T21:03:00Z', metadata = undefined) => ({ type: 'response_item', timestamp,
+    ...(metadata ? { metadata } : {}), payload: { type: 'message', role, phase, content: [{ type: role === 'user' ? 'input_text' : 'output_text', text }] } })
+  const prompt = 'Préserve exactement mes deux fichiers. 日本語.'
+  await writeFile(filename, [
+    { type: 'session_meta', payload: { id: sessionId, cwd: home } },
+    record('user', prompt), record('assistant', 'Internal progress only.', 'commentary'),
+    record('assistant', 'Two files are verified.', 'final_answer', '2026-10-07T21:03:00.100Z', { retained_source: { id: { turn_id: 'actual-canonical-turn', role: 'assistant' } } }),
+    // 9 October 2026, 14:06 CEST: Codex repeats its final text in the task-complete event.
+    { type: 'event_msg', timestamp: '2026-10-07T21:03:00.200Z', payload: { type: 'task_complete', turn_id: 'actual-canonical-turn', last_agent_message: 'Two files are verified.', error: null } },
+  ].map(JSON.stringify).join('\n') + '\n')
+  const errors = []
+  const capture = await createFeedbackCapture({ config: { storage: { stateDir, feedbackWriter: configured.storage.feedbackWriter } }, home,
+    projects: () => [{ id: 'project', feedbackPath, sources: [] }], atomicJson: (file, value) => writeFile(file, JSON.stringify(value)),
+    onError: (error) => errors.push(error.message) })
+  cleanup.push(() => capture.close())
+  await capture.drain()
+  expect(await readFile(feedbackPath, 'utf8')).toBe(original)
+  await writeFile(bindingsPath, JSON.stringify({ [sessionId]: 'project' }))
+  await capture.drain()
+  const saved = await readFile(feedbackPath, 'utf8')
+  expect(saved.startsWith(original)).toBe(true)
+  expect(saved).toContain(prompt)
+  expect(saved).toContain('Two files are verified.')
+  expect(saved).not.toContain('Internal progress only.')
+  expect(saved.match(/<!-- feedback-event:/g)).toHaveLength(2)
+  await capture.replay(sessionId)
+  expect(await readFile(feedbackPath, 'utf8')).toBe(saved)
+  capture.close()
+  const resumed = await createFeedbackCapture({ config: { storage: { stateDir, feedbackWriter: configured.storage.feedbackWriter } }, home,
+    projects: () => [{ id: 'project', feedbackPath, sources: [] }], atomicJson: (file, value) => writeFile(file, JSON.stringify(value)),
+    onError: (error) => errors.push(error.message) })
+  cleanup.push(() => resumed.close())
+  await resumed.drain()
+  expect(await readFile(feedbackPath, 'utf8')).toBe(saved)
+  const nextPrompt = 'Continue after the collector restart.'
+  await writeFile(filename, (await readFile(filename, 'utf8')) + JSON.stringify(record('user', nextPrompt)) + '\n')
+  await resumed.drain()
+  const continued = await readFile(feedbackPath, 'utf8')
+  expect(continued.startsWith(saved)).toBe(true)
+  expect(continued).toContain(nextPrompt)
+  expect(continued.match(/<!-- feedback-event:/g)).toHaveLength(3)
+  expect(errors).toEqual([])
+})
+
+// 8 October 2026, 22:37 CEST: a busy background transcript scan must queue, not reject, a new project binding.
+it('queues a session replay while another transcript is being captured', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'zr-transcript-capture-'))
+  const stateDir = path.join(root, 'state')
+  const home = path.join(root, 'home')
+  const feedbackPath = path.join(root, 'FEEDBACK.md')
+  const sessionId = 'actual-session-12345678'
+  const transcriptPath = path.join(home, '.codex', 'sessions', `${sessionId}.jsonl`)
+  const markerPath = path.join(root, 'writer-events.jsonl')
+  const writerPath = path.join(root, 'slow-feedback-writer.py')
+  await mkdir(stateDir, { recursive: true })
+  await mkdir(path.dirname(transcriptPath), { recursive: true })
+  await writeFile(path.join(stateDir, 'SessionBindings.json'), JSON.stringify({ [sessionId]: 'project-a' }))
+  await writeFile(transcriptPath, [
+    JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd: '/project-a' } }),
+    JSON.stringify({ type: 'response_item', timestamp: '2026-10-08T20:00:00.000Z', payload: { role: 'user', content: [{ type: 'input_text', text: 'Open the new project.' }] } }),
+    '',
+  ].join('\n'))
+  await writeFile(writerPath, [
+    'import sys, time',
+    `with open(${JSON.stringify(markerPath)}, 'a', encoding='utf-8') as stream:`,
+    '    stream.write(sys.argv[9] + "\\n")',
+    '    stream.flush()',
+    'time.sleep(0.35)',
+  ].join('\n') + '\n')
+
+  const capture = await createFeedbackCapture({
+    config: { storage: { stateDir, feedbackWriter: writerPath } },
+    projects: () => [{ id: 'project-a', feedbackPath, sources: [] }],
+    atomicJson: (filename, value) => writeFile(filename, JSON.stringify(value)),
+    home,
+  })
+  let firstDrain
+  try {
+    firstDrain = capture.drain()
+    await waitFor(async () => (await readFile(markerPath, 'utf8').catch(() => '')).trim().length > 0)
+    await expect(capture.replay(sessionId)).resolves.toMatchObject({ queued: true })
+    await firstDrain
+    await waitFor(async () => (await readFile(markerPath, 'utf8').catch(() => '')).trim().split('\n').length >= 2)
+    const eventIds = (await readFile(markerPath, 'utf8')).trim().split('\n')
+    expect(eventIds[1]).toBe(eventIds[0])
+  } finally {
+    capture.close()
+    await firstDrain?.catch(() => {})
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('captures bound Antigravity messages incrementally and deduplicates a replay', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'zr-antigravity-feedback-'))
+  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  const stateDir = path.join(root, 'state')
+  const conversationDir = path.join(root, 'home', '.gemini', 'antigravity', 'conversations')
+  const feedbackPath = path.join(root, 'FEEDBACK.md')
+  const sessionId = '12345678-1234-4234-8234-123456789abc'
+  const databasePath = path.join(conversationDir, `${sessionId}.db`)
+  await mkdir(stateDir, { recursive: true })
+  await mkdir(conversationDir, { recursive: true })
+  await writeFile(databasePath, 'native database marker')
+  await writeFile(path.join(stateDir, 'SessionBindings.json'), JSON.stringify({ [sessionId]: 'project' }))
+  await writeFile(feedbackPath, '# Existing feedback\n')
+  const configured = JSON.parse(await readFile(new URL('./AssetsConfig.json', import.meta.url), 'utf8'))
+  let revision = 0
+  const calls = []
+  const message = (stepIndex, kind = 'prompt') => ({
+    id: `native-message-${stepIndex}`,
+    stepIndex,
+    kind,
+    text: `${kind} ${stepIndex}`,
+    timestamp: `2026-10-09T04:46:${String(stepIndex).padStart(2, '0')}.000Z`,
+  })
+  const readPage = async (filename, before, receivedSessionId) => {
+    expect(filename).toBe(databasePath)
+    expect(receivedSessionId).toBe(sessionId)
+    calls.push({ revision, before })
+    if (revision === 0) return before === undefined
+      ? { messages: [message(8, 'iteration'), message(7)], nextBefore: 6 }
+      : { messages: [message(6, 'iteration'), message(5)], nextBefore: null }
+    return before === undefined
+      ? { messages: [message(10, 'iteration'), message(9), message(8, 'iteration')], nextBefore: 7 }
+      : { messages: [message(7), message(6, 'iteration'), message(5)], nextBefore: null }
+  }
+  const capture = await createFeedbackCapture({
+    config: { storage: { stateDir, feedbackWriter: configured.storage.feedbackWriter } },
+    projects: () => [{ id: 'project', feedbackPath, sources: [] }],
+    atomicJson: (filename, value) => writeFile(filename, JSON.stringify(value)),
+    home: path.join(root, 'home'),
+    readGeminiPage: readPage,
+  })
+  cleanup.push(() => capture.close())
+  await capture.drain()
+  const first = await readFile(feedbackPath, 'utf8')
+  expect(first.match(/<!-- feedback-event:/g)).toHaveLength(4)
+  expect(first).toContain('prompt 5')
+  expect(first).toContain('iteration 8')
+  expect(first.indexOf('prompt 5')).toBeLessThan(first.indexOf('prompt 7'))
+  expect(first.indexOf('prompt 7')).toBeLessThan(first.indexOf('iteration 8'))
+
+  revision = 1
+  await writeFile(databasePath, 'native database marker with two newer messages')
+  await capture.drain()
+  const incremental = await readFile(feedbackPath, 'utf8')
+  expect(incremental.match(/<!-- feedback-event:/g)).toHaveLength(6)
+  expect(incremental).toContain('prompt 9')
+  expect(incremental).toContain('iteration 10')
+  expect(JSON.parse(await readFile(path.join(stateDir, 'TranscriptCursors.json'), 'utf8'))[databasePath]).toMatchObject({ provider: 'antigravity', sessionId, lastStepIndex: 10 })
+
+  await capture.replay(sessionId)
+  await waitFor(async () => calls.length === 5 && (await readFile(feedbackPath, 'utf8')).match(/<!-- feedback-event:/g)?.length === 6)
+  expect((await readFile(feedbackPath, 'utf8')).match(/<!-- feedback-event:/g)).toHaveLength(6)
+  expect(calls).toHaveLength(5)
+})
+
+async function waitFor(predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error('Timed out waiting for transcript capture')
+}

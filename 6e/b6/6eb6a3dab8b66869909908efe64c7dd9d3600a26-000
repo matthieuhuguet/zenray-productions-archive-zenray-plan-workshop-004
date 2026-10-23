@@ -1,0 +1,1982 @@
+// ZenRayMedia — LE MODÈLE DE CALQUES (carte L1, 2026-08-04).
+//
+// « Pense éditeur d'UI comme React mais en GUI + layer HTML comme Photoshop = layer de PNG ou
+// effets. » Cette phrase de Matthieu tranche une contradiction qui a coûté cinq jours : l'INTERFACE
+// est celle d'Unreal, le MODÈLE est celui de Photoshop.
+//
+// Photoshop n'imbrique pas, il EMPILE. Une pile ordonnée de calques sur un canevas de taille fixe,
+// chacun portant sa position, sa taille, son rang, son opacité, son mode de fusion et ses effets.
+// C'est ce qui rend la composition rapide, et c'est aussi ce qui rend ce fichier court : un arbre
+// avec emplacements demanderait des semaines pour un gain nul sur « craft rapidement ».
+//
+// LE CONTRAT DE `composition.js` N'EST PAS ROUVERT, et c'est le cadeau de la carte C1 du
+// 2026-08-01 : depuis cette date `normalizeComposition` conserve les clefs qu'elle ne connaît pas.
+// Un tableau `layers` posé à côté de `rows` survit donc à tous les gestes sans qu'une seule ligne de
+// son contrat change, et les documents déjà enregistrés restent lisibles puisqu'un document sans
+// calques rend simplement un tableau vide.
+
+import { makeId } from './contracts.js'
+
+// FAMILLE POWERPOINT 5 · UN CINQUIÈME TYPE DE CALQUE, LE TABLEAU. Portée assumée, écrite ici plutôt
+// que devinée en silence : les graphiques et SmartArt de PowerPoint réclament soit une bibliothèque
+// de rendu de graphiques, soit un moteur de mise en page générative pour les diagrammes — un
+// chantier disproportionné pour l'usage réel d'aujourd'hui (des affiches, VISION.md), et absent de
+// ce dépôt. Le TABLEAU, lui, est borné (texte en grille) et sert un cas fréquent des publications
+// sociales (comparatif, trois conseils en colonnes) : c'est la seule des trois retenue.
+export const LAYER_KINDS = ['text', 'image', 'shape', 'component', 'table']
+
+// FAMILLE PHOTOSHOP 4 · FORMES VECTORIELLES. Un calque « shape » ne rendait qu'un rectangle : la
+// couleur de remplissage et le contour existaient déjà (LAYER_STYLES porte backgroundColor et
+// border), mais la GÉOMÉTRIE, elle, n'avait qu'une seule forme possible. Trois formes couvrent le
+// noyau que la doc Photoshop retient : rectangle, ellipse, ligne.
+//
+// FAMILLE FIGMA 6 · le polygone et l'étoile s'ajoutent ici : ce sont les deux formes PARAMÉTRIQUES
+// que Figma construit par un nombre de côtés et, pour l'étoile, un ratio de rayon interne — jamais
+// un tracé à points qu'on déplace un par un. CE POINT EST ÉCRIT PLUTÔT QUE CACHÉ : la doc Figma va
+// plus loin, jusqu'à l'outil Plume et l'édition de points de courbe individuels, ce qui suppose un
+// second modèle de géométrie entier (des points de contrôle, pas une boîte x/y/w/h) pour un usage
+// que ce produit — des compositions de type poster/carrousel, jamais une icône dessinée à la main —
+// ne rencontre pas. Polygone et étoile couvrent la façon dont Figma sert RÉELLEMENT ce cas courant,
+// le tracé à points reste hors périmètre, assumé par écrit.
+export const SHAPE_TYPES = ['rectangle', 'ellipse', 'line', 'polygon', 'star']
+
+// FAMILLE POWERPOINT 3 · TEXTE ET TYPOGRAPHIE. Police, corps, graisse, casse, alignements et
+// interlignage sont déjà couverts par `LAYER_STYLES` (carte S2) ; ce qui manquait au regard de la
+// doc PowerPoint est la LISTE (à puces ou numérotée) et le LIEN. Portée assumée : une liste ici est
+// une ligne par retour à la ligne du texte, jamais des niveaux de puces imbriqués — le texte d'un
+// calque reste un champ plat, et un système de sous-niveaux rouvrirait ce champ pour un gain que
+// l'usage réel (une affiche, pas un document long) ne réclame pas.
+export const LIST_STYLES = ['none', 'bullet', 'number']
+
+// FAMILLE POWERPOINT 6 · ANIMATIONS. Portée assumée, écrite plutôt que devinée : les TRANSITIONS
+// entre diapositives n'ont pas d'équivalent réel ici — un carrousel Instagram change de panneau par
+// un coup sec, jamais un fondu, et ZenRayMedia ne porte aucun mode « présentation » qui jouerait une
+// transition entre deux compilations. Seule l'ENTRÉE ANIMÉE d'un calque survit à la traduction :
+// elle sert l'aperçu interactif et un futur export vidéo/GIF d'un seul canevas, sans réclamer de
+// moteur de timeline (déclenchement, séquençage, sortie) qu'aucun usage réel ne demande aujourd'hui.
+export const ANIMATION_STYLES = ['none', 'fade', 'rise', 'zoom']
+
+export const CONSTRAINTS_H = ['left', 'center', 'right', 'scale']
+export const CONSTRAINTS_V = ['top', 'center', 'bottom', 'scale']
+
+// Les modes de fusion sont ceux que CSS sait appliquer NATIVEMENT via `mix-blend-mode`. On ne
+// propose que ce que le navigateur exécute réellement : un mode qu'il faudrait émuler en toile
+// coûterait un rendu hors iframe et casserait l'export en page autonome.
+export const BLEND_MODES = [
+  'normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten',
+  'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'difference', 'exclusion',
+]
+
+// Les effets sont des FILTRES CSS, pour la même raison. Chacun se réduit à une fonction de
+// `filter` ou à `box-shadow`, donc à une chaîne que l'export emporte sans dépendance.
+export const EFFECT_KEYS = ['blur', 'brightness', 'contrast', 'saturate', 'shadow']
+
+// FAMILLE FIGMA 7 · APPARENCE. Opacité, fusion, filtres et ombre existaient déjà (ci-dessus) : ce
+// qui manquait au regard de la doc Figma est le REMPLISSAGE DÉGRADÉ, omniprésent dans une affiche
+// ou un post social (fond qui module la lumière derrière un titre) et absent tant que `backgroundColor`
+// ne portait qu'une couleur unie. PORTÉE ASSUMÉE, ÉCRITE PLUTÔT QUE CACHÉE : Figma empile plusieurs
+// fills indépendants par calque (solide + dégradé + image, chacun avec sa propre opacité) ; ce
+// produit n'en garde qu'UN SEUL À LA FOIS, solide ou dégradé, choisi par `fillType`. L'empilement de
+// fills sert des compositions bien plus complexes qu'une affiche 2D pour Instagram ou LinkedIn — le
+// seul usage réel aujourd'hui, au sens de VISION.md — et l'ajouter maintenant coûterait une UI de
+// calques DANS le calque pour un gain que ce produit ne rencontre pas encore.
+export const FILL_TYPES = ['solid', 'gradient']
+
+const HEX_RE = /^#[0-9a-fA-F]{3,8}$/
+
+// Le dégradé linéaire d'un calque, en CSS réel. Fonction PURE, séparée de `styleOf` : un dégradé a
+// besoin de PLUSIEURS champs coordonnés (deux couleurs, un angle), pas d'une seule valeur de texte
+// libre comme le reste de `LAYER_STYLES` — même raison de conception que `transformOf`/`shapeClipPath`.
+export function fillOf(layer) {
+  if (layer?.fillType !== 'gradient') return ''
+  const de = HEX_RE.test(layer.gradientFrom) ? layer.gradientFrom : '#6fb6ed'
+  const a = HEX_RE.test(layer.gradientTo) ? layer.gradientTo : '#4371ee'
+  const angle = Number.isFinite(layer.gradientAngle) ? ((Math.round(layer.gradientAngle) % 360) + 360) % 360 : 135
+  return `background:linear-gradient(${angle}deg, ${de}, ${a})`
+}
+
+// FAMILLE POWERPOINT 3 · LE LIEN, restreint aux protocoles qu'un clic dans l'aperçu peut suivre
+// sans risque. `javascript:` (et tout schéma non listé) est refusé plutôt qu'assaini : un lien
+// qu'on refuse d'écrire ne peut jamais s'exécuter, ce qu'aucun nettoyage de chaîne ne garantit
+// avec la même certitude.
+export function safeHref(href) {
+  const valeur = typeof href === 'string' ? href.trim() : ''
+  if (!valeur) return ''
+  if (/^(https?:|mailto:)/i.test(valeur) || valeur.startsWith('/') || valeur.startsWith('#')) return valeur
+  return ''
+}
+
+// FAMILLE POWERPOINT 6 · l'entrée animée d'un calque, en CSS réel. Même nom de keyframe pour tous
+// les calques d'un style donné (`zrm-anim-fade` etc.) : les définitions vivent UNE fois dans la
+// feuille statique de la page, jamais dupliquées par calque.
+export function animationOf(layer) {
+  if (!layer || layer.animationStyle === 'none' || !layer.animationStyle) return ''
+  const delai = Number.isFinite(layer.animationDelay) ? Math.max(0, Math.round(layer.animationDelay)) : 0
+  return `animation:zrm-anim-${layer.animationStyle} 520ms var(--zrm-ease,ease) ${delai}ms both`
+}
+
+// LE STYLE PROPRE D'UN CALQUE, et d'abord celui d'un calque de TEXTE. Matthieu : « toutes les
+// fonctions de base que tu as créées, comme la fonction texte, je veux qu'elle soit parfaite. »
+// Un calque de texte qui ne sait ni changer de corps, ni de couleur, ni d'alignement n'est pas une
+// fonction texte, c'est une étiquette. La liste est FERMÉE, pour la même raison que celle des
+// sous-composants : on écrit du style en ligne à partir de valeurs connues, jamais de saisie libre.
+export const LAYER_STYLES = [
+  { key: 'color', label: 'Couleur', type: 'color' },
+  { key: 'backgroundColor', label: 'Fond', type: 'color' },
+  { key: 'fontFamily', label: 'Police', type: 'select', options: ['', 'AnthropicSans', 'AnthropicSerif', 'AnthropicMono'] },
+  { key: 'fontSize', label: 'Corps', type: 'text', hint: '48px' },
+  { key: 'fontWeight', label: 'Graisse', type: 'select', options: ['', '300', '400', '500', '600', '700', '800'] },
+  { key: 'fontStyle', label: 'Italique', type: 'select', options: ['', 'normal', 'italic'] },
+  { key: 'letterSpacing', label: 'Interlettre', type: 'text', hint: '-.02em' },
+  { key: 'lineHeight', label: 'Interligne', type: 'text', hint: '1.1' },
+  { key: 'textAlign', label: 'Alignement', type: 'select', options: ['', 'left', 'center', 'right'] },
+  { key: 'textTransform', label: 'Casse', type: 'select', options: ['', 'none', 'uppercase', 'lowercase', 'capitalize'] },
+  { key: 'justifyContent', label: 'Vertical', type: 'select', options: ['', 'flex-start', 'center', 'flex-end'] },
+  { key: 'padding', label: 'Marge int.', type: 'text', hint: '0' },
+  { key: 'borderRadius', label: 'Rayon', type: 'text', hint: '0' },
+  { key: 'border', label: 'Bordure', type: 'text', hint: '1px solid #000' },
+]
+
+const CLEFS_STYLE_CALQUE = new Set(LAYER_STYLES.map((c) => c.key))
+
+// FAMILLE INDESIGN D4 · LES CHAMPS QU'UN STYLE DE TEXTE NOMMÉ PORTE — un sous-ensemble de
+// `LAYER_STYLES`, volontairement SANS `backgroundColor`/`padding`/`borderRadius`/`border` : ceux-là
+// relèvent de l'APPARENCE de l'objet (carte D7, styles d'objet), pas de sa typographie. Un style de
+// PARAGRAPHE InDesign complet ; le style de CARACTÈRE (une plage de texte DANS un calque) resterait
+// hors de portée sans texte enrichi par portions, modèle que ce produit ne porte pas — écart assumé.
+export const TEXT_STYLE_KEYS = ['color', 'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'lineHeight', 'textAlign', 'textTransform', 'justifyContent']
+
+// AUDIT P0-T8 · UN CHAMP CSS LIBRE (bordure, ombre portée) NE DOIT JAMAIS pouvoir fermer
+// l'attribut `style` qui le porte, y ajouter une déclaration supplémentaire, ni charger une
+// ressource distante à l'insu de qui ouvre le document. `;`/`<`/`>`/`"`/`'` cassent l'attribut ou
+// ajoutent une déclaration ; `url(` charge une ressource externe — un pixel de suivi caché dans un
+// champ d'apparence anodine. Fonction UNIQUE, réutilisée par CHAQUE champ CSS libre du produit :
+// deux copies de la même règle de sécurité dérivent tôt ou tard l'une de l'autre.
+export function safeCssValue(value) {
+  if (typeof value !== 'string') return ''
+  const nettoye = value.replace(/[;<>"']/g, '')
+  return /url\s*\(/i.test(nettoye) ? '' : nettoye
+}
+
+// La chaîne de style d'un calque, filtrée sur la liste fermée et débarrassée de tout caractère qui
+// permettrait de sortir de l'attribut. Même précaution que dans `nodes.js`, même raison.
+export function styleOf(layer) {
+  return Object.entries(layer?.style || {})
+    .filter(([clef, valeur]) => CLEFS_STYLE_CALQUE.has(clef) && typeof valeur === 'string' && valeur.trim())
+    .map(([clef, valeur]) => `${clef.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)}:${safeCssValue(valeur)}`)
+    .join(';')
+}
+
+export function emptyEffects() {
+  return { blur: 0, brightness: 1, contrast: 1, saturate: 1, shadow: '' }
+}
+
+// Le gabarit d'un calque neuf. Une taille par défaut qui NE SOIT PAS nulle : un calque de zéro
+// pixel se pose sans qu'on le voie, et l'utilisateur conclut que le dépôt a échoué.
+export function makeLayer(composition, kind, patch = {}) {
+  if (!LAYER_KINDS.includes(kind)) throw new Error(`kind de calque inconnu : ${kind}`)
+  const serial = (composition?.serial || 0) + 1
+  return {
+    id: makeId('lay', `${composition?.themeId || 'sans-theme'}:${kind}`, serial),
+    serial,
+    kind,
+    name: patch.name || defaultName(kind),
+    x: 0, y: 0, w: 320, h: kind === 'text' ? 64 : 180,
+    z: nextZ(composition),
+    rotation: 0,     // degrés, sens horaire, pivot au centre du calque
+    flipX: false, flipY: false,   // retournement horizontal / vertical (famille Photoshop 2)
+    shapeType: 'rectangle',   // famille Photoshop 4 : rectangle | ellipse | line | polygon | star (F6)
+    shapeSides: 6, shapeStarRatio: 0.5,   // famille Figma 6 : nombre de côtés, ratio de l'étoile
+    fillType: 'solid', gradientFrom: '#6fb6ed', gradientTo: '#4371ee', gradientAngle: 135,   // famille Figma 7
+    listStyle: 'none', href: '',   // famille PowerPoint 3 : liste à puces/numérotée, lien
+    threadNextId: '', threadPrevId: '',   // famille InDesign D3 : chaînage entre blocs de texte
+    textStyleId: '',   // famille InDesign D4 : style de texte nommé appliqué (vide = aucun)
+    objectStyleId: '',   // famille InDesign D7 : style d'objet nommé appliqué (vide = aucun)
+    tableRows: 2, tableCols: 2, tableCells: ['', '', '', ''],   // famille PowerPoint 5 : tableau
+    animationStyle: 'none', animationDelay: 0,   // famille PowerPoint 6 : entrée animée
+    connectFrom: '', connectTo: '',   // famille Miro 6 : connecteur, identifiants des deux calques reliés
+    connectorX1: 0, connectorY1: 0, connectorX2: 0, connectorY2: 0,   // coordonnées relatives, recalculées
+    pathPoints: [], pathClosed: false,   // famille Illustrator I2 : tracé vectoriel, l'outil Plume
+    pathStrokeColor: '', pathStrokeWidth: 2,   // contour du tracé, indépendant du fond (backgroundColor)
+    focalX: 50, focalY: 50,   // famille Photoshop 6 : point focal d'une image dans son cadre, en %
+    wrapAroundId: '', wrapGap: 16,   // famille InDesign D5 : habillage de texte, obstacle évité + marge en px
+    // FAMILLE FIGMA 3 · CONTRAINTES. Comment le calque réagit quand le CANEVAS change de taille
+    // (changer de format n'est pas rare ici : un même brief se décline en carré, en 9:16, en A4).
+    // « left/top » : distance au bord fixe, par défaut, exactement le défaut de Figma. « right »,
+    // « bottom » : distance à l'autre bord fixe. « center » : reste à équidistance des deux bords.
+    // « scale » : grandit ou rétrécit avec le canevas, dans la même proportion.
+    constrainH: 'left', constrainV: 'top',
+    opacity: 1,
+    blend: 'normal',
+    hidden: false,
+    locked: false,
+    source: '',          // texte du calque, adresse de l'image, ou identifiant du composant
+    style: {},           // style propre, voir LAYER_STYLES
+    effects: emptyEffects(),
+    ...patch,
+  }
+}
+
+function defaultName(kind) {
+  return { text: 'Texte', image: 'Image', shape: 'Forme', component: 'Composant', table: 'Tableau' }[kind]
+}
+
+// FAMILLE POWERPOINT 5 · LE TABLEAU. `tableCells` est un tableau À PLAT de `tableRows * tableCols`
+// chaînes, jamais une grille de tableaux — un chemin d'indices `[ligne][colonne]` demanderait deux
+// bornes à vérifier partout où une seule (`lignes * colonnes`) suffit.
+function normaliserTableau(l) {
+  const lignes = Math.min(8, Math.max(1, Math.round(nombre(l.tableRows, 2))))
+  const colonnes = Math.min(8, Math.max(1, Math.round(nombre(l.tableCols, 2))))
+  const brut = Array.isArray(l.tableCells) ? l.tableCells : []
+  const cellules = Array.from({ length: lignes * colonnes }, (_, i) => (typeof brut[i] === 'string' ? brut[i] : ''))
+  return { tableRows: lignes, tableCols: colonnes, tableCells: cellules }
+}
+
+// FAMILLE ILLUSTRATOR I2 · LE TRACÉ VECTORIEL. Chaque point porte sa position ET ses deux poignées
+// bézier (`inX/inY` pour la courbe qui ARRIVE sur ce point, `outX/outY` pour celle qui EN PART),
+// toutes en POURCENTAGE de la boîte du calque (0-100), jamais en pixels absolus — exactement la
+// même raison que le remplissage dégradé (carte F7) ou le point focal (carte P6) : le tracé doit
+// s'étirer avec le calque, pas se recalculer contre ses pixels réels à chaque redimensionnement.
+// Un point dont la poignée coïncide avec l'ancre (in ou out égal à x/y) ne courbe pas ce côté-là :
+// c'est un ANGLE. Des poignées écartées de l'ancre produisent une courbe : un point LISSE.
+function borneNombre(v, repli) {
+  return Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : repli
+}
+
+function normaliserPointTrace(p) {
+  const x = borneNombre(p?.x, 0), y = borneNombre(p?.y, 0)
+  return {
+    x, y,
+    inX: borneNombre(p?.inX, x), inY: borneNombre(p?.inY, y),
+    outX: borneNombre(p?.outX, x), outY: borneNombre(p?.outY, y),
+  }
+}
+
+function normaliserTrace(l) {
+  const points = Array.isArray(l.pathPoints) ? l.pathPoints.filter((p) => p && typeof p === 'object').map(normaliserPointTrace) : []
+  return {
+    pathPoints: points,
+    pathClosed: !!l.pathClosed,
+    pathStrokeColor: typeof l.pathStrokeColor === 'string' && HEX_RE.test(l.pathStrokeColor) ? l.pathStrokeColor : '',
+    pathStrokeWidth: Math.min(20, Math.max(0.5, nombre(l.pathStrokeWidth, 2))),
+  }
+}
+
+/**
+ * Redimensionne une grille de cellules à `newRows × newCols`, en conservant le contenu des
+ * cellules qui existaient déjà aux mêmes coordonnées — agrandir un tableau ne doit jamais effacer
+ * ce qu'il portait, et rétrécir ne doit perdre que ce qui tombe hors des nouvelles bornes.
+ */
+export function resizeTableCells(cells, oldRows, oldCols, newRows, newCols) {
+  const source = Array.isArray(cells) ? cells : []
+  const grille = []
+  for (let r = 0; r < newRows; r++) {
+    for (let c = 0; c < newCols; c++) {
+      grille.push(r < oldRows && c < oldCols ? (source[r * oldCols + c] ?? '') : '')
+    }
+  }
+  return grille
+}
+
+// LE RANG LE PLUS ÉLEVÉ EST DEVANT, comme dans Photoshop où le calque du haut de la pile masque
+// ceux du dessous. Un calque neuf se pose donc AU-DESSUS de tout, ce qui est le seul comportement
+// qui ne surprenne personne : on veut voir ce qu'on vient de poser.
+function nextZ(composition) {
+  const layers = readLayers(composition)
+  return layers.length ? Math.max(...layers.map((l) => l.z)) + 1 : 0
+}
+
+// LECTURE TOLÉRANTE, ÉCRITURE STRICTE. Un document venu du disque peut n'avoir aucun tableau de
+// calques, en avoir un corrompu, ou porter des calques auxquels il manque des champs ajoutés après
+// coup. La lecture répare sans jamais jeter ; l'écriture, elle, ne produit que des calques complets.
+export function readLayers(composition) {
+  const brut = composition?.layers
+  if (!Array.isArray(brut)) return []
+  // FAMILLE MIRO 6 · un connecteur pointe vers d'AUTRES calques, jamais vers un tableau à part
+  // (contrairement à `groupId`, qui pointe vers `composition.groups`) : il faut donc connaître
+  // l'ensemble des identifiants valides AVANT de normaliser chaque calque un par un.
+  const idsConnus = new Set(brut.filter((l) => l && typeof l.id === 'string').map((l) => l.id))
+  // FAMILLE INDESIGN D3 · un chaînage ne pointe QUE vers un autre calque TEXTE, jamais vers une
+  // forme ou une image : il faut donc distinguer ce sous-ensemble avant de normaliser, exactement
+  // la même raison que `idsConnus` pour les connecteurs (carte Miro 6).
+  const idsTexte = new Set(brut.filter((l) => l && typeof l.id === 'string' && l.kind === 'text').map((l) => l.id))
+  return brut
+    .filter((l) => l && typeof l === 'object' && LAYER_KINDS.includes(l.kind))
+    .map((l, i) => ({
+      ...l,
+      id: l.id || makeId('lay', 'repare', i),
+      name: typeof l.name === 'string' && l.name ? l.name : defaultName(l.kind),
+      x: nombre(l.x, 0), y: nombre(l.y, 0),
+      w: Math.max(1, nombre(l.w, 320)), h: Math.max(1, nombre(l.h, 180)),
+      z: nombre(l.z, i),
+      rotation: ((nombre(l.rotation, 0) % 360) + 360) % 360,   // toujours 0-359, jamais -30 ni 730
+      flipX: !!l.flipX, flipY: !!l.flipY,
+      shapeType: SHAPE_TYPES.includes(l.shapeType) ? l.shapeType : 'rectangle',
+      // 3 côtés minimum (en dessous, ce n'est plus un polygone) ; 12 au plus, au-delà la forme se
+      // confond visuellement avec une ellipse et le réglage ne sert plus à rien.
+      shapeSides: Math.min(12, Math.max(3, Math.round(nombre(l.shapeSides, 6)))),
+      shapeStarRatio: Math.min(0.9, Math.max(0.1, nombre(l.shapeStarRatio, 0.5))),
+      fillType: FILL_TYPES.includes(l.fillType) ? l.fillType : 'solid',
+      gradientFrom: typeof l.gradientFrom === 'string' && HEX_RE.test(l.gradientFrom) ? l.gradientFrom : '#6fb6ed',
+      gradientTo: typeof l.gradientTo === 'string' && HEX_RE.test(l.gradientTo) ? l.gradientTo : '#4371ee',
+      gradientAngle: ((Math.round(nombre(l.gradientAngle, 135)) % 360) + 360) % 360,
+      listStyle: LIST_STYLES.includes(l.listStyle) ? l.listStyle : 'none',
+      href: typeof l.href === 'string' ? l.href : '',
+      threadNextId: typeof l.threadNextId === 'string' && l.threadNextId && l.threadNextId !== l.id && idsTexte.has(l.threadNextId) ? l.threadNextId : '',
+      threadPrevId: typeof l.threadPrevId === 'string' && l.threadPrevId && l.threadPrevId !== l.id && idsTexte.has(l.threadPrevId) ? l.threadPrevId : '',
+      // FAMILLE INDESIGN D4 · `null`/absent de `composition.textStyles` = pas de style appliqué,
+      // jamais un identifiant qui pointerait vers un style depuis supprimé.
+      textStyleId: typeof l.textStyleId === 'string' && l.textStyleId && (composition?.textStyles || []).some((s) => s?.id === l.textStyleId) ? l.textStyleId : '',
+      // FAMILLE INDESIGN D7 · même garde-fou que `textStyleId` : jamais un identifiant qui pointerait
+      // vers un style d'objet depuis supprimé.
+      objectStyleId: typeof l.objectStyleId === 'string' && l.objectStyleId && (composition?.objectStyles || []).some((s) => s?.id === l.objectStyleId) ? l.objectStyleId : '',
+      ...normaliserTableau(l),
+      animationStyle: ANIMATION_STYLES.includes(l.animationStyle) ? l.animationStyle : 'none',
+      animationDelay: Math.min(3000, Math.max(0, Math.round(nombre(l.animationDelay, 0)))),
+      connectFrom: typeof l.connectFrom === 'string' && l.connectFrom && l.connectFrom !== l.id && idsConnus.has(l.connectFrom) ? l.connectFrom : '',
+      connectTo: typeof l.connectTo === 'string' && l.connectTo && l.connectTo !== l.id && idsConnus.has(l.connectTo) ? l.connectTo : '',
+      connectorX1: nombre(l.connectorX1, 0), connectorY1: nombre(l.connectorY1, 0),
+      connectorX2: nombre(l.connectorX2, 0), connectorY2: nombre(l.connectorY2, 0),
+      ...normaliserTrace(l),
+      focalX: Math.min(100, Math.max(0, nombre(l.focalX, 50))), focalY: Math.min(100, Math.max(0, nombre(l.focalY, 50))),
+      // FAMILLE INDESIGN D5 · un obstacle d'habillage est n'importe quel AUTRE calque (image ou
+      // forme le plus souvent), jamais soi-même : même garde-fou que `connectFrom`/`connectTo`.
+      wrapAroundId: typeof l.wrapAroundId === 'string' && l.wrapAroundId && l.wrapAroundId !== l.id && idsConnus.has(l.wrapAroundId) ? l.wrapAroundId : '',
+      wrapGap: Math.min(80, Math.max(0, nombre(l.wrapGap, 16))),
+      constrainH: CONSTRAINTS_H.includes(l.constrainH) ? l.constrainH : 'left',
+      constrainV: CONSTRAINTS_V.includes(l.constrainV) ? l.constrainV : 'top',
+      opacity: Math.min(1, Math.max(0, nombre(l.opacity, 1))),
+      blend: BLEND_MODES.includes(l.blend) ? l.blend : 'normal',
+      hidden: !!l.hidden, locked: !!l.locked,
+      source: typeof l.source === 'string' ? l.source : '',
+      style: l.style && typeof l.style === 'object' ? l.style : {},
+      effects: { ...emptyEffects(), ...(l.effects && typeof l.effects === 'object' ? l.effects : {}) },
+      // FAMILLE PHOTOSHOP 5 · le groupe d'appartenance, `null` si absent OU si le groupe visé a
+      // depuis disparu : un calque ne doit jamais pointer vers un dossier qui n'existe plus.
+      groupId: (typeof l.groupId === 'string' && l.groupId && (composition?.groups || []).some((g) => g?.id === l.groupId)) ? l.groupId : null,
+    }))
+}
+
+function nombre(valeur, repli) {
+  return Number.isFinite(valeur) ? valeur : repli
+}
+
+// L'ORDRE DE PEINTURE, du fond vers le premier plan. C'est cette liste que la compilation écrit
+// dans le DOM, et c'est aussi celle que la hiérarchie affiche À L'ENVERS, puisqu'une pile de calques
+// se lit du haut, c'est-à-dire du plus proche de l'œil.
+export function paintOrder(composition) {
+  return readLayers(composition).sort((a, b) => a.z - b.z || a.serial - b.serial)
+}
+
+export function stackOrder(composition) {
+  return paintOrder(composition).reverse()
+}
+
+function ecrire(composition, layers) {
+  const serials = layers.map((l) => l.serial || 0)
+  return {
+    ...composition,
+    serial: Math.max(composition?.serial || 0, ...(serials.length ? serials : [0])),
+    layers,
+  }
+}
+
+export function addLayer(composition, kind, patch = {}) {
+  const layer = makeLayer(composition, kind, patch)
+  return ecrire(composition, [...readLayers(composition), layer])
+}
+
+export function patchLayer(composition, layerId, patch) {
+  return ecrire(composition, readLayers(composition).map((l) => {
+    if (l.id !== layerId) return l
+    // Les effets se fusionnent CHAMP PAR CHAMP : régler le flou ne doit pas effacer la saturation,
+    // erreur exacte que la carte C1 avait déjà payée sur `item.props` le 2026-08-01.
+    // Style et effets se fusionnent champ par champ : régler la couleur ne doit pas effacer le
+    // corps, régler le flou ne doit pas effacer la saturation.
+    const effects = patch.effects ? { ...l.effects, ...patch.effects } : l.effects
+    const style = patch.style ? { ...l.style, ...patch.style } : l.style
+    return { ...l, ...patch, effects, style }
+  }))
+}
+
+export function removeLayer(composition, layerId) {
+  return ecrire(composition, readLayers(composition).filter((l) => l.id !== layerId))
+}
+
+export function duplicateLayer(composition, layerId) {
+  const source = readLayers(composition).find((l) => l.id === layerId)
+  if (!source) return composition
+  // Le doublon se décale de dix pixels, sans quoi il se pose exactement sur son modèle et l'on
+  // croit que rien ne s'est produit.
+  const copie = makeLayer(composition, source.kind, {
+    ...source, id: undefined, serial: undefined, z: undefined,
+    name: `${source.name} copie`, x: source.x + 10, y: source.y + 10,
+    effects: { ...source.effects },
+  })
+  const neuf = makeLayer(composition, source.kind)
+  return ecrire(composition, [...readLayers(composition), { ...copie, id: neuf.id, serial: neuf.serial, z: neuf.z }])
+}
+
+// MONTER OU DESCENDRE DANS LA PILE. On renumérote la pile entière plutôt que d'échanger deux rangs,
+// parce qu'un document réparé peut porter des rangs égaux et qu'un échange y serait sans effet.
+export function reorderLayer(composition, layerId, direction) {
+  const ordre = paintOrder(composition)
+  const index = ordre.findIndex((l) => l.id === layerId)
+  if (index < 0) return composition
+  const cible = direction === 'up' ? index + 1 : index - 1
+  if (cible < 0 || cible >= ordre.length) return composition
+  const permute = [...ordre]
+  permute[index] = ordre[cible]
+  permute[cible] = ordre[index]
+  return ecrire(composition, permute.map((l, i) => ({ ...l, z: i })))
+}
+
+export function moveLayerTo(composition, layerId, x, y) {
+  return patchLayer(composition, layerId, { x: Math.round(x), y: Math.round(y) })
+}
+
+export function resizeLayerTo(composition, layerId, w, h) {
+  return patchLayer(composition, layerId, { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) })
+}
+
+export function countLayers(composition) {
+  return readLayers(composition).length
+}
+
+export function findLayer(composition, layerId) {
+  return readLayers(composition).find((l) => l.id === layerId) || null
+}
+
+// LA CHAÎNE `filter` D'UN CALQUE, vide quand rien n'est réglé. Une chaîne vide plutôt que
+// `filter:none` : le style produit reste alors strictement identique à celui d'avant les calques
+// pour un calque neuf, ce qui garde la compilation déterministe comparable octet pour octet.
+export function filterOf(layer) {
+  const e = layer.effects || emptyEffects()
+  const parts = []
+  if (nombre(e.blur, 0) > 0) parts.push(`blur(${e.blur}px)`)
+  if (nombre(e.brightness, 1) !== 1) parts.push(`brightness(${e.brightness})`)
+  if (nombre(e.contrast, 1) !== 1) parts.push(`contrast(${e.contrast})`)
+  if (nombre(e.saturate, 1) !== 1) parts.push(`saturate(${e.saturate})`)
+  return parts.join(' ')
+}
+
+// LA GÉOMÉTRIE D'UN GESTE, sortie du composant pour être TESTABLE (carte L6).
+//
+// Laissée dans le gestionnaire de pointeur, cette arithmétique n'aurait aucune porte : on ne
+// simule pas huit poignées dans jsdom sans y passer l'après-midi. Ici, elle se vérifie en une
+// ligne par cas, et le composant n'a plus qu'à l'appeler.
+//
+// `dx` et `dy` arrivent DÉJÀ divisés par l'échelle d'affichage, donc en pixels du canevas. C'est le
+// piège central du geste : sans cette division, tirer de dix pixels à l'écran en déplacerait
+// vingt-cinq dans un canevas 1080 affiché à 40 %, et le modèle mentirait sur ce que l'export rend.
+export function applyHandle(start, mode, dx, dy, garderRatio = false) {
+  // FAMILLE POWERPOINT 2 · « Shift conserve les proportions », dans un coin (deux lettres) : le
+  // deuxième axe se RECALCULE depuis le premier au ratio de départ, avant tout calcul de côté,
+  // pour qu'un coin quelconque (nw/ne/se/sw) grandisse ou rétrécisse à l'identique.
+  if (garderRatio && mode.length === 2 && start.w > 0 && start.h > 0) {
+    const ratio = start.w / start.h
+    const largeurVoulue = mode.includes('e') ? dx : -dx
+    const hauteurVoulue = largeurVoulue / ratio
+    dy = mode.includes('s') ? hauteurVoulue : -hauteurVoulue
+  }
+  const out = { x: start.x, y: start.y, w: start.w, h: start.h }
+  if (mode === 'move') {
+    out.x = start.x + dx
+    out.y = start.y + dy
+  } else {
+    // Tirer un côté ouest ou nord déplace l'origine ET réduit la taille d'autant, sans quoi le
+    // calque s'étirerait dans la mauvaise direction. Plancher à un pixel, jamais zéro.
+    if (mode.includes('e')) out.w = Math.max(1, start.w + dx)
+    if (mode.includes('s')) out.h = Math.max(1, start.h + dy)
+    if (mode.includes('w')) { out.w = Math.max(1, start.w - dx); out.x = start.x + (start.w - out.w) }
+    if (mode.includes('n')) { out.h = Math.max(1, start.h - dy); out.y = start.y + (start.h - out.h) }
+  }
+  return { x: Math.round(out.x), y: Math.round(out.y), w: Math.round(out.w), h: Math.round(out.h) }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// MAGNÉTISME ET CADRAGE (carte S2, famille « Viewports et manipulation directe »)
+//
+// Deux fonctions PURES, sans DOM ni React, pour la même raison qu'`applyHandle` : la géométrie d'un
+// geste se vérifie en une ligne par cas, ce qu'on ne fait pas en simulant une souris dans jsdom.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+// LE MAGNÉTISME. Trois familles de repères, dans l'ordre où Photoshop et Figma les proposent :
+// les bords et le centre du CANEVAS, puis les bords et le centre des AUTRES calques. Un repère
+// n'agit que dans une fenêtre de quelques pixels autour de sa position, `seuil`, sans quoi le
+// calque resterait collé en permanence et le magnétisme deviendrait une gêne plutôt qu'une aide.
+//
+// Retourne la position CORRIGÉE et la liste des guides à dessiner, un guide par accroche retenue
+// et par axe : jamais plus d'un guide horizontal et d'un guide vertical, sinon l'écran se couvre
+// de traits et aucun ne se distingue plus des autres.
+export function snapMove(box, autres, canvas, seuil = 6, guidesManuels = []) {
+  const guides = { x: null, y: null }
+  let { x, y } = box
+  const cx = x + box.w / 2
+  const cy = y + box.h / 2
+  const droite = x + box.w
+  const bas = y + box.h
+
+  const reperesX = [
+    { at: 0, valeurs: [x] },
+    { at: canvas.w / 2, valeurs: [cx] },
+    { at: canvas.w, valeurs: [droite] },
+  ]
+  const reperesY = canvas.h > 0 ? [
+    { at: 0, valeurs: [y] },
+    { at: canvas.h / 2, valeurs: [cy] },
+    { at: canvas.h, valeurs: [bas] },
+  ] : []
+
+  for (const autre of autres) {
+    const acx = autre.x + autre.w / 2, acy = autre.y + autre.h / 2
+    reperesX.push({ at: autre.x, valeurs: [x, droite] }, { at: acx, valeurs: [cx] }, { at: autre.x + autre.w, valeurs: [x, droite] })
+    reperesY.push({ at: autre.y, valeurs: [y, bas] }, { at: acy, valeurs: [cy] }, { at: autre.y + autre.h, valeurs: [y, bas] })
+  }
+
+  // FAMILLE INDESIGN D6 · un repère PERSISTANT (posé depuis la règle, ou généré depuis les
+  // marges/colonnes) accroche exactement comme le bord d'un AUTRE calque : seuls les bords du
+  // calque qu'on déplace s'y collent, jamais son centre — une ligne unique n'a pas de centre propre.
+  for (const g of guidesManuels) {
+    if (g.axis === 'x') reperesX.push({ at: g.position, valeurs: [x, droite] })
+    else reperesY.push({ at: g.position, valeurs: [y, bas] })
+  }
+
+  let meilleurX = null
+  for (const repere of reperesX) {
+    for (const valeur of repere.valeurs) {
+      const ecart = Math.abs(repere.at - valeur)
+      if (ecart <= seuil && (!meilleurX || ecart < meilleurX.ecart)) meilleurX = { ecart, decalage: repere.at - valeur, at: repere.at }
+    }
+  }
+  if (meilleurX) { x += meilleurX.decalage; guides.x = meilleurX.at }
+
+  let meilleurY = null
+  for (const repere of reperesY) {
+    for (const valeur of repere.valeurs) {
+      const ecart = Math.abs(repere.at - valeur)
+      if (ecart <= seuil && (!meilleurY || ecart < meilleurY.ecart)) meilleurY = { ecart, decalage: repere.at - valeur, at: repere.at }
+    }
+  }
+  if (meilleurY) { y += meilleurY.decalage; guides.y = meilleurY.at }
+
+  return { x: Math.round(x), y: Math.round(y), guides }
+}
+
+// LE CADRAGE DE LA SÉLECTION (« Frame Selected »), distinct du recadrage général posé sur la
+// touche F : celui-ci ramène le plan de travail entier, celui-ci centre et zoome sur UN calque.
+// Une marge de 12 % autour de la boîte, pour ne jamais coller le calque au bord du panneau.
+export function frameBox(box, viewportW, viewportH, marge = 0.12) {
+  const w = Math.max(1, box.w) * (1 + marge * 2)
+  const h = Math.max(1, box.h) * (1 + marge * 2)
+  const zoom = Math.max(0.05, Math.min(8, Math.min(viewportW / w, viewportH / h)))
+  const cx = box.x + box.w / 2
+  const cy = box.y + box.h / 2
+  return {
+    zoom: Math.round(zoom * 1000) / 1000,
+    pan: {
+      x: Math.round(viewportW / 2 - cx * zoom),
+      y: Math.round(viewportH / 2 - cy * zoom),
+    },
+  }
+}
+
+// La transformation CSS d'un calque : rotation seule pour l'instant, pivot au centre. Sortie en
+// fonction pour que la compilation et l'éditeur emploient TOUJOURS la même formule.
+export function transformOf(layer) {
+  // LE RETOURNEMENT SE POSE AVANT LA ROTATION dans la chaîne CSS, et l'ordre compte : `transform`
+  // applique ses fonctions de DROITE À GAUCHE au repère courant. Poser le flip en dernier dans
+  // l'écriture (donc appliqué en premier) retourne le calque sur ses propres axes, puis la
+  // rotation tourne le résultat — l'inverse retournerait un calque déjà tourné, ce qui produit un
+  // miroir selon un axe qui n'est plus horizontal ni vertical à l'écran.
+  const parties = []
+  if (layer.rotation) parties.push(`rotate(${layer.rotation}deg)`)
+  if (layer.flipX || layer.flipY) parties.push(`scale(${layer.flipX ? -1 : 1}, ${layer.flipY ? -1 : 1})`)
+  return parties.join(' ')
+}
+
+// FAMILLE FIGMA 6 · le contour d'un polygone ou d'une étoile, en pourcentages de la boîte du
+// calque — ainsi la forme s'étire avec le calque au lieu de se recalculer contre ses pixels
+// réels, exactement comme `object-position` (carte P6) reste relatif au cadre plutôt qu'à l'image.
+// Premier point au SOMMET (comme l'outil Figma), puis dans le sens horaire.
+export function shapeClipPath(layer) {
+  if (layer.shapeType !== 'polygon' && layer.shapeType !== 'star') return ''
+  const cotes = Math.min(12, Math.max(3, Math.round(layer.shapeSides || 6)))
+  const enEtoile = layer.shapeType === 'star'
+  const nombrePoints = enEtoile ? cotes * 2 : cotes
+  const pas = (2 * Math.PI) / nombrePoints
+  const points = []
+  for (let i = 0; i < nombrePoints; i++) {
+    const rayon = enEtoile && i % 2 === 1 ? 50 * (layer.shapeStarRatio ?? 0.5) : 50
+    const theta = i * pas
+    const x = Math.round((50 + rayon * Math.sin(theta)) * 100) / 100
+    const y = Math.round((50 - rayon * Math.cos(theta)) * 100) / 100
+    points.push(`${x}% ${y}%`)
+  }
+  return `polygon(${points.join(', ')})`
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE ILLUSTRATOR I2 · L'OUTIL PLUME (carte I2, 2026-08-06)
+//
+// Matthieu craignait que la Plume soit manquante ; elle l'était réellement, la carte F6 l'ayant
+// explicitement écartée. C'est ici qu'elle arrive : un tracé vectoriel VÉRITABLE, point par point,
+// avec des poignées bézier indépendantes par point, pas une géométrie paramétrique de plus.
+//
+// LE CHOIX QUI DÉCIDE DE TOUT LE RESTE : les points se dessinent en coordonnées ABSOLUES du
+// canevas pendant le geste (comme un vrai clic à l'écran), mais se STOCKENT en POURCENTAGE de la
+// boîte du calque une fois le tracé achevé (`createPathLayer`). Ainsi déplacer ou redimensionner
+// le calque déplace ou redimensionne le tracé tout seul, par le mécanisme déjà en place pour
+// CHAQUE autre calque (position/taille en CSS) — aucun recalcul n'est nécessaire à chaque geste,
+// contrairement au connecteur (carte M6) dont la géométrie dépend d'AUTRES calques.
+function round2(n) { return Math.round(n * 100) / 100 }
+
+/** La chaîne `d` d'un tracé SVG : une courbe de Bézier cubique entre CHAQUE paire de points
+ * consécutifs, même quand elle est plate (poignée confondue avec l'ancre = point d'ANGLE). Une
+ * seule formule pour angle et courbe, plutôt que deux commandes SVG à choisir au cas par cas. */
+export function pathD(points, closed) {
+  if (!Array.isArray(points) || points.length < 2) return ''
+  const [p0] = points
+  let d = `M ${round2(p0.x)} ${round2(p0.y)}`
+  for (let i = 1; i < points.length; i++) {
+    const precedent = points[i - 1], p = points[i]
+    d += ` C ${round2(precedent.outX)} ${round2(precedent.outY)} ${round2(p.inX)} ${round2(p.inY)} ${round2(p.x)} ${round2(p.y)}`
+  }
+  if (closed && points.length > 2) {
+    const dernier = points[points.length - 1]
+    d += ` C ${round2(dernier.outX)} ${round2(dernier.outY)} ${round2(p0.inX)} ${round2(p0.inY)} ${round2(p0.x)} ${round2(p0.y)} Z`
+  }
+  return d
+}
+
+/** Crée le calque tracé à partir de points en coordonnées ABSOLUES du canevas (celles que le
+ * geste de dessin accumule). La boîte englobante inclut les POIGNÉES, pas seulement les ancres :
+ * une courbe de Bézier reste toujours À L'INTÉRIEUR de l'enveloppe convexe de ses quatre points de
+ * contrôle, propriété mathématique qui garantit que rien ne dépasse de la boîte calculée ainsi. */
+export function createPathLayer(composition, points, closed) {
+  if (!Array.isArray(points) || points.length < 2) return composition
+  const xs = points.flatMap((p) => [p.x, p.inX, p.outX])
+  const ys = points.flatMap((p) => [p.y, p.inY, p.outY])
+  const minX = Math.min(...xs), minY = Math.min(...ys)
+  const w = Math.max(1, Math.max(...xs) - minX), h = Math.max(1, Math.max(...ys) - minY)
+  const pathPoints = points.map((p) => ({
+    x: ((p.x - minX) / w) * 100, y: ((p.y - minY) / h) * 100,
+    inX: ((p.inX - minX) / w) * 100, inY: ((p.inY - minY) / h) * 100,
+    outX: ((p.outX - minX) / w) * 100, outY: ((p.outY - minY) / h) * 100,
+  }))
+  return addLayer(composition, 'shape', {
+    name: 'Tracé', x: Math.round(minX), y: Math.round(minY), w: Math.round(w), h: Math.round(h),
+    pathPoints, pathClosed: !!closed, pathStrokeColor: '#151515',
+  })
+}
+
+/** Les points d'un tracé, convertis de POURCENTAGE (0-100 relatif à la boîte) en PIXELS DU CALQUE —
+ * la conversion que la compilation SVG et la couche d'édition doivent appliquer À L'IDENTIQUE :
+ * sortie ici une seule fois plutôt que réécrite à deux endroits, au risque d'un jour diverger. */
+export function pathPointsInPixels(layer) {
+  return (layer.pathPoints || []).map((p) => ({
+    x: (p.x / 100) * layer.w, y: (p.y / 100) * layer.h,
+    inX: (p.inX / 100) * layer.w, inY: (p.inY / 100) * layer.h,
+    outX: (p.outX / 100) * layer.w, outY: (p.outY / 100) * layer.h,
+  }))
+}
+
+/** Déplace l'ancre d'un point : ses DEUX poignées suivent par la même translation, pour que la
+ * courbe garde sa forme relative — exactement le comportement de la Sélection directe d'Illustrator. */
+export function movePathAnchor(points, index, x, y) {
+  const point = points[index]
+  if (!point) return points
+  const dx = x - point.x, dy = y - point.y
+  const suivant = [...points]
+  suivant[index] = { x, y, inX: point.inX + dx, inY: point.inY + dy, outX: point.outX + dx, outY: point.outY + dy }
+  return suivant
+}
+
+/** Déplace UNE SEULE poignée (in ou out), indépendamment de l'autre : c'est ce qui permet de
+ * casser la symétrie d'un point lisse et de sculpter la courbe de chaque côté séparément. */
+export function movePathHandle(points, index, which, x, y) {
+  const point = points[index]
+  if (!point) return points
+  const suivant = [...points]
+  suivant[index] = { ...point, [`${which}X`]: x, [`${which}Y`]: y }
+  return suivant
+}
+
+/** Retire un point du tracé. En dessous de deux points restants, un tracé n'a plus de sens : la
+ * fonction ne descend jamais sous ce plancher. */
+export function removePathPoint(points, index) {
+  if (points.length <= 2) return points
+  return points.filter((_, i) => i !== index)
+}
+
+/** Insère un point d'ANGLE (poignées confondues avec l'ancre) juste après `afterIndex`. */
+export function insertPathPoint(points, afterIndex, x, y) {
+  const suivant = [...points]
+  suivant.splice(afterIndex + 1, 0, { x, y, inX: x, inY: y, outX: x, outY: y })
+  return suivant
+}
+
+/** Convertit un point d'ANGLE (poignées confondues avec l'ancre) en point LISSE — poignées tirées
+ * le long de la tangente aux deux voisins — ou inversement ramène les poignées sur l'ancre : le
+ * même geste que double-cliquer une ancre avec la Plume dans Illustrator. Fonctionne aussi en bout
+ * de tracé ouvert (un seul voisin) et à seulement deux points, sans branche séparée : la tangente se
+ * calcule alors depuis le seul point disponible plutôt que depuis une moyenne. */
+export function toggleAnchorSmoothness(points, index, closed) {
+  const point = points[index]
+  if (!point) return points
+  const suivant = [...points]
+  const estAngle = point.inX === point.x && point.inY === point.y && point.outX === point.x && point.outY === point.y
+  if (estAngle) {
+    const avant = points[index - 1] ?? (closed ? points[points.length - 1] : null)
+    const apres = points[index + 1] ?? (closed ? points[0] : null)
+    const gauche = avant || point, droite = apres || point
+    const dx = (droite.x - gauche.x) / 6, dy = (droite.y - gauche.y) / 6
+    suivant[index] = { ...point, inX: point.x - dx, inY: point.y - dy, outX: point.x + dx, outY: point.y + dy }
+  } else {
+    suivant[index] = { ...point, inX: point.x, inY: point.y, outX: point.x, outY: point.y }
+  }
+  return suivant
+}
+
+function pointSurSegment(p0, p1, p2, p3, t) {
+  const mt = 1 - t
+  const a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, d = t * t * t
+  return { x: a * p0.x + b * p1.x + c * p2.x + d * p3.x, y: a * p0.y + b * p1.y + c * p2.y + d * p3.y }
+}
+
+/** Le point le plus proche de (x,y) SUR LA COURBE, échantillonnée à 24 pas par segment — une
+ * méthode standard d'approximation, pas une projection exacte, mais un tracé de cette taille ne
+ * distinguerait de toute façon pas mieux à l'écran. Sert à poser un nouveau point d'ancrage
+ * EXACTEMENT sur le tracé (au double-clic sur un segment), plutôt qu'à l'endroit brut, un peu à
+ * côté, où le clic est réellement tombé. */
+export function nearestPointOnTrace(points, closed, x, y) {
+  if (!Array.isArray(points) || points.length < 2) return null
+  const segments = closed ? points.length : points.length - 1
+  let meilleur = null
+  for (let i = 0; i < segments; i++) {
+    const p0 = points[i], p3 = points[(i + 1) % points.length]
+    for (let pas = 0; pas <= 24; pas++) {
+      const t = pas / 24
+      const echantillon = pointSurSegment(p0, { x: p0.outX, y: p0.outY }, { x: p3.inX, y: p3.inY }, p3, t)
+      const dist = Math.hypot(echantillon.x - x, echantillon.y - y)
+      if (!meilleur || dist < meilleur.dist) meilleur = { dist, afterIndex: i, x: echantillon.x, y: echantillon.y }
+    }
+  }
+  return meilleur ? { afterIndex: meilleur.afterIndex, x: meilleur.x, y: meilleur.y } : null
+}
+
+
+// LA LARGEUR D'UNE COLONNE REDIMENSIONNÉE (carte S3, famille « Docking »), sortie en fonction pure
+// pour la même raison qu'`applyHandle` : jsdom simule mal `PointerEvent.clientX` (limite connue,
+// pas propre à ce projet), donc un glisser réel n'y prouve rien. Le calcul se vérifie ici, en une
+// ligne par cas ; le geste du composant se contente de l'appeler.
+export function resizedColumn(cote, depart, delta) {
+  const brut = cote === 'left' ? depart + delta : depart - delta
+  const [min, max] = cote === 'left' ? [140, 460] : [160, 520]
+  return Math.round(Math.max(min, Math.min(max, brut)))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE PHOTOSHOP 1 · SÉLECTION ET CIBLAGE (carte P1, 2026-08-04)
+//
+// « Rectangle de sélection » chez Photoshop isole une région de PIXELS. ZenRayMedia n'a pas de
+// pixels à isoler, il a des calques : le même geste, glisser un rectangle sur le vide, y devient
+// tout naturellement une sélection de calques, exactement le second sens que la doc Adobe donne
+// elle-même au mot « sélection » (« un ou plusieurs calques »).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/** Les identifiants des calques qui CROISENT un rectangle, en pixels du canevas. Fonction pure : */
+export function layersInRect(layers, rect) {
+  const gauche = Math.min(rect.x1, rect.x2)
+  const droite = Math.max(rect.x1, rect.x2)
+  const haut = Math.min(rect.y1, rect.y2)
+  const bas = Math.max(rect.y1, rect.y2)
+  return layers
+    .filter((l) => l.x < droite && l.x + l.w > gauche && l.y < bas && l.y + l.h > haut)
+    .map((l) => l.id)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE PHOTOSHOP 2 · ALIGNEMENT ET DISTRIBUTION (carte P2, 2026-08-04)
+//
+// Chez Photoshop, aligner une sélection de plusieurs calques les aligne les uns SUR LES AUTRES, en
+// se servant de leur boîte englobante commune comme référence — pas du canevas. C'est le
+// comportement par défaut, et c'est celui-ci qui est repris : aligner deux calques les colle l'un
+// à l'autre, jamais au bord du document, ce que personne ne demande en sélectionnant plusieurs
+// objets à la fois.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+function boiteEnglobante(layers) {
+  const gauche = Math.min(...layers.map((l) => l.x))
+  const droite = Math.max(...layers.map((l) => l.x + l.w))
+  const haut = Math.min(...layers.map((l) => l.y))
+  const bas = Math.max(...layers.map((l) => l.y + l.h))
+  return { x: gauche, y: haut, w: droite - gauche, h: bas - haut }
+}
+
+/**
+ * Les patches de position pour aligner un jeu de calques sur leur boîte englobante commune.
+ * `mode` ∈ left | hcenter | right | top | vcenter | bottom.
+ * Retourne `[{id, x} ...]` ou `[{id, y} ...]`, jamais les deux à la fois : aligner à gauche ne
+ * doit pas déplacer verticalement, sans quoi un simple alignement ferait aussi une distribution.
+ *
+ * FAMILLE POWERPOINT 2 · ALIGNER SUR LE CANEVAS. Un SEUL calque n'a rien à aligner sur lui-même
+ * (`layers.length < 2` rendait `[]`) — mais PowerPoint, Figma et Miro alignent tous les trois un
+ * objet unique sur le CANEVAS (centrer un logo sur la diapositive est l'usage le plus courant de
+ * la commande). `canvas` est optionnel et ne change RIEN au comportement à 2 calques ou plus, qui
+ * reste l'alignement mutuel déjà en place.
+ */
+export function alignPatch(layers, mode, canvas) {
+  if (layers.length === 1) return canvas ? [{ id: layers[0].id, ...alignerUnCalque(layers[0], canvas, mode) }] : []
+  if (layers.length < 1) return []
+  const boite = boiteEnglobante(layers)
+  const axeX = mode === 'left' || mode === 'hcenter' || mode === 'right'
+  return layers.map((l) => {
+    if (axeX) {
+      const x = mode === 'left' ? boite.x : mode === 'right' ? boite.x + boite.w - l.w : boite.x + (boite.w - l.w) / 2
+      return { id: l.id, x: Math.round(x) }
+    }
+    const y = mode === 'top' ? boite.y : mode === 'bottom' ? boite.y + boite.h - l.h : boite.y + (boite.h - l.h) / 2
+    return { id: l.id, y: Math.round(y) }
+  })
+}
+
+function alignerUnCalque(l, canvas, mode) {
+  const axeX = mode === 'left' || mode === 'hcenter' || mode === 'right'
+  if (axeX) {
+    const x = mode === 'left' ? 0 : mode === 'right' ? canvas.w - l.w : (canvas.w - l.w) / 2
+    return { x: Math.round(x) }
+  }
+  const y = mode === 'top' ? 0 : mode === 'bottom' ? canvas.h - l.h : (canvas.h - l.h) / 2
+  return { y: Math.round(y) }
+}
+
+/** Place un calque devant TOUS les autres, en un seul saut — distinct de `reorderLayer('up')`,
+ * qui n'avance que d'un rang. */
+export function bringToFront(composition, layerId) {
+  const ordre = paintOrder(composition).filter((l) => l.id !== layerId)
+  const cible = findLayer(composition, layerId)
+  if (!cible) return composition
+  return ecrire(composition, [...ordre, cible].map((l, i) => ({ ...l, z: i })))
+}
+
+/** Place un calque derrière TOUS les autres, en un seul saut. */
+export function sendToBack(composition, layerId) {
+  const ordre = paintOrder(composition).filter((l) => l.id !== layerId)
+  const cible = findLayer(composition, layerId)
+  if (!cible) return composition
+  return ecrire(composition, [cible, ...ordre].map((l, i) => ({ ...l, z: i })))
+}
+
+/**
+ * Répartit un jeu de calques à intervalles ÉGAUX entre les deux extrêmes, sans déplacer ces deux-
+ * là. `axis` ∈ 'x' | 'y'. Sous trois calques, distribuer n'a pas de sens (il n'y a rien « entre »
+ * deux objets) : la fonction rend alors un tableau vide plutôt qu'un résultat trompeur.
+ */
+export function distributePatch(layers, axis) {
+  if (layers.length < 3) return []
+  const cle = axis === 'x' ? 'x' : 'y'
+  const taille = axis === 'x' ? 'w' : 'h'
+  const tries = [...layers].sort((a, b) => a[cle] - b[cle])
+  const premier = tries[0], dernier = tries[tries.length - 1]
+  // L'espace disponible se mesure de la FIN du premier calque au DÉBUT du dernier, pas bord à
+  // bord des positions : distribuer doit égaliser les VIDES entre les objets, pas leurs origines,
+  // sans quoi des calques de tailles différentes resteraient visuellement mal espacés.
+  const disponible = (dernier[cle] - (premier[cle] + premier[taille]))
+  const sommeTailles = tries.slice(1, -1).reduce((n, l) => n + l[taille], 0)
+  const vide = Math.max(0, (disponible - sommeTailles) / (tries.length - 1))
+  const patches = [{ id: premier.id, [cle]: premier[cle] }]
+  let curseur = premier[cle] + premier[taille] + vide
+  for (const l of tries.slice(1, -1)) {
+    patches.push({ id: l.id, [cle]: Math.round(curseur) })
+    curseur += l[taille] + vide
+  }
+  patches.push({ id: dernier.id, [cle]: dernier[cle] })
+  return patches
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE PHOTOSHOP 5 · GROUPES (carte P5, 2026-08-04)
+//
+// « Un groupe permet de déplacer, masquer et organiser plusieurs calques ensemble, réduisant le
+// bruit visuel dans un document complexe. » Le modèle reste PLAT : chaque calque garde son rang
+// `z` propre, un groupe n'est qu'une ÉTIQUETTE commune (`groupId`) plus un enregistrement séparé
+// portant son nom, sa visibilité et son verrou. C'est le plus petit changement qui donne un vrai
+// dossier repliable sans réécrire l'ordre d'empilement ni rouvrir `composition.js` une seconde
+// fois pour une carte de plus — la permissivité posée par C1 (2026-08-01) suffit : `groups` vit à
+// côté de `layers` sans qu'aucun contrat n'ait besoin de le nommer par avance.
+//
+// LE DÉPLACEMENT COLLECTIF, que Photoshop offre en plus, N'EST PAS FAIT ICI et c'est assumé : il
+// demanderait un second mode de geste sur le canevas (faire glisser TOUT un groupe d'un coup), ce
+// que rien n'a encore demandé et qui doublerait la surface de `onPoigneeMove` pour un gain non
+// réclamé. Masquer, verrouiller, renommer et replier ensemble, le noyau que la doc réclame, sont
+// couverts.
+
+function normaliseAutoLayout(al) {
+  if (!al || typeof al !== 'object') return null
+  const direction = al.direction === 'row' ? 'row' : 'column'
+  const gap = Number.isFinite(al.gap) ? al.gap : 8
+  const padding = Number.isFinite(al.padding) ? al.padding : 0
+  return { direction, gap, padding }
+}
+
+export function readGroups(composition) {
+  const brut = composition?.groups
+  if (!Array.isArray(brut)) return []
+  return brut
+    .filter((g) => g && typeof g === 'object' && typeof g.id === 'string')
+    .map((g) => ({
+      id: g.id,
+      name: typeof g.name === 'string' && g.name ? g.name : 'Groupe',
+      hidden: !!g.hidden,
+      locked: !!g.locked,
+      // FAMILLE FIGMA 4 · un groupe en Auto Layout porte sa disposition ET son ancre d'origine —
+      // sans ancre, on ne saurait pas depuis quel coin faire partir le flux après un rechargement.
+      autoLayout: normaliseAutoLayout(g.autoLayout),
+      ...(Number.isFinite(g.autoX) ? { autoX: g.autoX } : {}),
+      ...(Number.isFinite(g.autoY) ? { autoY: g.autoY } : {}),
+    }))
+}
+
+function ecrireGroupes(composition, groups) {
+  return { ...composition, groups }
+}
+
+// AUDIT P1-R9 · une diapositive ou une page parente REMPLOIE un groupe ordinaire comme conteneur
+// (carte PowerPoint 1 / InDesign D1), mais la hiérarchie expose ce même groupe avec les commandes
+// ordinaires. Dissoudre son groupe support libère ses membres SANS que la diapositive le sache —
+// `readSlides` filtre ensuite sur un `groupId` qui ne désigne plus aucun groupe, et la diapositive
+// disparaît silencieusement de la lecture. Supprimer ce groupe efface ses membres pour la même
+// raison, sans jamais passer par `removeSlide`/`removeParentPage`, qui savent nettoyer proprement.
+// `isSystemGroupId` distingue ce conteneur PROTÉGÉ d'un groupe ordinaire que l'utilisateur peut
+// librement dissoudre ou supprimer — jamais une nouvelle donnée à maintenir, une simple lecture
+// croisée de ce qui existe déjà.
+export function isSystemGroupId(composition, groupId) {
+  if (!groupId) return false
+  return readSlides(composition).some((s) => s.groupId === groupId)
+    || readParentPages(composition).some((p) => p.groupId === groupId)
+}
+
+/** Crée un groupe contenant les calques désignés, et les y rattache. */
+export function groupLayers(composition, layerIds, name = 'Groupe') {
+  const ids = new Set(layerIds)
+  const layers = readLayers(composition)
+  if (![...ids].every((id) => layers.some((l) => l.id === id))) return composition
+  const serial = (composition.serial || 0) + 1
+  const groupId = makeId('grp', `${composition.themeId || 'sans-theme'}:groupe`, serial)
+
+  // LES MEMBRES DEVIENNENT CONTIGUS DANS LA PILE, exactement comme grouper le fait dans Photoshop.
+  // Sans ça, l'arbre de la hiérarchie devrait pouvoir afficher un même dossier à DEUX endroits si
+  // ses calques sont entrelacés avec d'autres dans l'ordre d'empilement — un dossier qui se
+  // scinde n'a pas de sens. On sort les membres de l'ordre de peinture, on les réinsère en un seul
+  // bloc à la position du membre le plus haut, en gardant leur ordre RELATIF entre eux.
+  const ordre = paintOrder({ ...composition, layers })
+  const membres = ordre.filter((l) => ids.has(l.id))
+  const autres = ordre.filter((l) => !ids.has(l.id))
+  const position = ordre.findIndex((l) => l.id === membres[membres.length - 1]?.id)
+  const avant = autres.filter((l) => ordre.indexOf(l) < position)
+  const apres = autres.filter((l) => ordre.indexOf(l) >= position)
+  const reordonne = [...avant, ...membres, ...apres]
+
+  const nextLayers = reordonne.map((l, i) => (ids.has(l.id) ? { ...l, groupId, z: i } : { ...l, z: i }))
+  const nextGroups = [...readGroups(composition), { id: groupId, name, hidden: false, locked: false }]
+  return ecrireGroupes({ ...composition, layers: nextLayers, serial }, nextGroups)
+}
+
+/** Dissout un groupe : ses calques restent, libérés, à leur rang d'origine. Refuse le conteneur
+ * SYSTÈME d'une diapositive ou d'une page parente (AUDIT P1-R9) : ce geste précis doit passer par
+ * `removeSlide`/`removeParentPage`, jamais par la commande générique de groupe. */
+export function ungroupLayers(composition, groupId) {
+  if (isSystemGroupId(composition, groupId)) return composition
+  const layers = readLayers(composition).map((l) => (l.groupId === groupId ? { ...l, groupId: null } : l))
+  const groups = readGroups(composition).filter((g) => g.id !== groupId)
+  return ecrireGroupes({ ...composition, layers }, groups)
+}
+
+export function patchGroup(composition, groupId, patch) {
+  const groups = readGroups(composition).map((g) => (g.id === groupId ? { ...g, ...patch } : g))
+  return ecrireGroupes(composition, groups)
+}
+
+/** Retire un groupe ET tout ce qu'il contient — distinct de `ungroupLayers`, qui les libère. Même
+ * refus qu'`ungroupLayers` sur le conteneur système d'une diapositive ou d'une page parente
+ * (AUDIT P1-R9) : la commande générique ne doit jamais pouvoir effacer une page entière en silence. */
+export function removeGroup(composition, groupId) {
+  if (isSystemGroupId(composition, groupId)) return composition
+  const layers = readLayers(composition).filter((l) => l.groupId !== groupId)
+  const groups = readGroups(composition).filter((g) => g.id !== groupId)
+  return ecrireGroupes({ ...composition, layers }, groups)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE POWERPOINT 1 · STRUCTURE, DIAPOSITIVES ET SYSTÈME DE CONCEPTION (carte P1, 2026-08-06)
+//
+// « Ajouter, supprimer, réordonner, appliquer des dispositions » — mais ZenRayMedia n'a jamais eu
+// qu'UN SEUL canevas par thème (`project.compositions[themeId]`), jamais une SÉQUENCE de canevas.
+// Rouvrir cette forme (en faire un TABLEAU de compositions) referait ce que la carte C1 a réglé
+// une fois pour toutes le 2026-08-01 : un contrat qui s'ouvre une deuxième fois coûte des jours.
+//
+// LA DIAPOSITIVE EST DONC UN GROUPE DÉDIÉ (carte P5), pas un second modèle de canevas. Chaque
+// diapositive porte un `groupId` qui lui est propre ; ses membres ne s'affichent QUE si elle est
+// ACTIVE (`composition.activeSlideId`). Un calque SANS diapositive — libre, ou dans un groupe
+// ordinaire qui n'en est pas une — reste visible sur TOUTES les diapositives : c'est très
+// exactement le rôle du MASQUE des diapositives, obtenu sans aucun concept neuf. Traduit dans
+// l'usage réel de VISION.md, une diapositive EST un panneau de carrousel Instagram.
+//
+// Portée assumée, hors périmètre pour cette carte : les DISPOSITIONS (layouts pré-remplis à
+// l'ajout) et les SECTIONS (regroupement de plusieurs diapositives) n'ont pas d'équivalent minimal
+// ici ; une diapositive neuve part vide, l'utilisateur y pose ses calques comme sur n'importe quel
+// canevas. La vue Trieuse se limite à une LISTE (pas des vignettes visuelles rendues), un rendu
+// miniature de chaque diapositive coûterait une recompilation par ligne pour un gain marginal.
+
+/** Les diapositives d'une composition, chacune adossée à un groupe qui doit encore exister. */
+export function readSlides(composition) {
+  const brut = composition?.slides
+  if (!Array.isArray(brut)) return []
+  const groupes = new Set(readGroups(composition).map((g) => g.id))
+  // FAMILLE INDESIGN D1 · `parentPageId` (page parente appliquée, `null` = `[Sans]`) et
+  // `masquerParent` (masque temporairement les éléments hérités SANS les détacher) rejoignent la
+  // diapositive ici — les omettre de cette normalisation les aurait effacés à chaque relecture,
+  // exactement le bogue déjà payé une fois sur `readGroups` (carte Figma F4).
+  const pages = new Set((Array.isArray(composition?.parentPages) ? composition.parentPages : []).map((p) => p?.id))
+  return brut
+    .filter((s) => s && typeof s.id === 'string' && typeof s.groupId === 'string' && groupes.has(s.groupId))
+    .map((s) => ({
+      id: s.id,
+      name: typeof s.name === 'string' && s.name ? s.name : 'Diapositive',
+      groupId: s.groupId,
+      parentPageId: typeof s.parentPageId === 'string' && pages.has(s.parentPageId) ? s.parentPageId : null,
+      masquerParent: !!s.masquerParent,
+    }))
+}
+
+/** Crée une diapositive neuve (groupe dédié vide) et l'active. */
+export function addSlide(composition, name) {
+  const serial = (composition?.serial || 0) + 1
+  const seed = `${composition?.themeId || 'sans-theme'}:diapositive`
+  const groupId = makeId('grp', seed, serial)
+  const slideId = makeId('sld', seed, serial)
+  const libelle = name || `Diapositive ${readSlides(composition).length + 1}`
+  const groups = [...readGroups(composition), { id: groupId, name: libelle, hidden: false, locked: false }]
+  const slides = [...readSlides(composition), { id: slideId, name: libelle, groupId }]
+  return { ...composition, serial, groups, slides, activeSlideId: slideId }
+}
+
+/** Retire une diapositive ET son contenu ; active une voisine s'il en reste. */
+export function removeSlide(composition, slideId) {
+  const slides = readSlides(composition)
+  const index = slides.findIndex((s) => s.id === slideId)
+  if (index < 0) return composition
+  const restantes = slides.filter((s) => s.id !== slideId)
+  const activeSlideId = composition.activeSlideId === slideId
+    ? (restantes[index] || restantes[index - 1] || null)?.id ?? null
+    : composition.activeSlideId
+  // AUDIT P1-R9 · `slides` perd CETTE diapositive AVANT l'appel à `removeGroup` : son groupe n'est
+  // plus un conteneur système dès que plus aucune diapositive ne le référence, ce qui distingue ce
+  // geste DÉDIÉ et complet d'un « Retirer le groupe » générique lancé sur le même conteneur, que
+  // `removeGroup` refuse désormais par ailleurs.
+  const suivant = removeGroup({ ...composition, slides: restantes }, slides[index].groupId)
+  return { ...suivant, activeSlideId }
+}
+
+/** Duplique une diapositive et tout son contenu, dans un groupe neuf, et l'active. */
+export function duplicateSlide(composition, slideId) {
+  const slides = readSlides(composition)
+  const slide = slides.find((s) => s.id === slideId)
+  if (!slide) return composition
+  const membres = readLayers(composition).filter((l) => l.groupId === slide.groupId)
+  const seed = `${composition?.themeId || 'sans-theme'}:diapositive`
+  let serial = composition?.serial || 0
+  let z = nextZ(composition)
+  serial += 1
+  const groupId = makeId('grp', seed, serial)
+  const slideIdCopie = makeId('sld', `${seed}:copie`, serial)
+  const nom = `${slide.name} copie`
+  const nouveauxCalques = membres.map((m) => {
+    serial += 1
+    z += 1
+    return { ...m, id: makeId('lay', `${seed}:calque`, serial), serial, z, groupId }
+  })
+  const groups = [...readGroups(composition), { id: groupId, name: nom, hidden: false, locked: false }]
+  return {
+    ...composition,
+    serial,
+    layers: [...readLayers(composition), ...nouveauxCalques],
+    groups,
+    // La copie garde la MÊME page parente que l'originale (une diapositive dupliquée reste ce
+    // qu'elle était), mais jamais son masquage temporaire : dupliquer n'est pas une raison de
+    // masquer les éléments hérités sur la copie si l'originale les montrait.
+    slides: [...slides, { id: slideIdCopie, name: nom, groupId, parentPageId: slide.parentPageId, masquerParent: false }],
+    activeSlideId: slideIdCopie,
+  }
+}
+
+/** Déplace une diapositive d'un rang dans l'ordre de la Trieuse — jamais hors bornes. */
+export function reorderSlide(composition, slideId, direction) {
+  const slides = readSlides(composition)
+  const i = slides.findIndex((s) => s.id === slideId)
+  if (i < 0) return composition
+  const j = direction === 'up' ? i - 1 : i + 1
+  if (j < 0 || j >= slides.length) return composition
+  const suivant = [...slides]
+  ;[suivant[i], suivant[j]] = [suivant[j], suivant[i]]
+  return { ...composition, slides: suivant }
+}
+
+/** Change la diapositive active, celle que l'aperçu affiche seule. */
+export function setActiveSlide(composition, slideId) {
+  if (!readSlides(composition).some((s) => s.id === slideId)) return composition
+  // Éditer une diapositive et éditer une page parente sont deux contextes MUTUELLEMENT EXCLUSIFS
+  // (comme le sont, chez InDesign, une page ordinaire et une page parente) : entrer dans l'un
+  // referme forcément l'autre, sinon `poserCalque` ne saurait plus dans quel groupe poser.
+  return { ...composition, activeSlideId: slideId, activePageParentId: null }
+}
+
+/** Un calque est effectivement masqué s'il l'est lui-même, si son groupe l'est, OU s'il appartient
+ * à une diapositive qui n'est pas l'active — un calque sans diapositive reste un masque visible
+ * sur toutes les diapositives. */
+export function isEffectivelyHidden(composition, layer) {
+  if (layer.hidden) return true
+  if (!layer.groupId) return false
+  if (readGroups(composition).find((g) => g.id === layer.groupId)?.hidden) return true
+  const slides = readSlides(composition)
+  if (composition?.activeSlideId && slides.some((s) => s.id === composition.activeSlideId)) {
+    const slide = slides.find((s) => s.groupId === layer.groupId)
+    if (slide && slide.id !== composition.activeSlideId) return true
+  }
+  // FAMILLE INDESIGN D1 · un calque qui vit SUR UNE PAGE PARENTE ne se peint comme un calque
+  // ordinaire QUE lorsqu'on édite CETTE page parente elle-même (`activePageParentId`, le
+  // contexte d'édition dédié — symétrique à `activeSlideId` pour une diapositive). En dehors de ce
+  // contexte, il n'existe qu'à travers `effectiveSlideLayers`, sur les diapositives qui
+  // l'appliquent. Sans cette règle, poser un calque sur une page parente le rendrait visible sur
+  // TOUTES les diapositives sans distinction — exactement le défaut du masque universel qu'une
+  // page parente NOMMÉE est censée remplacer.
+  const pageParente = readParentPages(composition).find((p) => p.groupId === layer.groupId)
+  if (pageParente) return pageParente.id !== composition?.activePageParentId
+  return false
+}
+
+export function isEffectivelyLocked(composition, layer) {
+  if (layer.locked) return true
+  if (!layer.groupId) return false
+  return !!readGroups(composition).find((g) => g.id === layer.groupId)?.locked
+}
+
+/** Le sous-ensemble de `readLayers` qu'un geste interactif doit voir (AUDIT P1-R4) : marquee,
+ * magnétisme et navigation clavier, exactement le même ensemble que `compile.js` peint déjà via
+ * `isEffectivelyHidden`. Sans cette fonction partagée, un calque d'une autre diapositive ou masqué
+ * par son groupe reste invisible à l'écran mais continue d'entrer dans le marquee, d'aimanter un
+ * glisser ou de recevoir le focus clavier — la boîte, elle, reste un filtre séparé (`stackOrder`
+ * doit garder son ORDRE de pile, que `readLayers` seul ne porte pas). */
+export function readVisibleLayers(composition) {
+  return readLayers(composition).filter((l) => !isEffectivelyHidden(composition, l))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE INDESIGN D1 · PAGES PARENTES (carte D1, 2026-08-06)
+//
+// Une diapositive (carte PowerPoint 1) connaissait déjà UNE SEULE forme de contenu récurrent : un
+// calque SANS diapositive, visible sur toutes. InDesign en distingue une seconde, plus riche : la
+// PAGE PARENTE, un gabarit NOMMÉ et RÉUTILISABLE que CHAQUE diapositive choisit d'appliquer ou non
+// (`[Sans]` par défaut, c'est-à-dire `parentPageId: null`), et dont les objets peuvent être
+// modifiés localement SANS rompre le lien avec les diapositives sœurs qui utilisent le même gabarit.
+//
+// Une page parente EST, structurellement, un groupe de plus (même mécanisme que les diapositives
+// elles-mêmes) : ses calques portent le `groupId` de ce groupe, jamais un champ séparé. Ce qui la
+// distingue d'un groupe ordinaire est seulement sa présence dans `composition.parentPages`, la
+// liste qui la rend RÉUTILISABLE PAR PLUSIEURS DIAPOSITIVES à la fois.
+export function readParentPages(composition) {
+  const brut = composition?.parentPages
+  if (!Array.isArray(brut)) return []
+  const groupes = new Set(readGroups(composition).map((g) => g.id))
+  const valides = brut.filter((p) => p && typeof p.id === 'string' && typeof p.groupId === 'string' && groupes.has(p.groupId))
+  // `basedOnId` se valide en DEUX passes, comme `connectFrom`/`connectTo` (carte Miro 6) : il faut
+  // connaître l'ensemble des identifiants RÉELLEMENT présents avant de vérifier qu'une base pointe
+  // vers l'un d'eux, sinon un identifiant disparu ou jamais valide resterait accepté tel quel.
+  const idsConnus = new Set(valides.map((p) => p.id))
+  return valides.map((p) => ({
+    id: p.id,
+    name: typeof p.name === 'string' && p.name ? p.name : 'Parente',
+    groupId: p.groupId,
+    // Une page parente peut être FONDÉE SUR une autre, jamais sur elle-même (un cycle romprait la
+    // chaîne d'héritage sans jamais se terminer) ni sur un identifiant qui n'existe pas.
+    basedOnId: typeof p.basedOnId === 'string' && p.basedOnId !== p.id && idsConnus.has(p.basedOnId) ? p.basedOnId : null,
+  }))
+}
+
+/** Crée une page parente neuve (groupe dédié vide), optionnellement fondée sur une autre. */
+export function addParentPage(composition, name, basedOnId = null) {
+  const serial = (composition?.serial || 0) + 1
+  const seed = `${composition?.themeId || 'sans-theme'}:parente`
+  const groupId = makeId('grp', seed, serial)
+  const parentId = makeId('prt', seed, serial)
+  const libelle = name || `Parente ${readParentPages(composition).length + 1}`
+  const groups = [...readGroups(composition), { id: groupId, name: libelle, hidden: false, locked: false }]
+  const base = readParentPages(composition).some((p) => p.id === basedOnId) ? basedOnId : null
+  const parentPages = [...readParentPages(composition), { id: parentId, name: libelle, groupId, basedOnId: base }]
+  return { ...composition, serial, groups, parentPages }
+}
+
+export function patchParentPage(composition, parentPageId, patch) {
+  const parentPages = readParentPages(composition).map((p) => (p.id === parentPageId ? { ...p, ...patch } : p))
+  return { ...composition, parentPages }
+}
+
+/** Retire une page parente ET son contenu ; les diapositives qui l'utilisaient reviennent à
+ * `[Sans]`, jamais orphelines d'un identifiant qui n'existe plus. */
+export function removeParentPage(composition, parentPageId) {
+  const page = readParentPages(composition).find((p) => p.id === parentPageId)
+  if (!page) return composition
+  // Une page parente FONDÉE SUR celle-ci perd sa base disparue, sans perdre le reste de sa propre
+  // définition (ses propres calques restent intacts).
+  const parentPagesAvant = readParentPages(composition)
+    .filter((p) => p.id !== parentPageId)
+    .map((p) => (p.basedOnId === parentPageId ? { ...p, basedOnId: null } : p))
+  const slidesAvant = readSlides(composition).map((s) => (s.parentPageId === parentPageId ? { ...s, parentPageId: null } : s))
+  // AUDIT P1-R9 · `parentPages` perd CETTE page AVANT l'appel à `removeGroup`, même ordre et même
+  // raison que `removeSlide` : son groupe cesse d'être un conteneur système dès que plus aucune
+  // page parente ne le référence, ce qui laisse `removeGroup` agir normalement pour CE geste dédié.
+  const suivant = removeGroup({ ...composition, parentPages: parentPagesAvant, slides: slidesAvant }, page.groupId)
+  return suivant
+}
+
+/** La chaîne d'héritage d'une page parente, de la plus proche à la plus lointaine — garde-fou
+ * anti-cycle : une page déjà vue dans la chaîne arrête la remontée plutôt que de boucler à l'infini. */
+export function parentPageChain(composition, parentPageId) {
+  const pages = readParentPages(composition)
+  const chaine = []
+  const vues = new Set()
+  let courant = pages.find((p) => p.id === parentPageId)
+  while (courant && !vues.has(courant.id)) {
+    chaine.push(courant)
+    vues.add(courant.id)
+    courant = courant.basedOnId ? pages.find((p) => p.id === courant.basedOnId) : null
+  }
+  return chaine
+}
+
+/** Applique (ou retire, avec `null`) une page parente à une diapositive. */
+export function setSlideParent(composition, slideId, parentPageId) {
+  const valide = parentPageId === null || readParentPages(composition).some((p) => p.id === parentPageId)
+  if (!valide) return composition
+  const slides = readSlides(composition).map((s) => (s.id === slideId ? { ...s, parentPageId } : s))
+  return { ...composition, slides }
+}
+
+/** Entre dans le contexte d'ÉDITION d'une page parente (poser et modifier ses propres calques) —
+ * referme forcément l'édition d'une diapositive, les deux étant mutuellement exclusives. `null`
+ * quitte ce contexte sans rien activer d'autre à sa place. */
+export function setActivePageParent(composition, parentPageId) {
+  if (parentPageId !== null && !readParentPages(composition).some((p) => p.id === parentPageId)) return composition
+  return { ...composition, activePageParentId: parentPageId, activeSlideId: parentPageId ? null : composition.activeSlideId }
+}
+
+/** Masque TEMPORAIREMENT tous les éléments hérités d'une diapositive, sans détacher ni rompre
+ * l'application de la page parente elle-même — un second geste la fait réapparaître intacte. */
+export function setSlideParentHidden(composition, slideId, hidden) {
+  const slides = readSlides(composition).map((s) => (s.id === slideId ? { ...s, masquerParent: !!hidden } : s))
+  return { ...composition, slides }
+}
+
+export function readParentOverrides(composition) {
+  const brut = composition?.parentOverrides
+  if (!Array.isArray(brut)) return []
+  return brut.filter((o) => o && typeof o.slideId === 'string' && typeof o.layerId === 'string' && o.patch && typeof o.patch === 'object')
+}
+
+/** Remplace LOCALEMENT un ou plusieurs attributs d'un objet hérité, SUR CETTE DIAPOSITIVE
+ * SEULEMENT : la page parente et les autres diapositives qui l'utilisent restent inchangées. Un
+ * second remplacement sur le même point FUSIONNE avec le premier plutôt que de l'écraser. */
+export function overrideParentLayer(composition, slideId, layerId, patch) {
+  const existantes = readParentOverrides(composition)
+  const index = existantes.findIndex((o) => o.slideId === slideId && o.layerId === layerId)
+  const suivantes = [...existantes]
+  if (index >= 0) suivantes[index] = { ...suivantes[index], patch: { ...suivantes[index].patch, ...patch } }
+  else suivantes.push({ slideId, layerId, patch })
+  return { ...composition, parentOverrides: suivantes }
+}
+
+/** Efface le remplacement local : l'objet revient exactement à ce que porte la page parente. */
+export function restoreParentLayer(composition, slideId, layerId) {
+  const parentOverrides = readParentOverrides(composition).filter((o) => !(o.slideId === slideId && o.layerId === layerId))
+  return { ...composition, parentOverrides }
+}
+
+/** Les détachements complets, par diapositive : une paire `(slideId, layerId)` présente ici dit
+ * « cette diapositive ne montre plus la version héritée de cet objet », sans rien retirer à la
+ * page parente elle-même ni aux autres diapositives qui continuent de l'utiliser intacte. */
+export function readParentDetachments(composition) {
+  const brut = composition?.parentDetachments
+  if (!Array.isArray(brut)) return []
+  return brut.filter((d) => d && typeof d.slideId === 'string' && typeof d.layerId === 'string')
+}
+
+/** DÉTACHE un objet hérité : il devient un calque RÉEL et INDÉPENDANT sur cette diapositive, avec
+ * son apparence ACTUELLE (remplacements compris) figée dans la copie. Contrairement à
+ * `restoreParentLayer`, ce geste est SANS RETOUR : la page parente garde sa propre définition,
+ * intacte, pour les autres diapositives, mais celle-ci ne la suit plus jamais. */
+export function detachParentLayer(composition, slideId, layerId) {
+  const source = effectiveSlideLayers(composition, slideId).find((l) => l.id === layerId)
+  const slide = readSlides(composition).find((s) => s.id === slideId)
+  if (!source || !slide) return composition
+  const { id, serial, z, inherited, overridden, groupId, ...donnees } = source
+  let suivant = addLayer(composition, source.kind, { ...donnees, groupId: slide.groupId })
+  suivant = restoreParentLayer(suivant, slideId, layerId)
+  const parentDetachments = [...readParentDetachments(suivant), { slideId, layerId }]
+  return { ...suivant, parentDetachments }
+}
+
+/** Les calques VIRTUELS hérités de la page parente d'une diapositive (chaîne complète, remplacements
+ * locaux appliqués), prêts à être peints DERRIÈRE le contenu propre de la diapositive. Ne modifie
+ * jamais `composition.layers` : ce sont des vues calculées, jamais des calques réels tant qu'ils
+ * n'ont pas été détachés (`detachParentLayer`), et un objet déjà détaché sur CETTE diapositive ne
+ * revient plus jamais dans cette liste, même si la page parente qui le porte est toujours là. */
+export function effectiveSlideLayers(composition, slideId) {
+  const slide = readSlides(composition).find((s) => s.id === slideId)
+  if (!slide || !slide.parentPageId || slide.masquerParent) return []
+  const chaine = parentPageChain(composition, slide.parentPageId)
+  if (!chaine.length) return []
+  const groupesHerites = new Set(chaine.map((p) => p.groupId))
+  const overrides = new Map(
+    readParentOverrides(composition).filter((o) => o.slideId === slideId).map((o) => [o.layerId, o.patch])
+  )
+  const detaches = new Set(
+    readParentDetachments(composition).filter((d) => d.slideId === slideId).map((d) => d.layerId)
+  )
+  // Masquer LE GROUPE d'une page parente (le geste générique « Masquer le groupe », déjà offert à
+  // tout groupe) doit avoir le même effet que masquer un groupe ordinaire : ses membres disparaissent
+  // de toute diapositive qui hérite d'elle, sans qu'il faille un second interrupteur dédié.
+  const groupesMasques = new Set(readGroups(composition).filter((g) => g.hidden).map((g) => g.id))
+  return readLayers(composition)
+    .filter((l) => groupesHerites.has(l.groupId) && !groupesMasques.has(l.groupId) && !l.hidden && !detaches.has(l.id))
+    .map((l) => ({
+      ...l,
+      ...(overrides.get(l.id) || {}),
+      // Un z synthétique, toujours sous n'importe quel calque réel (`nextZ` ne descend jamais sous
+      // zéro) : l'hérité peint DERRIÈRE, jamais devant, sans toucher au compteur réel de la
+      // diapositive qui l'affiche.
+      z: -1_000_000 + l.z,
+      inherited: true,
+      overridden: overrides.has(l.id),
+    }))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE MIRO 6 · CONNECTEURS, LIGNES ET FLÈCHES (carte M6, 2026-08-06)
+//
+// Un connecteur RELIE deux calques, jamais deux points fixes : c'est ce qui distingue un
+// connecteur d'une simple ligne (carte P4/F6, laquelle reste un segment posé une fois pour
+// toutes). Le calque connecteur porte `connectFrom`/`connectTo`, deux identifiants de calques, et
+// sa géométrie (x/y/w/h + deux points relatifs) se RECALCULE après chaque mutation de la
+// composition — exactement le même principe que l'Auto Layout (carte F4) : une contrainte vivante,
+// jamais un alignement figé au moment où on l'a posé.
+//
+// LA BOÎTE ENGLOBANTE PLUTÔT QU'UNE ROTATION CSS. Une ligne diagonale pourrait aussi bien être un
+// segment de largeur fixe tourné d'un angle — mais la rotation CSS pivote au CENTRE du calque
+// (`transform-origin:center`, déjà la convention de toute rotation dans ce produit, carte S2), et
+// un connecteur doit pivoter à son POINT DE DÉPART, pas au milieu. Changer cette convention pour
+// un seul type de calque aurait été plus risqué que de s'en passer : la boîte englobante des deux
+// centres, avec la ligne dessinée en SVG à l'intérieur par ses coordonnées relatives, n'a besoin
+// d'aucune rotation et ne touche donc à aucune convention déjà posée.
+
+/** Calcule la géométrie d'un connecteur : boîte englobante des CENTRES des deux calques, et les
+ * deux points, relatifs à cette boîte, que le SVG interne doit relier. */
+export function connectorGeometry(depuis, vers) {
+  const cx1 = depuis.x + depuis.w / 2, cy1 = depuis.y + depuis.h / 2
+  const cx2 = vers.x + vers.w / 2, cy2 = vers.y + vers.h / 2
+  const x = Math.min(cx1, cx2), y = Math.min(cy1, cy2)
+  const w = Math.max(1, Math.abs(cx2 - cx1)), h = Math.max(1, Math.abs(cy2 - cy1))
+  return {
+    x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h),
+    connectorX1: Math.round(cx1 - x), connectorY1: Math.round(cy1 - y),
+    connectorX2: Math.round(cx2 - x), connectorY2: Math.round(cy2 - y),
+  }
+}
+
+/** Crée un calque connecteur entre deux calques EXISTANTS. Ne fait rien si l'un des deux est
+ * introuvable, si les deux désignent le même calque (un connecteur relie deux choses), ou si les
+ * deux extrémités n'appartiennent pas à la MÊME page (AUDIT P1-R10, carte P1-R9 rendue possible
+ * par la distinction Page/groupe/masque). Un connecteur hors page devenait un masque rendu sur
+ * TOUTES les diapositives ; le nouveau connecteur hérite au contraire du `groupId` COMMUN de ses
+ * deux extrémités — celui d'une diapositive, d'une page parente, d'un groupe ordinaire, ou `null`
+ * si les deux restent des masques globaux, jamais un mélange des deux. */
+export function createConnector(composition, fromId, toId) {
+  if (fromId === toId) return composition
+  const depuis = findLayer(composition, fromId)
+  const vers = findLayer(composition, toId)
+  if (!depuis || !vers) return composition
+  if (depuis.groupId !== vers.groupId) return composition
+  const geo = connectorGeometry(depuis, vers)
+  return addLayer(composition, 'shape', { name: 'Connecteur', connectFrom: fromId, connectTo: toId, groupId: depuis.groupId, ...geo })
+}
+
+/** Recalcule la géométrie de TOUS les connecteurs d'une composition, d'après la position ACTUELLE
+ * des calques qu'ils relient. Appelé après CHAQUE mutation, comme `applyAutoLayout` : un
+ * connecteur qui ne suivrait pas un déplacement serait un connecteur cassé, pas une fonctionnalité. */
+export function applyConnectors(composition) {
+  const layers = readLayers(composition)
+  if (!layers.some((l) => l.connectFrom && l.connectTo)) return composition
+  const parId = new Map(layers.map((l) => [l.id, l]))
+  let change = false
+  const suivants = layers.map((l) => {
+    if (!l.connectFrom || !l.connectTo) return l
+    const depuis = parId.get(l.connectFrom)
+    const vers = parId.get(l.connectTo)
+    if (!depuis || !vers) return l
+    const geo = connectorGeometry(depuis, vers)
+    if (geo.x !== l.x || geo.y !== l.y || geo.w !== l.w || geo.h !== l.h
+      || geo.connectorX1 !== l.connectorX1 || geo.connectorY1 !== l.connectorY1
+      || geo.connectorX2 !== l.connectorX2 || geo.connectorY2 !== l.connectorY2) change = true
+    return { ...l, ...geo }
+  })
+  return change ? { ...composition, layers: suivants } : composition
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE INDESIGN D3 · CHAÎNAGE DE BLOCS DE TEXTE (carte D3, 2026-08-06)
+//
+// Un bloc de texte reste, par construction, un calque autonome (son propre `source`) : le chaînage
+// n'en fait PAS un fragment d'un long texte unique redistribué automatiquement (la redistribution
+// intelligente, qui ajouterait ou retirerait des PAGES toute seule, est hors périmètre écrit en
+// KANBAN.md — trop éloignée d'une affiche 2D pour Instagram ou LinkedIn). Ce que le chaînage porte
+// RÉELLEMENT ici : la relation structurelle entre deux blocs (`threadNextId`/`threadPrevId`,
+// symétriques comme un double lien de liste chaînée), les lignes de liaison qui la rendent visible,
+// et l'indicateur de TEXTE EN EXCÈS quand un bloc déborde et n'a personne à qui le passer.
+//
+// Chaîner DEPUIS un bloc qui a déjà un suivant, ou VERS un bloc qui a déjà un précédent, REROUTE le
+// fil plutôt que d'échouer : exactement le comportement réel d'InDesign, où charger le curseur
+// depuis un point déjà connecté rouvre la chaîne à cet endroit.
+export function threadTextLayers(composition, fromId, toId) {
+  if (fromId === toId) return composition
+  const layers = readLayers(composition)
+  const depuis = layers.find((l) => l.id === fromId && l.kind === 'text')
+  const vers = layers.find((l) => l.id === toId && l.kind === 'text')
+  if (!depuis || !vers) return composition
+  // Refuse un cycle : remonter depuis `vers` ne doit jamais retomber sur `depuis`.
+  const vus = new Set()
+  let courant = vers
+  while (courant?.threadNextId) {
+    if (courant.threadNextId === fromId) return composition
+    if (vus.has(courant.threadNextId)) break
+    vus.add(courant.threadNextId)
+    courant = layers.find((l) => l.id === courant.threadNextId) || null
+  }
+  const suivants = layers.map((l) => {
+    if (l.id === fromId) return { ...l, threadNextId: toId }
+    if (l.id === toId) return { ...l, threadPrevId: fromId }
+    // Reroutage : l'ancien suivant de `depuis` perd son précédent ; l'ancien précédent de `vers`
+    // perd son suivant — sinon deux blocs se partageraient la même extrémité de fil.
+    if (l.id === depuis.threadNextId && l.id !== toId) return { ...l, threadPrevId: '' }
+    if (l.id === vers.threadPrevId && l.id !== fromId) return { ...l, threadNextId: '' }
+    return l
+  })
+  return ecrire(composition, suivants)
+}
+
+/** Déchaîne un bloc de son suivant : le contenu de chacun reste exactement où il est (aucun calque
+ * ne porte le texte de l'autre), seul le lien structurel disparaît. */
+export function unthreadTextLayer(composition, layerId) {
+  const layers = readLayers(composition)
+  const layer = layers.find((l) => l.id === layerId)
+  if (!layer?.threadNextId) return composition
+  const suivantId = layer.threadNextId
+  const suivants = layers.map((l) => {
+    if (l.id === layerId) return { ...l, threadNextId: '' }
+    if (l.id === suivantId) return { ...l, threadPrevId: '' }
+    return l
+  })
+  return ecrire(composition, suivants)
+}
+
+/** La chaîne COMPLÈTE d'un bloc, du tout premier au tout dernier — remonte au début puis redescend,
+ * garde-fou anti-cycle inclus (une chaîne bien formée n'en a jamais, mais la lecture ne doit jamais
+ * boucler si des données corrompues en produisaient une). */
+export function readTextChain(composition, layerId) {
+  const layers = readLayers(composition)
+  const parId = new Map(layers.map((l) => [l.id, l]))
+  let debut = parId.get(layerId)
+  if (!debut) return []
+  const vus = new Set([debut.id])
+  while (debut.threadPrevId && parId.has(debut.threadPrevId) && !vus.has(debut.threadPrevId)) {
+    debut = parId.get(debut.threadPrevId)
+    vus.add(debut.id)
+  }
+  const chaine = [debut]
+  const revus = new Set([debut.id])
+  let courant = debut
+  while (courant.threadNextId && parId.has(courant.threadNextId) && !revus.has(courant.threadNextId)) {
+    courant = parId.get(courant.threadNextId)
+    chaine.push(courant)
+    revus.add(courant.id)
+  }
+  return chaine
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE INDESIGN D4 · STYLES DE TEXTE NOMMÉS (carte D4, 2026-08-06)
+//
+// Chaque calque texte réglait déjà sa typographie localement (`LAYER_STYLES`), mais AUCUNE
+// définition n'était PARTAGÉE : modifier la police d'un titre ne changeait jamais les neuf autres
+// qui devaient rester identiques. Un style de texte NOMMÉ comble cela — l'équivalent, ici, du style
+// de PARAGRAPHE d'InDesign (il s'applique au calque entier, jamais à une plage de caractères DANS
+// le texte : ce découpage demanderait du texte enrichi par portions, modèle que ce produit ne porte
+// pas, écart assumé plutôt que deviné).
+//
+// Le remplacement local NE DEMANDE AUCUNE STRUCTURE NEUVE : `layer.style` reste exactement ce qu'il
+// était, et CE QUI Y EST DÉJÀ RÉGLÉ localement l'emporte sur le style nommé, champ par champ,
+// exactement comme InDesign superpose un remplacement à la définition du style. Supprimer le style
+// ne supprime PAS l'apparence : les remplacements locaux, déjà dans `layer.style`, restent tels quels.
+export function readTextStyles(composition) {
+  const brut = composition?.textStyles
+  if (!Array.isArray(brut)) return []
+  return brut
+    .filter((s) => s && typeof s.id === 'string')
+    .map((s) => ({
+      id: s.id,
+      name: typeof s.name === 'string' && s.name ? s.name : 'Style',
+      style: TEXT_STYLE_KEYS.reduce((acc, cle) => ({ ...acc, [cle]: typeof s.style?.[cle] === 'string' ? s.style[cle] : '' }), {}),
+    }))
+}
+
+/** Crée un style de texte nommé, optionnellement AMORCÉ depuis le style résolu d'un calque existant
+ * (« créer un style depuis la sélection », le geste le plus courant pour en poser un premier). */
+export function addTextStyle(composition, name, seedFromLayerId = null) {
+  const serial = (composition?.serial || 0) + 1
+  const id = makeId('txs', `${composition?.themeId || 'sans-theme'}:style-texte`, serial)
+  const source = seedFromLayerId ? readLayers(composition).find((l) => l.id === seedFromLayerId) : null
+  const style = TEXT_STYLE_KEYS.reduce((acc, cle) => ({ ...acc, [cle]: (source?.style?.[cle]) || '' }), {})
+  const textStyles = [...readTextStyles(composition), { id, name: name || `Style ${readTextStyles(composition).length + 1}`, style }]
+  return { ...composition, serial, textStyles }
+}
+
+/** Modifie la DÉFINITION du style : chaque calque qui l'applique en hérite aussitôt, sans qu'aucun
+ * calque n'ait besoin d'être touché individuellement — c'est tout le sens d'un style partagé. */
+export function patchTextStyle(composition, styleId, patch) {
+  const textStyles = readTextStyles(composition).map((s) => (s.id === styleId ? { ...s, ...patch, style: { ...s.style, ...patch.style } } : s))
+  return { ...composition, textStyles }
+}
+
+/** Retire un style. Les calques qui l'appliquaient reviennent à `[Aucun]`, mais gardent VISUELLEMENT
+ * leur apparence : celle-ci vivait dans les remplacements locaux (`layer.style`), jamais dans le
+ * style lui-même, donc rien ne change à l'écran au moment de la suppression. */
+export function removeTextStyle(composition, styleId) {
+  const textStyles = readTextStyles(composition).filter((s) => s.id !== styleId)
+  const layers = readLayers(composition).map((l) => (l.textStyleId === styleId ? { ...l, textStyleId: '' } : l))
+  return ecrire({ ...composition, textStyles }, layers)
+}
+
+export function setLayerTextStyle(composition, layerId, styleId) {
+  const valide = styleId === '' || readTextStyles(composition).some((s) => s.id === styleId)
+  if (!valide) return composition
+  return ecrire(composition, readLayers(composition).map((l) => (l.id === layerId ? { ...l, textStyleId: styleId } : l)))
+}
+
+/** Efface les remplacements locaux d'un calque : il revient EXACTEMENT à ce que porte son style
+ * nommé, plus rien à lui de propre. Sans style appliqué, ce geste n'a pas de sens et ne fait rien. */
+export function clearTextStyleOverrides(composition, layerId) {
+  const layer = readLayers(composition).find((l) => l.id === layerId)
+  if (!layer?.textStyleId) return composition
+  const style = { ...layer.style }
+  for (const cle of TEXT_STYLE_KEYS) style[cle] = ''
+  return patchLayer(composition, layerId, { style })
+}
+
+/** Le style RÉSOLU d'un calque : chaque champ vient de son remplacement local s'il est réglé
+ * (non vide), sinon du style nommé appliqué, sinon reste vide (héritage CSS normal). Fonction PURE,
+ * ne modifie jamais le calque — c'est un calcul de lecture, à l'instant de la compilation ou de
+ * l'affichage du panneau, jamais une valeur stockée qui pourrait se périmer. */
+export function resolvedTextStyle(composition, layer) {
+  if (!layer?.textStyleId) return layer?.style || {}
+  const style = readTextStyles(composition).find((s) => s.id === layer.textStyleId)?.style
+  if (!style) return layer?.style || {}
+  const resultat = { ...layer.style }
+  for (const cle of TEXT_STYLE_KEYS) {
+    const local = layer.style?.[cle]
+    if (!local && style[cle]) resultat[cle] = style[cle]
+  }
+  return resultat
+}
+
+/** Un calque a-t-il un remplacement local par rapport à SON style appliqué ? N'importe quel champ
+ * réglé localement EST un remplacement, même si sa valeur coïncide avec celle du style aujourd'hui
+ * — le style peut changer plus tard, le remplacement resterait alors figé sans suivre. Sert
+ * uniquement à afficher le signe « + » (carte doc), jamais à décider du rendu lui-même. */
+export function hasTextStyleOverride(layer) {
+  if (!layer?.textStyleId) return false
+  return TEXT_STYLE_KEYS.some((cle) => !!layer.style?.[cle])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE INDESIGN D5 · L'HABILLAGE DE TEXTE (carte D5, 2026-08-06)
+//
+// « Le texte environnant peut suivre le contour d'un objet plutôt que l'ignorer. » InDesign propose
+// trois modes (boîte englobante, forme réelle, trajectoire de détourage) : seul le premier est bâti
+// ici. Les deux autres exigeraient une analyse du canal alpha d'une image ou une intersection
+// vectorielle avec un tracé — hors de portée d'un moteur qui ne peint que du CSS statique, et
+// disproportionnés au regard de ce que la boîte englobante couvre déjà dans l'immense majorité des
+// mises en page réelles.
+//
+// Le mécanisme est CSS natif, sans la moindre géométrie de texte à courir soi-même : le calque
+// texte qui habille reçoit, en tout premier enfant de son propre contenu, un élément invisible
+// FLOTTANT (`float:left`/`right`) dimensionné pour occuper exactement l'espace que l'obstacle
+// recouvre À L'INTÉRIEUR de la boîte de texte. Le paragraphe qui suit un flottant l'évite tout seul
+// — c'est le moteur de mise en page du navigateur qui fait le travail, pas une ligne de code à moi.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/**
+ * La géométrie du flottant invisible qui fait habiller un texte autour d'un obstacle. Fonction
+ * PURE : deux boîtes `{x,y,w,h}` dans le MÊME repère (le canevas), un écart en pixels. Rend `null`
+ * si l'obstacle ne croise verticalement la boîte de texte à aucun endroit (rien à éviter), sinon
+ * `{ side, width, height, marginTop }`, tous RELATIFS à l'origine de la boîte de texte elle-même.
+ */
+export function computeTextWrap(textBox, obstacleBox, gap = 16) {
+  if (!textBox || !obstacleBox) return null
+  const haut = obstacleBox.y - textBox.y
+  const bas = obstacleBox.y + obstacleBox.h - textBox.y
+  if (bas <= 0 || haut >= textBox.h) return null
+  const centreObstacle = obstacleBox.x + obstacleBox.w / 2
+  const centreTexte = textBox.x + textBox.w / 2
+  const side = centreObstacle < centreTexte ? 'left' : 'right'
+  const largeur = side === 'left'
+    ? obstacleBox.x + obstacleBox.w - textBox.x + gap
+    : textBox.x + textBox.w - obstacleBox.x + gap
+  const debut = Math.max(0, haut)
+  const fin = Math.min(textBox.h, bas + gap)
+  return {
+    side,
+    width: Math.round(Math.min(textBox.w, Math.max(0, largeur))),
+    height: Math.round(Math.max(0, fin - debut)),
+    marginTop: Math.round(debut),
+  }
+}
+
+/**
+ * La géométrie d'habillage RÉSOLUE d'un calque texte : retrouve son obstacle par `wrapAroundId` et
+ * calcule `computeTextWrap`. `null` sans obstacle réglé, obstacle supprimé, ou obstacle masqué — un
+ * objet invisible ne fait éviter personne, exactement le comportement d'InDesign sur un cadre masqué.
+ */
+export function textWrapFloat(composition, textLayer) {
+  if (!textLayer?.wrapAroundId) return null
+  const obstacle = readLayers(composition).find((l) => l.id === textLayer.wrapAroundId)
+  if (!obstacle || obstacle.hidden) return null
+  return computeTextWrap(textLayer, obstacle, textLayer.wrapGap)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE INDESIGN D6 · MARGES, COLONNES, REPÈRES, GRILLES, ALIGNEMENT (carte D6, 2026-08-06)
+//
+// L'ALIGNEMENT, mutuel et sur le canevas, est déjà couvert (`alignPatch`/`distributePatch`, cartes
+// Photoshop 2 et PowerPoint 2) : rien à y ajouter. Le vrai manque, vérifié dans le code avant tout
+// ajout : aucun REPÈRE PERSISTANT n'existait, seul le magnétisme AUTOMATIQUE et transitoire de
+// `snapMove` — un repère posé disparaissait avec le geste qui l'affichait.
+//
+// Un repère (guide) est une simple ligne verticale ou horizontale posée une fois et qui RESTE,
+// exactement comme dans Photoshop, Illustrator ou InDesign. Les MARGES ET COLONNES d'InDesign, une
+// fois posées, ne sont RIEN D'AUTRE qu'un jeu de tels repères calculé d'un coup : même primitive
+// (`composition.guides`), deux façons de la peupler (une à une depuis la règle, ou toutes ensemble
+// depuis un formulaire), jamais deux systèmes parallèles à maintenir synchronisés entre eux.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+export function readGuides(composition) {
+  const brut = composition?.guides
+  if (!Array.isArray(brut)) return []
+  return brut
+    .filter((g) => g && typeof g === 'object' && (g.axis === 'x' || g.axis === 'y'))
+    .map((g, i) => ({ id: typeof g.id === 'string' && g.id ? g.id : makeId('gd', 'repare', i), axis: g.axis, position: nombre(g.position, 0) }))
+}
+
+export function addGuide(composition, axis, position) {
+  if (axis !== 'x' && axis !== 'y') return composition
+  const serial = (composition?.serial || 0) + 1
+  const guide = { id: makeId('gd', `${composition?.themeId || 'sans-theme'}:${axis}`, serial), axis, position }
+  return { ...composition, serial, guides: [...readGuides(composition), guide] }
+}
+
+export function moveGuide(composition, guideId, position) {
+  return { ...composition, guides: readGuides(composition).map((g) => (g.id === guideId ? { ...g, position } : g)) }
+}
+
+export function removeGuide(composition, guideId) {
+  return { ...composition, guides: readGuides(composition).filter((g) => g.id !== guideId) }
+}
+
+export function clearGuides(composition) {
+  return { ...composition, guides: [] }
+}
+
+/**
+ * Les réglages de marges/colonnes : de simples nombres mémorisés d'une session à l'autre, jamais
+ * une propriété LIVE qui régénérerait les repères toute seule à chaque changement — « Générer les
+ * repères » reste un geste explicite ; les repères qu'il pose redeviennent ensuite des repères
+ * ordinaires, librement déplaçables ou supprimables un par un, comme n'importe quel autre.
+ */
+export function readMarginSettings(composition) {
+  const m = composition?.marginSettings || {}
+  return {
+    top: Math.max(0, nombre(m.top, 40)), right: Math.max(0, nombre(m.right, 40)),
+    bottom: Math.max(0, nombre(m.bottom, 40)), left: Math.max(0, nombre(m.left, 40)),
+    columns: Math.min(12, Math.max(1, Math.round(nombre(m.columns, 1)))),
+    gutter: Math.max(0, nombre(m.gutter, 20)),
+  }
+}
+
+export function patchMarginSettings(composition, patch) {
+  return { ...composition, marginSettings: { ...readMarginSettings(composition), ...patch } }
+}
+
+/**
+ * REMPLACE le jeu de repères actuel par les marges (une ligne par bord réglé à plus de zéro) et les
+ * colonnes internes (une ligne au CENTRE de chaque gouttière, entre deux colonnes voisines).
+ * Fonction PURE : la géométrie ne dépend que des réglages mémorisés et de la taille du canevas,
+ * jamais d'un état antérieur — regénérer produit toujours EXACTEMENT le même résultat.
+ */
+export function generateMarginGuides(composition, canvas) {
+  const m = readMarginSettings(composition)
+  const poses = []
+  if (m.left > 0) poses.push({ axis: 'x', position: m.left })
+  if (m.right > 0) poses.push({ axis: 'x', position: Math.max(0, canvas.w - m.right) })
+  if (m.top > 0) poses.push({ axis: 'y', position: m.top })
+  if (m.bottom > 0) poses.push({ axis: 'y', position: Math.max(0, canvas.h - m.bottom) })
+  if (m.columns > 1) {
+    const largeurContenu = Math.max(0, canvas.w - m.left - m.right)
+    const colW = (largeurContenu - m.gutter * (m.columns - 1)) / m.columns
+    for (let i = 1; i < m.columns; i++) poses.push({ axis: 'x', position: m.left + i * colW + (i - 0.5) * m.gutter })
+  }
+  let suivant = clearGuides(composition)
+  for (const p of poses) suivant = addGuide(suivant, p.axis, p.position)
+  return suivant
+}
+
+export function readGridSettings(composition) {
+  return { show: !!composition?.showGrid, size: Math.min(200, Math.max(4, nombre(composition?.gridSize, 40))) }
+}
+
+export function setGridSettings(composition, patch) {
+  const suivant = { ...readGridSettings(composition), ...patch }
+  return { ...composition, showGrid: suivant.show, gridSize: suivant.size }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE INDESIGN D7 · COULEURS, CONTOURS, EFFETS, STYLES D'OBJET (carte D7, 2026-08-06)
+//
+// Vérifié dans le code avant tout ajout : COULEURS (fond uni `backgroundColor` et dégradé, carte
+// Figma F7), CONTOURS (`border`, un champ CSS libre couleur+épaisseur+style en une valeur) et EFFETS
+// (opacité, onze modes de fusion, flou/luminosité/contraste/saturation, ombre portée) sont TOUS DÉJÀ
+// câblés, avec de vrais réglages dédiés dans la section Apparence — rien à ajouter là. Le vrai
+// manque, déjà nommé PAR ÉCRIT à la carte D4 (voir le commentaire au-dessus de `TEXT_STYLE_KEYS`) :
+// un STYLE D'OBJET NOMMÉ, l'équivalent partagé pour l'APPARENCE de ce que D4 a construit pour la
+// TYPOGRAPHIE.
+//
+// Même mécanisme, EXACTEMENT : `layer.style` fait déjà office de remplacement local, un champ qui y
+// est réglé gagne TOUJOURS sur le style, champ par champ. `OBJECT_STYLE_KEYS` est le complément
+// FERMÉ de `TEXT_STYLE_KEYS` au sein de `LAYER_STYLES` (aucun chevauchement entre les deux listes) :
+// fond, marge intérieure, rayon, bordure. Un style d'objet s'applique à N'IMPORTE QUEL calque, texte
+// compris — un bloc de texte peut porter à la fois un style de PARAGRAPHE (D4) et un style D'OBJET
+// (celui-ci) en même temps, exactement comme dans InDesign, puisque les deux listes de champs ne se
+// recouvrent jamais. Opacité, fusion, dégradé et effets restent EXCLUS de ce style partagé, par
+// écart assumé : ils ne vivent pas dans `layer.style` mais en propriétés propres du calque, les y
+// inclure aurait demandé une STRUCTURE DE REMPLACEMENT NEUVE (un style d'objet réel d'InDesign les
+// couvre, mais via des catégories cochables séparément, un système bien plus riche que ce que ce
+// produit a besoin de porter pour des affiches et visuels sociaux).
+export const OBJECT_STYLE_KEYS = ['backgroundColor', 'padding', 'borderRadius', 'border']
+
+export function readObjectStyles(composition) {
+  const brut = composition?.objectStyles
+  if (!Array.isArray(brut)) return []
+  return brut
+    .filter((s) => s && typeof s.id === 'string')
+    .map((s) => ({
+      id: s.id,
+      name: typeof s.name === 'string' && s.name ? s.name : 'Style',
+      style: OBJECT_STYLE_KEYS.reduce((acc, cle) => ({ ...acc, [cle]: typeof s.style?.[cle] === 'string' ? s.style[cle] : '' }), {}),
+    }))
+}
+
+export function addObjectStyle(composition, name, seedFromLayerId = null) {
+  const serial = (composition?.serial || 0) + 1
+  const id = makeId('obs', `${composition?.themeId || 'sans-theme'}:style-objet`, serial)
+  const source = seedFromLayerId ? readLayers(composition).find((l) => l.id === seedFromLayerId) : null
+  const style = OBJECT_STYLE_KEYS.reduce((acc, cle) => ({ ...acc, [cle]: (source?.style?.[cle]) || '' }), {})
+  const objectStyles = [...readObjectStyles(composition), { id, name: name || `Style ${readObjectStyles(composition).length + 1}`, style }]
+  return { ...composition, serial, objectStyles }
+}
+
+export function patchObjectStyle(composition, styleId, patch) {
+  const objectStyles = readObjectStyles(composition).map((s) => (s.id === styleId ? { ...s, ...patch, style: { ...s.style, ...patch.style } } : s))
+  return { ...composition, objectStyles }
+}
+
+export function removeObjectStyle(composition, styleId) {
+  const objectStyles = readObjectStyles(composition).filter((s) => s.id !== styleId)
+  const layers = readLayers(composition).map((l) => (l.objectStyleId === styleId ? { ...l, objectStyleId: '' } : l))
+  return ecrire({ ...composition, objectStyles }, layers)
+}
+
+export function setLayerObjectStyle(composition, layerId, styleId) {
+  const valide = styleId === '' || readObjectStyles(composition).some((s) => s.id === styleId)
+  if (!valide) return composition
+  return ecrire(composition, readLayers(composition).map((l) => (l.id === layerId ? { ...l, objectStyleId: styleId } : l)))
+}
+
+export function clearObjectStyleOverrides(composition, layerId) {
+  const layer = readLayers(composition).find((l) => l.id === layerId)
+  if (!layer?.objectStyleId) return composition
+  const style = { ...layer.style }
+  for (const cle of OBJECT_STYLE_KEYS) style[cle] = ''
+  return patchLayer(composition, layerId, { style })
+}
+
+/** Le style d'objet RÉSOLU d'un calque, même logique que `resolvedTextStyle` : chaque champ vient
+ * du remplacement local s'il est réglé, sinon du style nommé, sinon reste vide. Compose SANS
+ * collision avec `resolvedTextStyle` : les deux listes de champs ne se recouvrent jamais. */
+export function resolvedObjectStyle(composition, layer) {
+  if (!layer?.objectStyleId) return layer?.style || {}
+  const style = readObjectStyles(composition).find((s) => s.id === layer.objectStyleId)?.style
+  if (!style) return layer?.style || {}
+  const resultat = { ...layer.style }
+  for (const cle of OBJECT_STYLE_KEYS) {
+    const local = layer.style?.[cle]
+    if (!local && style[cle]) resultat[cle] = style[cle]
+  }
+  return resultat
+}
+
+export function hasObjectStyleOverride(layer) {
+  if (!layer?.objectStyleId) return false
+  return OBJECT_STYLE_KEYS.some((cle) => !!layer.style?.[cle])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE INDESIGN D8 · CONTRÔLE EN AMONT, ASSEMBLAGE, EXPORTATION (carte D8, 2026-08-06)
+//
+// L'EXPORTATION est déjà couverte (HTML/PNG/PDF, `exporters.js`) et l'ASSEMBLAGE (« Package »
+// InDesign : copier document + polices + images liées dans un dossier portable) EST DÉJÀ RÉSOLU,
+// autrement : `embedFonts`/`embedImages` produisent un fichier UNIQUE et AUTONOME, sans dossier
+// Liens ni dossier Polices à transporter à côté — un fichier qui marche seul bat un dossier de
+// trois éléments pour la portabilité, rien à ajouter là. Le vrai manque : aucun CONTRÔLE EN AMONT
+// (Preflight) ne prévenait Matthieu, AVANT d'exporter, d'un problème sur ses images.
+//
+// Une seule fonction PURE ici : `layersMissingImageSource`, la moitié du contrôle qui ne demande
+// aucune mesure du DOM rendu (une source vide est une donnée, pas un rendu). Le reste du contrôle
+// (lien qui ne charge pas, résolution trop basse pour la taille affichée) exige de lire le `<img>`
+// RÉELLEMENT chargé dans l'aperçu — cette mesure vit dans `MediaApp.jsx`, jamais ici, exactement
+// comme le texte en excès (carte D3) : ce fichier ne touche jamais au DOM.
+export function layersMissingImageSource(composition) {
+  return readLayers(composition).filter((l) => l.kind === 'image' && !l.source).map((l) => l.id)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE FIGMA 3 · CONTRAINTES (carte F3, 2026-08-04)
+//
+// « Lorsque la frame est redimensionnée, l'enfant reste attaché, centré, étiré ou mis à l'échelle
+// selon le réglage. » Le canevas de ZenRayMedia change de taille chaque fois qu'on change de
+// FORMAT (carré, 9:16, A4…) : sans contrainte, un logo posé en haut à gauche d'un carré 1080
+// resterait à la même position en pixels dans un A4 de 2480 px de large, donc visuellement
+// rétréci dans un coin, jamais là où l'auteur l'avait posé PAR RAPPORT au cadre.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/**
+ * La géométrie d'un calque après un changement des dimensions du canevas.
+ * Fonction PURE : mêmes entrées, même sortie, aucune dépendance à React ni au DOM.
+ */
+export function applyConstraints(layer, oldCanvas, newCanvas) {
+  const dW = newCanvas.w - oldCanvas.w
+  const dH = (newCanvas.h || oldCanvas.h) - oldCanvas.h
+  let { x, y, w, h } = layer
+
+  if (layer.constrainH === 'right') x = layer.x + dW
+  else if (layer.constrainH === 'center') x = layer.x + dW / 2
+  else if (layer.constrainH === 'scale' && oldCanvas.w > 0) {
+    const echelle = newCanvas.w / oldCanvas.w
+    x = layer.x * echelle; w = layer.w * echelle
+  }
+  // 'left' : x et w ne bougent pas, la distance au bord gauche est ce qui reste fixe.
+
+  if (oldCanvas.h > 0 && newCanvas.h > 0) {
+    if (layer.constrainV === 'bottom') y = layer.y + dH
+    else if (layer.constrainV === 'center') y = layer.y + dH / 2
+    else if (layer.constrainV === 'scale') {
+      const echelleV = newCanvas.h / oldCanvas.h
+      y = layer.y * echelleV; h = layer.h * echelleV
+    }
+  }
+  // Un canevas à hauteur LIBRE (format web, sans oldCanvas.h/newCanvas.h) n'a pas de bord bas à
+  // mesurer : la contrainte verticale ne peut alors s'appliquer, et 'top' reste le seul sens.
+
+  return { x: Math.round(x), y: Math.round(y), w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) }
+}
+
+/** Applique les contraintes de TOUS les calques d'une composition à la fois, pour un nouveau canevas. */
+export function applyConstraintsToAll(composition, oldCanvas, newCanvas) {
+  if (oldCanvas.w === newCanvas.w && oldCanvas.h === newCanvas.h) return composition
+  const layers = readLayers(composition).map((l) => ({ ...l, ...applyConstraints(l, oldCanvas, newCanvas) }))
+  return { ...composition, layers }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// FAMILLE FIGMA 4 · AUTO LAYOUT (carte F4, 2026-08-04)
+//
+// « Le parent réagit immédiatement aux changements de contenu. » C'est la différence entre Auto
+// Layout et un simple alignement ponctuel (déjà fait, carte P2) : un alignement s'applique UNE
+// fois et se fige, Auto Layout reste une CONTRAINTE qui se réapplique à chaque geste — ajouter un
+// membre, en retirer un, redimensionner l'un d'eux.
+//
+// PORTÉE ASSUMÉE, ET C'EST DIT PLUTÔT QUE CACHÉ : Figma calcule aussi le « Hug/Fill/Fixed » de
+// CHAQUE axe du conteneur lui-même, ce qui suppose qu'un groupe possède sa propre géométrie — or
+// un groupe de ce produit n'est qu'une étiquette (carte P5), sans boîte propre. Réintroduire une
+// géométrie de groupe rouvrirait le contrat une troisième fois pour une carte de plus. Ce qui EST
+// fait, et qui est le cœur de la valeur du geste, « je n'ai plus à déplacer chaque voisin à la
+// main » : les membres d'un groupe en Auto Layout se rangent en ligne ou en colonne, avec un écart
+// et une marge, ancrés au coin où le groupe se trouvait à l'activation, et cela se RECALCULE à
+// chaque mutation de la composition, pas une fois pour toutes.
+export function toggleAutoLayout(composition, groupId, direction = 'column') {
+  const groups = readGroups(composition)
+  const groupe = groups.find((g) => g.id === groupId)
+  if (!groupe) return composition
+  if (groupe.autoLayout) {
+    // Désactiver GÈLE la disposition telle qu'elle est : les membres gardent leur position
+    // actuelle, comme Figma qui conserve la géométrie au moment où Auto Layout est retiré.
+    return patchGroup(composition, groupId, { autoLayout: null })
+  }
+  const membres = readLayers(composition).filter((l) => l.groupId === groupId)
+  if (!membres.length) return composition
+  const gauche = Math.min(...membres.map((l) => l.x))
+  const haut = Math.min(...membres.map((l) => l.y))
+  return patchGroup(composition, groupId, { autoLayout: { direction, gap: 8, padding: 0 }, autoX: gauche, autoY: haut })
+}
+
+export function setAutoLayoutProp(composition, groupId, patch) {
+  const groupe = readGroups(composition).find((g) => g.id === groupId)
+  if (!groupe?.autoLayout) return composition
+  return patchGroup(composition, groupId, { autoLayout: { ...groupe.autoLayout, ...patch } })
+}
+
+/**
+ * Réaligne les membres de CHAQUE groupe en Auto Layout, dans l'ordre d'empilement (même ordre que
+ * `paintOrder`, pour que la pile visuelle et le flux de lecture ne racontent jamais deux histoires
+ * différentes). Fonction PURE, appelée après CHAQUE mutation de la composition — c'est ce qui la
+ * rend « vivante » plutôt que ponctuelle.
+ */
+export function applyAutoLayout(composition) {
+  const groups = readGroups(composition)
+  if (!groups.some((g) => g.autoLayout)) return composition
+  let layers = readLayers(composition)
+  for (const groupe of groups) {
+    if (!groupe.autoLayout) continue
+    const membres = layers.filter((l) => l.groupId === groupe.id).sort((a, b) => a.z - b.z)
+    if (!membres.length) continue
+    const { direction, gap, padding } = groupe.autoLayout
+    const ancreX = Number.isFinite(groupe.autoX) ? groupe.autoX : membres[0].x
+    const ancreY = Number.isFinite(groupe.autoY) ? groupe.autoY : membres[0].y
+    let curseur = (direction === 'row' ? ancreX : ancreY) + padding
+    const places = new Map()
+    for (const m of membres) {
+      const x = direction === 'row' ? curseur : ancreX + padding
+      const y = direction === 'row' ? ancreY + padding : curseur
+      places.set(m.id, { x: Math.round(x), y: Math.round(y) })
+      curseur += (direction === 'row' ? m.w : m.h) + gap
+    }
+    layers = layers.map((l) => (places.has(l.id) ? { ...l, ...places.get(l.id) } : l))
+  }
+  return { ...composition, layers }
+}

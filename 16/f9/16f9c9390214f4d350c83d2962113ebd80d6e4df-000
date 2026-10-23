@@ -1,0 +1,70 @@
+#!/usr/bin/env node
+// CheckSubtitles.mjs (12 October 2026): the verifier of the subtitles stored in the film manifests.
+// For every track: it decodes, parses with the SAME parser as the player, counts cues, compares the last cue with the duration,
+// compares the announced language with the text, and reports films that have no French track.
+//   node scripts/CheckSubtitles.mjs --clone <zenray-data clone> [--base pages/Anime_Movies_Series_Documentaries] [--json]
+// Exit code 1 when a track is unreadable or empty (it would not show in the player); missing French is reported, not fatal.
+import fs from 'node:fs'
+import path from 'node:path'
+import { gunzipSync } from 'node:zlib'
+import { parseSubtitles } from '../src/media/subtitles/subtitleParser.js'
+import { detectLanguage } from './AttachSidecarSubtitles.mjs'
+import { FILM_BASE } from './lib/film-categories.mjs'
+
+const argv = process.argv.slice(2)
+const value = (flag, fallback = '') => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : fallback }
+const clone = path.resolve(value('--clone'))
+const base = path.join(clone, value('--base', FILM_BASE))
+
+const walk = (dir, out = []) => {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) { if (entry.name !== '.streams' && entry.name !== '.git') walk(full, out) }
+    else if (entry.name.endsWith('.media.json')) out.push(full)
+  }
+  return out
+}
+
+const decode = (track) => {
+  if (track.encoding === 'gzip+base64') return gunzipSync(Buffer.from(track.data, 'base64')).toString('utf8')
+  if (track.encoding === 'base64') return Buffer.from(track.data, 'base64').toString('utf8')
+  return String(track.data || track.text || '')
+}
+
+const problems = []
+const noFrench = []
+let films = 0
+let tracks = 0
+for (const file of walk(base)) {
+  const rel = path.relative(base, file)
+  let manifest
+  try { manifest = JSON.parse(fs.readFileSync(file, 'utf8')) } catch (error) { problems.push({ film: rel, track: '-', issue: `manifest unreadable: ${error.message}` }); continue }
+  if (!manifest.hlsDashVerified) continue
+  films += 1
+  const subs = manifest.subtitles || []
+  if (!subs.some((s) => String(s.lang || '').startsWith('fr'))) noFrench.push({ film: rel, tracks: subs.map((s) => s.lang).join(',') || 'none' })
+  for (const track of subs) {
+    tracks += 1
+    const where = { film: rel, track: `${track.id}:${track.lang}` }
+    try {
+      const text = decode(track)
+      const cues = parseSubtitles(text, track.format)
+      if (!cues.length) { problems.push({ ...where, issue: 'no cue parsed (the player would show nothing)' }); continue }
+      const empty = cues.filter((c) => !String(c.text || '').trim()).length
+      if (empty > cues.length * 0.2) problems.push({ ...where, issue: `${empty} of ${cues.length} cues are empty` })
+      const last = Math.max(...cues.map((c) => c.end || 0))
+      if (manifest.duration && last > manifest.duration * 1.05) problems.push({ ...where, issue: `last cue ${Math.round(last)} s after the end of the film (${Math.round(manifest.duration)} s): another release?` })
+      const detected = detectLanguage(cues.slice(0, 400).map((c) => c.text).join(' '))
+      const announced = String(track.lang || '').startsWith('fr') ? 'fre' : String(track.lang) === 'eng' ? 'eng' : ''
+      if (announced && detected !== 'und' && detected !== announced) problems.push({ ...where, issue: `announced ${track.lang} but the text reads ${detected}` })
+    } catch (error) { problems.push({ ...where, issue: `decode failed: ${error.message}` }) }
+  }
+}
+
+const report = { films, tracks, withoutFrench: noFrench.length, problems: problems.length }
+if (argv.includes('--json')) console.log(JSON.stringify({ ...report, problems, noFrench }, null, 1))
+else {
+  console.log(`${films} films, ${tracks} tracks, ${problems.length} problem(s), ${noFrench.length} film(s) without a French track`)
+  for (const p of problems.slice(0, 40)) console.log(`  ✗ ${p.film} [${p.track}] ${p.issue}`)
+}
+process.exit(problems.length ? 1 : 0)

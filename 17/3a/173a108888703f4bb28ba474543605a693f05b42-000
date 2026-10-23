@@ -1,0 +1,178 @@
+// 12 October 2026 17:40 CEST: cross-language hashes, shard failures and meaningful lesson limits.
+import { createHash, webcrypto } from 'node:crypto'
+import { describe, expect, it, vi } from 'vitest'
+import { CORPUS_CONFIG, normalizeCorpusText, corpusTokens, corpusBucket, searchBucket, createCorpusClient, createLatestRequest, cookCorpusLesson, canonicalLessonContent, lessonValidationIssue } from './japaneseCorpusModel.js'
+
+vi.stubGlobal('crypto', webcrypto)
+// 13 October 2026 00:07 CEST: synthetic approvals are test fixtures only, never corpus data.
+function approveFixture(record) {
+  const content = { ...record, lessonContentVersion: '1' }
+  delete content.lessonValidation; delete content.lessonContentHash
+  const lessonContentHash = createHash('sha256').update(canonicalLessonContent(content)).digest('hex')
+  return { ...content, lessonContentHash, lessonValidation: { status: 'approved', contentVersion: '1', contentHash: lessonContentHash, reviewerIds: ['synthetic-a', 'synthetic-b'], evidenceUrls: ['https://example.org/synthetic-review'], unresolvedFindings: [] } }
+}
+const original = { id: 'grammar-test', title: 'テスト', domain: 'grammar', level: 'N4', explanationFr: 'Un exemple.', status: 'reviewed', examples: [{ ja: '雨が降ります。', reading: 'あめがふります。', fr: 'Il pleut.', origin: 'Original example' }], sources: [{ title: 'Source', url: 'https://example.org/source', license: 'Rights retained' }] }
+const head = { schemaVersion: 1, basePath: 'release/frozen', recordShards: 256, searchShards: 256, cards: [original] }
+const shardPath = (kind, bucket) => `${head.basePath}/${kind}/${String(bucket).padStart(3, '0')}.json`
+
+describe('corpus model', () => {
+  // 15 October 2026, 10:00 CEST: stale coverage and transient failures must never become a cached success.
+  it('rejects coverage for another release and retries the corrected response', async () => {
+    let matching = false
+    const read = vi.fn(async path => path === CORPUS_CONFIG.cataloguePath ? { ...head, release: 'current' }
+      : { schemaVersion: 1, release: matching ? 'current' : 'old', completeAudit: true, counts: { covered: 1, open: 1 }, requirements: [{}, {}] })
+    const client = createCorpusClient(read)
+    await expect(client.getCoverage()).rejects.toThrow('invalides')
+    matching = true
+    await expect(client.getCoverage()).resolves.toHaveProperty('release', 'current')
+  })
+  it('normalizes width, accents and French ligature consistently with the Python compiler', () => {
+    expect(normalizeCorpusText('Œuvre ÉTÉ ＡＢＣ ｶﾅ')).toBe('oeuvre ete abc カナ')
+    expect(corpusTokens('は / が, école école')).toEqual(['は', 'が', 'ecole'])
+  })
+  it('hashes Unicode codepoints, including a supplementary kanji, against independent Python fixtures', () => {
+    expect(corpusBucket('𠮷野')).toBe(168)
+    expect(corpusBucket('word-1002740')).toBe(0)
+    expect(corpusBucket('は')).toBe(158)
+    expect(searchBucket('𠮷野さん')).toBe(168)
+  })
+  // 12 October 2026: synthetic terms test actual lookup with independently computed Python shard IDs.
+  it('searches a standalone supplementary kanji and a compound token using two codepoints', async () => {
+    const kanji = { id: 'kanji-2000b', title: '𠀋', domain: 'kanji', level: 'unclassified' }
+    const compound = { id: 'word-supplementary', title: '𠀋野原', domain: 'dictionary', level: 'unclassified' }
+    const files = new Map([
+      [CORPUS_CONFIG.cataloguePath, { ...head, cards: [] }],
+      [shardPath('search', 74), { '𠀋': [kanji.id] }],
+      [shardPath('search', 204), { '𠀋野原': [compound.id], '𠀋野外': ['word-distractor'] }],
+      [shardPath('records', 1), [kanji]],
+      [shardPath('records', 199), [compound]],
+    ])
+    const read = vi.fn(async (path) => {
+      if (!files.has(path)) throw new Error(`Unexpected shard: ${path}`)
+      return files.get(path)
+    })
+    const client = createCorpusClient(read)
+    expect(corpusTokens('𠀋 𠀋野原')).toEqual(['𠀋', '𠀋野原'])
+    expect(searchBucket('𠀋')).toBe(74)
+    expect(searchBucket('𠀋野原')).toBe(204)
+    expect(await client.search('𠀋', { domain: 'kanji' })).toEqual([kanji])
+    expect(await client.search('𠀋野原', { domain: 'dictionary' })).toEqual([compound])
+    expect(read.mock.calls.filter(([path]) => path.includes('/search/')).map(([path]) => path))
+      .toEqual([shardPath('search', 74), shardPath('search', 204)])
+  })
+  it('uses immutable release shards, intersects query tokens and ranks curated exact entries', async () => {
+    const dictionary = { id: 'word-1', title: 'は', aliases: [], domain: 'dictionary' }
+    const files = new Map([[CORPUS_CONFIG.cataloguePath, head],
+      [shardPath('search', searchBucket('は')), { 'は': [original.id, dictionary.id], 'はな': ['other'] }],
+      [shardPath('search', searchBucket('が')), { 'が': [original.id] }],
+      [shardPath('records', corpusBucket(original.id)), [original]],
+    ])
+    const read = vi.fn(async (path) => files.get(path))
+    const client = createCorpusClient(read)
+    expect((await client.search('は が')).map((record) => record.id)).toEqual([original.id])
+    expect(await client.getCatalogue()).toBe(head)
+    expect(read.mock.calls.filter(([path]) => path === CORPUS_CONFIG.cataloguePath)).toHaveLength(1)
+    expect(read.mock.calls.every(([path]) => path === CORPUS_CONFIG.cataloguePath || path.startsWith(head.basePath))).toBe(true)
+  })
+  it('deduplicates simultaneous loads but retries failures rather than caching them', async () => {
+    const read = vi.fn().mockRejectedValueOnce(new Error('network')).mockResolvedValue(head)
+    const client = createCorpusClient(read)
+    const first = await Promise.allSettled([client.getCatalogue(), client.getCatalogue()])
+    expect(first.every((result) => result.status === 'rejected')).toBe(true)
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(await client.getCatalogue()).toBe(head)
+    expect(read).toHaveBeenCalledTimes(2)
+  })
+  it('rejects malformed catalogue data and permits the next correct attempt', async () => {
+    const read = vi.fn().mockResolvedValueOnce({ missing: true }).mockResolvedValue(head)
+    const client = createCorpusClient(read)
+    await expect(client.getCatalogue()).rejects.toThrow('invalides')
+    expect(await client.getCatalogue()).toBe(head)
+  })
+  it('rejects a record missing from an otherwise valid shard', async () => {
+    const client = createCorpusClient(async (path) => path === CORPUS_CONFIG.cataloguePath ? head : [])
+    await expect(client.getRecord('missing')).rejects.toThrow('fiche manque')
+  })
+  it('applies the requested domain before the 40-result boundary', async () => {
+    const kanji = { id: 'kanji-065e5', title: '日', domain: 'kanji', level: 'unclassified' }
+    const manyWords = Array.from({ length: 45 }, (_, index) => `word-${index}`)
+    const client = createCorpusClient(async (path) => {
+      if (path === CORPUS_CONFIG.cataloguePath) return head
+      if (path.includes('/search/')) return { '日': [...manyWords, kanji.id] }
+      return [kanji]
+    })
+    expect(await client.search('日', { domain: 'kanji' })).toEqual([kanji])
+  })
+  it('invalidates earlier request tickets when newer actions or navigation occur', () => {
+    const gate = createLatestRequest()
+    const old = gate.start(); const current = gate.start()
+    expect(gate.isCurrent(old)).toBe(false)
+    expect(gate.isCurrent(current)).toBe(true)
+    gate.cancel(); expect(gate.isCurrent(current)).toBe(false)
+  })
+  it('limits local lessons to one new topic and three original exercises with examples before explanation', async () => {
+    const records = Array.from({ length: 5 }, (_, index) => ({ ...original, id: `grammar-${index}`, examples: Array.from({ length: 5 }, () => original.examples[0]) }))
+    const result = await cookCorpusLesson(records.map(approveFixture), { script: 'kana', activity: 'oral', learner: approveFixture({ retestItems: [{ fr: 'Hier ?', ja: '昨日。' }] }) })
+    expect(result.exercises).toHaveLength(3)
+    expect(result.records).toHaveLength(1)
+    expect(result.exercises[0].answer).toBe('あめがふります。')
+    expect(result.retestItems).toHaveLength(1)
+    expect(result.markdown).toContain('15 minutes, puis 2 minutes')
+    expect(result.markdown).toContain('https://example.org/source')
+    expect(result.markdown).toContain('aucun acquis enregistré')
+    expect(result.markdown.indexOf('| Japonais et lecture |')).toBeLessThan(result.markdown.indexOf('Un exemple.'))
+    expect(result.markdown).toContain('n’écris PAS, dis à voix haute')
+  })
+  it('does not manufacture dictionary or imported sentence exercises', async () => {
+    const result = await cookCorpusLesson([approveFixture({ ...original, status: 'source-imported', domain: 'sentence' })])
+    expect(result.exercises).toEqual([])
+    expect(result.referenceOnly).toBe(true)
+    expect(result.markdown).toContain('Référence uniquement')
+  })
+  it('blocks kana cooking when a Han character has no supplied reading', async () => {
+    const noReading = { ...original, examples: [{ ...original.examples[0], reading: '' }] }
+    await expect(cookCorpusLesson([approveFixture(noReading)], { script: 'kana' })).rejects.toThrow('lecture en kana manque')
+    expect((await cookCorpusLesson([approveFixture(noReading)], { script: 'mixed' })).exercises[0].answer).toBe('雨が降ります。')
+  })
+  it('uses the canonical catalogue lesson duration parameters', async () => {
+    const result = await cookCorpusLesson([approveFixture(original)], {}, { ...CORPUS_CONFIG, lesson: { minutes: 20, pauseMinutes: 3, maxNewItems: 1, maxDrills: 3 } })
+    expect(result.markdown).toContain('20 minutes, puis 3 minutes')
+  })
+})
+
+describe('lesson approval gate', () => {
+  it('accepts independently SHA256-hashed content including Unicode and nested keys', async () => {
+    expect(await lessonValidationIssue(approveFixture(original))).toBe('')
+  })
+  it.each([
+    ['absent approval', (record) => ({ ...record, lessonValidation: undefined })],
+    ['changed content', (record) => ({ ...record, explanationFr: 'Changed' })],
+    ['changed examples', (record) => ({ ...record, examples: [{ ja: '変更', fr: 'Changed' }] })],
+    ['changed version', (record) => ({ ...record, lessonContentVersion: '2' })],
+    ['one reviewer', (record) => ({ ...record, lessonValidation: { ...record.lessonValidation, reviewerIds: ['same', 'same'] } })],
+    ['open issue', (record) => ({ ...record, lessonValidation: { ...record.lessonValidation, unresolvedFindings: ['error'] } })],
+    ['unknown issues', (record) => ({ ...record, lessonValidation: { ...record.lessonValidation, unresolvedFindings: undefined } })],
+    ['no evidence', (record) => ({ ...record, lessonValidation: { ...record.lessonValidation, evidenceUrls: [] } })],
+    ['insecure evidence', (record) => ({ ...record, lessonValidation: { ...record.lessonValidation, evidenceUrls: ['http://example.org/review'] } })],
+    ['unsupported version', (record) => ({ ...record, lessonContentVersion: '2', lessonValidation: { ...record.lessonValidation, contentVersion: '2' } })],
+    ['unsafe evidence', (record) => ({ ...record, lessonValidation: { ...record.lessonValidation, evidenceUrls: ['javascript:alert(1)'] } })],
+    ['mismatched hash', (record) => ({ ...record, lessonContentHash: '0'.repeat(64) })],
+  ])('blocks %s', async (_, mutate) => {
+    await expect(cookCorpusLesson([mutate(approveFixture(original))])).rejects.toThrow('Leçon bloquée')
+  })
+  it('validates every input record, including one beyond the cooking limit', async () => {
+    await expect(cookCorpusLesson([approveFixture(original), original])).rejects.toThrow('Leçon bloquée')
+  })
+  it('blocks unapproved or modified retest and permits an empty retest', async () => {
+    const learner = { retestItems: [{ ja: '昨日。', fr: 'Hier.' }] }
+    await expect(cookCorpusLesson([approveFixture(original)], { learner })).rejects.toThrow('Retest')
+    const approved = approveFixture(learner)
+    await expect(cookCorpusLesson([approveFixture(original)], { learner: approved })).resolves.toHaveProperty('retestItems')
+    await expect(cookCorpusLesson([approveFixture(original)], { learner: { ...approved, retestItems: [{ ja: '今日。', fr: 'Hier.' }] } })).rejects.toThrow('Retest')
+    await expect(cookCorpusLesson([approveFixture(original)], { learner: { retestItems: [] } })).resolves.toHaveProperty('markdown')
+  })
+})
+
+it('canonicalizes numeric and supplementary Unicode keys in Python-compatible order', () => {
+  expect(canonicalLessonContent({ '2': 'b', '10': 'a', '\ue000': 'c', '𠮷': 'd' })).toBe('{"10":"a","2":"b","\ue000":"c","𠮷":"d"}')
+})

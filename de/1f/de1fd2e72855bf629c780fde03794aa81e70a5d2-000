@@ -1,0 +1,84 @@
+// THE SHARE PREVIEW IS COMPOSED ON REQUEST (2 October 2026, demand of Matthieu: « dynamique, pas au moment de la
+// création »). Pure pixel work, no network, no codec of its own: the decoders and the encoder are injected, so the same
+// code runs in the Worker (WebAssembly libwebp + mozjpeg, see mosaicCodecs.workers.js) and in tests.
+//
+// WHY THIS IS POSSIBLE NOW. The old design composed the mosaic in the BROWSER at link creation because « a Worker has no
+// canvas ». A Worker does have WebAssembly: libwebp decodes the thumbnails, a few lines of sampling build the 2x2 square,
+// mozjpeg encodes it. Measured on the production runtime (preview deployment, 2 October 2026): a ~0.4 s CPU job passes
+// every time, so a ~150 ms composition is comfortably inside the real limit. The result is edge-cached by the caller.
+export const COVER_SIDE = 600
+export const COVER_GUTTER = 4
+export const COVER_BACKGROUND = [0x17, 0x18, 0x1b]
+
+import { pickCandidates, COVER_PICK } from '../src/lib/coverPick.js'
+export { pickCandidates, COVER_PICK }
+
+// object-fit: cover into a size x size tile, 3x3 supersampling (cheap area average): good enough for a 300 px preview.
+export function coverTile(src, size) {
+  const { data, width, height } = src
+  const out = new Uint8ClampedArray(size * size * 4)
+  const crop = Math.min(width, height)
+  const x0 = (width - crop) / 2, y0 = (height - crop) / 2
+  const scale = crop / size
+  const offsets = [0.25, 0.75] // 2x2 supersampling: half the work of 3x3, still smooth at preview size
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      let r = 0, g = 0, b = 0, n = 0
+      for (const oy of offsets) {
+        const sy = Math.min(height - 1, Math.floor(y0 + (y + oy) * scale)) * width
+        for (const ox of offsets) {
+          const i = (sy + Math.min(width - 1, Math.floor(x0 + (x + ox) * scale))) * 4
+          r += data[i]; g += data[i + 1]; b += data[i + 2]; n++
+        }
+      }
+      const o = (y * size + x) * 4
+      out[o] = r / n; out[o + 1] = g / n; out[o + 2] = b / n; out[o + 3] = 255
+    }
+  }
+  return out
+}
+
+function blit(canvas, side, tile, tileSize, left, top) {
+  for (let y = 0; y < tileSize; y++) {
+    const from = y * tileSize * 4
+    canvas.set(tile.subarray(from, from + tileSize * 4), ((top + y) * side + left) * 4)
+  }
+}
+
+export const COVER_TILE = (COVER_SIDE - COVER_GUTTER) / 2
+
+// FAST JPEG SETTINGS: the default mozjpeg profile (progressive + trellis + optimised tables) costs ~2x the CPU for ~25 % fewer
+// bytes. A preview is read once by a crawler, so speed wins.
+export const JPEG_FAST = { quality: 78, progressive: false, optimize_coding: false, trellis_multipass: false, trellis_opt_zero: false, trellis_opt_table: false, trellis_loops: 1, baseline: true }
+
+/**
+ * Compose the preview from READY TILES (RGBA, COVER_TILE x COVER_TILE each) and encode it. Splitting « make a tile » from
+ * « assemble and encode » lets each step run in its own Worker invocation with its own CPU budget (see share-cover.js).
+ * Four tiles: 2x2 mosaic. One to three: the first tile alone, enlarged (rule of Matthieu: four or one, never a half-empty grid).
+ */
+export async function composeFromTiles(tiles, { encode, quality } = {}) {
+  if (!Array.isArray(tiles) || !tiles.length || typeof encode !== 'function') return null
+  const side = COVER_SIDE
+  const canvas = new Uint8ClampedArray(side * side * 4)
+  for (let i = 0; i < canvas.length; i += 4) { canvas[i] = COVER_BACKGROUND[0]; canvas[i + 1] = COVER_BACKGROUND[1]; canvas[i + 2] = COVER_BACKGROUND[2]; canvas[i + 3] = 255 }
+  if (tiles.length >= 4) {
+    const t = COVER_TILE
+    const positions = [[0, 0], [t + COVER_GUTTER, 0], [0, t + COVER_GUTTER], [t + COVER_GUTTER, t + COVER_GUTTER]]
+    tiles.slice(0, 4).forEach((tile, i) => blit(canvas, side, tile, t, positions[i][0], positions[i][1]))
+  } else {
+    // a single tile (full-size 600 if the caller asked for it, else enlarged 2x with a nearest-neighbour step)
+    const tile = tiles[0]
+    const tileSize = Math.round(Math.sqrt(tile.length / 4))
+    if (tileSize === side) blit(canvas, side, tile, side, 0, 0)
+    else for (let y = 0; y < side; y++) for (let x = 0; x < side; x++) { const sx = Math.min(tileSize - 1, Math.floor((x * tileSize) / side)), sy = Math.min(tileSize - 1, Math.floor((y * tileSize) / side)); canvas.set(tile.subarray((sy * tileSize + sx) * 4, (sy * tileSize + sx) * 4 + 4), (y * side + x) * 4) }
+  }
+  const jpeg = await encode({ data: canvas, width: side, height: side }, { ...JPEG_FAST, ...(quality ? { quality } : {}) })
+  return new Uint8Array(jpeg)
+}
+
+/** Same, from DECODED images: builds the tiles first (used by tests and by single-invocation callers). */
+export async function composeCover(images, { encode, quality } = {}) {
+  if (!Array.isArray(images) || !images.length) return null
+  const tiles = images.length >= 4 ? images.slice(0, 4).map((img) => coverTile(img, COVER_TILE)) : [coverTile(images[0], COVER_SIDE)]
+  return composeFromTiles(tiles, { encode, quality })
+}

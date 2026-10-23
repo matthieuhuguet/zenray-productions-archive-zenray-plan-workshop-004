@@ -1,0 +1,105 @@
+import { urlLectureAffichage, urlLectureEdition } from '../lib/urlLecture.js'
+// C211c — Métadonnée Eagle attachée à un fichier (bloc `eagle` dans son jumeau .props.json).
+// Décision D1 : l'unité Eagle = page .md + .props.json (pas de .img.json). Le bloc `eagle` est rétrocompatible
+// (n'altère pas {icon,cover,date,place,custom}). Décision D2 : la source est CE .props.json, jamais un index.
+const enc = encodeURIComponent
+const propsPathOf = (path) => path.replace(/\.md$/, '.props.json')
+
+// LECTURE D EDITION : elle garde le `sha`, que `writeProps` exige pour que GitHub accepte l ecriture
+// sans ecraser le travail d un autre. Elle passe donc par l API contents, et consomme le quota. C est
+// le prix d une modification, et il est justifie ici.
+export async function readProps(path) {
+  const j = await fetch(urlLectureEdition(propsPathOf(path)), { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+  if (j && j.markdown && !j.missing) { try { return { props: JSON.parse(j.markdown) || {}, sha: j.sha } } catch { return { props: {}, sha: j.sha } } }
+  return { props: {}, sha: null }
+}
+export async function writeProps(path, props, sha) {
+  const j = await fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'save', path: propsPathOf(path), markdown: JSON.stringify(props), sha }) }).then((r) => r.json()).catch(() => null)
+  return j && j.ok ? j.sha : null
+}
+// LECTURE D AFFICHAGE : sans `sha`, donc HORS QUOTA. `buildEagleIndex` lit un .props.json PAR PAGE
+// du dossier : sur un dossier de deux cents pages, c'etait deux cents requetes sur les cinq mille
+// horaires, payees au simple fait d'ouvrir le dossier. Aucune de ces lectures n'est suivie d'une
+// ecriture, donc aucune n'a besoin du sha. Voir src/lib/urlLecture.js pour le partage des deux cas.
+async function lirePropsAffichage(path) {
+  const j = await fetch(urlLectureAffichage(propsPathOf(path)), { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+  if (j && j.markdown && !j.missing) { try { return { props: JSON.parse(j.markdown) || {} } } catch { return { props: {} } } }
+  return { props: {} }
+}
+
+// C211d — Index Eagle DÉRIVÉ (décision D2 : cache, jamais source). Lit les .props.json des pages et
+// agrège uniquement les nœuds porteurs d'un bloc eagle. Concurrence limitée (ne tue pas le réseau).
+// Renvoie Map<pagePath, {kind,w,h,src,rating,tags,addedAt}>. À régénérer, jamais à réécrire d'un bloc.
+export async function buildEagleIndex(paths, { concurrency = 8, onProgress } = {}) {
+  const pages = (paths || []).filter((p) => p.endsWith('.md'))
+  const index = new Map()
+  let i = 0, done = 0
+  async function worker() {
+    while (i < pages.length) {
+      const p = pages[i++]
+      const { props } = await lirePropsAffichage(p)
+      if (props && props.eagle && props.eagle.kind) {
+        const e = props.eagle
+        index.set(p, { kind: e.kind, w: e.w, h: e.h, src: e.src, rating: e.rating || 0, tags: Array.isArray(e.tags) ? e.tags : [], addedAt: e.addedAt || 0, usedAt: e.usedAt || 0 })
+      }
+      done++; if (onProgress && done % 20 === 0) onProgress(done / pages.length)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, pages.length) }, worker))
+  return index
+}
+
+// Vues système Eagle (calculées sur l'index). Décision : pas de fichier, dérivé.
+export function systemView(index, view) {
+  const all = [...index.entries()].map(([path, m]) => ({ path, ...m }))
+  switch (view) {
+    case 'untagged': return all.filter((x) => !x.tags || x.tags.length === 0)
+    case 'recent-added': return all.slice().sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
+    case 'recent-used': return all.filter((x) => x.usedAt).sort((a, b) => (b.usedAt || 0) - (a.usedAt || 0))
+    case 'random': return all.map((x) => [x, ((x.addedAt || 1) * 9301 + 49297) % 233280]).sort((a, b) => a[1] - b[1]).map((p) => p[0])
+    default: return all
+  }
+}
+
+export const orientationOf = (w, h) => (!w || !h ? 'unknown' : w > h ? 'paysage' : w < h ? 'portrait' : 'carré')
+
+// C211i — Smart Folders : filtres sauvegardés (pages/.zr-eagle.json). Règles pures sur les champs de l'index.
+// smart = { id, name, match:'all'|'any', rules:[{field,op,value}] }. Champs: rating,tagCount,w,h,orientation,bytes,name,tag.
+const FIELD = {
+  rating: (m) => m.rating || 0,
+  tagCount: (m) => (m.tags ? m.tags.length : 0),
+  w: (m) => m.w || 0, h: (m) => m.h || 0,
+  orientation: (m) => orientationOf(m.w, m.h),
+  bytes: (m) => m.bytes || 0,
+  name: (m, path) => (path || '').split('/').pop(),
+}
+function matchRule(m, path, r) {
+  if (r.field === 'tag') { const tags = m.tags || []; return r.op === '!=' ? !tags.includes(r.value) : tags.includes(r.value) }
+  const v = (FIELD[r.field] || (() => ''))(m, path); const rv = r.value
+  switch (r.op) {
+    case '>=': return Number(v) >= Number(rv)
+    case '<=': return Number(v) <= Number(rv)
+    case '>': return Number(v) > Number(rv)
+    case '<': return Number(v) < Number(rv)
+    case '=': return String(v) === String(rv)
+    case '!=': return String(v) !== String(rv)
+    case 'contains': return String(v).toLowerCase().includes(String(rv).toLowerCase())
+    default: return true
+  }
+}
+export function applySmart(index, smart) {
+  const rules = (smart && smart.rules) || []
+  const all = smart && smart.match === 'any'
+  return [...index.entries()].filter(([path, m]) => rules.length === 0 || (all ? rules.some((r) => matchRule(m, path, r)) : rules.every((r) => matchRule(m, path, r)))).map(([path, m]) => ({ path, ...m }))
+}
+export async function readSmartFolders() {
+  const j = await fetch('/api/page?action=read&path=pages/.zr-eagle.json', { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+  if (j && j.markdown && !j.missing) { try { return { smart: (JSON.parse(j.markdown).smart) || [], sha: j.sha } } catch { return { smart: [], sha: j.sha } } }
+  return { smart: [], sha: null }
+}
+export async function writeSmartFolders(smart, sha) {
+  const j = await fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'save', path: 'pages/.zr-eagle.json', markdown: JSON.stringify({ smart }) }) }).then((r) => r.json()).catch(() => null)
+  return j && j.ok ? j.sha : null
+}
+export const domainOf = (url) => { try { return new URL(url).hostname.replace(/^www\./, '') } catch { return '' } }
+export const humanBytes = (b) => (!b ? '' : b < 1048576 ? (b / 1024).toFixed(0) + ' Ko' : (b / 1048576).toFixed(1) + ' Mo')

@@ -1,0 +1,557 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { PALETTE, RADII, SHADOWS } from '../theme.js'
+import Icon from './Icon.jsx'
+import { buildJsDelivrUrl, OWNER, parseShard, KINDS, VIS } from '../capture/shardNaming.js'
+
+// C204 — Drive Dashboard façon Google Drive :
+//  (1) liste des repos du drive + barres de remplissage (existant)
+//  (2) double-clic sur un repo -> arborescence des fichiers (lazy, via /api/repos?action=tree)
+//  (3) bouton "Nouveau repo" par TYPE + visibilité -> POST /api/repos {action:'create-shard',kind,vis}
+//  (4) drag-and-drop / "Déplacer vers…" d'un fichier entre repos MÊME type+vis (move-blob),
+//      via une QUEUE concurrence max 2 + zone grisée "déplacement en cours"
+//  (5) liens de téléchargement (jsDelivr/raw + commandes curl/sparse-checkout/degit) sur les repos PUBLICS
+//
+// Règle archi : tout passe par les PETITES ops REST du serveur (tree, move-blob 1-2 fichiers, create-shard).
+// Le BULK reste hors UI (scripts git). Anti-fuite : seuls des chemins hachés ab/cd/<sha> sont affichés.
+const FONTS = { sans: "var(--zr-police-sans)", serif: "var(--zr-police-serif)" }
+const MOVE_CONCURRENCY = 2
+
+const fmtBytes = (b) => {
+  const n = Number(b || 0)
+  if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(2) + ' Go'
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' Mo'
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' Ko'
+  return n + ' o'
+}
+const fmtMB = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(2) + ' Go' : mb + ' Mo')
+
+// La vignette .webp jumelle d'un binaire haché ab/cd/<sha>.<ext> = ab/cd/<sha>.webp.
+const thumbPathOf = (binPath) => {
+  const m = /^(\w{2}\/\w{2}\/[0-9a-f]+)\.[^.]+$/.exec(binPath)
+  return m ? `${m[1]}.webp` : null
+}
+const hashOf = (binPath) => {
+  const m = /\/([0-9a-f]+)\.[^.]+$/.exec(binPath)
+  return m ? m[1] : null
+}
+
+let _idSeq = 0
+const nextId = () => `mv${Date.now().toString(36)}${(_idSeq++).toString(36)}`
+
+// Famille d'un shard (même kind+vis, ex. zenray-vid-public-NN) -- pure, ne dépend que de parseShard.
+// Remontée au niveau module (bug réel 2026-07-16 : définie seulement dans le useMemo groupedShownRepos,
+// donc "famOf is not defined" au premier rendu groupé, cette fonction étant aussi appelée hors de ce scope).
+const famOf = (r) => { const p = parseShard(r.name); if (!p) return null; if (p.v2) return `zenrayshards-${p.kind}`; return `zenray-${p.legacy === 'media' ? 'media' : p.legacy === 'vid' ? 'vid' : p.kind + '-' + p.vis}` }
+
+export default function DriveDashboard({ t }) {
+  const [data, setData] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [createKind, setCreateKind] = useState('img')
+  const [createVis, setCreateVis] = useState('private')
+  const [showArchives, setShowArchives] = useState(false) // afficher/masquer les shards img privés (archives, plus servies)
+  // Familles de shards dépliées dans la vue groupée (ex. { 'zenray-vid-public': true }). Persisté.
+  const [openFams, setOpenFams] = useState(() => { try { return JSON.parse(localStorage.getItem('zr:drive:openFams')) || {} } catch { return {} } })
+  const toggleFam = (f) => setOpenFams((o) => { const n = { ...o, [f]: !o[f] }; try { localStorage.setItem('zr:drive:openFams', JSON.stringify(n)) } catch {} return n })
+  const [createMsg, setCreateMsg] = useState(null)
+  const [browse, setBrowse] = useState(null) // {repo,kind,vis,private,commit,truncated,totalFiles,totalBytes,groups}
+  const [openPrefix, setOpenPrefix] = useState(null) // {prefix, files, loading}
+  const [moves, setMoves] = useState([])
+  const [dlFor, setDlFor] = useState(null) // {repo, commit, path} pour panneau de liens
+  const [toast, setToast] = useState(null)
+
+  const load = () => fetch('/api/repos', { cache: 'no-store' }).then((r) => r.json()).then(setData).catch(() => setData({ error: 'net' }))
+  useEffect(() => { load() }, [])
+  // Plusieurs déplacements terminant à quelques ms d'écart déclenchaient chacun leur propre load() complet
+  // (liste tous les repos + tailles) ; regroupées en un seul appel 400 ms après la dernière fin de move.
+  const loadDebounceRef = useRef(null)
+  const loadDebounced = () => { clearTimeout(loadDebounceRef.current); loadDebounceRef.current = setTimeout(load, 400) }
+
+  // ARCHIVES + VUE GROUPÉE (families de shards) : recalculé seulement quand data/showArchives changent, jamais
+  // à chaque render (ex. toggleFam, ou un état sans rapport plus haut dans l'arbre). Doit rester un hook de haut
+  // niveau (pas dans la JSX conditionnelle plus bas) pour respecter les rules of hooks.
+  const groupedShownRepos = useMemo(() => {
+    const repos = (data && data.repos) || []
+    const isArchived = (r) => { const p = parseShard(r.name); return !!p && p.kind === 'img' && p.vis === 'private' }
+    const hiddenCount = repos.filter(isArchived).length
+    const shownRepos = showArchives ? repos : repos.filter((r) => !isArchived(r))
+    const fams = new Map()
+    for (const r of shownRepos) { const f = famOf(r); if (f) { if (!fams.has(f)) fams.set(f, []); fams.get(f).push(r) } }
+    return { hiddenCount, shownRepos, fams }
+  }, [data, showArchives])
+
+  const flashToast = (msg) => { setToast(msg); setTimeout(() => setToast((c) => (c === msg ? null : c)), 2600) }
+
+  // ---- Création de repo par type + visibilité ----
+  const createShard = async () => {
+    setBusy(true); setCreateMsg(null)
+    const j = await fetch('/api/repos', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'create-shard', kind: createKind, vis: createVis }) }).then((r) => r.json()).catch(() => null)
+    setBusy(false)
+    // drive-3 : `existed:true` => le repo existait déjà (422 côté GitHub). On le DIT, on ne ment pas « Créé ».
+    if (j && j.ok) { setCreateMsg({ ok: true, text: (j.existed ? 'Repo déjà présent : ' : 'Créé : ') + j.name }); load() }
+    else setCreateMsg({ ok: false, text: 'Échec : ' + ((j && (j.error || j.detail)) || 'réseau') })
+  }
+
+  // ---- Arborescence (browse) ----
+  const openRepo = async (repo) => {
+    const p = parseShard(repo)
+    if (!p) return // zenray-data / progress : pas d'arborescence shardée
+    setOpenPrefix(null); setDlFor(null)
+    setBrowse({ repo, loading: true })
+    const j = await fetch(`/api/repos?action=tree&repo=${encodeURIComponent(repo)}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+    if (!j || j.error) { setBrowse({ repo, error: (j && j.error) || 'net' }); return }
+    setBrowse({ ...j })
+  }
+  const openPrefixGroup = async (prefix) => {
+    if (!browse) return
+    setOpenPrefix({ prefix, loading: true, files: [] })
+    const j = await fetch(`/api/repos?action=tree&repo=${encodeURIComponent(browse.repo)}&prefix=${encodeURIComponent(prefix)}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+    if (!j || j.error) { setOpenPrefix({ prefix, error: (j && j.error) || 'net', files: [] }); return }
+    setOpenPrefix({ prefix, files: j.files || [] })
+  }
+
+  // ---- Queue de déplacements ----
+  const runningCount = useMemo(() => moves.filter((m) => m.status === 'running').length, [moves])
+  const queuedCount = useMemo(() => moves.filter((m) => m.status === 'queued').length, [moves])
+  const movesRef = useRef(moves); movesRef.current = moves
+
+  const setMove = (id, patch) => setMoves((arr) => arr.map((m) => (m.id === id ? { ...m, ...patch } : m)))
+
+  const runMove = async (m) => {
+    setMove(m.id, { status: 'running', progress: 0.1 })
+    try {
+      const r = await fetch('/api/upload-shard', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'move-blob', srcRepo: m.srcRepo, dstRepo: m.dstRepo, paths: m.paths, hash: m.hash, sizeBytes: m.sizeBytes }) })
+      const j = await r.json().catch(() => null)
+      if (j && j.ok) {
+        // move-blob renvoie {ok:true, moved, deleted, dstRepo, sourceKept} (modèle PROXY AUTO-RÉSILIENT : le
+        // manifest n'est jamais réécrit, /api/shard retrouve le binaire sur la cible). Pas de champ `rewritten`.
+        // drive-1 : sourceKept=true => la copie a réussi mais une suppression source a échoué (binaire EN DOUBLE).
+        // On affiche alors un état distinct du succès, pas un « Déplacé » trompeur qui laisse croire l'espace libéré.
+        if (j.sourceKept) {
+          setMove(m.id, { status: 'warn', progress: 1, error: 'source-kept' })
+          flashToast(`Copié vers ${m.dstRepo} — source partiellement conservée`)
+        } else {
+          setMove(m.id, { status: 'done', progress: 1 })
+          flashToast(`Déplacé vers ${m.dstRepo}`)
+        }
+      } else {
+        // Tout échec serveur => {error:...} (status 200). La source n'est jamais supprimée avant la copie,
+        // donc une erreur ici signifie "rien déplacé, média toujours servi".
+        setMove(m.id, { status: 'error', progress: 1, error: (j && j.error) || ('http ' + r.status) })
+        flashToast(`Échec déplacement : ${(j && j.error) || r.status}`)
+      }
+    } catch (e) {
+      setMove(m.id, { status: 'error', progress: 1, error: 'net' })
+    }
+    // auto-purge des terminés + rafraîchir tailles (groupé : voir loadDebounced ci-dessus)
+    setTimeout(() => setMoves((arr) => arr.filter((x) => x.id !== m.id || x.status === 'running' || x.status === 'queued')), 5000)
+    loadDebounced()
+  }
+
+  // Planificateur : promeut les 'queued' tant que runningCount < MOVE_CONCURRENCY.
+  useEffect(() => {
+    if (runningCount >= MOVE_CONCURRENCY) return
+    const next = moves.find((m) => m.status === 'queued')
+    if (next) runMove(next)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moves, runningCount])
+
+  // Règle exacte : au-delà de 2 EN COURS + au moins 1 en attente, refuser un nouveau dépôt de move (zone grisée).
+  const moveBlocked = runningCount >= MOVE_CONCURRENCY && queuedCount >= 1
+
+  const enqueueMove = (payload) => {
+    if (moveBlocked) { flashToast('Déplacement en cours — réessaie dans un instant'); return false }
+    setMoves((arr) => [...arr, { id: nextId(), status: 'queued', progress: 0, ...payload }])
+    return true
+  }
+  const enqueueRef = useRef(enqueueMove); enqueueRef.current = enqueueMove
+
+  // Pont pour le fallback "Déplacer vers…" (MoveToMenu émet un CustomEvent).
+  useEffect(() => {
+    const h = (e) => enqueueRef.current(e.detail)
+    window.addEventListener('zr-enqueue-move', h)
+    return () => window.removeEventListener('zr-enqueue-move', h)
+  }, [])
+
+  // ---- DnD entre repos ----
+  const [dropTarget, setDropTarget] = useState(null) // {repo, ok:bool}
+  const onFileDragStart = (e, file) => {
+    if (!browse) return
+    const hash = hashOf(file.path)
+    const thumb = thumbPathOf(file.path)
+    const paths = [file.path, ...(thumb ? [thumb] : [])]
+    const payload = { srcRepo: browse.repo, kind: browse.kind, vis: browse.vis, paths, hash, sizeBytes: file.size }
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('application/zenray-blob', JSON.stringify(payload))
+  }
+  const compatible = (payload, repoName) => {
+    if (!payload || repoName === payload.srcRepo) return false
+    const pd = parseShard(repoName)
+    return !!pd && pd.kind === payload.kind && pd.vis === payload.vis
+  }
+  const readDrag = (e) => { try { return JSON.parse(e.dataTransfer.getData('application/zenray-blob')) } catch { return null } }
+
+  const kindColor = { content: PALETTE.blue, media: PALETTE.primary, 'video-cdn': PALETTE.green, archive: PALETTE.orange, app: PALETTE.gray500 }
+  const card = { background: t.cardBg, border: t.hairline || `1px solid ${t.border}`, borderRadius: RADII.lg, boxShadow: SHADOWS.apple, padding: 18 }
+  const btnGhost = { display: 'inline-flex', alignItems: 'center', gap: 6, background: 'transparent', border: t.hairline || `1px solid ${t.border}`, borderRadius: RADII.sm, color: t.textSecondary, cursor: 'pointer', padding: '6px 11px', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)' }
+
+  return (
+    <div className="zr-stage" style={{ maxWidth: 920, margin: '0 auto', borderRadius: RADII.lg, boxShadow: SHADOWS.apple, padding: 26, position: 'relative' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+        <span style={{ fontFamily: FONTS.sans, fontSize: 24, fontWeight: 700, color: t.textPrimary }}>Drive</span>
+        <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>repos GitHub · quota ~5 Go/repo</span>
+        <a href={`https://github.com/${OWNER}?tab=repositories`} target="_blank" rel="noreferrer" title="Tous mes repos GitHub" style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: PALETTE.primary, textDecoration: 'none' }}>tous mes repos<Icon name="arrow.up.right" size={11} weight={1.8} /></a>
+        <button onClick={load} title="Rafraîchir" style={{ marginLeft: 'auto', ...btnGhost, padding: '6px 9px' }}><Icon name="arrow.clockwise" size={15} weight={1.7} /></button>
+        <div style={{ position: 'relative' }}>
+          <button onClick={() => { setCreateOpen((v) => !v); setCreateMsg(null) }} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: PALETTE.gradient, color: '#fff', border: 'none', borderRadius: RADII.sm, padding: '6px 14px', cursor: 'pointer', fontSize: 'var(--zr-ui-md)', fontWeight: 600, fontFamily: FONTS.sans }}><Icon name="plus" size={14} weight={2} color="#fff" />Nouveau repo</button>
+          {createOpen && (
+            <div style={{ position: 'absolute', right: 0, top: '110%', zIndex: 20, width: 280, ...card, padding: 14, fontFamily: FONTS.sans }}>
+              <div style={{ fontSize: 'var(--zr-ui-sm)', fontWeight: 600, color: t.textSecondary, marginBottom: 7 }}>Type</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+                {KINDS.map((k) => (
+                  <button key={k} onClick={() => setCreateKind(k)} style={{ ...btnGhost, padding: '4px 10px', fontSize: 'var(--zr-ui-sm)', ...(createKind === k ? { background: PALETTE.primarySoft, borderColor: PALETTE.primary, color: PALETTE.primary } : {}) }}>{k}</button>
+                ))}
+              </div>
+              <div style={{ fontSize: 'var(--zr-ui-sm)', fontWeight: 600, color: t.textSecondary, marginBottom: 7 }}>Visibilité</div>
+              <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+                {VIS.map((v) => (
+                  <button key={v} onClick={() => setCreateVis(v)} style={{ ...btnGhost, flex: 1, justifyContent: 'center', padding: '5px 0', fontSize: 'var(--zr-ui-sm)', ...(createVis === v ? { background: PALETTE.primarySoft, borderColor: PALETTE.primary, color: PALETTE.primary } : {}) }}>{v === 'public' ? 'Public' : 'Privé'}</button>
+                ))}
+              </div>
+              {createVis === 'public' && (
+                <div style={{ fontSize: 'var(--zr-ui-xs)', color: PALETTE.orange, lineHeight: 1.5, marginBottom: 10, fontFamily: FONTS.sans }}>Public = CDN gratuit jsDelivr, fichiers hashés, AUCUN nom humain. Ne jamais y mettre de média sensible.</div>
+              )}
+              <button onClick={createShard} disabled={busy} style={{ width: '100%', background: PALETTE.gradient, color: '#fff', border: 'none', borderRadius: RADII.sm, padding: '7px 0', cursor: busy ? 'wait' : 'pointer', fontSize: 'var(--zr-ui-md)', fontWeight: 600, fontFamily: FONTS.sans }}>{busy ? 'Création…' : `Créer zenray-${createKind}-${createVis}-NN`}</button>
+              {createMsg && <div style={{ marginTop: 8, fontSize: 'var(--zr-ui-sm)', color: createMsg.ok ? PALETTE.green : PALETTE.red, fontFamily: FONTS.sans }}>{createMsg.text}</div>}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {!data && <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-md)', padding: 20 }}>chargement…</div>}
+      {data && data.error && <div style={{ color: PALETTE.red, fontSize: 'var(--zr-ui-md)', padding: 20 }}>Erreur : {data.error}</div>}
+
+      {/* Vue ARBORESCENCE d'un repo (objectif 2a) */}
+      {browse && data && data.repos && (
+        <RepoTree
+          t={t} browse={browse} openPrefix={openPrefix}
+          onBack={() => { setBrowse(null); setOpenPrefix(null); setDlFor(null) }}
+          onOpenPrefix={openPrefixGroup}
+          onFileDragStart={onFileDragStart}
+          repos={data.repos}
+          onDownload={(path) => setDlFor({ repo: browse.repo, commit: browse.commit, path })}
+        />
+      )}
+
+      {/* Liste des repos (vue par défaut) */}
+      {!browse && data && data.repos && (() => {
+        // ARCHIVES : les shards d'IMAGES PRIVÉS (zenray-img-private-NN + legacy zenray-media-NN) ne servent PLUS
+        // rien depuis le passage tout-public (tout est sur jsDelivr). On les MASQUE de la vue (les repos restent
+        // intacts sur GitHub = sauvegarde des originaux), avec un toggle pour les réafficher au besoin.
+        // VUE GROUPÉE : les familles de shards (même kind+vis, ex. zenray-vid-public-NN) avec BEAUCOUP de repos
+        // sont repliées en UNE ligne agrégée « famille · N shards · X Go » (barre = somme), dépliables au clic.
+        // État persisté. Les repos hors-famille (zenray-data, app) et petites familles restent en lignes simples.
+        // Calcul mémoïsé dans groupedShownRepos (voir plus haut).
+        const { hiddenCount, shownRepos, fams } = groupedShownRepos
+        const GROUP_MIN = 4 // en-dessous, pas la peine de replier
+        return (
+        <>
+          <div style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, margin: '6px 0 18px' }}>{shownRepos.length} repos · {fmtMB(data.totalMB)} utilisés au total · double-clic pour explorer{hiddenCount > 0 && <> · <button onClick={() => setShowArchives((v) => !v)} style={{ background: 'transparent', border: 'none', color: PALETTE.primary, cursor: 'pointer', font: 'inherit', padding: 0 }}>{showArchives ? 'masquer' : 'afficher'} {hiddenCount} archive{hiddenCount > 1 ? 's' : ''} privée{hiddenCount > 1 ? 's' : ''}</button></>}</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {(() => {
+              const rows = []
+              const seenFam = new Set()
+              for (const r of shownRepos) {
+                const f = famOf(r)
+                if (f && fams.get(f).length >= GROUP_MIN) {
+                  if (seenFam.has(f)) continue
+                  seenFam.add(f)
+                  const list = fams.get(f)
+                  const totalGo = list.reduce((n, x) => n + x.sizeMB, 0) / 1024
+                  const open = !!openFams[f]
+                  const col = kindColor[list[0].kind] || PALETTE.gray500
+                  rows.push(
+                    <div key={`fam:${f}`} style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                      <div onClick={() => toggleFam(f)} style={{ display: 'flex', alignItems: 'center', gap: 8, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)', cursor: 'pointer', borderRadius: RADII.sm, padding: '4px 8px', margin: '-4px -8px' }} title={open ? 'Replier la famille' : 'Déplier les shards'}>
+                        <Icon name={open ? 'chevron.down' : 'chevron.right'} size={12} weight={2} />
+                        <span style={{ width: 8, height: 8, borderRadius: 99, background: col }} />
+                        <span style={{ fontWeight: 600, color: t.textPrimary }}>{f}-*</span>
+                        <span style={{ fontSize: 'var(--zr-ui-2xs)', fontFamily: FONTS.sans, color: t.textSecondary, border: t.hairline || `1px solid ${t.border}`, borderRadius: 5, padding: '0 5px' }}>{list.length} shards</span>
+                        <span style={{ marginLeft: 'auto', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary }}>{totalGo.toFixed(1)} Go au total</span>
+                      </div>
+                      {!open && (
+                        <div style={{ height: 8, borderRadius: 99, background: t.border, overflow: 'hidden', display: 'flex' }}>
+                          {list.map((x) => <div key={x.name} style={{ width: `${100 / list.length}%`, height: '100%', background: col, opacity: 0.35 + 0.65 * Math.min(1, x.pct / 100), borderRight: '1px solid rgba(255,255,255,.35)' }} />)}
+                        </div>
+                      )}
+                      {open && <div style={{ display: 'flex', flexDirection: 'column', gap: 14, paddingLeft: 20 }}>{list.map((x) => renderRepo(x))}</div>}
+                    </div>
+                  )
+                } else rows.push(renderRepo(r))
+              }
+              return rows
+            })()}
+          </div>
+          <div style={{ marginTop: 22, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, lineHeight: 1.6, borderTop: t.hairline || `1px solid ${t.border}`, paddingTop: 14 }}>
+            Familles par type : zenray-&lt;kind&gt;-&lt;public|private&gt;-NN. Un repo dépasse ~5 Go → nouveau shard. Fichiers hashés (noms aléatoires). Déplacement entre repos du MÊME type+visibilité uniquement.
+          </div>
+        </>
+        )
+        // Rendu d'UNE ligne repo (déplacé en function hoistée pour être utilisable par la vue groupée ci-dessus).
+        function renderRepo(r) {
+              const go = fmtMB(r.sizeMB)
+              const warn = r.pct >= 80
+              const shard = parseShard(r.name)
+              // cible de drop : surlignée selon compatibilité avec le payload en cours de drag
+              const dt = dropTarget && dropTarget.repo === r.name ? dropTarget : null
+              const dropDisabled = runningCount >= MOVE_CONCURRENCY
+              return (
+                <div
+                  key={r.name}
+                  onDoubleClick={() => openRepo(r.name)}
+                  onDragOver={shard ? (e) => {
+                    const payload = window.__zrDragPayload
+                    const ok = compatible(payload, r.name) && !dropDisabled
+                    e.preventDefault(); e.dataTransfer.dropEffect = ok ? 'move' : 'none'
+                    if (!dt || dt.ok !== ok) setDropTarget({ repo: r.name, ok })
+                  } : undefined}
+                  onDragLeave={() => setDropTarget((c) => (c && c.repo === r.name ? null : c))}
+                  onDrop={shard ? (e) => {
+                    e.preventDefault(); setDropTarget(null)
+                    const payload = readDrag(e) || window.__zrDragPayload
+                    if (!compatible(payload, r.name)) { flashToast('Type incompatible'); return }
+                    if (dropDisabled) { flashToast('Déplacement en cours — réessaie'); return }
+                    if (payload.multi) { for (const it of payload.multi) enqueueMove({ srcRepo: payload.srcRepo, dstRepo: r.name, paths: it.paths, hash: it.hash, sizeBytes: it.sizeBytes }) }
+                    else enqueueMove({ srcRepo: payload.srcRepo, dstRepo: r.name, paths: payload.paths, hash: payload.hash, sizeBytes: payload.sizeBytes })
+                  } : undefined}
+                  style={{ display: 'flex', flexDirection: 'column', gap: 7, cursor: shard ? 'pointer' : 'default', borderRadius: RADII.sm, padding: '4px 8px', margin: '-4px -8px', outline: dt ? `2px dashed ${dt.ok ? PALETTE.green : PALETTE.red}` : 'none', outlineOffset: 2, transition: 'outline-color .12s' }}
+                  title={shard ? 'Double-clic : explorer l’arborescence' : undefined}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)' }}>
+                    <span style={{ width: 8, height: 8, borderRadius: 99, background: kindColor[r.kind] || PALETTE.gray500 }} />
+                    <span style={{ fontWeight: 600, color: t.textPrimary }}>{r.name}</span>
+                    <a href={`https://github.com/${OWNER}/${r.name}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()} title="Ouvrir le repo sur GitHub" style={{ display: 'inline-flex', color: t.textSecondary, lineHeight: 0 }}><Icon name="arrow.up.right" size={12} weight={1.8} /></a>
+                    {r.private
+                      ? <span style={{ fontSize: 'var(--zr-ui-2xs)', fontFamily: FONTS.sans, color: t.textSecondary, border: t.hairline || `1px solid ${t.border}`, borderRadius: 5, padding: '0 5px', display: 'inline-flex', alignItems: 'center', gap: 3 }}><Icon name="lock" size={9} weight={1.8} />privé</span>
+                      : <span style={{ fontSize: 'var(--zr-ui-2xs)', fontFamily: FONTS.sans, color: PALETTE.green, border: `1px solid ${PALETTE.green}`, borderRadius: 5, padding: '0 5px', display: 'inline-flex', alignItems: 'center', gap: 3 }}><Icon name="globe" size={9} weight={1.8} color={PALETTE.green} />public</span>}
+                    <span style={{ marginLeft: 'auto', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', color: warn ? PALETTE.orange : t.textSecondary }}>{go} / 5 Go · {r.pct}%</span>
+                  </div>
+                  <div style={{ height: 8, borderRadius: 99, background: t.border, overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.max(2, r.pct)}%`, height: '100%', background: warn ? PALETTE.orange : PALETTE.green }} />
+                  </div>
+                </div>
+              )
+        } })()}
+
+      {/* Panneau de liens de téléchargement (repo public, objectifs 4/5) */}
+      {dlFor && <DownloadPanel t={t} {...dlFor} onClose={() => setDlFor(null)} onCopied={() => flashToast('Copié')} />}
+
+      {/* Indicateur de file de déplacements + zone grisée */}
+      {moves.length > 0 && (
+        <div style={{ position: 'fixed', right: 22, bottom: 22, width: 300, zIndex: 30, ...card, padding: 12, fontFamily: FONTS.sans }}>
+          <div style={{ fontSize: 'var(--zr-ui-sm)', fontWeight: 700, color: t.textPrimary, marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
+            Déplacements
+            {moveBlocked && <span style={{ fontSize: 'var(--zr-ui-2xs)', fontFamily: FONTS.sans, color: PALETTE.orange, marginLeft: 'auto' }}>file pleine (max {MOVE_CONCURRENCY})</span>}
+          </div>
+          {moves.map((m) => (
+            <div key={m.id} style={{ marginBottom: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 'var(--zr-ui-xs)', fontFamily: FONTS.sans, color: t.textSecondary }}>
+                <span style={{ color: m.status === 'error' ? PALETTE.red : m.status === 'warn' ? PALETTE.orange : m.status === 'done' ? PALETTE.green : t.textPrimary }}>{m.srcRepo} → {m.dstRepo}</span>
+                <span style={{ marginLeft: 'auto' }}>{m.status === 'queued' ? 'en attente' : m.status === 'running' ? '…' : m.status === 'done' ? 'ok' : m.status === 'warn' ? 'source conservée' : (m.error || 'err')}</span>
+              </div>
+              <div style={{ height: 4, borderRadius: 99, background: t.border, overflow: 'hidden', marginTop: 3 }}>
+                <div style={{ width: `${Math.round((m.progress || 0) * 100)}%`, height: '100%', background: m.status === 'error' ? PALETTE.red : m.status === 'warn' ? PALETTE.orange : m.status === 'done' ? PALETTE.green : PALETTE.primary, transition: 'width .3s' }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {toast && (
+        <div style={{ position: 'fixed', left: '50%', bottom: 28, transform: 'translateX(-50%)', zIndex: 40, background: t.textPrimary, color: t.cardBg, padding: '8px 16px', borderRadius: RADII.sm, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)', boxShadow: SHADOWS.apple }}>{toast}</div>
+      )}
+    </div>
+  )
+}
+
+// ---- Sous-vue : arborescence d'un repo ----
+function RepoTree({ t, browse, openPrefix, onBack, onOpenPrefix, onFileDragStart, repos, onDownload }) {
+  const FONTS2 = FONTS
+  const compatRepos = useMemo(() => {
+    const p = parseShard(browse.repo)
+    if (!p) return []
+    return (repos || []).filter((r) => { const pr = parseShard(r.name); return pr && pr.kind === p.kind && pr.vis === p.vis && r.name !== browse.repo }).map((r) => r.name)
+  }, [repos, browse.repo])
+  // SÉLECTION MULTIPLE (Shift+clic) dans la liste de fichiers du préfixe ouvert.
+  const [sel, setSel] = useState(() => new Set()) // paths sélectionnés
+  const lastIdx = useRef(-1)
+  useEffect(() => { setSel(new Set()); lastIdx.current = -1 }, [openPrefix && openPrefix.prefix]) // reset au changement de préfixe
+  const files = (openPrefix && openPrefix.files) || []
+  const onRowClick = (e, f, i) => {
+    if (e.shiftKey && lastIdx.current >= 0) { // plage
+      const [lo, hi] = lastIdx.current < i ? [lastIdx.current, i] : [i, lastIdx.current]
+      const next = e.metaKey || e.ctrlKey ? new Set(sel) : new Set()
+      for (let k = lo; k <= hi; k++) next.add(files[k].path)
+      setSel(next)
+    } else if (e.metaKey || e.ctrlKey) { // toggle
+      const next = new Set(sel); next.has(f.path) ? next.delete(f.path) : next.add(f.path); setSel(next); lastIdx.current = i
+    } else { // simple
+      setSel(new Set([f.path])); lastIdx.current = i
+    }
+  }
+  // Déplacement GROUPÉ de la sélection vers un repo cible : enfile chaque fichier (la queue borne la concurrence à 2).
+  const enqueueSelection = (dstRepo) => {
+    for (const f of files) {
+      if (!sel.has(f.path)) continue
+      window.dispatchEvent(new CustomEvent('zr-enqueue-move', { detail: { srcRepo: browse.repo, dstRepo, paths: [f.path, ...(thumbPathOf(f.path) ? [thumbPathOf(f.path)] : [])], hash: hashOf(f.path), sizeBytes: f.size } }))
+    }
+    setSel(new Set())
+  }
+
+  return (
+    <div style={{ fontFamily: FONTS2.sans }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0 14px' }}>
+        <button onClick={onBack} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: 'transparent', border: t.hairline || `1px solid ${t.border}`, borderRadius: RADII.sm, color: t.textSecondary, cursor: 'pointer', padding: '5px 10px', fontSize: 'var(--zr-ui-md)' }}><Icon name="chevron.left" size={13} weight={2} />Retour</button>
+        <span style={{ fontWeight: 600, color: t.textPrimary, fontSize: 'var(--zr-ui-xl)' }}>{browse.repo}</span>
+        {browse.private === false && <span style={{ fontSize: 'var(--zr-ui-2xs)', fontFamily: FONTS2.mono, color: PALETTE.green, border: `1px solid ${PALETTE.green}`, borderRadius: 5, padding: '0 5px' }}>public</span>}
+        {browse.truncated && <span style={{ fontSize: 'var(--zr-ui-2xs)', fontFamily: FONTS2.mono, color: PALETTE.orange }}>totaux approximatifs (arbre tronqué)</span>}
+      </div>
+
+      {sel.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px', marginBottom: 10, borderRadius: RADII.sm, background: PALETTE.primarySoft, border: `1px solid ${PALETTE.primary}`, fontSize: 'var(--zr-ui-sm)', fontFamily: FONTS2.sans }}>
+          <span style={{ fontWeight: 600, color: PALETTE.primary }}>{sel.size} fichier{sel.size > 1 ? 's' : ''} sélectionné{sel.size > 1 ? 's' : ''}</span>
+          {compatRepos.length > 0
+            ? <BulkMoveMenu t={t} targets={compatRepos} onPick={enqueueSelection} />
+            : <span style={{ color: t.textSecondary }}>aucun repo compatible</span>}
+          <button onClick={() => setSel(new Set())} style={{ marginLeft: 'auto', background: 'transparent', border: 'none', color: t.textSecondary, cursor: 'pointer', fontSize: 'var(--zr-ui-sm)' }}>Désélectionner</button>
+        </div>
+      )}
+      {browse.loading && <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-md)', padding: 14 }}>lecture de l’arborescence…</div>}
+      {browse.error && <div style={{ color: PALETTE.red, fontSize: 'var(--zr-ui-md)', padding: 14 }}>Erreur : {browse.error}</div>}
+
+      {browse.groups && (
+        <>
+          <div style={{ fontFamily: FONTS2.mono, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, marginBottom: 12 }}>{browse.totalFiles} fichiers · {fmtBytes(browse.totalBytes)} · {browse.groups.length} groupes (préfixe 2 car.)</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            {browse.groups.map((g) => {
+              const open = openPrefix && openPrefix.prefix === g.prefix
+              return (
+                <div key={g.prefix}>
+                  <div onClick={() => (open ? onOpenPrefix(null) : onOpenPrefix(g.prefix))} className="zr-treeitem" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', borderRadius: RADII.sm, cursor: 'pointer', fontSize: 'var(--zr-ui-md)' }}>
+                    <Icon name={open ? 'chevron.down' : 'chevron.right'} size={12} weight={2} color={t.textSecondary} />
+                    <Icon name="folder" size={15} weight={1.6} color={PALETTE.blue} />
+                    <span style={{ fontFamily: FONTS2.mono, color: t.textPrimary }}>{g.prefix}/</span>
+                    <span style={{ marginLeft: 'auto', fontFamily: FONTS2.mono, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>{g.files == null ? (open && openPrefix.files ? `${openPrefix.files.length} fichiers` : 'ouvrir pour compter') : `${g.files} fichiers · ${fmtBytes(g.bytes)}`}</span>
+                  </div>
+                  {open && openPrefix.loading && <div style={{ paddingLeft: 34, color: t.textSecondary, fontSize: 'var(--zr-ui-sm)', padding: '4px 0 4px 34px' }}>chargement…</div>}
+                  {open && openPrefix.error && <div style={{ paddingLeft: 34, color: PALETTE.red, fontSize: 'var(--zr-ui-sm)' }}>Erreur : {openPrefix.error}</div>}
+                  {open && openPrefix.files && openPrefix.files.map((f, i) => (
+                    <div
+                      key={f.path}
+                      draggable
+                      onClick={(e) => onRowClick(e, f, i)}
+                      onDragStart={(e) => { const movingPaths = sel.has(f.path) ? files.filter((x) => sel.has(x.path)) : [f]; window.__zrDragPayload = movingPaths.length > 1 ? { srcRepo: browse.repo, kind: browse.kind, vis: browse.vis, multi: movingPaths.map((x) => ({ paths: [x.path, ...(thumbPathOf(x.path) ? [thumbPathOf(x.path)] : [])], hash: hashOf(x.path), sizeBytes: x.size })) } : { srcRepo: browse.repo, kind: browse.kind, vis: browse.vis, paths: [f.path, ...(thumbPathOf(f.path) ? [thumbPathOf(f.path)] : [])], hash: hashOf(f.path), sizeBytes: f.size }; onFileDragStart(e, f) }}
+                      onDragEnd={() => { window.__zrDragPayload = null }}
+                      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px 4px 34px', borderRadius: RADII.sm, fontSize: 'var(--zr-ui-sm)', cursor: 'grab', background: sel.has(f.path) ? PALETTE.primarySoft : 'transparent' }}
+                      className="zr-treeitem"
+                      title="Clic = sélectionner · Shift+clic = plage · glisser vers un repo compatible"
+                    >
+                      <Icon name="doc" size={13} weight={1.6} color={sel.has(f.path) ? PALETTE.primary : t.textSecondary} />
+                      <span style={{ fontFamily: FONTS2.mono, color: t.textPrimary }}>{f.path}</span>
+                      <span style={{ marginLeft: 'auto', fontFamily: FONTS2.mono, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>{fmtBytes(f.size)}</span>
+                      {browse.private === false && <button onClick={(e) => { e.stopPropagation(); onDownload(f.path) }} style={{ background: 'transparent', border: 'none', color: PALETTE.primary, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 3, fontSize: 'var(--zr-ui-xs)' }}><Icon name="arrow.down.right" size={12} weight={1.8} color={PALETTE.primary} />lien</button>}
+                      {compatRepos.length > 0 && <MoveToMenu t={t} file={f} browse={browse} targets={compatRepos} />}
+                    </div>
+                  ))}
+                </div>
+              )
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+// Déplacement GROUPÉ de la sélection : menu de repos cibles compatibles.
+function BulkMoveMenu({ t, targets, onPick }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <span style={{ position: 'relative' }}>
+      <button onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: PALETTE.primary, color: '#fff', border: 'none', borderRadius: RADII.sm, padding: '4px 11px', cursor: 'pointer', fontSize: 'var(--zr-ui-sm)', fontWeight: 600, fontFamily: FONTS.sans }}><Icon name="arrow.up.right" size={12} weight={2} color="#fff" />Déplacer vers…</button>
+      {open && (
+        <div onClick={(e) => e.stopPropagation()} style={{ position: 'absolute', left: 0, top: '120%', zIndex: 25, minWidth: 190, background: t.cardBg, border: t.hairline || `1px solid ${t.border}`, borderRadius: RADII.sm, boxShadow: SHADOWS.apple, padding: 6 }}>
+          {targets.map((name) => (
+            <div key={name} onClick={() => { setOpen(false); onPick(name) }} className="zr-treeitem" style={{ padding: '5px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 'var(--zr-ui-sm)', fontFamily: FONTS.sans, color: t.textPrimary }}>{name}</div>
+          ))}
+        </div>
+      )}
+    </span>
+  )
+}
+
+// Fallback "interface classique" : menu Déplacer vers… (sans DnD)
+function MoveToMenu({ t, file, browse, targets }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <span style={{ position: 'relative' }}>
+      <button onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }} style={{ background: 'transparent', border: 'none', color: t.textSecondary, cursor: 'pointer', fontSize: 'var(--zr-ui-xs)', fontFamily: FONTS.sans }} title="Déplacer vers un repo compatible">déplacer</button>
+      {open && (
+        <div onClick={(e) => e.stopPropagation()} style={{ position: 'absolute', right: 0, top: '120%', zIndex: 25, minWidth: 180, background: t.cardBg, border: t.hairline || `1px solid ${t.border}`, borderRadius: RADII.sm, boxShadow: SHADOWS.apple, padding: 6 }}>
+          {targets.map((name) => (
+            <div key={name} onClick={() => {
+              setOpen(false)
+              const ev = new CustomEvent('zr-enqueue-move', { detail: { srcRepo: browse.repo, dstRepo: name, paths: [file.path, ...(thumbPathOf(file.path) ? [thumbPathOf(file.path)] : [])], hash: hashOf(file.path), sizeBytes: file.size } })
+              window.dispatchEvent(ev)
+            }} className="zr-treeitem" style={{ padding: '5px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 'var(--zr-ui-sm)', fontFamily: FONTS.sans, color: t.textPrimary }}>{name}</div>
+          ))}
+        </div>
+      )}
+    </span>
+  )
+}
+
+// ---- Panneau liens de téléchargement (repo public) ----
+function DownloadPanel({ t, repo, commit, path, onClose, onCopied }) {
+  const base = path.split('/').pop()
+  const jsd = buildJsDelivrUrl(repo, commit, path)
+  const raw = commit ? `https://raw.githubusercontent.com/${OWNER}/${repo}/${commit}/${path}` : null
+  const dir = path.split('/').slice(0, -1).join('/')
+  const cmds = [
+    { label: 'curl (un fichier)', text: `curl -L -o ${base} "${jsd || raw}"` },
+    { label: 'git sparse-checkout (un fichier, sans blobs)', text: `git clone --filter=blob:none --no-checkout --depth 1 https://github.com/${OWNER}/${repo}.git r && cd r && git sparse-checkout set --no-cone "${path}" && git checkout` },
+    { label: 'npx degit (sous-dossier)', text: `npx degit ${OWNER}/${repo}/${dir} dest` },
+  ]
+  const copy = (txt) => { try { navigator.clipboard.writeText(txt); onCopied && onCopied() } catch {} }
+  const block = { fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: t.textPrimary, background: t.border, borderRadius: RADII.sm, padding: '8px 10px', whiteSpace: 'pre-wrap', wordBreak: 'break-all', lineHeight: 1.5 }
+  const lbl = { fontSize: 'var(--zr-ui-xs)', fontWeight: 600, color: t.textSecondary, margin: '12px 0 4px', display: 'flex', alignItems: 'center', gap: 8 }
+  const copyBtn = { background: 'transparent', border: 'none', color: PALETTE.primary, cursor: 'pointer', fontSize: 'var(--zr-ui-xs)', fontFamily: FONTS.sans }
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(0,0,0,.28)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 560, maxWidth: '92vw', maxHeight: '84vh', overflow: 'auto', background: t.cardBg, border: t.hairline || `1px solid ${t.border}`, borderRadius: RADII.lg, boxShadow: SHADOWS.apple, padding: 22, fontFamily: FONTS.sans }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+          <span style={{ fontSize: 'var(--zr-ui-3xl)', fontWeight: 700, color: t.textPrimary }}>Lien de téléchargement</span>
+          <button onClick={onClose} style={{ marginLeft: 'auto', background: 'transparent', border: 'none', cursor: 'pointer', color: t.textSecondary }}><Icon name="xmark" size={16} weight={2} /></button>
+        </div>
+        <div style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary, marginBottom: 8 }}>{repo} @ {commit ? commit.slice(0, 7) : '—'} · {path}</div>
+
+        {jsd && (<>
+          <div style={lbl}>jsDelivr (CDN, pinné sur commit, immuable)<button style={copyBtn} onClick={() => copy(jsd)}>Copier</button></div>
+          <div style={block}>{jsd}</div>
+        </>)}
+        {raw && (<>
+          <div style={lbl}>raw GitHub (pinné sur commit)<button style={copyBtn} onClick={() => copy(raw)}>Copier</button></div>
+          <div style={block}>{raw}</div>
+        </>)}
+        {cmds.map((c) => (
+          <React.Fragment key={c.label}>
+            <div style={lbl}>{c.label}<button style={copyBtn} onClick={() => copy(c.text)}>Copier</button></div>
+            <div style={block}>{c.text}</div>
+          </React.Fragment>
+        ))}
+        <div style={{ fontSize: 'var(--zr-ui-xs)', color: t.textSecondary, marginTop: 14, lineHeight: 1.5 }}>degit récupère un sous-dossier (granularité dossier) ; pour UN seul fichier précis, curl ou sparse-checkout sont exacts.</div>
+      </div>
+    </div>
+  )
+}

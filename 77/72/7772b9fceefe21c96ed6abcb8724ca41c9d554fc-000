@@ -1,0 +1,228 @@
+// 12 October 2026 17:20 CEST: deterministic, release-consistent corpus lookup and lesson cooking.
+export const CORPUS_CONFIG = Object.freeze({
+  cataloguePath: 'Memory/Japanese/Site/corpus/catalogue.json',
+  coveragePath: 'Memory/Japanese/Site/corpus/coverage.json',
+  resultLimit: 40,
+  shardCount: 256,
+  cachedShards: 12,
+  concurrentReads: 4,
+  lesson: Object.freeze({ maxNewItems: 1, maxDrills: 3, minutes: 15, pauseMinutes: 2 }),
+})
+
+const accents = Object.fromEntries(Array.from('àâäéèêëîïôöùûüÿç').map((letter, index) => [letter, 'aaaeeeeiioouuuyc'[index]]))
+export function normalizeCorpusText(value) {
+  return String(value || '').normalize('NFKC').toLowerCase().replaceAll('œ', 'oe').replace(/[àâäéèêëîïôöùûüÿç]/g, (letter) => accents[letter])
+}
+export function corpusTokens(value) {
+  return [...new Set(normalizeCorpusText(value).match(/[\p{L}\p{N}_]+/gu) || [])]
+}
+export function corpusBucket(value, count = CORPUS_CONFIG.shardCount) {
+  let hash = 2166136261
+  for (const character of String(value)) hash = Math.imul(hash ^ character.codePointAt(0), 16777619) >>> 0
+  return hash % count
+}
+export function searchBucket(token, count = CORPUS_CONFIG.shardCount) {
+  return corpusBucket(Array.from(token).slice(0, 2).join(''), count)
+}
+export function filterCorpusCards(cards, { domain = '', level = '' } = {}) {
+  return cards.filter((card) => (!domain || card.domain === domain) && (!level || card.level === level))
+}
+export function rankCorpusRecords(records, query, curatedIds = new Set()) {
+  const normalized = normalizeCorpusText(query).trim()
+  const score = (record) => (normalizeCorpusText(record.title) === normalized ? 100 : 0)
+    + ((record.aliases || []).some((alias) => normalizeCorpusText(alias) === normalized) ? 60 : 0)
+    + (curatedIds.has(record.id) ? 20 : 0)
+  return [...records].sort((a, b) => score(b) - score(a))
+}
+
+export function createLatestRequest() {
+  let revision = 0
+  return { start: () => ++revision, isCurrent: (ticket) => revision === ticket, cancel: () => ++revision }
+}
+
+export function createCorpusClient(readJson, config = CORPUS_CONFIG) {
+  const cache = new Map()
+  const pending = new Map()
+  let catalogue
+  async function read(path, validate) {
+    if (cache.has(path)) {
+      const value = cache.get(path)
+      cache.delete(path); cache.set(path, value)
+      return value
+    }
+    if (!pending.has(path)) {
+      const promise = Promise.resolve().then(() => readJson(path)).then((value) => {
+        if (!validate(value)) throw new Error(`Données du corpus invalides : ${path}`)
+        cache.set(path, value)
+        while (cache.size > config.cachedShards) cache.delete(cache.keys().next().value)
+        return value
+      }).finally(() => pending.delete(path))
+      pending.set(path, promise)
+    }
+    return pending.get(path)
+  }
+  async function getCatalogue() {
+    if (catalogue) return catalogue
+    catalogue = await read(config.cataloguePath, (value) => value?.schemaVersion === 1 && Array.isArray(value.cards) && typeof value.basePath === 'string')
+    return catalogue
+  }
+  async function recordsByIds(ids, head) {
+    const groups = new Map()
+    for (const id of ids) {
+      const bucket = corpusBucket(id, head.recordShards || config.shardCount)
+      if (!groups.has(bucket)) groups.set(bucket, new Set())
+      groups.get(bucket).add(id)
+    }
+    const batches = [...groups.entries()]
+    const found = []
+    for (let offset = 0; offset < batches.length; offset += config.concurrentReads) {
+      const results = await Promise.all(batches.slice(offset, offset + config.concurrentReads).map(async ([bucket, wanted]) => {
+        const records = await read(`${head.basePath}/records/${String(bucket).padStart(3, '0')}.json`, Array.isArray)
+        const matches = records.filter((record) => wanted.has(record.id))
+        if (matches.length !== wanted.size) throw new Error('Une fiche manque dans cette version du corpus. Réessayer ou actualiser la page.')
+        return matches
+      }))
+      found.push(...results.flat())
+    }
+    return found
+  }
+  async function search(query, filters = {}) {
+    const tokens = corpusTokens(query)
+    if (!tokens.length) return []
+    const head = await getCatalogue()
+    const buckets = [...new Set(tokens.map((token) => searchBucket(token, head.searchShards || config.shardCount)))]
+    const shards = new Map(await Promise.all(buckets.map(async (bucket) => [bucket,
+      await read(`${head.basePath}/search/${String(bucket).padStart(3, '0')}.json`, (value) => !!value && !Array.isArray(value) && typeof value === 'object'),
+    ])))
+    let candidates
+    const exact = new Set()
+    for (const token of tokens) {
+      const shard = shards.get(searchBucket(token, head.searchShards || config.shardCount))
+      const matched = new Set()
+      for (const [word, ids] of Object.entries(shard)) {
+        if (!word.startsWith(token)) continue
+        for (const id of ids) { matched.add(id); if (word === token) exact.add(id) }
+      }
+      candidates = candidates ? new Set([...candidates].filter((id) => matched.has(id))) : matched
+    }
+    const curatedCards = new Map(head.cards.map((card) => [card.id, card]))
+    const curated = new Set(curatedCards.keys())
+    const candidateMatches = (id) => {
+      const card = curatedCards.get(id)
+      const domain = card?.domain || (id.startsWith('word-') ? 'dictionary' : id.startsWith('kanji-') ? 'kanji' : id.startsWith('sentence-') ? 'sentence' : '')
+      const level = card?.level || 'unclassified'
+      return (!filters.domain || domain === filters.domain) && (!filters.level || level === filters.level)
+    }
+    const prioritized = [...(candidates || [])].filter(candidateMatches).sort((a, b) => (Number(curated.has(b)) * 2 + Number(exact.has(b))) - (Number(curated.has(a)) * 2 + Number(exact.has(a))))
+    return rankCorpusRecords(filterCorpusCards(await recordsByIds(prioritized.slice(0, config.resultLimit), head), filters), query, curated)
+  }
+  // 15 October 2026, 10:00 CEST: coverage is evidence for the loaded release, never a count of cards.
+  async function getCoverage() {
+    const head = await getCatalogue()
+    return read(config.coveragePath, value => value?.schemaVersion === 1 && value.release === head.release
+      && value.completeAudit === true && Number.isInteger(value.counts?.covered) && Number.isInteger(value.counts?.open)
+      && value.counts.covered + value.counts.open === value.requirements?.length)
+  }
+  return { getCatalogue, getCoverage, search, getRecord: async (id) => (await recordsByIds([id], await getCatalogue()))[0] }
+}
+
+export function originalExamples(record) {
+  if (record.status === 'source-imported') return []
+  return (record.examples || []).filter((example) => example.ja && example.fr && /original/i.test(example.origin || example.provenance || ''))
+}
+// 13 October 2026 00:07 CEST: approval binds all record content to two reviewers; missing evidence fails closed.
+export function canonicalLessonContent(record) {
+  const { lessonValidation, lessonContentHash, ...content } = record
+  const compareKeys = (a, b) => {
+    const left = Array.from(a, (letter) => letter.codePointAt(0)); const right = Array.from(b, (letter) => letter.codePointAt(0))
+    for (let index = 0; index < Math.min(left.length, right.length); index++) if (left[index] !== right[index]) return left[index] - right[index]
+    return left.length - right.length
+  }
+  const encode = (value) => Array.isArray(value) ? `[${value.map(encode).join(',')}]`
+    : value && typeof value === 'object' ? `{${Object.keys(value).sort(compareKeys).map((key) => `${JSON.stringify(key)}:${encode(value[key])}`).join(',')}}` : JSON.stringify(value)
+  return encode(content)
+}
+export async function lessonContentHash(record) {
+  const bytes = new TextEncoder().encode(canonicalLessonContent(record))
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes)
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+export async function lessonValidationIssue(record) {
+  const approval = record?.lessonValidation
+  if (approval?.status !== 'approved') return 'Approbation de la leçon absente.'
+  if (record.lessonContentVersion !== '1'
+    || approval.contentVersion !== record.lessonContentVersion) return 'Version de validation absente ou périmée.'
+  if (!Array.isArray(approval.reviewerIds) || approval.reviewerIds.some((id) => typeof id !== 'string' || !id.trim())
+    || new Set(approval.reviewerIds.map((id) => id.trim())).size < 2) return 'Deux relecteurs distincts sont requis.'
+  if (!Array.isArray(approval.evidenceUrls) || !approval.evidenceUrls.length || approval.evidenceUrls.some((url) => {
+    try { return new URL(url).protocol !== 'https:' } catch { return true }
+  })) return 'Preuves de relecture absentes ou invalides.'
+  if (!Array.isArray(approval.unresolvedFindings) || approval.unresolvedFindings.length) return 'Des remarques restent ouvertes ou leur état manque.'
+  if (!/^[a-f0-9]{64}$/.test(record.lessonContentHash || '') || approval.contentHash !== record.lessonContentHash) return 'Empreinte de validation absente ou périmée.'
+  try {
+    if (await lessonContentHash(record) !== record.lessonContentHash) return 'Contenu modifié depuis la validation.'
+  } catch { return 'Vérification de l’empreinte indisponible.' }
+  return ''
+}
+export async function corpusLessonValidationIssue(records, learner = {}) {
+  if (!records.length) return 'Choisir une fiche validée.'
+  for (const record of records) {
+    const issue = await lessonValidationIssue(record)
+    if (issue) return `${record.title || record.id || 'Fiche'} : ${issue}`
+  }
+  if (learner.retestItems != null && !Array.isArray(learner.retestItems)) return 'Retest : données invalides.'
+  if (learner.retestItems?.length) {
+    const issue = await lessonValidationIssue(learner)
+    if (issue) return `Retest : ${issue}`
+  }
+  return ''
+}
+export async function cookCorpusLesson(records, { script = 'kana', activity = 'oral', date = '12 October 2026', learner = {} } = {}, config = CORPUS_CONFIG) {
+  const validationIssue = await corpusLessonValidationIssue(records, learner)
+  if (validationIssue) throw new Error(`Leçon bloquée : ${validationIssue}`)
+  const lessonConfig = { ...CORPUS_CONFIG.lesson, ...(config.lesson || {}) }
+  const selected = records.slice(0, lessonConfig.maxNewItems)
+  const exercises = selected.flatMap((record) => originalExamples(record).slice(0, lessonConfig.maxDrills).map((example) => ({
+    recordId: record.id,
+    prompt: example.fr,
+    answer: script === 'kana' && example.reading ? example.reading : example.ja,
+    mixed: example.ja,
+    reading: example.reading || '',
+    activity,
+  }))).slice(0, lessonConfig.maxDrills)
+  if (script === 'kana' && selected.some((record) => originalExamples(record).some((example) => /\p{Script=Han}/u.test(example.ja) && !example.reading))) {
+    throw new Error('Une lecture en kana manque dans cette sélection. Choisir kanji et kana ou une fiche avec lecture attestée.')
+  }
+  const retestItems = (learner.retestItems || []).filter((item) => item.fr && item.ja).slice(0, 2)
+  const lines = [`# Leçon préparée, ${date}`, '', `Durée : ${lessonConfig.minutes} minutes, puis ${lessonConfig.pauseMinutes} minutes de pause.`, '',
+    activity === 'oral' ? 'ORAL : n’écris PAS, dis à voix haute.' : 'LECTURE : lire, puis restituer.', '',
+    'Corpus documentaire, aucun acquis enregistré. Niveaux pédagogiques estimés ; validation éditoriale liée au contenu, sans garantie de maîtrise.', '',
+    '## Retest', '', 'Avant de lire, restituer le point étudié lors de la séance précédente. Si aucun point précédent n’est connu, dire « non évalué ».', '',
+    ]
+  for (const [index, item] of retestItems.entries()) lines.push(`${index + 1}. ${item.fr}`, '', '<details><summary>Réponse du retest</summary>', '', item.ja, '', '</details>', '')
+  lines.push('## Neuf', '')
+  const cell = (value) => String(value || '').replaceAll('|', '\\|').replaceAll('\n', ' ')
+  for (const record of selected) {
+    lines.push(`### ${record.title}`, '')
+    if (originalExamples(record).length) {
+      lines.push('| Japonais et lecture | Français |', '|---|---|')
+      for (const example of originalExamples(record).slice(0, lessonConfig.maxDrills)) lines.push(`| ${cell(script === 'kana' && example.reading ? example.reading : example.ja)} | ${cell(example.fr)} |`)
+      lines.push('')
+    }
+    lines.push(record.explanationFr || record.markdown || 'Fiche de référence.', '')
+    if (record.glossLanguages?.length) lines.push(`Langue des définitions : ${record.glossLanguages.join(', ')}.`, '')
+    if (!originalExamples(record).length) lines.push('Référence uniquement : aucun exercice original disponible dans cette fiche.', '')
+  }
+  lines.push('## Drill', '')
+  if (!exercises.length) lines.push('Aucun exercice original disponible pour cette sélection. Consulter les références ou choisir une fiche pédagogique.', '')
+  for (const [index, exercise] of exercises.entries()) lines.push(`${index + 1}. ${activity === 'oral' ? 'Dire à voix haute' : 'Lire, puis restituer'} : ${exercise.prompt}`, '', '<details><summary>Réponse de référence</summary>', '', exercise.answer, '', '</details>', '')
+  lines.push('## Sources et droits', '')
+  const urls = new Set()
+  for (const record of selected) for (const source of record.sources || []) {
+    if (urls.has(source.url)) continue
+    urls.add(source.url)
+    lines.push(`- [${source.title || source.publisher || source.url}](${source.url}), ${source.publisher || ''}, ${source.license || 'droits à vérifier'}, vérifié : ${source.checkedAt || 'date non fournie'}.`)
+  }
+  lines.push('', '## Fin de séance', '', 'Noter ce qui est restitué et ce qui reste non évalué. Une consultation ou un téléchargement ne prouve pas une maîtrise.', '', 'FINI : pause de deux minutes.', '')
+  return { markdown: lines.join('\n'), exercises, retestItems, records: selected, referenceOnly: exercises.length === 0 }
+}

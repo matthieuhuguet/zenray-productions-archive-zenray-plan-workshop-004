@@ -1,0 +1,188 @@
+// rename-drives-git.mjs — RENOMME les shards IMAGE PRIVÉE legacy zenray-media-NN -> zenray-img-private-NN.
+//
+// ⚠️ STATUT : LEGACY / OBSOLÈTE — NE PAS LANCER EN --apply EN L'ÉTAT.
+//   1. L'étape A fait `gh repo rename`, ce qui VIOLE une contrainte P0 actuelle (« JAMAIS gh repo rename »).
+//   2. Le rename n'est de toute façon PLUS NÉCESSAIRE : le PROXY AUTO-RÉSILIENT (server/shard.js) retrouve
+//      déjà le binaire au même chemin haché sur les anciens zenray-media-NN comme sur les nouveaux
+//      zenray-img-private-NN (il scanne les DEUX familles, voir shard.js cands), et defaultShard/nextShard
+//      créent désormais les FUTURS shards directement sous le nouveau nom. La SEULE vérité de relocalisation
+//      binaire est donc le proxy, qui n'exige aucune réécriture de manifest ni aucun rename de repo.
+//   => Les anciens zenray-media-NN restent en place, lus tels quels par parseShard/proxy ; ce script ne sert
+//      plus qu'à un éventuel chantier de cohérence cosmétique, à n'exécuter QUE si la contrainte P0 est levée.
+//
+// POURQUOI (intention historique) : aligner le nommage des drives sur le schéma générique zenray-<kind>-<vis>-NN
+// (objectif 1 du chantier Drive). Les anciens repos s'appelaient zenray-media-NN (= img/private historique).
+// On voulait qu'ils portent zenray-img-private-NN, comme toutes les autres familles (audio/doc/table…).
+//
+// CE QU'IL FAIT, en deux temps :
+//   A) gh repo rename : pour chaque zenray-media-NN du compte -> zenray-img-private-NN.
+//      GitHub pose une REDIRECTION old->new (les anciennes URLs continuent de répondre), donc zéro casse
+//      pendant la transition tant que le code accepte les DEUX noms (déjà le cas : shardRe + parseShard).
+//   B) EN TRANSPORT GIT (clone local, jamais API REST en masse) : dans zenray-data, on remplace dans TOUS les
+//      manifests .img.json le champ repo "zenray-media-NN" -> "zenray-img-private-NN", et on migre le fichier
+//      d'état pages/.zr-drive.json (champ active). Puis 1 commit + push.
+//
+// SÉCURITÉ (P0) : DRY-RUN par défaut. Sans --apply, AUCUN rename, AUCUN push : on clone zenray-data en shallow,
+// on calcule le diff, on l'affiche, on s'arrête. --apply pour exécuter pour de vrai.
+//
+// ANTI-FUITE P0 : les chemins de manifests dans zenray-data sont privés (jamais publiés). Le message de commit
+// ne contient aucun nom humain (juste "rename drives: zenray-media-NN -> zenray-img-private-NN"). OK.
+//
+// ORDRE D'EXÉCUTION POUR ZÉRO DOWNTIME (IMPÉRATIF) :
+//   1. Déployer d'ABORD le CODE qui accepte les DEUX noms ET fait pointer les FUTURS shards img/private sur
+//      zenray-img-private-NN (modifs upload-shard.js / repos.js / shard-naming.js de ce chantier).
+//   2. ENSUITE seulement lancer ce script en --apply. Avant l'étape 1, le rename casserait le proxy/upload.
+//
+// USAGE :
+//   GITHUB_TOKEN=$(gh auth token) node scripts/rename-drives-git.mjs            # DRY-RUN (défaut)
+//   GITHUB_TOKEN=$(gh auth token) node scripts/rename-drives-git.mjs --apply    # exécute (rename + git push)
+//
+// PRÉREQUIS : `gh` authentifié (gh auth status) pour l'étape A (gh repo rename). Étape B utilise git + token.
+
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs'
+import path from 'node:path'
+
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN manquant (GITHUB_TOKEN=$(gh auth token) node scripts/rename-drives-git.mjs)'); process.exit(1) }
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const CONTENT_REPO = (process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data').split('/').pop()
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+const args = Object.fromEntries(process.argv.slice(2).map((a) => {
+  const m = a.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [a, true]
+}))
+const APPLY = !!args.apply
+const WORK = path.resolve(args.workdir || '.rename-tmp')
+const STATE_PATH = 'pages/.zr-drive.json' // état legacy img/private (driveStatePath(img,private))
+
+const cloneUrl = (repo) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`
+const redact = (s) => String(s).split(TOKEN).join('***')
+const git = (cwd, ...a) => { try { return execFileSync('git', a, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() } catch (e) { throw new Error('git ' + a[0] + ': ' + redact((e.stderr || e.stdout || e.message).toString().slice(0, 300))) } }
+const gh = (...a) => { try { return execFileSync('gh', a, { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() } catch (e) { throw new Error('gh ' + a[0] + ': ' + redact((e.stderr || e.stdout || e.message).toString().slice(0, 300))) } }
+
+const legacyMediaRe = /^zenray-media-(\d{2,})$/
+const newName = (legacy) => { const m = legacyMediaRe.exec(legacy); return m ? `zenray-img-private-${m[1]}` : null }
+
+console.log(APPLY ? '=== MODE APPLY (rename + push RÉELS) ===' : '=== MODE DRY-RUN (aucune écriture) ===')
+
+// ---- A. lister les repos zenray-media-NN du compte (API GitHub paginée, lecture seule) ----
+async function listMediaRepos() {
+  const found = []
+  for (let page = 1; page <= 10; page++) {
+    const r = await fetch(`https://api.github.com/user/repos?per_page=100&page=${page}&affiliation=owner`, {
+      headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-rename' },
+    })
+    if (!r.ok) { console.error('listrepos: HTTP ' + r.status); break }
+    const arr = await r.json()
+    if (!Array.isArray(arr) || !arr.length) break
+    for (const x of arr) if (legacyMediaRe.test(x.name)) found.push(x.name)
+    if (arr.length < 100) break
+  }
+  return found.sort()
+}
+
+const mediaRepos = await listMediaRepos()
+if (!mediaRepos.length) { console.log('Aucun repo zenray-media-NN trouvé. Rien à renommer.'); process.exit(0) }
+console.log('Repos à renommer (' + mediaRepos.length + ') :')
+for (const r of mediaRepos) console.log('  ' + r + '  ->  ' + newName(r))
+
+// ---- B. clone zenray-data, calcul du diff manifests + état ----
+mkdirSync(WORK, { recursive: true })
+const dataDir = path.join(WORK, CONTENT_REPO)
+if (existsSync(path.join(dataDir, '.git'))) { console.log('• zenray-data déjà cloné, fetch…'); git(dataDir, 'fetch', '--depth', '1', 'origin', BRANCH); git(dataDir, 'reset', '--hard', 'origin/' + BRANCH) }
+else { console.log('• clone zenray-data (shallow)…'); git(WORK, 'clone', '--depth', '1', '--branch', BRANCH, cloneUrl(CONTENT_REPO), CONTENT_REPO) }
+
+// table de correspondance exacte legacy -> new (uniquement les repos qui existent vraiment)
+const map = new Map(mediaRepos.map((r) => [r, newName(r)]))
+
+// remplace toute occurrence d'un zenray-media-NN connu par son zenray-img-private-NN dans une chaîne JSON.
+function rewriteRepoRefs(text) {
+  let out = text, hits = 0
+  for (const [oldN, newN] of map) {
+    // on remplace le token entier "zenray-media-NN" (entre guillemets ou pas) ; sûr car NN est borné.
+    const re = new RegExp(oldN.replace(/-/g, '\\-') + '\\b', 'g')
+    out = out.replace(re, () => { hits++; return newN })
+  }
+  return { out, hits }
+}
+
+// parcours récursif des .img.json sous pages/
+const pagesDir = path.join(dataDir, 'pages')
+let manifestsChanged = 0, refsRewritten = 0
+const changedFiles = []
+function walk(absDir) {
+  let entries = []
+  try { entries = readdirSync(absDir, { withFileTypes: true }) } catch { return }
+  for (const e of entries) {
+    const abs = path.join(absDir, e.name)
+    if (e.isDirectory()) walk(abs)
+    else if (e.name.endsWith('.img.json')) {
+      let txt = ''
+      try { txt = readFileSync(abs, 'utf8') } catch { continue }
+      const { out, hits } = rewriteRepoRefs(txt)
+      if (hits > 0 && out !== txt) {
+        manifestsChanged++; refsRewritten += hits; changedFiles.push(path.relative(dataDir, abs))
+        if (APPLY) writeFileSync(abs, out)
+      }
+    }
+  }
+}
+if (existsSync(pagesDir)) walk(pagesDir)
+
+// migration du fichier d'état .zr-drive.json (champ active)
+let stateChanged = false
+const stateAbs = path.join(dataDir, STATE_PATH)
+if (existsSync(stateAbs)) {
+  let st = null
+  try { st = JSON.parse(readFileSync(stateAbs, 'utf8')) } catch {}
+  if (st && typeof st.active === 'string' && map.has(st.active)) {
+    const before = st.active
+    st.active = map.get(st.active)
+    stateChanged = true
+    console.log('• état .zr-drive.json : active ' + before + ' -> ' + st.active)
+    if (APPLY) writeFileSync(stateAbs, JSON.stringify(st, null, 2))
+  } else {
+    console.log('• état .zr-drive.json : active="' + (st && st.active) + '" non concerné (pas un zenray-media-NN existant)')
+  }
+} else {
+  console.log('• état .zr-drive.json absent (défaut zenray-media-01) — sera créé naturellement au prochain upload')
+}
+
+console.log('\n--- RÉSUMÉ ---')
+console.log('Manifests .img.json à modifier : ' + manifestsChanged + ' (références réécrites : ' + refsRewritten + ')')
+console.log('Fichier d\'état modifié : ' + (stateChanged ? 'oui' : 'non'))
+if (changedFiles.length && changedFiles.length <= 40) for (const f of changedFiles) console.log('   ~ ' + f)
+else if (changedFiles.length) console.log('   (' + changedFiles.length + ' fichiers, liste tronquée)')
+
+if (!APPLY) {
+  console.log('\nDRY-RUN terminé. Aucun rename, aucun push.')
+  console.log('Pour exécuter (APRÈS avoir déployé le code qui accepte les 2 noms) : ajouter --apply')
+  process.exit(0)
+}
+
+// ---- C. APPLY : rename repos (gh) PUIS push zenray-data (git) ----
+// Ordre : d'ABORD les renames (GitHub pose la redirection old->new, le code accepte déjà new),
+// PUIS le push des manifests réécrits. Si un rename échoue, on s'arrête avant de pousser pour éviter
+// un état mi-figue (manifests pointant sur des repos pas encore renommés sans redirection).
+console.log('\n• rename des repos via gh…')
+for (const [oldN, newN] of map) {
+  try {
+    gh('repo', 'rename', newN, '--repo', `${OWNER}/${oldN}`, '--yes')
+    console.log('   ✓ ' + oldN + ' -> ' + newN)
+  } catch (e) {
+    // 'already exists' tolérable si un run précédent a déjà renommé ce repo.
+    if (/already exists|Name already/i.test(String(e.message))) { console.log('   = ' + newN + ' existe déjà (rename antérieur) — OK'); continue }
+    console.error('   ✗ rename ' + oldN + ' a échoué : ' + e.message)
+    console.error('   ARRÊT avant push pour éviter un état incohérent. Corrige puis relance.')
+    process.exit(1)
+  }
+}
+
+if (manifestsChanged === 0 && !stateChanged) { console.log('\nAucune modification de zenray-data nécessaire. Terminé.'); process.exit(0) }
+
+console.log('\n• commit + push zenray-data…')
+git(dataDir, 'add', '-A')
+git(dataDir, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-m', 'rename drives: zenray-media-NN -> zenray-img-private-NN (' + manifestsChanged + ' manifests)')
+git(dataDir, 'push', 'origin', 'HEAD:' + BRANCH)
+console.log('✓ zenray-data poussé. Rename terminé.')

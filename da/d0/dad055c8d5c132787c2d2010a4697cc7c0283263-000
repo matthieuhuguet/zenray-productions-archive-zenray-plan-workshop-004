@@ -1,0 +1,116 @@
+// ⚠️ ÉCRITURE DÉPRÉCIÉE (2026-07-21) : l'uploader client correspondant (uploadChunked,
+// src/media/chunked.js) n'a plus aucun appelant -- tout upload passe par /api/upload-shard
+// (universalCapture, chunks de stockage 19 MiB/95 Mo chiffrés, politique finale du CLAUDE.md).
+// Cet endpoint n'est conservé QUE parce que d'anciens manifestes 3 Mo non chiffrés existent ;
+// ne jamais y brancher un nouvel upload.
+// C202 — Upload de média chunké via la Git Data API du repo drive zenray-data.
+// Stateless : le client crée chaque blob (action 'blob' -> renvoie {sha}),
+// accumule la liste [{i, sha}] et l'envoie dans 'commit' (tree+commit+ref = 1 commit atomique).
+// Limite réelle : body POST Vercel ~4,5 Mo => part brute 3 Mo (base64 ~4,0 Mo). Cf SPEC C202.
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const CHUNK_SIZE = 3145728 // 3 Mo brut. base64 ~4,0 Mo < cap Vercel < plafond GitHub.
+
+import { instrument } from './cmdlog.js'
+const b64d = (s) => Buffer.from(s || '', 'base64').toString('utf8')
+const ghRaw = (token, path, init = {}) =>
+  fetch(`https://api.github.com/repos/${REPO}/${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) },
+  })
+const gh = instrument(ghRaw, { repoOf: () => REPO, pathOf: (args) => args[1], initOf: (args) => args[2] || {} })
+// id de dossier unique et stable (jamais réutilisé) : pas de collision possible.
+const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`
+const pad = (i) => String(i).padStart(3, '0')
+const isB64 = (s) => typeof s === 'string' && s.length > 0 && /^[A-Za-z0-9+/=\r\n]+$/.test(s)
+
+export const config = { api: { bodyParser: { sizeLimit: '8mb' } } }
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(200).json({ error: 'no-token' })
+  res.setHeader('Cache-Control', 'no-store')
+  if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return res.status(405).end() }
+
+  let body = req.body
+  if (typeof body === 'string') { try { body = JSON.parse(body) } catch { body = {} } }
+  const action = body && body.action
+
+  try {
+    // 1) init : valide les métadonnées, génère un dossier unique. N'écrit rien encore.
+    if (action === 'init') {
+      const name = String(body.name || '').replace(/[/\\]/g, '_').slice(0, 200)
+      const size = Number(body.size)
+      const mime = String(body.mime || 'application/octet-stream').slice(0, 120)
+      if (!name || !Number.isFinite(size) || size <= 0) return res.status(400).json({ error: 'bad-init' })
+      const id = newId()
+      const dir = `media/${id}`
+      const count = Math.ceil(size / CHUNK_SIZE)
+      return res.status(200).json({ ok: true, id, dir, count, chunkSize: CHUNK_SIZE, name, mime, size })
+    }
+
+    // 2) blob : crée UN blob Git à partir d'une part base64, renvoie son sha. Idempotent par nature
+    //    (un même contenu => même sha ; GitHub dédoublonne). Le client garde {i, sha}.
+    if (action === 'blob') {
+      const b64 = body.b64
+      if (!isB64(b64)) return res.status(400).json({ error: 'bad-b64' })
+      const r = await gh(token, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: b64, encoding: 'base64' }) })
+      if (!r.ok) { const t = await r.text(); return res.status(200).json({ error: 'github', detail: t.slice(0, 160) }) }
+      const j = await r.json()
+      return res.status(200).json({ ok: true, sha: j.sha })
+    }
+
+    // 3) commit : assemble le tree (toutes les parts + le manifest) en UN commit atomique.
+    //    body : { dir, name, mime, size, manifestPath, blobs:[{i, sha}] }
+    if (action === 'commit') {
+      const { dir, name, mime, size, manifestPath, w, h, duration } = body
+      const blobs = Array.isArray(body.blobs) ? body.blobs : []
+      if (!dir || !/^media\/[A-Za-z0-9._-]+$/.test(dir)) return res.status(400).json({ error: 'bad-dir' })
+      if (typeof manifestPath !== 'string' || manifestPath.includes('..') || !manifestPath.startsWith('pages/') || !manifestPath.endsWith('.media.json')) return res.status(400).json({ error: 'bad-manifest-path' })
+      if (!blobs.length) return res.status(400).json({ error: 'no-blobs' })
+      for (const b of blobs) { if (!Number.isInteger(b.i) || typeof b.sha !== 'string') return res.status(400).json({ error: 'bad-blob-entry' }) }
+
+      const sorted = [...blobs].sort((a, b) => a.i - b.i)
+      const parts = sorted.map((b) => pad(b.i))
+      const manifest = {
+        type: 'chunked-media', v: 1, name: String(name), mime: String(mime || 'application/octet-stream'),
+        size: Number(size), chunkSize: CHUNK_SIZE, count: sorted.length, dir, parts,
+        ...(Number(w) ? { w: Number(w) } : {}), ...(Number(h) ? { h: Number(h) } : {}), ...(Number(duration) ? { duration: Number(duration) } : {}),
+        createdAt: new Date().toISOString(),
+      }
+      // blob du manifest
+      const mr = await gh(token, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8').toString('base64'), encoding: 'base64' }) })
+      if (!mr.ok) { const t = await mr.text(); return res.status(200).json({ error: 'github', detail: 'manifest-blob ' + t.slice(0, 120) }) }
+      const manifestSha = (await mr.json()).sha
+
+      // HEAD du commit courant (base_tree + parent)
+      const refR = await gh(token, `git/ref/heads/${BRANCH}`)
+      if (!refR.ok) return res.status(200).json({ error: 'github', detail: 'ref' })
+      const headSha = (await refR.json()).object.sha
+      const commitR = await gh(token, `git/commits/${headSha}`)
+      if (!commitR.ok) return res.status(200).json({ error: 'github', detail: 'head-commit' })
+      const baseTree = (await commitR.json()).tree.sha
+
+      const tree = sorted.map((b) => ({ path: `${dir}/${pad(b.i)}.bin`, mode: '100644', type: 'blob', sha: b.sha }))
+      tree.push({ path: manifestPath, mode: '100644', type: 'blob', sha: manifestSha })
+
+      const tr = await gh(token, 'git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree }) })
+      if (!tr.ok) { const t = await tr.text(); return res.status(200).json({ error: 'github', detail: 'tree ' + t.slice(0, 120) }) }
+      const newTree = (await tr.json()).sha
+
+      const cr = await gh(token, 'git/commits', { method: 'POST', body: JSON.stringify({ message: `media commit ${sorted.length} part(s)`, tree: newTree, parents: [headSha] }) })
+      if (!cr.ok) { const t = await cr.text(); return res.status(200).json({ error: 'github', detail: 'commit ' + t.slice(0, 120) }) }
+      const newCommit = (await cr.json()).sha
+
+      // PATCH ref EN DERNIER : tant que ce PATCH n'a pas lieu, rien n'est visible (blobs orphelins GC'd).
+      const pr = await gh(token, `git/refs/heads/${BRANCH}`, { method: 'PATCH', body: JSON.stringify({ sha: newCommit, force: false }) })
+      if (!pr.ok) { const t = await pr.text(); return res.status(200).json({ error: 'github', detail: 'ref-update ' + t.slice(0, 120) }) }
+
+      return res.status(200).json({ ok: true, path: manifestPath, manifest })
+    }
+
+    return res.status(400).json({ error: 'bad-action' })
+  } catch (e) {
+    return res.status(200).json({ error: 'fetch' })
+  }
+}

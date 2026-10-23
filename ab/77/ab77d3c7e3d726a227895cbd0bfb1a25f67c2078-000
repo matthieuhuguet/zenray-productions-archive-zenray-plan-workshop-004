@@ -1,0 +1,639 @@
+// ═══ ZENRAYJAPANESE — VOIR SON JAPONAIS, PLUTÔT QUE DE LE RELIRE (2026-08-27) ══════════════════════
+//
+// Demande de Matthieu : « le but de ZenRayJapanese, c'est de rendre visuellement plus attractif
+// l'apprentissage du japonais, et surtout quand je génère une leçon à l'avenir, la voir directement
+// sur le site. »
+//
+// LE PROBLÈME QUE CETTE VUE RÉSOUT, ET IL N'EST PAS ESTHÉTIQUE. Deux ans de leçons vivent dans un seul
+// fichier de 473 Ko, `Memory/Japanese/Japanese1.md`, append-only, où tout est vrai et rien n'est
+// visible. Aucun feedback de progression, aucune façon de retrouver un point de grammaire sans
+// dérouler six mille lignes. C'est exactement le vide informationnel décrit dans les règles globales :
+// l'effort part, rien ne répond, et le cerveau finit par fabriquer son propre verdict.
+//
+// CE QUE CETTE VUE N'EST PAS. Ce n'est pas une seconde source de vérité. Le corpus reste seul maître :
+// il porte le récit, les scores, les corrections, y compris les corrections de corrections. Cette vue
+// n'affiche RIEN qu'il ne contienne déjà — elle lit un index dérivé (Site/japanese.json, produit par
+// Scripts/build-japanese-index.py) pour les compteurs et les listes, et va chercher le texte de chaque
+// leçon dans le corpus lui-même, à la ligne près. Rien n'est éditable ici, et c'est voulu : un journal
+// append-only qu'on pourrait retoucher depuis une page web cesserait d'être un journal.
+//
+// LES CHIFFRES DE LA JAUGE NE SONT PAS CALCULÉS ICI. Ils sont RELUS dans le corpus, à la section
+// « État mesuré au … » de la leçon 104. Les recalculer depuis le nombre de fiches présentes
+// reviendrait à appeler « su » ce qui n'a été que montré, alors que le corpus distingue justement
+// ENSEIGNÉ et CONSOLIDÉ, et que c'est le second qui compte.
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import Icon from '../components/Icon.jsx'
+import Segmente from '../components/Segmente.jsx'
+import { safeMarkedParse } from '../safeMarked.js'
+import './ZenRayJapanese.css'
+import JapaneseCorpus from './JapaneseCorpus.jsx'
+import JapaneseStudy from './JapaneseStudy.jsx'
+import JapaneseReferences from './JapaneseReferences.jsx'
+import JapaneseLessonCategory from './JapaneseLessonCategory.jsx'
+import { createStudyClient } from './japaneseStudyClient.js'
+const historyPersonalClient = createStudyClient()
+
+// ── L'INTERFACE DE PARAMÈTRES (loi HDA) ───────────────────────────────────────────────────────────
+export const JP = {
+  index: 'Memory/Japanese/Site/japanese.json',
+  corpus: 'Memory/Japanese/Japanese1.md',
+  // SONS — de vrais fichiers Apple, fournis par Matthieu et ré-encodés en AAC mono. Le VOLUME est cuit
+  // dans le fichier au moment de l'encodage, jamais réglé à l'appel : un son d'interface trop fort est
+  // le défaut qui devient insupportable le plus vite, et il doit se corriger à un seul endroit.
+  sons: {
+    survol: '/sounds/japanese/survol.m4a',
+    onglet: '/sounds/japanese/onglet.m4a',
+    ouvrir: '/sounds/japanese/ouvrir.m4a',
+    fermer: '/sounds/japanese/fermer.m4a',
+    jauge:  '/sounds/japanese/jauge.m4a',
+    succes: '/sounds/japanese/succes.m4a',
+  },
+  // Un survol qui sonne à chaque pixel devient un crépitement. La bride est en millisecondes.
+  brideSurvol: 190,
+  jauge: { montee: 1150, decalage: 130, pas: 28 },
+  couleurs: { N5: '#30d158', N4: '#3b82f7', N3: '#bf5af2', N2: '#ff9f0a' },
+  // POPOVER DE TRACÉ. La largeur est le seul nombre qui compte : en dessous de 380 px les panneaux de
+  // tracé deviennent illisibles, au-dessus de 460 le popover cesse d'être un popover et devient une
+  // fenêtre qui masque la grille dont il parle.
+  popover: { largeur: 420, marge: 12, seuilMobile: 720 },
+  onglets: [
+    { cle: 'study', libelle: 'Parcours' },
+    { cle: 'corpus', libelle: 'Corpus' },
+    { cle: 'references', libelle: 'Kana · vocabulaire · jōyō' },
+    { cle: 'lecons', libelle: 'Leçons' },
+    { cle: 'grammaire', libelle: 'Grammaire' },
+    { cle: 'vocabulaire', libelle: 'Vocabulaire' },
+    { cle: 'kanji', libelle: 'Kanji' },
+  ],
+}
+
+// ── SON ───────────────────────────────────────────────────────────────────────────────────────────
+// Un élément par son, cloné à chaque lecture : sans le clone, deux survols rapprochés se coupent l'un
+// l'autre et l'on entend un hoquet au lieu de deux clics.
+const cache = new Map()
+function jouer(nom, muet) {
+  if (muet || typeof Audio === 'undefined') return
+  try {
+    let base = cache.get(nom)
+    if (!base) { base = new Audio(JP.sons[nom]); base.preload = 'auto'; cache.set(nom, base) }
+    // Le navigateur refuse de jouer avant le premier geste de l'utilisateur, et il a raison : un son
+    // qu'on n'a pas demandé est une agression. Le rejet est donc normal, jamais une erreur à signaler.
+    base.cloneNode().play().catch(() => {})
+  } catch { /* audio indisponible : la vue fonctionne sans */ }
+}
+
+// ── LIRE UNE FICHE KANJI ET LA REPEINDRE AUX COULEURS DU SITE ────────────────────────────────────
+// Les 137 fiches existent depuis L35, avec leur tracé pas à pas et leur mnémo. Les afficher dans une
+// iframe aurait été plus court, mais aurait importé leur feuille de style : fond blanc, police
+// système, encadrés jaunes. Matthieu demande « le style propre du site », donc on ne prend que la
+// MATIÈRE (le SVG, les lectures, la mnémo, la phrase) et le site fournit la forme.
+//
+// La recoloration passe par des CLASSES, jamais par des `var()` posés dans les attributs de
+// présentation : ceux-ci ne résolvent pas les variables CSS de façon fiable selon les moteurs. Une
+// règle CSS, elle, l'emporte toujours sur un attribut de présentation, ce qui suffit et ne dépend de
+// rien. La correspondance part des couleurs d'origine des fiches, qui sont constantes d'un fichier à
+// l'autre puisqu'un même générateur les a toutes produites.
+const TEINTES = {
+  '#d6d6d6': 'jp-t-fantome',   // traits déjà posés, en gris clair
+  '#eeeeee': 'jp-t-cadre',     // le carré de chaque panneau
+  '#000000': 'jp-t-actif',     // le trait du panneau courant
+  '#1a1a1a': 'jp-t-actif',
+  '#cc0033': 'jp-t-num',       // le numéro de trait et sa flèche
+  '#444': 'jp-t-titre',        // la légende « 道 (12 strokes) »
+  '#ffffff': 'jp-t-fond',      // le fond blanc de page, retiré
+}
+
+function analyserFiche(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  // Le contenu vient du drive privé de Matthieu et ces fiches ne portent aucun script, mais on ne
+  // fait pas confiance à un fichier parce qu'on croit savoir ce qu'il contient : on nettoie.
+  doc.querySelectorAll('script').forEach((n) => n.remove())
+  const svg = doc.querySelector('.strokes svg')
+  if (svg) {
+    svg.removeAttribute('width'); svg.removeAttribute('height')
+    svg.querySelectorAll('*').forEach((el) => {
+      for (const attr of ['stroke', 'fill']) {
+        const c = (el.getAttribute(attr) || '').toLowerCase()
+        if (TEINTES[c]) el.classList.add(TEINTES[c])
+      }
+      for (const a of [...el.attributes]) if (/^on/i.test(a.name)) el.removeAttribute(a.name)
+    })
+    svg.querySelectorAll('.jp-t-fond').forEach((n) => n.remove())
+  }
+  const texte = (sel) => { const n = doc.querySelector(sel); return n ? n.textContent.trim() : '' }
+  return {
+    titre: texte('h1'),
+    meta: [...doc.querySelectorAll('.meta span')].map((n) => n.textContent.trim()).filter(Boolean),
+    svg: svg ? svg.outerHTML : '',
+    mnemo: texte('.mnemo'),
+    phrase: texte('.phrase'),
+    lignes: [...doc.querySelectorAll('table tr')]
+      .map((tr) => [...tr.children].map((td) => td.textContent.trim()))
+      .filter((l) => l.length >= 2 && l[0]),
+  }
+}
+
+const lireJson = (chemin) =>
+  fetch(`/api/page?action=read&raw=1&path=${encodeURIComponent(chemin)}`, { cache: 'no-store' })
+    .then((r) => r.json())
+    .then((j) => (j && j.markdown && !j.missing ? JSON.parse(j.markdown) : null))
+
+// ── UNE JAUGE ─────────────────────────────────────────────────────────────────────────────────────
+// LES CINQ NIVEAUX PARTAGENT UNE SEULE GRILLE, et c'est la seule façon d'obtenir un alignement qui
+// tienne. Ce composant ne rend donc AUCUN conteneur à lui : il pose ses cellules directement dans la
+// grille du parent, si bien que la colonne du pourcentage tombe au même pixel pour N5 et pour N1,
+// quelle que soit la longueur des libellés. La version précédente donnait un conteneur par niveau,
+// posés côte à côte : chacun s'alignait sur lui-même, aucun ne s'alignait sur son voisin.
+//
+// La barre monte en CSS, le nombre monte en JavaScript, et les deux prennent exactement le même temps :
+// l'œil qui voit la barre arriver avant son chiffre lit un décalage comme un bug. Le compteur passe par
+// `setInterval` et non `requestAnimationFrame`, suspendu dès que l'onglet passe en arrière-plan.
+const NA = 'N/A'
+// « N/A » plutôt qu'une cellule vide, convention informatique habituelle : on ÉCRIT ce qu'on ne sait
+// pas. Une case vide se confond avec un zéro, alors que zéro est une mesure et l'inconnu n'en est pas une.
+const chiffre = (v) => (v === null || v === undefined ? NA : v)
+// LE TILDE EST UNE INFORMATION. Le corpus écrit « ~55% consolidé », « grammaire ~9/42 », « vocab
+// ~700/800 » : ce sont des estimations, et les afficher sans leur tilde revient à présenter une
+// estimation comme une mesure. Faute relevée par Matthieu le 2026-08-27, sur cinq nombres à la fois.
+const env = (approx) => (approx ? '~' : '')
+
+function Jauge({ niveau, retard, anime }) {
+  const cible = niveau.enseigne || 0
+  const [valeur, setValeur] = useState(0)
+  useEffect(() => {
+    if (!anime) { setValeur(cible); return undefined }
+    let t = 0
+    const id = setInterval(() => {
+      t += JP.jauge.pas
+      const k = Math.min(1, t / JP.jauge.montee)
+      // Sortie en cubique : la barre part vite et se pose, au lieu d'avancer d'un pas régulier de
+      // machine. C'est le même easing que la barre CSS, sans quoi les deux se désynchronisent.
+      setValeur(Math.round(cible * (1 - Math.pow(1 - k, 3))))
+      if (k >= 1) clearInterval(id)
+    }, JP.jauge.pas)
+    return () => clearInterval(id)
+  }, [cible, anime])
+
+  const couleur = JP.couleurs[niveau.code] || '#8e8e93'
+  const style = { '--jp-c': couleur, '--jp-retard': `${retard}ms`, '--jp-montee': `${JP.jauge.montee}ms` }
+  const compteurs = niveau.compteurs.map((c) => ({
+    cle: c.cle,
+    libelle: c.cle,
+    compte: c.fait === null || c.fait === undefined ? NA : `${env(c.approx)}${c.fait}/${chiffre(c.cible)}`,
+  }))
+
+  return (
+    <>
+      <span className="jp-code" style={style}>{niveau.code}</span>
+      <div className="jp-piste" style={style}>
+        <div className={`jp-remplissage${anime ? ' jp-anime' : ''}`} style={{ width: `${cible}%` }} />
+      </div>
+      <span className="jp-pct">{env(niveau.enseigneApprox)}{valeur}<i>%</i></span>
+      <span className="jp-consolide" title="restitué en drill, la seule mesure qui compte vraiment">
+        {niveau.consolide === null || niveau.consolide === undefined
+          ? NA : `${env(niveau.consolideApprox)}${niveau.consolide}%`}
+        {' '}consolidé
+      </span>
+      <div className="jp-compteurs">
+        <Segmente statique ariaLabel={`Compteurs ${niveau.code}`} options={compteurs} />
+        {niveau.deduit && <span className="jp-deduit" title="aucune mesure au corpus : déduit de N2 à 0%">déduit</span>}
+      </div>
+    </>
+  )
+}
+
+// ── LA VUE ────────────────────────────────────────────────────────────────────────────────────────
+export default function ZenRayJapanese() {
+  // 16 October 2026 14:20 Europe/Paris: historical lesson categories attach to the stable lesson ID across its ranges.
+  const [personalState,setPersonalState] = useState(null), [personalError,setPersonalError] = useState(''), [personalBusy,setPersonalBusy] = useState(false), [personalPending,setPersonalPending] = useState(null)
+  const [historyCategory,setHistoryCategory] = useState(''), [historyFavorites,setHistoryFavorites] = useState(false), [historySort,setHistorySort] = useState('original')
+  const [idx, setIdx] = useState(null)
+  const [erreur, setErreur] = useState('')
+  const [onglet, setOnglet] = useState('study')
+  const [filtre, setFiltre] = useState('')
+  const [muet, setMuet] = useState(false)
+  const [anime, setAnime] = useState(false)
+  const [lecture, setLecture] = useState(null)     // { titre, sous, markdown } ou null
+  const [chargeLecture, setChargeLecture] = useState(false)
+  const corpus = useRef(null)                      // le corpus n'est cherché qu'à la PREMIÈRE ouverture
+  const latestHistoryRef = useRef(null)
+  const historyReadTicket = useRef(0)
+  const dernierSurvol = useRef(0)
+  const [fiche, setFiche] = useState(null)         // { kanji, ancre, donnees } ou null
+  const [pos, setPos] = useState(null)             // { left, top, cote } ou { mobile: true }
+  const refPop = useRef(null)
+  const cacheFiches = useRef(new Map())            // une fiche lue une fois n'est plus jamais refetchée
+
+  const sobre = useMemo(() => typeof window !== 'undefined' && window.matchMedia
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches, [])
+
+  useEffect(() => { if (onglet !== 'lecons' && !lecture?.personalId) return; let current=true; historyPersonalClient.load().then(value=>{if(current){setPersonalState(value.state);setPersonalError('')}}).catch(error=>{if(current)setPersonalError(error.message)}); return()=>{current=false} },[onglet,lecture?.personalId])
+  async function saveHistoricalCategory(event) {
+    if(personalBusy) return false
+    setPersonalBusy(true);setPersonalPending(event);setPersonalError('')
+    try { const value=await historyPersonalClient.save(event);setPersonalState(value.state);setPersonalPending(null);return true }
+    catch(error){setPersonalError(error.message);return false}
+    finally{setPersonalBusy(false)}
+  }
+  const survol = useCallback(() => {
+    const t = Date.now()
+    if (t - dernierSurvol.current < JP.brideSurvol) return
+    dernierSurvol.current = t
+    jouer('survol', muet)
+  }, [muet])
+
+  useEffect(() => {
+    let vivant = true
+    lireJson(JP.index)
+      .then((j) => {
+        if (!vivant) return
+        if (!j) { setErreur("index introuvable — lancer Scripts/build-japanese-index.py dans Memory/Japanese"); return }
+        setIdx(j)
+        // L'animation ne part qu'une fois les données là : lancer les jauges sur des zéros puis les
+        // relancer à l'arrivée du fichier donnerait deux montées, dont une fausse.
+        setTimeout(() => { setAnime(true); jouer('jauge', muet) }, 60)
+      })
+      .catch((e) => vivant && setErreur(String(e && e.message ? e.message : e)))
+    return () => { vivant = false }
+  }, [])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 14 October 2026, 11:50 CEST: show a saved lesson immediately and pin its reader to the committed chronology.
+  useEffect(() => {
+    const updated = (event) => {
+      corpus.current = null
+      latestHistoryRef.current = event.detail.commit
+      if (event.detail.index) setIdx(event.detail.index)
+    }
+    window.addEventListener('zr:japanese-updated', updated)
+    return () => window.removeEventListener('zr:japanese-updated', updated)
+  }, [])
+
+  // ── OUVRIR UNE LEÇON ───────────────────────────────────────────────────────────────────────────
+  // Le corpus est cherché UNE fois, à la première ouverture, et gardé en mémoire ensuite. Le charger
+  // au montage ferait payer 470 Ko à quelqu'un qui vient seulement regarder sa jauge.
+  const ouvrirLecon = useCallback(async (lecon) => {
+    const ticket = ++historyReadTicket.current
+    jouer('ouvrir', muet)
+    setChargeLecture(true)
+    setLecture({ personalId: `history-${lecon.id}`, titre: `${lecon.id} · ${lecon.titre}`, sous: lecon.date || '', markdown: null })
+    try {
+      if (!corpus.current) {
+        const historyUrl = latestHistoryRef.current ? `/api/japanese?view=history&ref=${latestHistoryRef.current}` : `/api/page?action=read&raw=1&path=${encodeURIComponent(JP.corpus)}`
+        const response = await fetch(historyUrl, { cache: 'no-store' })
+        const j = await response.json()
+        if (!response.ok || j.error || typeof j.markdown !== 'string' || !j.markdown.trim()) throw new Error(j.error || 'Chronologie indisponible, réessaie la lecture.')
+        if (ticket !== historyReadTicket.current) return
+        corpus.current = j.markdown.split('\n')
+      }
+      // La borne de fin vient de l'INDEX, calculée une fois au moment de sa construction. La recalculer
+      // ici ferait vivre deux implémentations du même découpage, et c'est en la calculant à la volée
+      // que la méga-leçon du vol s'était retrouvée amputée de six cents lignes.
+      const lignes = corpus.current
+      const tranche = lignes.slice(lecon.ligne - 1, lecon.fin).join('\n').trim()
+      setLecture({ personalId: `history-${lecon.id}`, titre: `${lecon.id} · ${lecon.titre}`, sous: lecon.date || '', markdown: tranche || '(section vide)' })
+      jouer('succes', muet)
+    } catch (e) {
+      if (ticket !== historyReadTicket.current) return
+      setLecture({ personalId: `history-${lecon.id}`, titre: lecon.id, sous: '', markdown: `**Lecture impossible.** ${String(e)}` })
+    } finally { if (ticket === historyReadTicket.current) setChargeLecture(false) }
+  }, [idx, muet])
+
+  const fermer = useCallback(() => { historyReadTicket.current++; jouer('fermer', muet); setLecture(null); setChargeLecture(false) }, [muet])
+
+  // ── LE POPOVER DE TRACÉ ────────────────────────────────────────────────────────────────────────
+  const ouvrirFiche = useCallback(async (k, elem) => {
+    jouer('ouvrir', muet)
+    const r = elem.getBoundingClientRect()
+    const ancre = { x: r.x, y: r.y, w: r.width, h: r.height }
+    // Le popover s'affiche AVANT d'avoir son contenu : attendre la fiche pour le faire apparaître
+    // donnerait l'impression que le clic n'a rien fait pendant le temps du réseau.
+    setFiche({ kanji: k, ancre, donnees: cacheFiches.current.get(k.fiche) || null })
+    setPos(null)
+    if (cacheFiches.current.has(k.fiche)) return
+    try {
+      const j = await fetch(`/api/page?action=read&raw=1&path=${encodeURIComponent(k.fiche)}`, { cache: 'no-store' })
+        .then((x) => x.json())
+      const d = analyserFiche(j && j.markdown ? j.markdown : '')
+      cacheFiches.current.set(k.fiche, d)
+      setFiche((f) => (f && f.kanji.fiche === k.fiche ? { ...f, donnees: d } : f))
+    } catch {
+      setFiche((f) => (f && f.kanji.fiche === k.fiche ? { ...f, donnees: { erreur: true } } : f))
+    }
+  }, [muet])
+
+  const fermerFiche = useCallback(() => { jouer('fermer', muet); setFiche(null); setPos(null) }, [muet])
+
+  // PLACEMENT : on MESURE, on ne devine pas. C'est le patron déjà employé par le composeur du Plan,
+  // à ceci près qu'il faut ici choisir un CÔTÉ avant de recaler. La règle est simple et se lit dans
+  // le code : à droite de la case si la place y est, à gauche sinon, et en feuille basse quand
+  // l'écran est trop étroit pour l'un comme pour l'autre. Mesurer après montage est indispensable :
+  // la hauteur du popover dépend du nombre de traits du kanji, qui va de un à vingt.
+  useLayoutEffect(() => {
+    if (!fiche || !refPop.current) return undefined
+    const el = refPop.current
+    const placer = () => {
+      const { marge, seuilMobile } = JP.popover
+      if (window.innerWidth < seuilMobile) { setPos({ mobile: true }); return }
+      // ON MESURE LA BOÎTE DE MISE EN PAGE, PAS LA BOÎTE PEINTE. `getBoundingClientRect` inclut les
+      // transformations, or le popover porte une animation d'entrée qui le rentre de 14 px et le
+      // réduit de trois pour cent. Mesuré pendant ces trois dixièmes de seconde, il se croyait large
+      // de 407 px au lieu de 420 et se plaçait 9 px trop à droite, chevauchant la case dont il sort.
+      // `offsetWidth` et `offsetHeight` ignorent la transformation : c'est la taille qu'aura l'objet
+      // une fois posé, et c'est la seule qui vaille pour décider où le poser.
+      const p = { width: el.offsetWidth, height: el.offsetHeight }
+      const a = fiche.ancre
+      const placeADroite = window.innerWidth - (a.x + a.w) - marge
+      const placeAGauche = a.x - marge
+      const cote = placeADroite >= p.width || placeADroite >= placeAGauche ? 'droite' : 'gauche'
+      let left = cote === 'droite' ? a.x + a.w + marge : a.x - p.width - marge
+      // Le popover se centre sur la case, puis se recale s'il déborde en haut ou en bas.
+      let top = a.y + a.h / 2 - p.height / 2
+      left = Math.min(Math.max(marge, left), window.innerWidth - p.width - marge)
+      top = Math.min(Math.max(marge, top), window.innerHeight - p.height - marge)
+      setPos((v) => (v && v.left === left && v.top === top && v.cote === cote ? v : { left, top, cote }))
+    }
+    placer()
+    // LA HAUTEUR CHANGE APRÈS COUP, et de beaucoup : un kanji de deux traits tient sur un panneau,
+    // un kanji de vingt en occupe quatre rangées, et le SVG n'arrive qu'après le réseau. Recalculer
+    // sur le seul changement d'état laissait le popover placé d'après sa hauteur de chargement.
+    // L'observateur règle le cas général sans qu'on ait à énumérer ce qui peut grandir.
+    const obs = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(placer) : null
+    if (obs) obs.observe(el)
+    return () => { if (obs) obs.disconnect() }
+  }, [fiche])
+
+  useEffect(() => {
+    if (!fiche) return undefined
+    const k = (e) => { if (e.key === 'Escape') fermerFiche() }
+    // Un popover ancré à une case doit suivre le défilement ou disparaître ; le faire suivre coûterait
+    // un recalcul par image, alors qu'il se referme naturellement dès qu'on regarde ailleurs.
+    const partir = () => fermerFiche()
+    window.addEventListener('keydown', k)
+    window.addEventListener('resize', partir)
+    window.addEventListener('scroll', partir, true)
+    return () => {
+      window.removeEventListener('keydown', k)
+      window.removeEventListener('resize', partir)
+      window.removeEventListener('scroll', partir, true)
+    }
+  }, [fiche, fermerFiche])
+  useEffect(() => {
+    if (!lecture) return undefined
+    const k = (e) => { if (e.key === 'Escape') fermer() }
+    window.addEventListener('keydown', k)
+    return () => window.removeEventListener('keydown', k)
+  }, [lecture, fermer])
+
+  // ── LES LISTES, FILTRÉES ───────────────────────────────────────────────────────────────────────
+  const f = filtre.trim().toLowerCase()
+  const listes = useMemo(() => {
+    if (!idx) return { lecons: [], grammaire: [], vocabulaire: [], kanji: [] }
+    const ok = (...parts) => !f || parts.filter(Boolean).join(' ').toLowerCase().includes(f)
+    return {
+      // À rebours du fichier : le corpus est append-only, donc la fin du fichier est le présent.
+      lecons: [...idx.lecons].reverse().filter((l) => ok(l.id, l.titre, l.date)),
+      grammaire: idx.grammaire.filter((g) => ok(g.point, g.sens, g.lecon)),
+      vocabulaire: idx.vocabulaire.filter((v) => ok(v.mot, v.sens, v.lecon)),
+      kanji: idx.kanji.filter((k) => ok(k.kanji, k.kun, k.on, k.niveau)),
+    }
+  }, [idx, f])
+
+  const parLecon = useMemo(() => {
+    // Un identifiant peut porter plusieurs tranches (annonce, puis consignation intégrale). Le lien
+    // depuis un mot ou un point de grammaire doit mener à celle qui contient le TEXTE, donc la plus
+    // longue : renvoyer vers l'annonce de douze lignes donnerait l'impression que la leçon est vide.
+    const m = new Map()
+    for (const l of (idx ? idx.lecons : [])) {
+      const p = m.get(l.id)
+      if (!p || (l.fin - l.ligne) > (p.fin - p.ligne)) m.set(l.id, l)
+    }
+    return m
+  }, [idx])
+
+  // 12 October 2026 17:30 CEST: corpus references are separate from historical learning counters.
+  const onglets = JP.onglets.map((o) => ({ ...o, compte: idx && listes[o.cle] ? listes[o.cle].length : null }))
+
+  // 14 October 2026, 11:45 CEST: a historical-index outage never hides the independent study app.
+  if (!idx) return <div className="jp-scene"><p className="jp-vide">日本語 · {erreur || 'chargement de l’historique…'}</p>
+    <button type="button" onClick={() => setOnglet(onglet === 'corpus' ? 'study' : 'corpus')}>{onglet === 'corpus' ? 'Parcours' : 'Corpus'}</button>
+    <button onClick={() => setOnglet('references')}>Kana · vocabulaire · jōyō</button><JapaneseReferences active={onglet === 'references'} /><JapaneseStudy active={onglet === 'study'} onCorpus={() => setOnglet('corpus')} /><JapaneseCorpus active={onglet === 'corpus'} /></div>
+
+  return (
+    <div className={`jp-scene${sobre ? ' jp-sobre' : ''}`}>
+      {/* ── EN-TÊTE : LA JAUGE, ET RIEN D'AUTRE ─────────────────────────────────────────────────
+          C'est la demande de la leçon 104, faite priorité zéro par Matthieu lui-même : « j'ai aucun
+          feedback visuel sur la progression ». Elle est donc en tête, avant les leçons, avant tout. */}
+      <header className="jp-entete">
+        <div className="jp-titre">
+          <span className="jp-kanji-titre" aria-hidden="true">日本語</span>
+          <div>
+            <h1>ZenRayJapanese</h1>
+            {/* « 125 leçons » était faux : le corpus en contient 107, dont treize reviennent en
+                plusieurs blocs (L32 en compte cinq, entre ses trois sessions et ses pauses). Chaque
+                bloc est une tranche à lire, donc une carte : compter les cartes est juste, les
+                appeler des leçons ne l'est pas. */}
+            <p>
+              {idx.resume ? idx.resume.leconsDistinctes : idx.lecons.length} leçons
+              {idx.resume && idx.resume.tranches !== idx.resume.leconsDistinctes
+                ? ` en ${idx.resume.tranches} tranches` : ''}
+              {' '}depuis {idx.lecons[0] && idx.lecons[0].date} · mesuré le {idx.jauge.mesureLe}
+            </p>
+          </div>
+        </div>
+        <button type="button" className="jp-son" onClick={() => { setMuet((m) => !m); if (muet) jouer('onglet', false) }}
+          title={muet ? 'Réactiver le son' : 'Couper le son'} aria-label={muet ? 'Réactiver le son' : 'Couper le son'}>
+          <Icon name={muet ? 'speaker.wave.0' : 'speaker.wave.2'} size={16} />
+        </button>
+      </header>
+
+      {onglet !== 'study' && <section className="jp-jauges">
+        {idx.jauge.niveaux.map((n, i) => (
+          <Jauge key={n.code} niveau={n} retard={i * JP.jauge.decalage} anime={anime && !sobre} />
+        ))}
+      </section>}
+
+      <div className="jp-barre">
+        <Segmente ariaLabel="Sections" options={onglets} valeur={onglet}
+          onSurvol={survol}
+          onChange={(c) => { setOnglet(c); setFiltre(''); jouer('onglet', muet) }} />
+        {!['corpus', 'study', 'references'].includes(onglet) && <input className="jp-filtre" value={filtre} onChange={(e) => setFiltre(e.target.value)}
+          placeholder="Filtrer…" aria-label="Filtrer" />}
+      </div>
+
+      {/* LA PHRASE QUI LÈVE LA CONFUSION, ET ELLE SE PLACE ICI, SOUS LES ONGLETS.
+          Matthieu, le 2026-08-27 : « c'est bizarre, sur vocabulaire on voit 312 pourtant c'est
+          700/800 ». Il a raison de trouver cela bizarre : le même mot désigne deux choses sur le même
+          écran. La jauge compte ce qui a été ENSEIGNÉ, carnet papier compris ; l'onglet compte ce que
+          le corpus ÉCRIT, c'est-à-dire ce qui est passé par un tableau. Placer l'explication au-dessus
+          des onglets, comme avant, la rendait invisible au moment précis où la question se pose. */}
+      {!['corpus', 'study', 'references'].includes(onglet) && <p className="jp-honnete">
+        Deux comptes différents, et ils ne se contredisent pas. La jauge compte ce qui a été
+        <b> enseigné</b>, carnet papier compris. Les onglets comptent ce que le corpus
+        <b> écrit noir sur blanc</b> : {idx.resume ? idx.resume.lignesVocabulaire : idx.vocabulaire.length} lignes
+        de vocabulaire pour <b>{idx.resume ? idx.resume.motsDistincts : '?'}</b> mots distincts, quand la
+        jauge en compte ~700 ; <b>{idx.grammaire.length}</b> points de grammaire nommés sur les 38 + ~9
+        comptés ; <b>{idx.kanji.length}</b> fiches kanji, qui recoupent exactement les 100 + 37 de la
+        jauge. L'écart n'est pas une erreur : c'est la part qui n'est jamais passée par un tableau.
+      </p>}
+
+      <JapaneseReferences active={onglet === 'references'} />
+      <JapaneseCorpus active={onglet === 'corpus'} />
+      <JapaneseStudy active={onglet === 'study'} onCorpus={() => setOnglet('corpus')} />
+
+      <div className="jp-contenu" key={onglet}>
+        {onglet === 'lecons' && <div className="jps"><p>Classement personnel par leçon ; toutes les tranches d’une même leçon partagent sa catégorie.</p><label>Catégorie historique<select aria-label="Catégorie historique" value={historyCategory} onChange={event=>setHistoryCategory(event.target.value)}><option value="">Toutes</option>{[...new Set(Object.entries(personalState?.annotations || {}).filter(([key])=>key.startsWith('history-')).map(([,value])=>value.category).filter(Boolean))].sort().map(value=><option key={value}>{value}</option>)}</select></label><label><input type="checkbox" checked={historyFavorites} onChange={event=>setHistoryFavorites(event.target.checked)} /> Leçons historiques favorites</label><label>Trier l’historique<select aria-label="Trier l’historique" value={historySort} onChange={event=>setHistorySort(event.target.value)}><option value="original">Ordre du journal</option><option value="recent">Plus récentes d’abord</option><option value="title">Titre</option></select></label>{personalError && <p role="alert">{personalError}</p>}</div>}
+        {onglet === 'lecons' && (
+          <div className="jp-grille">
+            {listes.lecons.filter(item=>(!historyCategory || personalState?.annotations?.[`history-${item.id}`]?.category===historyCategory) && (!historyFavorites || personalState?.annotations?.[`history-${item.id}`]?.favorite)).sort((a,b)=>historySort==='recent'?b.ligne-a.ligne:historySort==='title'?a.titre.localeCompare(b.titre,'fr'):a.ligne-b.ligne).map((l, i) => (
+              <button key={`${l.id}-${l.ligne}`} type="button" className="jp-carte" style={{ '--i': Math.min(i, 24) }}
+                onMouseEnter={survol} onClick={() => ouvrirLecon(l)}>
+                <span className="jp-carte-id">{l.id}</span>
+                <span className="jp-carte-titre">{l.titre}</span>
+                <span className="jp-carte-pied">
+                  {l.date || '—'} · {l.fin - l.ligne + 1} lignes
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {onglet === 'grammaire' && (
+          <ul className="jp-liste">
+            {listes.grammaire.map((g, i) => (
+              <li key={`${g.point}-${g.ligne}`} style={{ '--i': Math.min(i, 24) }}>
+                <button type="button" className="jp-ligne" onMouseEnter={survol}
+                  onClick={() => parLecon.get(g.lecon) && ouvrirLecon(parLecon.get(g.lecon))}>
+                  <span className="jp-jp">{g.point}</span>
+                  <span className="jp-fr">{g.sens || ''}</span>
+                  <span className="jp-tag">{g.lecon || ''}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {onglet === 'vocabulaire' && (
+          <ul className="jp-liste">
+            {listes.vocabulaire.map((v, i) => (
+              <li key={`${v.mot}-${v.ligne}`} style={{ '--i': Math.min(i, 24) }}>
+                <button type="button" className="jp-ligne" onMouseEnter={survol}
+                  onClick={() => parLecon.get(v.lecon) && ouvrirLecon(parLecon.get(v.lecon))}>
+                  <span className="jp-jp">{v.mot}</span>
+                  <span className="jp-fr">{v.sens}</span>
+                  <span className="jp-tag">{v.lecon || ''}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {onglet === 'kanji' && (
+          <div className="jp-kanjis">
+            {listes.kanji.map((k, i) => (
+              <button key={`${k.niveau}-${k.numero}`} type="button"
+                className={`jp-kanji${fiche && fiche.kanji.fiche === k.fiche ? ' jp-kanji-ouvert' : ''}`}
+                style={{ '--i': Math.min(i, 40) }}
+                onMouseEnter={survol}
+                onClick={(e) => ouvrirFiche(k, e.currentTarget)}
+                aria-haspopup="dialog" aria-expanded={!!(fiche && fiche.kanji.fiche === k.fiche)}
+                title={`${k.kun} · ${k.on}`}>
+                <span className="jp-kanji-char">{k.kanji}</span>
+                <span className="jp-kanji-lect">{k.kun}{k.on ? ` · ${k.on}` : ''}</span>
+                <span className={`jp-kanji-niv jp-niv-${k.niveau}`}>{k.niveau}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── LE POPOVER DE TRACÉ ───────────────────────────────────────────────────────────────────
+          Porté vers `document.body`, pour la même raison que le lecteur : `div.zr-stage` porte un
+          `backdrop-filter` et capturerait tout `position: fixed` descendant.
+          Le voile est TRANSPARENT et non assombri : un popover n'est pas une fenêtre modale, il
+          commente la grille dont il sort, et masquer cette grille lui retirerait son point d'appui. */}
+      {fiche && typeof document !== 'undefined' && createPortal(
+        <div className="jp-voile-pop" onPointerDown={(e) => { if (e.target === e.currentTarget) fermerFiche() }}>
+          <div ref={refPop} role="dialog" aria-label={`Tracé de ${fiche.kanji.kanji}`}
+            className={`jp-pop${pos && pos.mobile ? ' jp-pop-mobile' : ''}${pos && pos.cote ? ` jp-pop-${pos.cote}` : ''}${pos ? ' jp-pop-place' : ''}`}
+            /* La largeur est posée DÈS LE PREMIER RENDU, avant même de connaître la position. Ne
+               l'appliquer qu'une fois placé revenait à mesurer un popover sans contrainte de largeur,
+               donc large de neuf cents pixels, puis à le placer d'après ce chiffre : mesuré le
+               2026-08-27, il chevauchait son ancre de 9 px et dépassait de 9 px sous l'écran. On
+               mesure ce qu'on affiche, jamais un état intermédiaire. */
+            style={pos && pos.mobile ? undefined
+              : { width: JP.popover.largeur, ...(pos ? { left: pos.left, top: pos.top } : null) }}>
+            <header className="jp-pop-tete">
+              <span className="jp-pop-char">{fiche.kanji.kanji}</span>
+              <div className="jp-pop-ident">
+                <b>{fiche.kanji.kun}{fiche.kanji.on ? ` · ${fiche.kanji.on}` : ''}</b>
+                <span>{fiche.kanji.niveau} · fiche {String(fiche.kanji.numero).padStart(3, '0')}</span>
+              </div>
+              <button type="button" className="jp-fermer" onClick={fermerFiche} aria-label="Fermer">
+                <Icon name="xmark" size={14} />
+              </button>
+            </header>
+
+            {!fiche.donnees && <div className="jp-chargement"><span /><span /><span /></div>}
+            {fiche.donnees && fiche.donnees.erreur && <p className="jp-pop-erreur">fiche illisible</p>}
+            {fiche.donnees && !fiche.donnees.erreur && (
+              <div className="jp-pop-corps">
+                {!!fiche.donnees.meta.length && (
+                  <ul className="jp-pop-meta">
+                    {fiche.donnees.meta.map((m) => <li key={m}>{m}</li>)}
+                  </ul>
+                )}
+                {/* Le SVG vient de nos propres fiches, nettoyé de tout script et de tout attribut
+                    d'événement par `analyserFiche` avant d'arriver ici. */}
+                {fiche.donnees.svg && (
+                  <div className="jp-trace" dangerouslySetInnerHTML={{ __html: fiche.donnees.svg }} />
+                )}
+                {fiche.donnees.mnemo && <p className="jp-pop-mnemo">{fiche.donnees.mnemo}</p>}
+                {!!fiche.donnees.lignes.length && (
+                  <table className="jp-pop-table"><tbody>
+                    {fiche.donnees.lignes.map((l, i) => (
+                      <tr key={i}><td>{l[0]}</td><td>{l.slice(1).join(' · ')}</td></tr>
+                    ))}
+                  </tbody></table>
+                )}
+                {fiche.donnees.phrase && <p className="jp-pop-phrase">{fiche.donnees.phrase}</p>}
+              </div>
+            )}
+          </div>
+        </div>, document.body)}
+
+      {/* ── LE LECTEUR ────────────────────────────────────────────────────────────────────────────
+          En lecture seule, et c'est une décision, pas une limite technique : Japanese1.md est un
+          journal append-only, et un journal qu'on peut retoucher depuis une page web cesse de dire ce
+          qu'on croyait à l'époque, ce qui est justement ce qu'on vient y chercher. */}
+      {/* PORTAIL VERS `document.body`, ET CE N'EST PAS UN DÉTAIL DE PROPRETÉ.
+          Mesuré le 2026-08-27 : la feuille se rendait à y = 2879 px, très en dessous de l'écran, donc
+          invisible. Cause réelle, trouvée en remontant les ancêtres : `div.zr-stage` porte un
+          `backdrop-filter`, ce qui en fait le BLOC CONTENEUR de tout `position: fixed` descendant. Le
+          `inset: 0` visait donc la boîte du stage, haute de plusieurs milliers de pixels, et non
+          l'écran. Le voile s'affichait bien, ce qui rendait le défaut trompeur : on voyait la page
+          s'assombrir et l'on concluait que le lecteur ne chargeait rien.
+          La règle est déjà écrite dans App.jsx : ce qui doit couvrir l'écran sous un ancêtre à
+          overflow, transform ou backdrop-filter passe par un portail. Je ne l'avais pas cherchée. */}
+      {lecture && typeof document !== 'undefined' && createPortal(
+        <div className="jp-lecteur" role="dialog" aria-modal="true" onClick={(e) => { if (e.target === e.currentTarget) fermer() }}>
+          <article className="jp-feuille">
+            <header>
+              <div>
+                <h2>{lecture.titre}</h2>
+                {lecture.sous && <p>{lecture.sous}</p>}
+              </div>
+              <span className="jp-seule">lecture seule</span>
+              <button type="button" className="jp-fermer" onClick={fermer} aria-label="Fermer">
+                <Icon name="xmark" size={15} />
+              </button>
+            </header>
+            <div className="jps">{personalState ? <JapaneseLessonCategory recordId={lecture.personalId} annotation={personalState.annotations?.[lecture.personalId]} busy={personalBusy} onSave={saveHistoricalCategory} /> : <p>Chargement du classement…</p>}{personalError && <p role="alert">{personalError}{personalPending && <button disabled={personalBusy} onClick={()=>saveHistoricalCategory(personalPending)}>Réessayer le classement</button>}</p>}</div>
+            {chargeLecture || !lecture.markdown
+              ? <div className="jp-chargement"><span /><span /><span /></div>
+              : <div className="md-body jp-md" dangerouslySetInnerHTML={{ __html: safeMarkedParse(lecture.markdown) }} />}
+          </article>
+        </div>, document.body)}
+    </div>
+  )
+}

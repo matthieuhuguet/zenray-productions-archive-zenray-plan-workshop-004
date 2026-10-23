@@ -1,0 +1,307 @@
+// A3 — Vue « Downloads » (archive universelle zenray-productions-archive).
+// UX calquée sur Google Drive (réf screenshot Matthieu) : carte centrale, titre + « N éléments »,
+// tableau Nom / Type / Taille, bouton télécharger en barre haute. UI = liquid glass tinted du projet,
+// texte regular/medium uniquement (jamais de gras). Deux niveaux :
+//   1) racine : les archives (dossiers de pages/Archives) en lignes type Drive
+//   2) une archive : tableau de TOUS ses fichiers (récursif, .file.json), téléchargement par ligne
+//      (raw direct ou re-concaténation des chunks) + « Tout télécharger » séquentiel.
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { PALETTE, RADII, SHADOWS } from '../theme.js'
+import { notify } from './Notifications.jsx'
+import Icon from './Icon.jsx'
+import { loadSearchIndex, getIndexPaths } from '../search/searchIndexClient.js'
+import { downloadUrls } from '../lib/archiveChunks.js'
+import { streamDownload, assembleBlobUrl as streamAssembleBlobUrl } from '../lib/fetchAsset.js'
+import { urlLectureAffichage } from '../lib/urlLecture.js'
+
+const FONTS = { sans: "var(--zr-police-sans)" }
+const ROOT = 'pages/Archives'
+const fmtSize = (n) => n == null ? '—' : n >= 1e9 ? `${(n / 1e9).toFixed(2)} Go` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} Mo` : `${Math.max(1, Math.round(n / 1024))} Ko`
+const kindOf = (mime) => !mime ? 'Fichier' : mime.startsWith('image/') ? 'Image' : mime.startsWith('video/') ? 'Vidéo' : mime.startsWith('audio/') ? 'Audio' : mime.startsWith('text/') ? 'Texte' : 'Fichier'
+
+// Cache des manifestes (localStorage, TTL 1h) : éviter de brûler 1 requête API GitHub par fichier à CHAQUE
+// refresh. Les manifestes sont immuables (figés sur un commit) -> 1h est large. On ne retape l'API qu'à l'expiration.
+// Cache TTL 10 min (assez court pour voir une NOUVELLE version après ré-archivage, sans re-burn l'API à chaque
+// refresh). Clé versionnée 'zrfm5:' : changer ce préfixe invalide d'un coup tous les anciens caches (ex: passage
+// au manifeste v3 avec versions[]). Bump le préfixe à chaque évolution du schéma de manifeste.
+const MANI_TTL = 600e3
+const maniCacheGet = (p) => { try { const j = JSON.parse(localStorage.getItem('zrfm5:' + p)); return (j && Date.now() - j.t < MANI_TTL) ? j.m : null } catch { return null } }
+const maniCacheSet = (p, m) => { try { localStorage.setItem('zrfm5:' + p, JSON.stringify({ t: Date.now(), m })) } catch {} }
+
+// Aperçu (QuickLook) : reconstitue le fichier en mémoire et renvoie une URL d'objet (Blob) prête à afficher.
+// raw = URL directe ; chunked = fetch des chunks dans l'ordre puis Blob (identique bit à bit). Cap mémoire 500 Mo.
+const PREVIEW_MAX = 500 * 1e6
+const canPreview = (mime, size) => !!mime && (/^(image|video|audio|text)\//.test(mime) || mime === 'application/pdf') && (size == null || size <= PREVIEW_MAX)
+// Aperçu : Blob borné (cap mémoire) des chunks dans l'ordre, via le résolveur unique + fetchAsset. Identique
+// au comportement historique, mais sans dupliquer la résolution parts[]/v2-v3-v4.
+async function assembleBlobUrl(m, onProgress) {
+  return streamAssembleBlobUrl({ urls: downloadUrls(m), mime: m.mime || 'application/octet-stream', onProgress })
+}
+
+// Téléchargement STREAMÉ (disque chunk par chunk si l'API le permet -> zéro pic RAM ; repli Blob borné sinon).
+async function downloadOne(m, onProgress) {
+  return streamDownload({ urls: downloadUrls(m), name: m.name, mime: m.mime || 'application/octet-stream', onProgress })
+}
+
+export default function DownloadsView({ t, paths }) {
+  const dark = t.textPrimary === PALETTE.textPrimaryDark
+  const g = t.glass || {}
+  const [archive, setArchive] = useState(null) // nom de l'archive ouverte (segment après pages/Archives/)
+  const [manifests, setManifests] = useState({}) // path -> manifest (lazy)
+  const [dl, setDl] = useState(null) // { path, prog } téléchargement en cours
+  const [bulk, setBulk] = useState(null) // { done, total } « tout télécharger »
+
+  // Inventaire dérivé de l'arbre global. `.file.json` est EXCLUSIF à la feature archive (les médias normaux
+  // sont .img.json/.media.json) -> on liste CES nœuds, regroupés par RACINE D'ARCHIVE (jamais par sous-dossier
+  // interne type Photos/Videos/BestOf : sinon UNE archive segmentée apparaîtrait comme plusieurs « archives »).
+  // La racine = <parent connu>/<1er segment>. Parents connus, du plus spécifique au plus général :
+  //   - pages/Archives/<nom>           -> archive « <nom> »            (générique, historique)
+  //   - pages/Build/DJI/<date>         -> archive « DJI <date> »       (rushs drone, segmentée Photos/Videos/BestOf)
+  // Le libellé préfixe le dernier segment du parent (sauf pages/Archives) -> « DJI 16 Juin 2026 », pas « 16 Juin 2026 ».
+  // Fallback (autre emplacement) : racine = dossier conteneur direct. clé = racine (unique), libellé séparé.
+  const ARCHIVE_PARENTS = ['pages/Archives', 'pages/Build/DJI']
+  // SOURCE FIABLE : l'index CDN complet (100k+) liste TOUS les .file.json sans troncature. L'ancien `paths`
+  // (action=tree) tronquait au-delà de ~30k entrées -> des archives entières (DJI) « disparaissaient ». On
+  // énumère donc l'UNION (index complet + paths frais). Sans ça, le bug d'archives manquantes revenait.
+  const [idxPaths, setIdxPaths] = useState([])
+  useEffect(() => { let live = true; loadSearchIndex().then(() => { if (live) setIdxPaths(getIndexPaths()) }).catch(() => {}); return () => { live = false } }, [])
+  const { archives, filesByArchive, rootByArchive, labelByArchive } = useMemo(() => {
+    const by = new Map(), roots = new Map(), labels = new Map()
+    const classify = (p) => {
+      for (const parent of ARCHIVE_PARENTS) {
+        if (p.startsWith(parent + '/')) {
+          const name = p.slice(parent.length + 1).split('/')[0]
+          const root = `${parent}/${name}`
+          const label = parent === ROOT ? name : `${parent.split('/').pop()} ${name}`
+          return { key: root, root, label }
+        }
+      }
+      const dir = p.slice(0, p.lastIndexOf('/'))
+      return { key: dir, root: dir, label: dir.split('/').pop() || dir }
+    }
+    const all = new Set(); for (const p of (paths || [])) all.add(p); for (const p of idxPaths) all.add(p)
+    for (const p of all) {
+      if (!p.endsWith('.file.json')) continue
+      const { key, root, label } = classify(p)
+      if (!by.has(key)) { by.set(key, []); roots.set(key, root); labels.set(key, label) }
+      by.get(key).push(p)
+    }
+    for (const arr of by.values()) arr.sort()
+    return { archives: [...by.keys()].sort(), filesByArchive: by, rootByArchive: roots, labelByArchive: labels }
+  }, [paths, idxPaths])
+  const files = archive ? (filesByArchive.get(archive) || []) : []
+
+  // Manifestes lazy : on charge par lots de 12 ceux de l'archive ouverte (tailles + mode + urls).
+  const loadingRef = useRef(false)
+  useEffect(() => {
+    if (!archive || loadingRef.current) return
+    let live = true; loadingRef.current = true
+    ;(async () => {
+      // 1) hydrate depuis le cache local (0 requête) ; 2) ne fetch QUE les manquants non cachés.
+      const fromCache = {}; for (const p of files) { const c = maniCacheGet(p); if (c) fromCache[p] = c }
+      if (live && Object.keys(fromCache).length) setManifests((m) => ({ ...fromCache, ...m }))
+      const missing = files.filter((p) => !manifests[p] && !fromCache[p])
+      for (let i = 0; i < missing.length && live; i += 12) {
+        const batch = missing.slice(i, i + 12)
+        const got = await Promise.all(batch.map((p) =>
+          // Lecture d'AFFICHAGE : hors quota REST. Un lot de douze par dossier consommait douze
+          // requetes sur cinq mille, et la vue en enchaine autant qu'il y a de fichiers.
+          fetch(urlLectureAffichage(p), { cache: 'no-store' }).then((r) => r.json())
+            .then((j) => { try { const m = JSON.parse(j.markdown); maniCacheSet(p, m); return [p, m] } catch { return [p, null] } }).catch(() => [p, null])
+        ))
+        if (!live) break
+        setManifests((m) => { const n = { ...m }; for (const [p, v] of got) if (v) n[p] = v; return n })
+      }
+      loadingRef.current = false
+    })()
+    return () => { live = false; loadingRef.current = false }
+  }, [archive, files.length])
+
+  const relOf = (p) => { const root = (archive && rootByArchive.get(archive)) || ROOT; return p.slice(root.length + 1).replace(/\.file\.json$/, '') }
+  const [sel, setSel] = useState(null)        // path sélectionné (pour Espace = aperçu)
+  const [preview, setPreview] = useState(null) // { name, mime, prog?, url?, text?, err?, unsupported?, tooBig?, size? }
+  const [verSel, setVerSel] = useState({})     // path -> index de version choisie (archive versionnée)
+  // Manifeste EFFECTIF selon la version choisie (dernière par défaut) : aperçu + téléchargement de CETTE version.
+  const effM = (p) => {
+    const m = manifests[p]; if (!m || !Array.isArray(m.versions) || m.versions.length < 2) return m
+    const vi = verSel[p]; if (vi == null || vi >= m.versions.length) return m
+    const v = m.versions[vi]; return { ...m, repo: v.repo, commit: v.commit, chunks: v.chunks, parts: v.parts, size: v.size, sha256: v.sha256, chunkSize: v.chunkSize || m.chunkSize, mode: 'chunked' }
+  }
+  const closePreview = () => setPreview((pv) => { if (pv && pv.url && pv.url.startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(pv.url), 100); return null })
+  const openPreview = async (p) => {
+    const m = effM(p); if (!m) return
+    const name = relOf(p), mime = m.mime || ''
+    if (!canPreview(mime, m.size)) { setPreview({ name, mime, size: m.size, ...(m.size > PREVIEW_MAX ? { tooBig: true } : { unsupported: true }) }); return }
+    setPreview({ name, mime, prog: 0 })
+    try {
+      const url = await assembleBlobUrl(m, (x) => setPreview((pv) => (pv && pv.name === name ? { ...pv, prog: x } : pv)))
+      const text = mime.startsWith('text/') ? await (await fetch(url)).text() : null
+      setPreview({ name, mime, url, text })
+    } catch { setPreview({ name, mime, err: true }) }
+  }
+  // Raccourcis type Finder : ↑/↓ déplacent la sélection, Espace/Entrée ouvrent l'aperçu, Échap/Espace le ferment.
+  useEffect(() => {
+    if (!archive) return
+    const onKey = (e) => {
+      if (!files.length) return
+      const i = files.indexOf(sel)
+      // Aperçu ouvert : ↑/↓ passent au média précédent/suivant (exclusif à cette vue), Échap/Espace ferment.
+      if (preview) {
+        if (e.key === 'Escape' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); closePreview(); return }
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault(); e.stopPropagation()
+          const ni = e.key === 'ArrowDown' ? Math.min(files.length - 1, i + 1) : Math.max(0, i - 1)
+          const np = files[ni]; if (np && np !== sel) { setSel(np); closePreview(); openPreview(np) }
+        }
+        return
+      }
+      if (e.key === 'ArrowDown') { e.preventDefault(); setSel(files[Math.min(files.length - 1, i + 1)] || files[0]) }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(files[Math.max(0, i - 1)] || files[0]) }
+      else if ((e.key === ' ' || e.key === 'Enter') && sel) { e.preventDefault(); openPreview(sel) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [archive, files, sel, preview, manifests])
+
+  const card = { maxWidth: 980, margin: '24px auto', padding: '22px 26px', borderRadius: 20, fontFamily: FONTS.sans, fontWeight: 400, color: t.textPrimary,
+    background: `linear-gradient(150deg, ${PALETTE.primary}12, ${PALETTE.primary}06 65%), ${g.bgStrong || 'rgba(253,253,252,.84)'}`,
+    backdropFilter: g.filterThick || 'blur(44px) saturate(210%)', WebkitBackdropFilter: g.filterThick || 'blur(44px) saturate(210%)',
+    boxShadow: `inset 1.5px 1.5px 1px rgba(255,255,255,${dark ? 0.18 : 0.58}), inset 0 0 0 0.5px rgba(255,255,255,${dark ? 0.1 : 0.4}), 0 26px 70px -28px rgba(20,30,70,.45)` }
+  const th = { textAlign: 'left', padding: '8px 10px', fontSize: 'var(--zr-ui-xs)', letterSpacing: 0.4, textTransform: 'uppercase', color: t.textSecondary, fontWeight: 500, borderBottom: `1px solid ${PALETTE.primary}22` }
+  const td = { padding: '9px 10px', fontSize: 'var(--zr-ui-md)', borderBottom: `1px solid ${dark ? 'rgba(255,255,255,.05)' : 'rgba(0,0,0,.04)'}` }
+
+  // « Tout télécharger » : séquentiel (le navigateur groupe les autorisations), jamais 2 gros en parallèle.
+  const downloadAll = async () => {
+    const list = files.map((p) => manifests[p]).filter(Boolean)
+    setBulk({ done: 0, total: list.length })
+    const failed = []
+    for (let i = 0; i < list.length; i++) {
+      try { await downloadOne(list[i]) } catch { failed.push(list[i].name || `fichier ${i + 1}`) }
+      setBulk({ done: i + 1, total: list.length })
+      await new Promise((r) => setTimeout(r, 350))
+    }
+    if (failed.length) {
+      notify({ kind: 'error', title: 'Téléchargement incomplet', label: 'Tout télécharger', body: `${failed.length} fichier${failed.length > 1 ? 's' : ''} en échec : ${failed.slice(0, 5).join(', ')}${failed.length > 5 ? '…' : ''}`, ttl: 12000 })
+    }
+    setTimeout(() => setBulk(null), 2500)
+  }
+
+  // ── Niveau 1 : liste des archives ──────────────────────────────────────────
+  if (!archive) {
+    return (
+      <div style={card}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+          <span style={{ fontSize: 22, fontWeight: 500, letterSpacing: -0.3 }}>Downloads</span>
+          <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>archives · re-téléchargeables à 100%</span>
+        </div>
+        <div style={{ fontSize: 'var(--zr-ui-sm)', color: t.textSecondary, marginBottom: 18 }}>{archives.length} archive{archives.length > 1 ? 's' : ''} · servies par GitHub, reconstituées bit à bit</div>
+        {archives.length === 0 && <div style={{ padding: '28px 0', color: t.textSecondary, fontSize: 'var(--zr-ui-md)' }}>Aucune archive. Archive un dossier avec : <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)' }}>node Scripts/archive-folder.mjs &lt;dossier&gt;</span></div>}
+        {archives.map((key) => (
+          <button key={key} onClick={() => setArchive(key)}
+            style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', textAlign: 'left', padding: '13px 12px', borderRadius: 12, border: 'none', cursor: 'pointer', background: 'transparent', color: t.textPrimary, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-lg)', transition: 'background .14s' }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = dark ? 'rgba(255,255,255,.05)' : 'rgba(255,255,255,.55)' }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}>
+            <span style={{ display: 'inline-flex', width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center', background: PALETTE.primarySoft, color: PALETTE.primary }}><Icon name="archivebox" size={16} weight={1.5} /></span>
+            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{labelByArchive.get(key) || key}</span>
+            <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>{(filesByArchive.get(key) || []).length.toLocaleString('fr-FR')} éléments</span>
+            <Icon name="chevron.right" size={13} weight={1.8} />
+          </button>
+        ))}
+      </div>
+    )
+  }
+
+  // ── Niveau 2 : une archive ouverte (UX Google Drive) ───────────────────────
+  const total = files.reduce((n, p) => n + ((manifests[p] && manifests[p].size) || 0), 0)
+  return (
+    <div style={card}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 2 }}>
+        <button onClick={() => setArchive(null)} title="Retour aux archives" style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 32, height: 32, borderRadius: 9, border: 'none', cursor: 'pointer', background: dark ? 'rgba(255,255,255,.07)' : 'rgba(255,255,255,.55)', color: t.textSecondary }}><Icon name="chevron.left" size={15} /></button>
+        <span style={{ fontSize: 21, fontWeight: 500, letterSpacing: -0.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{labelByArchive.get(archive) || archive}</span>
+        <span style={{ fontSize: 'var(--zr-ui-md)', color: t.textSecondary }}>{files.length.toLocaleString('fr-FR')} éléments{total ? ` · ${fmtSize(total)}` : ''} · <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)' }}>Espace = aperçu</span></span>
+        <button onClick={downloadAll} disabled={!!bulk}
+          style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 7, padding: '8px 16px', borderRadius: 11, border: 'none', cursor: 'pointer', background: PALETTE.primary, color: '#fff', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)', fontWeight: 500, boxShadow: `0 6px 16px -4px ${PALETTE.primary}99`, opacity: bulk ? 0.7 : 1 }}>
+          <Icon name="arrow.down.right" size={13} color="#fff" weight={1.8} />
+          {bulk ? `${bulk.done}/${bulk.total}…` : 'Tout télécharger'}
+        </button>
+      </div>
+      <table style={{ width: '100%', borderCollapse: 'separate', borderSpacing: '0 3px', marginTop: 14 }}>
+        <thead><tr><th style={th}>Nom</th><th style={{ ...th, width: 110 }}>Type</th><th style={{ ...th, width: 110, textAlign: 'right' }}>Taille</th><th style={{ ...th, width: 54 }} /></tr></thead>
+        <tbody>
+          {files.map((p) => {
+            const m = manifests[p]
+            const em = effM(p)
+            const rel = relOf(p)
+            const busy = dl && dl.path === p
+            const on = sel === p
+            const vers = (m && Array.isArray(m.versions) && m.versions.length > 1) ? m.versions : null
+            const vi = vers ? (verSel[p] != null && verSel[p] < vers.length ? verSel[p] : vers.length - 1) : null
+            return (
+              <tr key={p} onClick={() => setSel(p)} onDoubleClick={() => openPreview(p)}
+                style={{ cursor: 'pointer', background: on ? `${PALETTE.primary}14` : 'transparent' }}>
+                <td style={{ ...td, fontFamily: FONTS.sans, borderTopLeftRadius: on ? 10 : 0, borderBottomLeftRadius: on ? 10 : 0 }}>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                    {/* VIGNETTE directe (sidecar du manifeste : thumb image / poster vidéo) — pas de réassemblage de
+                        l'original. À défaut, icône générique selon le mime. */}
+                    {m && (m.thumb || m.poster) ? (
+                      <span style={{ position: 'relative', display: 'inline-block', width: 30, height: 20, borderRadius: 4, overflow: 'hidden', background: 'rgba(128,128,128,0.12)', flexShrink: 0 }}>
+                        <img src={m.thumb || m.poster} alt="" loading="lazy" draggable={false} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+                        {!m.thumb && m.poster && <span style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Icon name="play.fill" size={8} color="#fff" /></span>}
+                      </span>
+                    ) : (
+                      <Icon name={m ? (m.mime || '').startsWith('image/') ? 'photo' : (m.mime || '').startsWith('video/') ? 'film' : (m.mime || '').startsWith('audio/') ? 'music.note' : 'doc' : 'doc'} size={14} weight={1.4} color={t.textSecondary} />
+                    )}
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: vers ? 380 : 520, display: 'inline-block', verticalAlign: 'middle' }}>{rel}</span>
+                    {/* Sélecteur de version (archive versionnée) : choisir une version antérieure -> aperçu/téléchargement de CELLE-ci. */}
+                    {vers && (
+                      <select value={vi} onClick={(e) => e.stopPropagation()} onChange={(e) => setVerSel((s) => ({ ...s, [p]: +e.target.value }))}
+                        title="Version" style={{ marginLeft: 8, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', padding: '2px 6px', borderRadius: 7, border: `1px solid ${PALETTE.primary}55`, background: dark ? 'rgba(255,255,255,.06)' : 'rgba(255,255,255,.7)', color: t.textPrimary, cursor: 'pointer' }}>
+                        {vers.map((v, i) => <option key={i} value={i}>v{i + 1}{i === vers.length - 1 ? ' (actuelle)' : ''} · {v.ts ? new Date(v.ts).toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'}</option>)}
+                      </select>
+                    )}
+                  </span>
+                </td>
+                <td style={{ ...td, color: t.textSecondary, fontSize: 'var(--zr-ui-sm)' }}>{m ? kindOf(m.mime) : '…'}</td>
+                <td style={{ ...td, textAlign: 'right', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary }}>{em ? fmtSize(em.size) : '…'}</td>
+                <td style={{ ...td, textAlign: 'right', borderTopRightRadius: on ? 10 : 0, borderBottomRightRadius: on ? 10 : 0 }}>
+                  <button disabled={!em || busy} onClick={() => { setDl({ path: p, prog: 0 }); downloadOne(em, (x) => setDl({ path: p, prog: x })).then(() => setDl(null)).catch(() => setDl(null)) }}
+                    title="Télécharger" style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 30, height: 30, borderRadius: 8, border: 'none', cursor: m ? 'pointer' : 'default', background: 'transparent', color: busy ? PALETTE.primary : t.textSecondary }}>
+                    {busy ? <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)' }}>{Math.round((dl.prog || 0) * 100)}%</span> : <Icon name="arrow.down.right" size={14} weight={1.7} />}
+                  </button>
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+
+      {/* QuickLook : aperçu plein écran du fichier reconstitué (Espace pour ouvrir/fermer, Échap pour fermer).
+          Rendu via PORTAL dans document.body : la carte parent a un backdrop-filter qui piégerait sinon le
+          position:fixed à l'intérieur d'elle (même bug que la carte markdown du Shelf, résolu pareil). */}
+      {preview && createPortal((
+        <div onClick={closePreview} style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.22)' }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ display: 'flex', flexDirection: 'column', maxWidth: '88vw', maxHeight: '88vh', borderRadius: 16, overflow: 'hidden', background: dark ? '#1c1c1e' : '#fff', boxShadow: '0 30px 90px -20px rgba(0,0,0,.6)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderBottom: `1px solid ${dark ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.06)'}` }}>
+              <Icon name={preview.mime.startsWith('image/') ? 'photo' : preview.mime.startsWith('video/') ? 'film' : preview.mime.startsWith('audio/') ? 'music.note' : 'doc'} size={15} weight={1.4} color={t.textSecondary} />
+              <span style={{ fontSize: 'var(--zr-ui-md)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '70vw' }}>{preview.name}</span>
+              <button onClick={closePreview} title="Fermer (Échap)" style={{ marginLeft: 'auto', display: 'inline-flex', width: 28, height: 28, borderRadius: 7, border: 'none', cursor: 'pointer', alignItems: 'center', justifyContent: 'center', background: dark ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.05)', color: t.textSecondary }}><Icon name="xmark" size={13} weight={2} /></button>
+            </div>
+            <div style={{ display: 'grid', placeItems: 'center', minWidth: 320, minHeight: 200, maxHeight: '80vh', overflow: 'auto' }}>
+              {preview.prog != null && !preview.url && <div style={{ padding: 48, color: t.textSecondary, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)' }}>Reconstitution… {Math.round(preview.prog * 100)}%</div>}
+              {preview.err && <div style={{ padding: 48, color: PALETTE.red }}>Erreur de reconstitution</div>}
+              {preview.unsupported && <div style={{ padding: 48, color: t.textSecondary, fontSize: 'var(--zr-ui-md)' }}>Aperçu indisponible pour ce type — télécharge le fichier.</div>}
+              {preview.tooBig && <div style={{ padding: 48, color: t.textSecondary, fontSize: 'var(--zr-ui-md)' }}>Trop volumineux pour l’aperçu ({fmtSize(preview.size)}) — télécharge-le.</div>}
+              {preview.url && preview.mime.startsWith('image/') && <img src={preview.url} alt={preview.name} style={{ maxWidth: '88vw', maxHeight: '80vh', display: 'block' }} />}
+              {preview.url && preview.mime.startsWith('video/') && !preview.playErr && <video src={preview.url} controls autoPlay onError={() => setPreview((pv) => pv ? { ...pv, playErr: true } : pv)} style={{ maxWidth: '88vw', maxHeight: '80vh', background: '#000' }} />}
+              {preview.url && preview.playErr && <div style={{ padding: 48, color: t.textSecondary, fontSize: 'var(--zr-ui-md)', textAlign: 'center', lineHeight: 1.6 }}>Codec non lisible par le navigateur (souvent .mov ProRes/HEVC).<br />Télécharge le fichier pour le lire.</div>}
+              {preview.url && preview.mime.startsWith('audio/') && <audio src={preview.url} controls autoPlay style={{ width: 440, margin: 48 }} />}
+              {preview.url && preview.mime === 'application/pdf' && <iframe title={preview.name} src={preview.url} style={{ width: '82vw', height: '80vh', border: 'none' }} />}
+              {preview.url && preview.text != null && <pre style={{ margin: 0, padding: 18, maxWidth: '82vw', maxHeight: '80vh', overflow: 'auto', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', lineHeight: 1.55, whiteSpace: 'pre-wrap', color: t.textPrimary }}>{preview.text}</pre>}
+            </div>
+          </div>
+        </div>
+      ), document.body)}
+    </div>
+  )
+}

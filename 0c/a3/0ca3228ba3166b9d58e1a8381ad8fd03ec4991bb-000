@@ -1,0 +1,158 @@
+#!/usr/bin/env node
+// 23 October 2026: the single command of ZenRay Knowledge (search, create, push, and the engine's steps).
+// FR : la commande unique de ZenRay Knowledge : chercher, créer, pousser, et les étapes du moteur.
+//   search "<mots>" [--json]      chercher dans la base (index mapping)
+//   add --q "<question ?>" --a "<paragraphe>" [--a ...] --proof "<extrait exact>" --source <fichier.md> [--d <domaine>] [--kw a,b]
+//   push [--dry]                  publier la base sur le drive (zenray-data/knowledge)
+//   prepare | pending | ingest | extract | run | status | hook
+import { readFile, mkdir, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { buildIndexMap, searchIndex, tokenize } from '../../src/lib/knowledgeIndex.js'
+import { expand, looksLikeQuestion } from './lib/Sources.mjs'
+import { checkEntry } from './lib/Validate.mjs'
+import { appendBook, loadStore, longDate, mergeEntries, saveStore, withStoreLock } from './lib/Store.mjs'
+import { extractWithCli, ingest, loadState, pendingUnits, prepare, runtimeDirectory, saveState } from './lib/Pipeline.mjs'
+import { publish, readInbox } from './lib/Publish.mjs'
+import { slotAfter } from '../Freelance/lib/Schedule.mjs'
+import { answerWithCli, findSame } from './lib/Ask.mjs'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+export const root = path.resolve(here, '../..')
+export const config = JSON.parse(await readFile(path.join(here, 'KnowledgeConfig.json'), 'utf8'))
+const args = process.argv.slice(2)
+const flag = (name) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined }
+const flags = (name) => args.flatMap((a, i) => (a === `--${name}` ? [args[i + 1]] : []))
+const has = (name) => args.includes(`--${name}`)
+const print = (value) => console.log(typeof value === 'string' ? value : JSON.stringify(value, null, 2))
+
+const cacheFile = () => path.join(runtimeDirectory(), 'LocalIndex.json')
+/** The local copy of the index mapping, rebuilt after every change, read by `search` and by the prompt hook. */
+export async function refreshLocalIndex(entries) {
+  await mkdir(runtimeDirectory(), { recursive: true })
+  await writeFile(cacheFile(), JSON.stringify({ builtAt: new Date().toISOString(), entries: entries.map(({ id, q, a, d, asked, firstAt, lastAt, src }) => ({ id, q, a, d, asked, firstAt, lastAt, ref: src[0]?.ref, kind: src[0]?.kind })), map: buildIndexMap(entries) }))
+}
+async function localIndex() {
+  try { return JSON.parse(await readFile(cacheFile(), 'utf8')) } catch { const entries = await loadStore(config); await refreshLocalIndex(entries); return JSON.parse(await readFile(cacheFile(), 'utf8')) }
+}
+export async function search(query, limit = 8) {
+  const index = await localIndex()
+  return searchIndex(index.map, query, { limit }).map((i) => index.entries[i])
+}
+const line = (e) => `${e.q}\n  ${e.a.join(' ')}\n  ${e.d} · ${e.asked?.length ? `posée ${e.asked.length} fois, dernière le ${longDate(e.lastAt)}` : `mémoire, ${longDate(e.firstAt)}`} · ${e.ref}`
+
+export async function engineStatus(extra = {}) {
+  const state = await loadState(), entries = await loadStore(config)
+  return { questions: entries.length, pending: (await pendingUnits()).length, lastRun: state.runs?.at(-1) || null, model: state.model || null, nextAt: slotAfter(new Date(), config.service.schedule).toISOString(), ...extra }
+}
+
+const clone = () => path.join(runtimeDirectory(), 'DataClone')
+
+/**
+ * Answer the questions asked on the site. A question already in the base is linked without any model; a new one is answered
+ * from memory passages with a proof, or marked « sans réponse prouvée ». A model that is down leaves it pending, visibly.
+ */
+export async function processInbox(entries, { withModel = true } = {}) {
+  const inbox = await readInbox(config, clone()), updates = {}
+  for (const item of (inbox.questions || []).filter((q) => q.status === 'pending')) {
+    const same = findSame(entries, item.q)
+    if (same) {
+      mergeEntries(entries, [{ q: same.q, a: same.a, d: same.d, kw: same.kw, asked: true, src: { kind: 'ask', ref: 'site', at: item.askedAt, proof: same.src[0].proof } }])
+      updates[item.id] = { status: 'answered', answerId: same.id, answeredAt: new Date().toISOString() }
+      continue
+    }
+    if (!withModel) continue
+    const result = await answerWithCli(config, root, item.q)
+    if (result.entry) {
+      const e = result.entry
+      const added = mergeEntries(entries, [{ q: e.q, a: e.a, d: e.d, kw: e.kw, asked: true, src: { kind: 'ask', ref: result.ref, at: item.askedAt, proof: e.proof } }])
+      await appendBook(config, added)
+      updates[item.id] = { status: 'answered', answerId: (added[0] || findSame(entries, e.q))?.id, answeredAt: new Date().toISOString() }
+    } else if (result.none) updates[item.id] = { status: 'unanswered', note: result.none, answeredAt: new Date().toISOString() }
+    else { updates[item.id] = { lastError: result.error }; break }
+  }
+  return updates
+}
+
+/**
+ * Drain step: read `limit` queued units with the model, ingest, publish. No source scan, so it can run back to back
+ * until the queue is empty. Returns how many units were read and whether the model is up.
+ */
+export async function drainStep(limit = config.extract.drainBatch) {
+  const extracted = await extractWithCli(config, { root, limit })
+  const state = await loadState()
+  if (extracted.error && !extracted.read) state.model = { ok: false, error: extracted.error, at: new Date().toISOString() }
+  else if (extracted.read) state.model = { ok: true, at: new Date().toISOString() }
+  await saveState(state)
+  const ingested = await ingest(config)
+  const entries = await loadStore(config)
+  await refreshLocalIndex(entries)
+  const published = ingested.added ? await publish(config, entries, await engineStatus(), { directory: clone() }) : { committed: false }
+  return { read: extracted.read, failed: extracted.failed, error: extracted.error, added: ingested.added, total: entries.length, pending: (await pendingUnits()).length, committed: published.committed }
+}
+
+/** One full pass: scan, read with the model, ingest, publish. A model that is down leaves units queued, visibly. */
+export async function runPass({ dryRun = false } = {}) {
+  const started = new Date().toISOString()
+  const prepared = await prepare(config, { root })
+  const extracted = await extractWithCli(config, { root })
+  const state = await loadState()
+  state.model = extracted.error && !extracted.read ? { ok: false, error: extracted.error, at: started } : { ok: true, at: started }
+  await saveState(state)
+  const ingested = await ingest(config)
+  const entries = await loadStore(config)
+  const inboxUpdates = await withStoreLock(config, async () => { const u = await processInbox(entries, { withModel: state.model.ok }); if (Object.keys(u).length) await saveStore(config, entries); return u })
+  await refreshLocalIndex(entries)
+  const status = await engineStatus({ lastPass: { started, finished: new Date().toISOString(), prepared, extracted, ingested } })
+  const published = await publish(config, entries, status, { directory: clone(), dryRun, inboxUpdates })
+  const after = await loadState(); after.runs = [...(after.runs || []).slice(-30), { started, prepared, extracted: { read: extracted.read, failed: extracted.failed, error: extracted.error }, ingested: { added: ingested.added, units: ingested.units }, committed: published.committed }]
+  await saveState(after)
+  return { prepared, extracted, ingested, published: { committed: published.committed, commit: published.commit } }
+}
+
+async function main() {
+  const command = args[0]
+  if (command === 'search') {
+    const found = await search(args.slice(1).filter((a) => !a.startsWith('--')).join(' '), Number(flag('limit')) || 8)
+    return has('json') ? print(found) : print(found.length ? found.map(line).join('\n\n') : 'Aucune question trouvée dans la base.')
+  }
+  if (command === 'add') {
+    const source = flag('source'); if (!source) throw new Error('--source <fichier> is required: an answer always cites its proof')
+    const text = await readFile(expand(source), 'utf8')
+    const verdict = checkEntry({ q: flag('q'), a: flags('a'), proof: flag('proof'), d: flag('d') || 'Autre', kw: (flag('kw') || '').split(',') }, text, config)
+    if (!verdict.ok) throw new Error(`Refused (${verdict.reason}): the proof must be copied word for word from ${source}`)
+    return print(await withStoreLock(config, async () => {
+      const entries = await loadStore(config), e = verdict.entry, now = new Date().toISOString()
+      const added = mergeEntries(entries, [{ q: e.q, a: e.a, d: e.d, kw: e.kw, asked: true, src: { kind: 'manual', ref: source.replace(process.env.HOME, '~'), at: now, proof: e.proof } }])
+      await saveStore(config, entries); await appendBook(config, added); await refreshLocalIndex(entries)
+      return { added: added.length, merged: added.length ? 0 : 1, total: entries.length }
+    }))
+  }
+  if (command === 'push') {
+    const entries = await loadStore(config)
+    const result = await publish(config, entries, await engineStatus(), { directory: path.join(runtimeDirectory(), 'DataClone'), dryRun: has('dry') })
+    return print({ committed: result.committed, commit: result.commit, report: result.report })
+  }
+  if (command === 'prepare') return print(await prepare(config, { root, memory: !has('conversations-only'), conversations: !has('memory-only') }))
+  if (command === 'pending') { const list = await pendingUnits(); return print({ pending: list.length, first: list.slice(0, Number(flag('limit')) || 10) }) }
+  if (command === 'ingest') { const report = await ingest(config); await refreshLocalIndex(await loadStore(config)); return print(report) }
+  if (command === 'extract') return print(await extractWithCli(config, { root, limit: Number(flag('limit')) || config.extract.maxUnitsPerRun }))
+  if (command === 'run') return print(await runPass({ dryRun: has('dry') }))
+  if (command === 'drain') return print(await drainStep(Number(flag('limit')) || config.extract.drainBatch))
+  if (command === 'status') return print(await engineStatus())
+  if (command === 'hook') {
+    // Claude Code UserPromptSubmit hook: a question is looked up in the base and the matches are given as context. Silent on any failure.
+    let input = ''; for await (const chunk of process.stdin) input += chunk
+    const prompt = (() => { try { return JSON.parse(input).prompt || '' } catch { return '' } })()
+    if (!looksLikeQuestion(prompt) || tokenize(prompt).length < 2) return
+    const found = (await search(prompt, 3)).filter(Boolean)
+    if (!found.length) return
+    const context = 'ZenRay Knowledge, questions déjà présentes dans la mémoire de Matthieu (preuve dans la source citée, peut contenir des erreurs) :\n' + found.map((e) => `- ${e.q} (${e.asked?.length ? `posée le ${longDate(e.lastAt)}` : `mémoire, ${longDate(e.firstAt)}`}, ${e.ref}) : ${e.a.join(' ')}`).join('\n')
+    return print({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: context } })
+  }
+  print('Usage: knowledge.mjs search|add|push|prepare|pending|ingest|extract|run|status|hook')
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => { if (args[0] === 'hook') process.exit(0); console.error(error.message); process.exit(1) })
+}

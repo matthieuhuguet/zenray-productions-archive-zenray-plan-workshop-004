@@ -1,0 +1,73 @@
+# 14 October 2026: tests of QueueStatus.py. Green on real worker log lines, red on unknown stages and on a reopened file.
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from QueueStatus import UploadQueue, stage_from_log_line, watch_progress  # noqa: E402
+
+LINES = {
+    '[15/15] Upload archive chiffree: The Dark Knight Rises (2012).mkv (7188.0 Mio)': ('archive', 'The Dark Knight Rises (2012).mkv'),
+    '✓ [15/15] Film archive (parts + HLS/DASH), verifie SHA-256 et decharge localement: The Dark Knight Rises (2012).mkv (9.10 Mio/s)': ('done', 'The Dark Knight Rises (2012).mkv'),
+    '[3/15] Upload archive chiffree: Le Sens De La Fete.mkv (1550.2 Mio)': ('archive', 'Le Sens De La Fete.mkv'),
+    '[3/15] Empaquetage CMAF HLS + DASH: Le Sens De La Fete.mkv': ('cmaf', 'Le Sens De La Fete.mkv'),
+    '[9/15] Verification cloud SHA-256: Peter Grill To Kenja No Jikan Season 02 - 12.mkv': ('proof', 'Peter Grill To Kenja No Jikan Season 02 - 12.mkv'),
+    '[9/15] Unload local apres preuve SHA-256: Peter Grill To Kenja No Jikan Season 02 - 12.mkv': ('unload', 'Peter Grill To Kenja No Jikan Season 02 - 12.mkv'),
+    '✓ [4/15] Film archive (parts + HLS/DASH), verifie SHA-256 et decharge localement: Peter Grill To Kenja No Jikan Season 02 - 04.mkv (7.80 Mio/s)': ('done', 'Peter Grill To Kenja No Jikan Season 02 - 04.mkv'),
+    '✗ Abandon (verification) de Peter Grill To Kenja No Jikan Season 02 - 03.mkv apres 4 tentatives (le film reste sur disque et sur le Drive).': ('failed', 'Peter Grill To Kenja No Jikan Season 02 - 03.mkv'),
+}
+
+for line, expected in LINES.items():
+    assert stage_from_log_line(line) == expected, (line, stage_from_log_line(line))
+assert stage_from_log_line('Demarrage de la file sequentielle') is None
+
+with tempfile.TemporaryDirectory() as directory:
+    queue = UploadQueue(directory, names=['a.mkv', 'b.mkv'])
+    data = json.loads((Path(directory) / 'UploadQueueStatus.json').read_text())
+    assert data['total'] == 2 and data['counts']['waiting'] == 2 and data['running'] is True
+    queue.on_log('[1/2] Upload archive chiffree: a.mkv (10.0 Mio)')
+    queue.on_log('✓ [1/2] Film archive, verifie et decharge: a.mkv (5.00 Mio/s)')
+    queue.on_log('[1/2] Unload local apres preuve SHA-256: a.mkv')  # late line: must not reopen a finished file
+    queue.on_log('✗ Abandon (verification) de b.mkv apres 4 tentatives (x)')
+    data = json.loads((Path(directory) / 'UploadQueueStatus.json').read_text())
+    stages = {item['name']: item['stage'] for item in data['items']}
+    assert stages == {'a.mkv': 'done', 'b.mkv': 'failed'}, stages
+    assert data['finished'] == 2 and data['running'] is False
+    try:
+        queue.set_stage('a.mkv', 'nonsense')
+        raise SystemExit('RED control failed: an unknown stage was accepted')
+    except ValueError:
+        pass
+# 14 October 2026: real time percentage of a stage
+import threading
+import time
+with tempfile.TemporaryDirectory() as directory:
+    queue = UploadQueue(directory, names=['film.mkv'])
+    queue.on_log('[1/1] Empaquetage CMAF HLS + DASH: film.mkv')
+    progress = Path(directory) / 'progress.json'
+    progress.write_text(json.dumps({'phase': 'package', 'percent': 42, 'mode': 'transcode', 'bitrateMbit': 8}))
+    stop = threading.Event()
+    thread = threading.Thread(target=watch_progress, args=(queue, 'film.mkv', progress, stop, 0.05))
+    thread.start()
+    time.sleep(0.4)
+    item = json.loads((Path(directory) / 'UploadQueueStatus.json').read_text())['items'][0]
+    assert item['percent'] == 42 and item['detail'] == 'conversion de la video a 8 Mbit/s pour le streaming', item
+    progress.write_text(json.dumps({'phase': 'push', 'percent': 63}))
+    time.sleep(0.4)
+    item = json.loads((Path(directory) / 'UploadQueueStatus.json').read_text())['items'][0]
+    assert item['percent'] == 63 and item['detail'] == 'envoi des segments vers GitHub', item
+    queue.on_log('[1/1] Verification cloud SHA-256: film.mkv')  # next stage: the packaging percentage must not stay
+    item = json.loads((Path(directory) / 'UploadQueueStatus.json').read_text())['items'][0]
+    assert 'percent' not in item, item
+    stop.set(); thread.join()
+    queue.on_log('✓ [1/1] Film archive, verifie et decharge: film.mkv (5.00 Mio/s)')
+    queue.set_progress('film.mkv', 10)  # a finished file ignores late progress
+    assert 'percent' not in json.loads((Path(directory) / 'UploadQueueStatus.json').read_text())['items'][0]
+with tempfile.TemporaryDirectory() as directory:
+    queue = UploadQueue(directory, names=['a.mkv'])
+    queue.on_log('[1/1] Upload archive chiffree: a.mkv (10.0 Mio)')
+    queue.close()
+    data = json.loads((Path(directory) / 'UploadQueueStatus.json').read_text())
+    assert data['running'] is False and data['pid'] > 0, data
+print('queue status tests OK')

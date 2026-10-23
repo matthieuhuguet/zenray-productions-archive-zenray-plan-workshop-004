@@ -1,0 +1,511 @@
+import { CONVERSATION_PROVIDERS } from '../../lib/assetsConversations.js'
+import ConversationView, { ConversationBadge } from './ConversationView.jsx'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import Icon from '../Icon.jsx'
+import { UI } from '../../config/colors.js'
+import { PALETTE } from '../../theme.js'
+import { extOf, kindForName } from '../../lib/fileKinds.js'
+import { readableSize, compareProjectsByDateDesc } from '../../lib/assetsProjects.js'
+import { mergeProjectConversations } from '../../lib/assetsProjectConversations.js'
+import { stripLeafExt } from '../../create/node.js'
+import { projectWorkshopPath, projectDependencies } from '../../lib/projectContextIndex.js'
+import './AssetsWorkspace.tokens.css'
+import ProjectIdentity from './ProjectIdentity.jsx'
+import StorageBreakdown from './StorageBreakdown.jsx'
+import LocationPath from './LocationPath.jsx'
+import FileLocations from './FileLocations.jsx'
+import FileFilters from './FileFilters.jsx'
+import FilePresentations, { FILE_VIEWS } from './FilePresentations.jsx'
+import { queryAssetsFiles, FILE_QUERY_DEFAULTS, fileDate, fileSizeLabel } from '../../lib/assetsFileQuery.js'
+import LiveTransfersPanel from './LiveTransfersPanel.jsx'
+import { TubeHome, TubeProject, TubeLayoutSwitch, CoverAdjustModal } from './AssetsTube.jsx'
+import { useProjectCovers } from '../../lib/useProjectCovers.js'
+import { pickProjectCover } from '../../lib/assetsProjectCover.js'
+import { coverThumbnailDataUri } from '../../lib/coverThumbnail.js'
+import ProjectArticle from './ProjectArticle.jsx'
+import { articleThumbnail, projectArticleFile, linkedArticleFile } from '../../lib/assetsProjectArticle.js'
+import './ProjectWorkspace.css'
+
+// 2 October 2026, 12:47 CEST: this workspace renders observations; the bridge owns file operations.
+const SOURCE_TYPES = [
+  { id: 'tmp', label: 'tmp', description: 'Chantiers et fichiers temporaires', icon: 'archivebox' },
+  { id: 'memory', label: 'Memory', description: 'Notes, décisions et suivi', icon: 'book' },
+  { id: 'houdini', label: 'Houdini', description: 'Scènes, outils et rendus', icon: 'square.grid.3x3' },
+  { id: 'unreal', label: 'Unreal', description: 'Projet et contenu du jeu', icon: 'square.grid.2x2' },
+]
+const SOURCE_LABELS = Object.fromEntries(SOURCE_TYPES.map((source) => [source.id, source.label]))
+const FILE_STATES = {
+  'older-local': { label: 'Copie precedente', tone: 'quiet', icon: 'clock' },
+  verified: { label: 'Vérifié', tone: 'good', icon: 'checkmark' },
+  'backed-up': { label: 'Sauvegardé', tone: 'good', icon: 'lock.icloud' },
+  'cloud-only': { label: 'Cloud', tone: 'quiet', icon: 'lock.icloud' },
+  cloud: { label: 'Cloud', tone: 'quiet', icon: 'lock.icloud' },
+  'local-only': { label: 'À sauvegarder', tone: 'pending', icon: 'arrow.up' },
+  pending: { label: 'En attente', tone: 'pending', icon: 'clock' },
+  modified: { label: 'Modifié', tone: 'pending', icon: 'arrow.up' },
+  'source-conflict': { label: 'Deux versions', tone: 'pending', icon: 'exclamationmark.triangle' },
+  missing: { label: 'Absent du Mac', tone: 'quiet', icon: 'externaldrive' },
+  error: { label: 'À vérifier', tone: 'error', icon: 'xmark' },
+}
+const TABS = [
+  { id: 'files', label: 'Fichiers', icon: 'doc.text' },
+  { id: 'conversations', label: 'Conversations', icon: 'bubble.left.and.bubble.right' },
+  { id: 'activity', label: 'Historique', icon: 'clock.arrow.2.circlepath' },
+  { id: 'origins', label: 'Emplacements', icon: 'externaldrive' },
+]
+const KIND_ICONS = { image: 'photo', 'image-lib': 'photo', video: 'film', audio: 'music.note', text: 'doc.text', pdf: 'doc.richtext', houdini: 'square.grid.3x3', '3d-lib': 'square.grid.3x3', archive: 'archivebox' }
+const EVENT_TYPES = {
+  // 3 October 2026, 22:25 CEST: delegated instructions stay in discussions with explicit provenance.
+  order: { label: 'Consigne de travail', icon: 'doc.text' },
+  prompt: { label: 'Prompt', icon: 'bubble.left' },
+  feedback: { label: 'Feedback', icon: 'bubble.left' },
+  note: { label: 'Note', icon: 'note.text' },
+  decision: { label: 'Décision', icon: 'checklist' },
+  result: { label: 'Résultat', icon: 'checkmark' },
+  iteration: { label: 'Itération', icon: 'arrow.clockwise' },
+  restore: { label: 'Chargement', icon: 'arrow.down' },
+  load: { label: 'Chargement', icon: 'arrow.down' },
+  archive: { label: 'Sauvegarde', icon: 'arrow.up' },
+  error: { label: 'Erreur', icon: 'xmark' },
+}
+// 2 October 2026, 15:35 CEST: each transfer shows its actual operation and queue state.
+const TRANSFER_LABELS = { archive: 'Sauvegarde', restore: 'Chargement', unload: 'Dechargement', recover: 'Recuperation', 'prepare-scene': 'Vérification Houdini' }
+const numberFormat = new Intl.NumberFormat('fr-FR')
+const PAGE_SIZE = 100
+const dateFormat = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+const timeFormat = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' })
+
+function fileView(file, index) {
+  const path = file.relativePath || file.path || file.contentPath || file.cloudPath || file.id || ''
+  const name = file.name || (file.relativePath ? path : stripLeafExt(path)).split('/').pop() || 'Fichier'
+  return {
+    ...file,
+    id: file.id || file.contentPath || file.cloudPath || `${path}:${index}`,
+    name,
+    relativePath: file.relativePath || name,
+    kind: file.kind || kindForName(name),
+    namespace: file.namespace || file.source || file.sourceId?.split(':')[0] || '',
+    searchable: `${name} ${path} ${file.cloudPath || ''}`.toLocaleLowerCase('fr'),
+  }
+}
+
+function dateLabel(value) {
+  if (!value) return ''
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? dateFormat.format(date) : ''
+}
+
+function timestampLabel(value) {
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? `${dateFormat.format(date)} · ${timeFormat.format(date)}` : ''
+}
+
+function Status({ status = 'unknown', children }) {
+  const state = FILE_STATES[status] || { label: 'État inconnu', tone: 'quiet', icon: 'clock' }
+  return <span className={`assets-status assets-status-${state.tone}`}><span className="assets-status-dot" aria-hidden="true" />{children || state.label}</span>
+}
+
+function ActionButton({ icon, children, primary = false, ...props }) {
+  return <button type="button" className={`assets-button${primary ? ' assets-button-primary' : ''}`} {...props}>{icon && <Icon name={icon} size={16} />}{children}</button>
+}
+
+function projectFileCount(project) {
+  return Math.max(0, project?.files?.length || 0, Number(project?.sync?.count) || 0, Number(project?.inventory?.count) || 0)
+}
+
+// 8 October 2026 23:21 CEST: separate project spaces from archived conversation workspaces in the overview.
+function ProjectInventorySummary({ projects, conversations = [], loading }) {
+  const fileCount = projects.reduce((total, project) => total + projectFileCount(project), 0)
+  const projectCount = projects.filter((project) => project.category !== 'Conversations').length
+  const conversationArchiveCount = projects.length - projectCount
+  return <section className="assets-inventory-summary" aria-label="Inventaire Assets" aria-busy={loading}>
+    <div className="assets-inventory-topline"><span className="assets-eyebrow">Tout votre atelier</span><span className="assets-inventory-bricks" aria-hidden="true">{Array.from({ length: 5 }, (_, index) => <i key={index} />)}</span></div>
+    <div className="assets-inventory-totals">
+      <div><span className="assets-number">{loading ? '…' : numberFormat.format(projects.length)}</span><span>espaces</span></div>
+      <div><span className="assets-number">{loading ? '…' : numberFormat.format(fileCount)}</span><span>fichiers</span></div>
+    </div>
+    <p>{loading ? 'Lecture des espaces et de leurs fichiers.' : `${numberFormat.format(projectCount)} ${projectCount === 1 ? 'projet' : 'projets'}, ${numberFormat.format(conversationArchiveCount)} ${conversationArchiveCount === 1 ? 'archive de conversation' : 'archives de conversations'} · ${numberFormat.format(conversations.length)} conversations indexées.`}</p>
+  </section>
+}
+
+function FileImage({ file, renderThumbnail, cover = false }) {
+  // A stored direct thumbnail (cover chosen or found by name) paints at once and never goes through a manifest read.
+  if (file?.thumbnailUrl || file?.coverUrl) return <img src={file.thumbnailUrl || file.coverUrl} alt="" loading="lazy" decoding="async" />
+  if (renderThumbnail && (file?.contentPath || file?.cloudPath || file?.kind === 'image')) return renderThumbnail(file, { size: cover ? 280 : 44, cover })
+  if (file?.thumbnailUrl || file?.coverUrl) return <img src={file.thumbnailUrl || file.coverUrl} alt="" loading="lazy" />
+  return <Icon name={KIND_ICONS[file?.kind] || 'doc'} size={cover ? 40 : 24} />
+}
+
+function ProjectRail({ conversationMirrorStatus, conversations = [], activeConversation, onConversation, projects, activeId, onSelect, onLinkProject, onAdjustCover, search, onSearch, renderThumbnail, loading }) {
+  // 3 October 2026, 16:05 CEST: conversations have their own shelf while retaining the project workspace and cloud mapping.
+  const [collection, setCollection] = useState(projects.find((project) => project.id === activeId)?.category === 'Conversations' ? 'conversations' : 'projects')
+  useEffect(() => { setCollection(projects.find((project) => project.id === activeId)?.category === 'Conversations' ? 'conversations' : 'projects') }, [activeId])
+  const collected = projects.filter((project) => (project.category === 'Conversations') === (collection === 'conversations'))
+  const visible = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase('fr')
+    return collected.filter((project) => !query || `${project.name} ${project.category || ''} ${project.summary || ''}`.toLocaleLowerCase('fr').includes(query)).sort(compareProjectsByDateDesc)
+  }, [projects, search, collection])
+  const conversationVisible = [...conversations].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).filter(item => !search.trim() || `${item.title} ${item.provider} ${CONVERSATION_PROVIDERS[item.provider] || ''}`.toLowerCase().includes(search.trim().toLowerCase()))
+  const projectItems = visible.map((project) => <button type="button" className="assets-project-item" data-active={project.id === activeId} aria-current={project.id === activeId ? 'page' : undefined} key={project.id} onClick={() => onSelect(project.id)} onContextMenu={(event) => { event.preventDefault(); onAdjustCover?.(project) }} title="Clic droit pour modifier la miniature">
+    <span className="assets-project-miniature">{project.coverUrl ? <img src={project.coverUrl} alt="" loading="lazy" /> : project.coverFile ? <FileImage file={project.coverFile} renderThumbnail={renderThumbnail} /> : <Icon name="archivebox" size={20} />}</span>
+    <span className="assets-project-item-copy"><span>{project.name}</span><span className="assets-project-item-meta"><small className="assets-project-file-count"><span className="assets-number">{numberFormat.format(projectFileCount(project))}</span> fichiers</small></span></span><Icon name="chevron.right" size={12} />
+  </button>)
+  const showConversationArchives = collection === 'conversations' && conversations.length > 0
+  return <aside className="assets-project-rail" aria-label="Projets">
+    <header className="assets-rail-heading"><div><span className="assets-eyebrow">Votre atelier</span><h1>ZenRay <em>Assets</em></h1></div></header>
+    <ProjectInventorySummary projects={projects} conversations={conversations} loading={loading} />
+    <label className="assets-search assets-project-search"><Icon name="magnifyingglass" size={15} /><input aria-label={collection === 'conversations' ? 'Rechercher une conversation' : 'Rechercher un projet'} value={search} onChange={(event) => onSearch(event.target.value)} placeholder={collection === 'conversations' ? 'Rechercher une conversation' : 'Rechercher un projet'} />{search && <button type="button" className="assets-icon-button" aria-label="Effacer la recherche de projets" onClick={() => onSearch('')}><Icon name="xmark" size={13} /></button>}</label>
+    <div className="assets-file-filters" role="group" aria-label="Collections">{[['projects', 'Projets'], ['conversations', 'Conversations']].map(([id, label]) => <button type="button" key={id} aria-pressed={collection === id} data-active={collection === id} onClick={() => setCollection(id)}>{label} <span className="assets-number">{id === 'conversations' && conversations.length ? conversations.length : projects.filter((project) => (project.category === 'Conversations') === (id === 'conversations')).length}</span></button>)}</div>
+    <div className="assets-rail-label">{collection === 'conversations' ? 'Conversations' : 'Projets'} <span className="assets-number">{numberFormat.format(collection === 'conversations' && conversations.length ? conversationVisible.length : visible.length)}</span></div>
+    {collection === 'conversations' && conversationMirrorStatus && <p className="assets-footnote"><span className="assets-number">{conversationMirrorStatus.staged} / {conversations.length}</span> conversations préparées pour la sauvegarde progressive.</p>}
+    {showConversationArchives && visible.length > 0 && <><div className="assets-rail-label">Archives de conversations <span className="assets-number">{numberFormat.format(visible.length)}</span></div><nav className="assets-project-list" aria-label="Choisir une archive de conversations">{projectItems}</nav></>}
+    {collection === 'conversations' && conversations.length > 0 && <nav className="assets-project-list" aria-label="Choisir une conversation">{conversationVisible.map(item => <button type="button" className="assets-project-item" key={item.id} data-active={activeConversation?.id === item.id} onClick={() => onConversation?.(item)}><span className="assets-project-item-copy"><ConversationBadge provider={item.provider} /><span>{item.title}</span><small className="assets-number">{timestampLabel(item.updatedAt)}{!item.readable && ' · Lecture en attente'}</small></span></button>)}</nav>}
+    {!showConversationArchives && <nav className="assets-project-list" aria-label={collection === 'conversations' ? 'Choisir une archive de conversations' : 'Choisir un projet'}>
+      {projectItems}
+      {!visible.length && !(collection === 'conversations' && conversations.length) && <p className="assets-rail-empty">{projects.length ? 'Aucun projet ne correspond.' : 'Votre premier projet apparaît ici.'}</p>}
+    </nav>}
+    <div className="assets-rail-footer"><ActionButton icon="plus" onClick={onLinkProject} disabled={!onLinkProject}>Relier un projet</ActionButton><p>Un projet rassemble ses fichiers, ses notes et ses emplacements.</p></div>
+  </aside>
+}
+
+function EmptyState({ icon = 'doc.text', title, children, action }) {
+  return <div className="assets-empty"><span className="assets-empty-icon"><Icon name={icon} size={28} /></span><h3>{title}</h3><p>{children}</p>{action}</div>
+}
+
+// 3 October 2026, 04:31 CEST: expose exact resource links while keeping unresolved references and runtime verification distinct.
+function SceneResources({ project, projects, connected, onNavigateResource, onPrepareScene, busy }) {
+  const scenes = project.sceneReferences || []
+  const pendingCount = connected ? project.sync?.sceneAuditPendingCount || 0 : 0
+  if (!scenes.length && !pendingCount) return null
+  const referenceLabels = { 'relocation-required': 'À reconnecter à la copie chargée', unresolved: 'À identifier', 'outside-mapping': 'Hors du projet', ambiguous: 'Plusieurs correspondances', dynamic: 'Séquence à vérifier', relative: 'Chemin relatif', uri: 'Ressource de session', directory: 'Dossier', internal: 'Ressource interne', output: 'Sortie' }
+  return <section aria-label="Ressources des scènes"><div className="assets-section-heading"><div><h3>Ressources des scènes</h3><p>Les fichiers reliés au projet et aux bibliothèques partagées.</p></div></div>{pendingCount > 0 && <p className="assets-footnote" role="status"><span className="assets-number">{pendingCount}</span> {pendingCount === 1 ? 'scène en cours ou en attente d’analyse automatique.' : 'scènes en cours ou en attente d’analyse automatique.'}</p>}{scenes.map((scene) => {
+    const targets = [...new Map(scene.references.filter((reference) => ['mapped', 'relocation-required'].includes(reference.type)).flatMap((reference) => reference.targets).map((target) => [`${target.projectId}/${target.fileId}`, target])).values()]
+    const unresolved = scene.references.filter((reference) => ['unresolved', 'outside-mapping', 'ambiguous', 'dynamic', 'relative', 'relocation-required'].includes(reference.type))
+    const sceneName = scene.sceneFileId.split(':').slice(1).join(':')
+    const sceneFile = project.files?.find((file) => file.id === scene.sceneFileId)
+    const canPrepare = connected && scene.state === 'current' && sceneFile?.loadedCopy && ['verified', 'backed-up'].includes(sceneFile.status)
+    const preparation = scene.preparation
+    return <details className="assets-origin-card assets-scene-resources" key={scene.sceneFileId}>
+      <summary><code>{sceneName}</code>{scene.state === 'current' ? <span><span className="assets-number">{targets.length}</span> {targets.length === 1 ? 'fichier identifié' : 'fichiers identifiés'}{unresolved.length > 0 && <> · <span className="assets-number">{unresolved.length}</span> {unresolved.length === 1 ? 'référence à vérifier' : 'références à vérifier'}</>}</span> : <span>Analyse périmée</span>}</summary>
+      {scene.state !== 'current' ? <p className="assets-footnote">La scène a changé. Son analyse se renouvelle automatiquement sur le Mac connecté.</p> : <>
+        {targets.map((target) => <div className="assets-source-detail assets-scene-resource" key={`${target.projectId}/${target.fileId}`}><button type="button" className="assets-path-button" onClick={() => onNavigateResource(target)}><code>{target.relativePath}</code><Icon name="arrow.up.right" size={13} /></button><div className="assets-source-meta"><span>{target.projectId === project.id ? 'Ce projet' : projects.find((entry) => entry.id === target.projectId)?.name || target.projectId}</span><Status status={target.status} /></div></div>)}
+        {unresolved.length > 0 && <details className="assets-source-detail"><summary>Références à vérifier</summary><p className="assets-footnote">Un chemin non identifié ne prouve pas qu’un fichier manque.</p>{unresolved.map((reference) => <div className="assets-source-detail" key={reference.referenceId}><code>{reference.parameterPath || 'Référence sans paramètre'}</code><p>{referenceLabels[reference.type]}</p></div>)}</details>}
+      </>}
+      {/* 3 October 2026, 09:19 CEST: a narrow resource proof stays distinct from a saved portable or rendered scene. */}
+      {preparation && <div className="assets-source-detail" role="status"><p>{preparation.state === 'stale' ? 'La copie ou une ressource a changé. La vérification est à refaire.' : `Reconnexion vérifiée ${timestampLabel(preparation.checkedAt)}${connected && preparation.state === 'verified' ? ' pour les copies actuelles' : ''}.`}</p><p className="assets-footnote"><span className="assets-number">{preparation.inputCount}</span> entrées · <span className="assets-number">{preparation.libraryCount}</span> bibliothèques · <span className="assets-number">{preparation.instanceCount}</span> instances.</p>{(preparation.warningCount > 0 || preparation.diagnosticCount > 0) && <p className="assets-footnote">Le contrôle comporte des diagnostics conservés dans la preuve locale.</p>}</div>}
+      {onPrepareScene && <ActionButton icon="checkmark" disabled={!canPrepare || busy} onClick={() => onPrepareScene(project, scene)}>Vérifier les ressources chargées</ActionButton>}
+      <p className="assets-footnote">Le fonctionnement de la scène après rechargement reste à vérifier.</p>
+    </details>
+  })}</section>
+}
+
+function Origins({ project, projects, sources, connected, checkedAt, onOpenPath, onOpenWorkshop, onLinkProject, onArchive, onSelectProject, onNavigateResource, onPrepareScene, busy }) {
+  const workshopPath = projectWorkshopPath(project)
+  const dependencyIds = projectDependencies(project).dependencies
+  return <section className="assets-origins" aria-label="Emplacements du projet">
+    <div className="assets-section-heading"><div><h3>Du Mac au projet</h3><p>Chaque source conserve son rôle et rejoint le même dossier dans le cloud.</p></div>{onLinkProject && <ActionButton icon="plus" onClick={() => onLinkProject(project)}>Relier un dossier</ActionButton>}</div>
+    <ProjectIdentity project={project} projects={projects} connected={connected} />
+    <div className="assets-origin-cards">
+      {SOURCE_TYPES.map((type) => {
+        const matches = sources.filter((source) => source.namespace === type.id || source.id === type.id || source.source === type.id)
+        return <section className="assets-origin-card" key={type.id}>
+          <div className="assets-origin-title"><span className="assets-origin-symbol"><Icon name={type.icon} size={20} /></span><div><h4>{type.label}</h4><p>{type.description}</p></div><span className="assets-number">{matches.length ? numberFormat.format(matches.reduce((count, source) => count + (source.count || 0), 0)) : ''}</span></div>
+          {matches.length ? matches.map((source, index) => <div className="assets-source-detail" key={source.id || source.localPath || index}>
+            <LocationPath label="Source sur ce Mac" icon="externaldrive" value={source.localPath || source.path} onOpen={connected && onOpenPath ? () => onOpenPath(source.localPath || source.path, project) : undefined} />
+            {project.workspace?.state === 'loaded' && type.id !== 'memory' && <LocationPath label="Copie de travail" icon="folder" value={`${project.workspace.path}/sources/${type.id}/${source.id}`} />}
+            <div className="assets-source-meta"><Status status={connected && (source.checkedAt || checkedAt) ? source.status === 'error' ? 'error' : source.present || source.status === 'present' ? 'local-only' : 'missing' : 'unknown'}>{connected && (source.checkedAt || checkedAt) ? source.status === 'error' ? 'Lecture impossible' : source.present || source.status === 'present' ? 'Sur ce Mac' : 'Absent du Mac' : 'État local à vérifier'}</Status>{Number.isFinite(source.bytes) && <span className="assets-number">{readableSize(source.bytes) || '0 Ko'}</span>}</div>
+            <LocationPath label="Destination cloud" icon="lock.icloud" value={source.cloudPath || source.destination || source.target || (project.folder ? `${project.folder}/sources/${type.id}/${source.id}` : null)} />
+          </div>) : <div className="assets-origin-unlinked"><span>Aucun dossier relié</span>{onLinkProject && <button type="button" onClick={() => onLinkProject(project, type.id)}>Relier un dossier <Icon name="plus" size={13} /></button>}</div>}
+        </section>
+      })}
+    </div>
+    <div className="assets-cloud-destination"><Icon name="lock.icloud" size={22} /><div><span className="assets-eyebrow">Destination du projet</span><code>{project.folder || 'Destination à définir'}</code></div>{project.folder && <ActionButton icon="arrow.up.right" onClick={() => window.dispatchEvent(new CustomEvent('zr:create-folder', { detail: { path: project.folder } }))}>Ouvrir dans Create</ActionButton>}{onArchive && <ActionButton icon="arrow.up" onClick={() => onArchive(project, [])} disabled={!connected || busy}>Sauvegarder le projet</ActionButton>}</div>
+    {workshopPath && <div className="assets-shared-host"><Icon name="externaldrive" size={18} /><div><strong>Atelier du projet</strong><p>Déposez vos nouveaux fichiers ici pour les suivre et les sauvegarder automatiquement.</p><code>{workshopPath}</code></div>{onOpenWorkshop && <ActionButton icon="arrow.up.right" onClick={() => onOpenWorkshop(project)} disabled={!connected}>Ouvrir l’atelier</ActionButton>}</div>}
+    {dependencyIds.map((id) => { const dependency = project.dependencies?.find((entry) => entry?.projectId === id); return <div className="assets-shared-host" key={id}><Icon name="link" size={18} /><div><strong>{projects.find((entry) => entry.id === id)?.name || dependency?.name || id}</strong><p>{dependency?.description}</p></div><ActionButton onClick={() => onSelectProject?.(id)}>Voir le projet hôte</ActionButton></div> })}
+    <SceneResources project={project} projects={projects} connected={connected} onNavigateResource={onNavigateResource} onPrepareScene={onPrepareScene} busy={busy} />
+    <p className="assets-footnote">{connected && checkedAt ? <>Dernier relevé : <span className="assets-number">{dateLabel(checkedAt)}</span>.</> : 'Connectez le Mac pour relever les dossiers actuels.'} Les emplacements restent visibles lorsque le Mac est déconnecté.</p>
+  </section>
+}
+
+function Activity({ events, project, onPreview }) {
+  const [search, setSearch] = useState('')
+  const [eventFilter, setEventFilter] = useState('all')
+  const filtered = events.filter(event => eventFilter === 'all' || (eventFilter === 'discussion' ? ['prompt', 'iteration', 'feedback', 'rule', 'result', 'order'].includes(event.type) : !['prompt', 'iteration', 'feedback', 'rule', 'result', 'order'].includes(event.type))).filter((event) => `${event.title || ''} ${event.body || event.detail || ''}`.toLocaleLowerCase('fr').includes(search.trim().toLocaleLowerCase('fr')))
+  if (!events.length) return <EmptyState icon="clock.arrow.2.circlepath" title="Le suivi commence ici">Les sauvegardes, chargements et notes de ce projet se réunissent dans cet historique.</EmptyState>
+  return <section className="assets-activity" aria-label="Historique du projet"><div className="assets-section-heading"><div><h3>La mémoire du projet</h3><p>Prompts, décisions et résultats composent la même chronologie.</p></div></div><input className="assets-search" aria-label="Rechercher dans la mémoire du projet" placeholder="Retrouver un prompt, une décision ou une itération" value={search} onChange={(event) => setSearch(event.target.value)} /><label className="assets-select-label">Afficher <select aria-label="Filtrer l’historique" value={eventFilter} onChange={event => setEventFilter(event.target.value)}><option value="all">Tout l’historique</option><option value="discussion">Discussions et feedbacks</option><option value="operations">Fichiers et opérations</option></select></label><p className="assets-footnote">Codex et Claude Code : messages des sessions liées. Gemini et Antigravity : compte rendu explicite de fin de tour, tant que leur conversation native n’est pas importée.</p><ol className="assets-timeline">{filtered.map((event, index) => {
+    const type = EVENT_TYPES[event.type] || { label: 'Action', icon: 'clock' }
+    const timestamp = event.createdAt || event.at || event.date
+    return <li key={event.id || `${timestamp}:${index}`}><span className="assets-timeline-symbol"><Icon name={type.icon} size={16} /></span><div className="assets-timeline-content"><span className="assets-eyebrow">{type.label}{event.provenance && <> · {event.provenance.provider || 'Feedback'}{event.provenance.actor === 'subagent' && ' · Sous-agent'} · {event.provenance.mode === 'transcript' ? 'Conversation capturée' : event.provenance.mode === 'checkpoint' ? 'Compte rendu de fin de tour' : 'Note consignée'}</>}</span><div><h4>{event.title || event.message || 'Action du projet'}</h4>{timestamp && <time className="assets-number" dateTime={String(timestamp)}>{timestampLabel(timestamp)}</time>}</div>{(event.detail || event.body) && <details><summary>{String(event.detail || event.body).split('\n').find((line) => line.trim())?.slice(0, 180) || 'Lire le contenu'}</summary><p>{event.detail || event.body}</p></details>}{event.provenance?.transcriptFile && <small className="assets-footnote">Source : <code>{event.provenance.transcriptFile}</code></small>}{event.file && onPreview && <button type="button" className="assets-text-button" onClick={() => onPreview(event.file, project)}>Lire le fichier <Icon name="arrow.up.right" size={13} /></button>}</div></li>
+  })}</ol></section>
+}
+
+// 9 October 2026, 11:04 CEST: Place synchronization controls with their Mac and cloud locations.
+function ProjectTransfer({ project, bridgeConnected, busy, interactiveBusy, pendingCount, pendingOperation, operation, activeJob, selectedFiles, downloadableFiles, onWatch, onArchive, onLoad, onUnload, onRecover, runAction }) {
+  return <section className="assets-project-transfer" aria-label="Sauvegarde et chargement"><div><Icon name="lock.icloud" size={22} /><div><span className="assets-transfer-title">{busy ? (pendingOperation && operation?.label ? `${operation.label}${operation.state === 'queued' ? ' en attente' : ''}` : null) || (activeJob ? `${TRANSFER_LABELS[activeJob.type] || 'Action'} ${activeJob.state === 'queued' ? 'en attente' : 'en cours'}…` : 'Action en cours…') : bridgeConnected && pendingCount ? <><span className="assets-number">{numberFormat.format(pendingCount)}</span> fichiers à sauvegarder</> : bridgeConnected ? 'Projet relié au Mac' : 'Retrouver le projet sur ce Mac'}</span><p>{busy && operation?.detail ? operation.detail : bridgeConnected && pendingCount ? 'Les fichiers modifiés rejoignent leur dossier dans le cloud.' : bridgeConnected ? project.workspace?.path ? 'La copie de travail est suivie. Les sources de production restent en place.' : 'La sauvegarde et le chargement gardent les mêmes emplacements.' : 'Le cloud est consultable. Connectez le Mac pour connaître ses fichiers actuels.'}</p></div></div><div className="assets-transfer-actions">{onWatch && <ActionButton icon="arrow.clockwise" onClick={() => runAction(onWatch, project, !project.sync?.watched)} disabled={!bridgeConnected || interactiveBusy}>{project.sync?.watched ? 'Auto activée' : 'Activer auto'}</ActionButton>}{onArchive && <ActionButton icon="arrow.up" onClick={() => runAction(onArchive, project, selectedFiles)} disabled={!bridgeConnected || busy}>Sauvegarder{selectedFiles.length ? ' la sélection' : ''}</ActionButton>}{onLoad && <ActionButton icon="arrow.down" onClick={() => runAction(onLoad, project, selectedFiles)} disabled={!bridgeConnected || interactiveBusy || !downloadableFiles.length}>{project.workspace?.path ? 'Compléter la copie' : 'Charger sur le Mac'}</ActionButton>}{onUnload && <ActionButton icon="externaldrive" onClick={() => runAction(onUnload, project, selectedFiles)} disabled={!bridgeConnected || interactiveBusy || !project.workspace?.path}>Décharger la copie chargée</ActionButton>}{onRecover && project.workspace?.recoverableCount > 0 && <ActionButton icon="arrow.down" onClick={() => runAction(onRecover, project)} disabled={!bridgeConnected || interactiveBusy || !!project.workspace?.path}>Récupérer la copie déchargée</ActionButton>}</div></section>
+}
+
+// 9 October 2026, 11:04 CEST: Show indexed evidence and primary binding as separate facts.
+function ProjectConversations({ project, projects, conversations, indexState, onOpen }) {
+  return <section className="assets-project-conversations" aria-label="Conversations liées au projet">
+    <div className="assets-section-heading"><div><h3>Conversations liées</h3><p>Les liens par activité restent distincts du projet principal de chaque session.</p></div><span className="assets-number">{numberFormat.format(conversations.length)}</span></div>
+    {indexState?.state === 'error' && <p role="alert">Index des conversations illisible : {indexState.error}</p>}
+    {indexState?.state === 'missing-index' && <p role="status">L’index de ce projet n’est pas encore disponible.</p>}
+    {indexState?.state === 'missing-source' && <p role="status">Aucun dossier Memory n’est relié à ce projet.</p>}
+    {!conversations.length && !['error', 'missing-index', 'missing-source'].includes(indexState?.state) && <p role="status">Recherche des conversations liées…</p>}
+    {conversations.length > 0 && <div className="assets-linked-conversation-list">{conversations.map((item) => {
+      const primaryName = projects.find((candidate) => candidate.id === item.primaryProjectId)?.name || item.primaryProjectId
+      const linkLabel = item.linkRelation === 'primary' ? 'Projet principal' : `Lié par activité · ${item.linkStrength === 'strong' ? 'forte' : item.linkStrength === 'weak' ? 'à confirmer' : 'indexée'}`
+      return <button type="button" className="assets-linked-conversation" key={item.id} onClick={() => onOpen(item)}>
+        <ConversationBadge provider={item.provider} />
+        <span className="assets-linked-conversation-copy"><span>{item.title}</span><small>{linkLabel}{item.primaryProjectId && item.primaryProjectId !== project.id ? ` · Projet principal : ${primaryName}` : ''}</small></span>
+        <span className="assets-linked-conversation-status">{item.readable ? 'Lire l’original' : 'Original indisponible'}</span>
+      </button>
+    })}</div>}
+    {indexState?.scannedAt && <p className="assets-footnote">Index contrôlé le <span className="assets-number">{dateLabel(indexState.scannedAt)}</span>.</p>}
+  </section>
+}
+
+
+export default function ProjectWorkspace({
+  conversationMirrorStatus, conversations = [], projectConversationLinks, readConversation,
+  projects: suppliedProjects = [], activeProjectId, onSelectProject, workspaceProject, files: suppliedFiles, activity,
+  t, loading = false, error, offline = false, bridgeConnected = false, bridgeCheckedAt,
+  operation, onRetry, onLinkProject, onArchive, onLoad, onUnload, onRecover, onPrepareScene, onDownload, onPreview, onWatch,
+  onOpenPath, onOpenWorkshop, onOpenLegacy, renderThumbnail, readArticle,
+}) {
+  const [activeConversation, setActiveConversation] = useState(null)
+  const [conversationReturnProjectId, setConversationReturnProjectId] = useState(null)
+  const currentConversation = conversations.find(item => item.id === activeConversation?.id) || activeConversation
+  const [internalProjectId, setInternalProjectId] = useState(null)
+  // 12 October 2026: a chosen thumbnail (right click) or one found by name replaces the project's automatic cover everywhere.
+  const { covers, setCover, previewCover, clearCover } = useProjectCovers()
+  const projects = useMemo(() => suppliedProjects.map((item) => {
+    const chosen = covers[item.id]
+    const value = chosen?.file ? { ...item, coverFile: chosen.file, coverChoice: chosen.choice } : item
+    const thumbnail = chosen?.choice !== 'manual' && articleThumbnail(item)
+    return thumbnail ? { ...value, coverUrl: thumbnail } : value
+  }), [suppliedProjects, covers])
+  // 12 October 2026: Tube is the default layout; Classic stays one click away for comparison.
+  const [layout, setLayoutState] = useState(() => { try { return localStorage.getItem('assets.layout') === 'classic' ? 'classic' : 'tube' } catch { return 'tube' } })
+  const setLayout = (value) => { setLayoutState(value); try { localStorage.setItem('assets.layout', value) } catch { /* storage may be blocked */ } }
+  const tube = layout === 'tube'
+  // Home grid first, unless the URL names a project (shared link or reload inside a project).
+  const [tubeHome, setTubeHome] = useState(() => { try { return !new URLSearchParams(location.search).has('project') } catch { return true } })
+  const [projectSearch, setProjectSearch] = useState('')
+  const [fileSearch, setFileSearch] = useState('')
+  const [sourceFilter, setSourceFilter] = useState('all')
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [tab, setTab] = useState(null)
+  const [selected, setSelected] = useState(new Set())
+  const [focusId, setFocusId] = useState(null)
+  const [fileLayout, setFileLayout] = useState('list')
+  const [query, setQuery] = useState({ ...FILE_QUERY_DEFAULTS })
+  const sort = query.sort
+  const setSort = (key) => setQuery(previous => ({ ...previous, sort: key, direction: previous.sort === key && previous.direction === 'asc' ? 'desc' : 'asc' }))
+  const [page, setPage] = useState(1)
+  const [message, setMessage] = useState('')
+  const [actionBusy, setActionBusy] = useState(false)
+  const [resourceTarget, setResourceTarget] = useState(null)
+  const selectAllRef = useRef(null)
+  const currentId = activeProjectId ?? internalProjectId
+  // 12 October 2026: while the catalogue still loads, a requested project is not replaced by the first one of the list.
+  const registryProject = projects.find((project) => project.id === currentId) || (currentId && loading ? null : projects[0]) || null
+  const project = registryProject ? workspaceProject?.id === registryProject.id ? { ...registryProject, ...workspaceProject } : registryProject : null
+  const projectId = project?.id
+  // 20 October 2026, 15:15 CEST: only projects with an explicit article open it before their files.
+  const hasArticle = Boolean(project?.article?.fileId)
+  // 21 October 2026 : ?article=<fileId> opens another HTML document of this project in the Article tab (the project's article index links to each article
+  // this way : the file is read live from the Mac, else from its latest archive, so a link never shows a stale copy and needs no push)
+  const [linkedArticleId] = useState(() => { try { return new URLSearchParams(location.search).get('article') } catch { return null } })
+  const currentTab = (tab === 'article' && !hasArticle ? 'files' : tab) || (hasArticle ? 'article' : 'files')
+  const projectTabs = hasArticle ? [{ id: 'article', label: 'Article', icon: 'doc.text' }, ...TABS] : TABS
+  const linkedIndexRows = projectConversationLinks && projectConversationLinks.projectId === projectId ? projectConversationLinks.conversations : project?.conversationLinks?.conversations
+  const linkedProjectConversations = useMemo(() => mergeProjectConversations(linkedIndexRows, conversations, projectId), [linkedIndexRows, conversations, projectId])
+  const openConversation = (item) => {
+    setConversationReturnProjectId(item.projectId || projectId || item.primaryProjectId || null)
+    setActiveConversation(item)
+  }
+  const projectFiles = suppliedFiles ?? project?.files ?? []
+  const files = useMemo(() => projectFiles.map(fileView), [projectFiles])
+  const sources = project?.sources || project?.origins || []
+  const events = activity ?? project?.events ?? project?.activity ?? []
+  const checkedAt = bridgeCheckedAt || project?.checkedAt
+  const activeJob = project?.jobs?.find((job) => job.state === 'running') || project?.jobs?.find((job) => job.state === 'queued')
+  const pendingOperation = Boolean(operation && !['idle', 'complete', 'error'].includes(operation.state))
+  // 14 October 2026: an automatic (background) pass never locks the buttons; the service hands the writer to a clicked action at the next batch.
+  const foregroundJob = project?.jobs?.find((job) => !job.background && (job.state === 'running' || job.state === 'queued'))
+  const busy = actionBusy || Boolean(foregroundJob) || pendingOperation
+  // 2 October 2026, 15:22 CEST: cloud backups may queue a foreground action instead of disabling its button.
+  const interactiveBusy = actionBusy || Boolean(foregroundJob && foregroundJob.type !== 'archive') || pendingOperation
+  const visible = useMemo(() => queryAssetsFiles(files.filter((file) =>
+    (sourceFilter === 'all' || (sourceFilter === 'cloud' ? !!(file.contentPath || file.cloudPath) : file.namespace === sourceFilter || sources.find(source => source.id === file.sourceId)?.namespace === sourceFilter))
+    && (statusFilter === 'all' || (statusFilter === 'pending' ? (bridgeConnected && file.sourceConflict) || ['local-only', 'pending', 'modified', 'error'].includes(file.status) : file.status === statusFilter))),
+    { ...query, search: fileSearch }), [files, fileSearch, sourceFilter, statusFilter, query, sources, bridgeConnected])
+
+  const selectedFiles = files.filter((file) => selected.has(file.id))
+  const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE))
+  const currentPage = Math.min(page, pageCount)
+  const displayed = visible.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
+  const downloadableFiles = (selectedFiles.length ? selectedFiles : visible).filter((file) => file.downloadable !== false && (file.contentPath || file.cloudPath))
+  const pendingCount = project?.sync?.pendingCount ?? files.filter((file) => ['local-only', 'pending', 'modified'].includes(file.status)).length
+  const totalBytes = files.reduce((total, file) => total + (Number(file.size) || 0), 0)
+  const allVisibleSelected = visible.length > 0 && visible.every((file) => selected.has(file.id))
+  const hasVisibleSelection = visible.some((file) => selected.has(file.id))
+  const focusedFile = files.find((file) => file.id === focusId) || selectedFiles[0]
+
+  useEffect(() => { setTab(null); setSelected(new Set()); setFocusId(null); setFileSearch(''); setSourceFilter('all'); setStatusFilter('all'); setQuery({ ...FILE_QUERY_DEFAULTS }); setMessage('') }, [projectId])
+  useEffect(() => { setPage(1) }, [projectId, fileSearch, sourceFilter, statusFilter, query])
+  useEffect(() => { if (selectAllRef.current) selectAllRef.current.indeterminate = hasVisibleSelection && !allVisibleSelected }, [hasVisibleSelection, allVisibleSelected])
+  useEffect(() => { const current = new Set(files.map((file) => file.id)); setSelected((previous) => [...previous].every((id) => current.has(id)) ? previous : new Set([...previous].filter((id) => current.has(id)))) }, [files])
+  // 3 October 2026, 04:32 CEST: locate a resource by exact identity after its own project has become active.
+  useEffect(() => {
+    if (resourceTarget?.projectId !== projectId || !files.some((file) => file.id === resourceTarget?.fileId)) return
+    setTab('files'); setFileSearch(resourceTarget.relativePath); setSourceFilter('all'); setStatusFilter('all'); setQuery({ ...FILE_QUERY_DEFAULTS })
+    setFocusId(resourceTarget.fileId); setSelected(new Set([resourceTarget.fileId])); setResourceTarget(null)
+  }, [resourceTarget, projectId, files])
+
+  const chooseProject = (id) => { setInternalProjectId(id); setTubeHome(false); onSelectProject?.(id) }
+  const toggleFile = (file, event) => {
+    setFocusId(file.id)
+    setSelected((previous) => {
+      const next = new Set(previous)
+      if (event?.shiftKey && focusId) {
+        const start = visible.findIndex((item) => item.id === focusId)
+        const end = visible.findIndex((item) => item.id === file.id)
+        if (start >= 0 && end >= 0) visible.slice(Math.min(start, end), Math.max(start, end) + 1).forEach((item) => next.add(item.id))
+      } else if (next.has(file.id)) next.delete(file.id)
+      else next.add(file.id)
+      return next
+    })
+  }
+  const toggleVisible = () => setSelected((previous) => { const next = new Set(previous); visible.forEach((file) => allVisibleSelected ? next.delete(file.id) : next.add(file.id)); return next })
+  const runReadAction = async (callback, ...args) => {
+    if (!callback) return
+    setMessage('')
+    try { await callback(...args) } catch (failure) { setMessage(failure.message || 'Lecture impossible.') }
+  }
+  const runAction = async (callback, ...args) => {
+    if (!callback || interactiveBusy) return
+    setActionBusy(true); setMessage('')
+    try { await callback(...args) } catch (failure) { setMessage(failure?.message || 'Cette action n’a pas abouti. Réessayez.') } finally { setActionBusy(false) }
+  }
+  const keyDown = (event) => {
+    if (event.target.closest('input, select, textarea, button, a')) return
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a') { event.preventDefault(); setSelected(new Set(visible.map((file) => file.id))); return }
+    if (event.key === 'Escape') { setSelected(new Set()); return }
+    if (event.key === ' ' && focusedFile && onPreview) { event.preventDefault(); runReadAction(onPreview, focusedFile, project); return }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      const index = visible.findIndex((file) => file.id === focusId)
+      const next = visible[Math.max(0, Math.min(visible.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))]
+      if (next) { setFocusId(next.id); setSelected(new Set([next.id])) }
+    }
+  }
+  const themeVariables = {
+    '--assets-ink': t?.textPrimary || PALETTE.textPrimaryLight,
+    '--assets-muted': t?.textSecondary || PALETTE.textSecondaryLight,
+    '--assets-background': t?.bg || PALETTE.bgLight,
+    '--assets-surface': t?.surface || PALETTE.surfaceLight,
+    '--assets-accent': PALETTE.orange,
+    '--assets-positive': UI.green,
+    '--assets-warning': UI.orange,
+    '--assets-error': UI.red,
+  }
+  const coverFile = project?.coverFile || files.find((file) => file.kind === 'image' && (file.contentPath || file.cloudPath || file.thumbnailUrl))
+  // Opening a project that has no chosen thumbnail but holds a file named like one adopts it, once, and remembers it.
+  const autoCoverTried = useRef(new Set())
+  // The stored reference carries a small fitted thumbnail (data URI) so the card never needs the original image again.
+  const chooseCover = async (file, choice = 'manual', reason) => {
+    previewCover(projectId, file, choice)
+    let thumbnailUrl
+    try { thumbnailUrl = await coverThumbnailDataUri(file) } catch { /* the app falls back to the shared renderer */ }
+    return setCover(projectId, thumbnailUrl ? { ...file, thumbnailUrl } : file, choice, reason)
+  }
+  const [adjustTarget, setAdjustTarget] = useState(null)
+  const openAdjustCover = (targetProject, targetFile) => {
+    if (!targetProject) return
+    const file = targetFile || targetProject.coverFile || (targetProject.coverUrl ? { thumbnailUrl: targetProject.coverUrl, name: `${targetProject.name} cover` } : null)
+    if (!file && (!targetProject.files || !targetProject.files.length)) {
+      if (targetProject.id === projectId && files.length) {
+        const picked = pickProjectCover(files)?.file || files.find((f) => f.kind === 'image')
+        if (picked) {
+          setAdjustTarget({ project: targetProject, file: picked })
+          return
+        }
+      }
+      setMessage("Ce projet n'a aucune image à cadrer.")
+      return
+    }
+    setAdjustTarget({ project: targetProject, file })
+  }
+
+  const handleSaveAdjustedCover = async (thumbnailUrl, metadata = {}) => {
+    if (!adjustTarget?.project?.id) return
+    const pid = adjustTarget.project.id
+    const baseFile = adjustTarget.file || adjustTarget.project.coverFile || {
+      id: `cover-${pid}`,
+      name: `${pid}-cover.webp`,
+      kind: 'image',
+    }
+    const updatedFile = {
+      ...baseFile,
+      thumbnailUrl,
+      adjustMeta: metadata,
+    }
+    previewCover(pid, updatedFile, 'manual')
+    const result = await setCover(pid, updatedFile, 'manual', 'adjusted')
+    setAdjustTarget(null)
+    setMessage('Miniature ajustée et enregistrée.')
+    return result
+  }
+  useEffect(() => {
+    const current = covers[projectId]
+    // A manual choice is final; an automatic one can still be upgraded when a file named like a thumbnail appears.
+    if (!projectId || articleThumbnail(project) || !files.length || autoCoverTried.current.has(projectId) || (current && (current.choice === 'manual' || current.reason === 'named'))) return
+    autoCoverTried.current.add(projectId)
+    const picked = pickProjectCover(files, { named: true })
+    if (picked && picked.file.id !== current?.file?.id) chooseCover(picked.file, 'auto', 'named')
+  }, [projectId, files, covers])
+
+  const layoutSwitch = <TubeLayoutSwitch layout={layout} onChange={setLayout} />
+  return <div className="assets-workspace" data-layout={layout} style={themeVariables} onKeyDown={keyDown}>
+    {!tube && <ProjectRail conversationMirrorStatus={conversationMirrorStatus} conversations={conversations} activeConversation={currentConversation} onConversation={(item) => { setConversationReturnProjectId(item.projectId || projectId); setActiveConversation(item) }} projects={projects} activeId={projectId} onSelect={(id) => { setActiveConversation(null); chooseProject(id) }} onLinkProject={onLinkProject} onAdjustCover={openAdjustCover} search={projectSearch} onSearch={setProjectSearch} renderThumbnail={renderThumbnail} loading={loading} />}
+    <main className="assets-workspace-main" aria-label="Espace du projet" tabIndex={0}>
+      <div className="assets-layout-bar">{layoutSwitch}</div>
+      {!tube && <LiveTransfersPanel />}
+      {tube && tubeHome && !currentConversation ? <><div className="tube-head"><h1>ZenRay <em>Assets</em></h1></div><TubeHome projects={projects} covers={covers} conversations={conversations} onSelect={chooseProject} onConversation={(item) => { setConversationReturnProjectId(item.projectId || null); setActiveConversation(item) }} onLinkProject={onLinkProject} onAdjustCover={openAdjustCover} renderThumbnail={renderThumbnail} loading={loading} /></> : currentConversation ? <><button type="button" className="assets-text-button" onClick={() => { setActiveConversation(null); if (conversationReturnProjectId || currentConversation.projectId) chooseProject(conversationReturnProjectId || currentConversation.projectId); setConversationReturnProjectId(null) }}>Retour au projet</button><ConversationView conversation={currentConversation} readConversation={readConversation} connected={bridgeConnected} /></> : <>
+      {(offline || error || message) && <div className={`assets-notice${error || message ? ' assets-notice-error' : ''}`} role={error || message ? 'alert' : 'status'}><Icon name={offline ? 'externaldrive' : 'xmark'} size={16} /><span>{message || (typeof error === 'string' ? error : error?.message) || 'Connexion interrompue. Les fichiers déjà chargés restent consultables.'}</span>{onRetry && <button type="button" onClick={onRetry}>Réessayer <Icon name="arrow.clockwise" size={13} /></button>}</div>}
+      {/* 3 October 2026, 03:21 CEST: a live watcher failure remains visible while archived files stay available. */}
+      {bridgeConnected && project?.sync?.sourceConflictCount > 0 && <div className="assets-notice" role="alert"><Icon name="exclamationmark.triangle" size={16} /><span><span className="assets-number">{project.sync.sourceConflictCount}</span> {project.sync.sourceConflictCount === 1 ? 'fichier existe' : 'fichiers existent'} en deux versions différentes : original et copie chargée. Le programme conserve les deux versions avant de poursuivre leur sauvegarde ; les autres fichiers restent suivis.</span></div>}
+      {bridgeConnected && project?.sync?.watchError && <div className="assets-notice" role="status" title={project.sync.watchError}><Icon name="arrow.clockwise" size={16} /><span>Le suivi d’un emplacement attend son rétablissement. Reconnexion automatique en cours.</span></div>}
+      {bridgeConnected && project?.sync?.feedbackError && <div className="assets-notice" role="status" title={project.sync.feedbackError}><Icon name="bubble.left" size={16} /><span>La collecte automatique des prompts rencontre une erreur. Certaines sessions attendent une vérification.</span></div>}
+      {/* 3 October 2026, 04:25 CEST: a failed automatic scene analysis remains visible while file tracking continues. */}
+      {bridgeConnected && project?.sync?.sceneAuditError && <div className="assets-notice" role="status" title={project.sync.sceneAuditError}><Icon name="arrow.clockwise" size={16} /><span>L’analyse des ressources d’une scène attend une nouvelle tentative automatique. Le suivi des fichiers continue.</span></div>}
+      {loading && !project ? <div className="assets-loading" role="status"><span className="assets-loading-line" /><span className="assets-loading-line" /><p>Chargement des projets…</p></div> : !project ? <EmptyState icon="archivebox" title="Un endroit pour chaque projet" action={onLinkProject && <ActionButton icon="plus" primary onClick={onLinkProject}>Relier mon premier projet</ActionButton>}>Reliez un chantier pour réunir ses fichiers du Mac, ses notes et son archive cloud.</EmptyState> : <>
+        <div className="assets-project-topline">{tube ? <button type="button" className="tube-back" onClick={() => setTubeHome(true)}><Icon name="chevron.left" size={13} />Projets</button> : <span><Icon name="archivebox" size={14} /> <span>Projets</span><Icon name="chevron.right" size={11} /><span>{project.name}</span></span>}<div className="assets-bridge-state"><span className="assets-status-dot" data-connected={bridgeConnected} />{bridgeConnected ? 'Mac connecté' : 'État local inconnu'}{onRetry && <button type="button" className="assets-icon-button" aria-label="Actualiser les états du projet" title="Actualiser les états" onClick={onRetry} disabled={loading}><Icon name="arrow.clockwise" size={14} /></button>}</div></div>
+        <header className="assets-project-header"><div className="assets-project-intro"><h2>{project.name}</h2>{(project.summary || project.description) && <p>{project.summary || project.description}</p>}<div className="assets-source-weights">{SOURCE_TYPES.map((type) => ({ ...type, bytes: sources.filter((source) => source.namespace === type.id).reduce((total, source) => total + (source.bytes || 0), 0) })).filter((source) => source.bytes > 0).map((source) => <span key={source.id}>{source.label} <span className="assets-number">{readableSize(source.bytes)}</span></span>)}</div><div className="assets-project-facts"><span><span className="assets-number">{numberFormat.format(files.length)}</span> fichiers</span>{totalBytes > 0 && <span className="assets-number">{readableSize(totalBytes)}</span>}{project.date && <span className="assets-number">{dateLabel(project.date)}</span>}</div></div><div className="assets-project-cover" data-placeholder={!coverFile && !project.coverUrl} onContextMenu={(event) => { event.preventDefault(); openAdjustCover(project, coverFile) }} title="Clic droit pour modifier la miniature">{project.coverUrl ? <img src={project.coverUrl} alt="" loading="lazy" /> : coverFile ? <FileImage file={coverFile} renderThumbnail={renderThumbnail} cover /> : <><Icon name="archivebox" size={34} /><span>Archive du projet</span></>}</div></header>
+
+
+        <nav className="assets-tabs" aria-label="Vues du projet">{projectTabs.map((item) => <button type="button" key={item.id} aria-current={currentTab === item.id ? 'page' : undefined} data-active={currentTab === item.id} onClick={() => setTab(item.id)}><Icon name={item.icon} size={16} />{item.label}{item.id === 'conversations' ? <span className="assets-number">{numberFormat.format(linkedProjectConversations.length)}</span> : item.id === 'files' && <span className="assets-number">{numberFormat.format(files.length)}</span>}</button>)}{onOpenLegacy && <button type="button" className="assets-legacy-link" onClick={() => onOpenLegacy(project)}>Voir la collection <Icon name="arrow.up.right" size={13} /></button>}</nav>
+        {currentTab === 'article' ? <ProjectArticle project={project} file={linkedArticleFile(project, files, linkedArticleId) || projectArticleFile(project, files)} readArticle={readArticle} /> : currentTab === 'origins' ? <><ProjectTransfer project={project} bridgeConnected={bridgeConnected} busy={busy} interactiveBusy={interactiveBusy} pendingCount={pendingCount} pendingOperation={pendingOperation} operation={operation} activeJob={activeJob} selectedFiles={selectedFiles} downloadableFiles={downloadableFiles} onWatch={onWatch} onArchive={onArchive} onLoad={onLoad} onUnload={onUnload} onRecover={onRecover} runAction={runAction} />        <Origins project={project} projects={projects} sources={sources} onSelectProject={chooseProject} onNavigateResource={(target) => { setResourceTarget(target); if (target.projectId !== projectId) chooseProject(target.projectId) }} connected={bridgeConnected} checkedAt={checkedAt} onOpenPath={onOpenPath} onOpenWorkshop={onOpenWorkshop ? (target) => runReadAction(onOpenWorkshop, target) : undefined} onLinkProject={onLinkProject} onArchive={onArchive ? (...args) => runAction(onArchive, ...args) : undefined} onPrepareScene={onPrepareScene ? (...args) => runAction(onPrepareScene, ...args) : undefined} busy={busy} /></> : currentTab === 'conversations' ? <ProjectConversations project={project} projects={projects} conversations={linkedProjectConversations} indexState={projectConversationLinks} onOpen={openConversation} /> : currentTab === 'activity' || currentTab === 'prompts' ? <Activity events={currentTab === 'prompts' ? events.filter((event) => ['prompt','feedback','iteration','rule'].includes(event.type)) : events} project={project} onPreview={onPreview} /> : tube ? <TubeProject project={project} files={files} visible={visible} sources={sources} selected={selected} onToggle={toggleFile} onPreview={onPreview ? (file) => runReadAction(onPreview, file, project) : undefined} onDownload={onDownload ? (list) => runReadAction(onDownload, list, { ...project, name: `tmp-${project.id}` }) : undefined} offline={offline} renderThumbnail={renderThumbnail} themeVars={themeVariables} coverId={covers[projectId]?.file?.id || project?.coverFile?.id} onSetCover={(file) => chooseCover(file, 'manual')} onClearCover={() => clearCover(projectId)} onAdjustCover={(file) => openAdjustCover(project, file)} search={fileSearch} onSearch={setFileSearch} sort={sort} direction={query.direction} onSort={setSort} /> : <>
+        <section className="assets-files" aria-label="Fichiers du projet">
+          <div className="assets-file-toolbar"><label className="assets-search assets-file-search"><Icon name="magnifyingglass" size={15} /><input aria-label="Rechercher un fichier" value={fileSearch} onChange={(event) => setFileSearch(event.target.value)} placeholder="Rechercher un fichier ou un chemin" />{fileSearch && <button type="button" className="assets-icon-button" aria-label="Effacer la recherche de fichiers" onClick={() => setFileSearch('')}><Icon name="xmark" size={13} /></button>}</label><div className="assets-file-toolbar-controls"><div className="assets-view-switch" role="group" aria-label="Présentation des fichiers">{FILE_VIEWS.map(view => <button type="button" className="assets-button" key={view.id} aria-pressed={fileLayout === view.id} onClick={() => setFileLayout(view.id)}><Icon name={view.icon} size={15} />{view.label}</button>)}</div><label className="assets-select-label"><span className="assets-sr-only">État des fichiers</span><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">Tous les états</option><option value="pending">À sauvegarder</option><option value="backed-up">Sauvegardés</option><option value="verified">Vérifiés</option><option value="error">À vérifier</option></select></label><ActionButton icon="arrow.down" primary disabled={!onDownload || !downloadableFiles.length || selectedFiles.length > downloadableFiles.length || offline} onClick={() => runReadAction(onDownload, downloadableFiles, project)}>Télécharger{selectedFiles.length ? <> <span className="assets-number">{downloadableFiles.length}</span></> : downloadableFiles.length === files.length ? ' tout' : <> les <span className="assets-number">{downloadableFiles.length}</span> sauvegardés</>}</ActionButton></div></div>
+          <FileFilters files={files} query={query} onChange={setQuery} />
+          <div className="assets-file-filters" aria-label="Filtrer par origine">{[{ id: 'all', label: 'Tout' }, { id: 'cloud', label: 'Cloud' }, ...SOURCE_TYPES].map((source) => <button type="button" key={source.id} data-active={sourceFilter === source.id} aria-pressed={sourceFilter === source.id} onClick={() => setSourceFilter(source.id)}>{source.label}</button>)}<span className="assets-filter-count" aria-label="Taille des fichiers filtrés"><span className="assets-number">{numberFormat.format(visible.length)}</span> fichiers · <span className="assets-number">{fileSizeLabel(visible)}</span></span></div>
+          {selectedFiles.length > 0 && <div className="assets-selection-bar" role="status"><span><span className="assets-number">{numberFormat.format(selectedFiles.length)}</span> sélectionnés · <span className="assets-number">{fileSizeLabel(selectedFiles)}</span></span><button type="button" onClick={() => setSelected(new Set(files.map((file) => file.id)))}>Tout le projet</button><button type="button" onClick={() => setSelected(new Set())}>Effacer <Icon name="xmark" size={12} /></button></div>}
+          {!files.length ? <EmptyState title="Les fichiers se réunissent ici">{bridgeConnected ? 'L’inventaire ne contient aucun fichier. Reliez les dossiers de ce projet dans Emplacements.' : 'L’archive ne contient aucun fichier chargé dans cette vue. Actualisez le cloud ou reliez un dossier local.'}</EmptyState> : !visible.length ? <EmptyState icon="magnifyingglass" title="Aucun fichier ne correspond" action={<ActionButton onClick={() => { setFileSearch(''); setSourceFilter('all'); setStatusFilter('all'); setQuery({ ...FILE_QUERY_DEFAULTS }) }}>Effacer les filtres</ActionButton>}>Changez le nom, l’origine ou l’état recherché.</EmptyState> : fileLayout !== 'list' ? <FilePresentations project={project} connected={bridgeConnected} key={projectId} view={fileLayout} files={fileLayout === 'columns' ? visible : displayed} selected={selected} focusedFile={focusedFile} onToggle={toggleFile} onFocus={file => setFocusId(file.id)} onPreview={onPreview ? file => runReadAction(onPreview, file, project) : undefined} renderImage={(file, cover) => <FileImage file={file} renderThumbnail={renderThumbnail} cover={cover} />} /> : <div className="assets-file-table" role="table" aria-label="Liste des fichiers"><div className="assets-file-table-head" role="row"><span role="columnheader"><input ref={selectAllRef} type="checkbox" aria-label="Sélectionner tous les fichiers filtrés" checked={allVisibleSelected} onChange={toggleVisible} /></span><button type="button" role="columnheader" onClick={() => setSort('name')}>Nom{sort === 'name' && <Icon name="chevron.down" size={11} />}</button><button type="button" role="columnheader" onClick={() => setSort('kind')}>Type</button><button type="button" role="columnheader" onClick={() => setSort('date')}>Date et heure</button><span role="columnheader">Origine</span><span role="columnheader">Cloud</span><button type="button" role="columnheader" className="assets-size-heading" onClick={() => setSort('size')}>Taille{sort === 'size' && <Icon name="chevron.down" size={11} />}</button><span className="assets-sr-only" role="columnheader">Actions</span></div>{displayed.map((file) => {
+            const source = sources.find((item) => item.id === file.sourceId)
+            const namespace = source?.namespace || file.namespace
+            const downloadable = file.downloadable !== false && (file.contentPath || file.cloudPath)
+            return <div className="assets-file-row" role="row" key={file.id} data-selected={selected.has(file.id)} data-focused={focusId === file.id} onClick={(event) => { if (!event.target.closest('button,input,a')) toggleFile(file, event) }} onDoubleClick={(event) => { if (!event.target.closest('button,input,a') && onPreview) runReadAction(onPreview, file, project) }}><span role="cell" className="assets-file-check"><input type="checkbox" aria-label={`Sélectionner ${file.name}`} checked={selected.has(file.id)} onChange={(event) => toggleFile(file, event.nativeEvent)} /></span><div role="cell" className="assets-file-name"><span className="assets-file-thumb"><FileImage file={file} renderThumbnail={renderThumbnail} /></span><div><button type="button" className="assets-file-name-button" onClick={() => { setFocusId(file.id); onPreview && runReadAction(onPreview, file, project) }} title={file.name}>{file.name}</button><FileLocations file={file} project={project} connected={bridgeConnected} /><span className="assets-file-mobile-meta"><span>{SOURCE_LABELS[namespace] || (downloadable ? 'Cloud' : 'Mac')}</span><Status status={bridgeConnected && file.sourceConflict ? 'source-conflict' : file.status || (downloadable ? 'cloud-only' : 'unknown')} /></span></div></div><span role="cell" className="assets-file-kind">{extOf(file.name).toUpperCase() || file.kind}</span><time role="cell" className="assets-file-date assets-number">{fileDate(file) !== null ? timestampLabel(fileDate(file)) : 'Non connue'}</time><span role="cell" className="assets-file-origin"><Icon name={SOURCE_TYPES.find((item) => item.id === namespace)?.icon || 'lock.icloud'} size={14} />{SOURCE_LABELS[namespace] || (downloadable ? 'Cloud' : 'Mac')}</span><span role="cell" className="assets-file-state"><Status status={bridgeConnected && file.sourceConflict ? 'source-conflict' : file.status || (downloadable ? 'cloud-only' : 'unknown')} /></span><span role="cell" className="assets-file-size assets-number">{Number.isFinite(file.size) ? readableSize(file.size) || '0 Ko' : 'À relever'}</span><span role="cell" className="assets-file-actions">{onPreview && <button type="button" className="assets-icon-button" aria-label={`Aperçu de ${file.name}`} title="Aperçu" onClick={() => runReadAction(onPreview, file, project)}><Icon name="eye" size={16} /></button>}{onDownload && <button type="button" className="assets-icon-button" aria-label={`Télécharger ${file.name}`} title="Télécharger" disabled={!downloadable || offline} onClick={() => runReadAction(onDownload, [file], project)}><Icon name="arrow.down" size={16} /></button>}</span></div>
+          })}</div>}
+          <footer className="assets-file-footer">{fileLayout !== 'columns' && displayed.length < visible.length && <span aria-label="Taille de la page affichée"><span className="assets-number">{numberFormat.format(displayed.length)}</span> affichés · <span className="assets-number">{fileSizeLabel(displayed)}</span></span>}<span>{selectedFiles.length ? <><span className="assets-number">{numberFormat.format(selectedFiles.length)}</span> fichiers sélectionnés</> : 'Sélectionnez un fichier, plusieurs ou tout le projet.'}</span><span className="assets-pagination" hidden={fileLayout === 'columns'}><button type="button" className="assets-text-button" disabled={currentPage === 1} onClick={() => setPage(currentPage - 1)}>Précédent</button><span className="assets-number">{currentPage} / {pageCount}</span><button type="button" className="assets-text-button" disabled={currentPage === pageCount} onClick={() => setPage(currentPage + 1)}>Suivant</button></span></footer>
+        {/* 9 October 2026, 11:15 CEST: Keep sibling keys unique so layout changes unmount the old presentation. */}
+        <StorageBreakdown key={`storage:${projectId}`} project={project} connected={bridgeConnected} files={files} onOpenFile={onPreview ? (file) => runReadAction(onPreview, file, project) : undefined} /></section>
+        </>}
+      </>}
+      </>}
+    </main>
+    {adjustTarget && <CoverAdjustModal project={adjustTarget.project} file={adjustTarget.file} themeVars={themeVariables} onClose={() => setAdjustTarget(null)} onSave={handleSaveAdjustedCover} />}
+  </div>
+}

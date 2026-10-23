@@ -1,0 +1,93 @@
+// LA MOSAÏQUE D'APERÇU D'UN DOSSIER PARTAGÉ (2026-08-05, demande de Matthieu).
+//
+// CE QU'ELLE RÉSOUT. Coller un lien de dossier dans WhatsApp n'affiche qu'UNE vignette, parce
+// qu'aucune messagerie ne lit la deuxième balise `og:image`. Déclarer les quatre premières images
+// était donc juste au sens du protocole et invisible à l'écran. Pour qu'on VOIE quatre photos, il
+// faut leur en donner UNE SEULE qui les contienne : une mosaïque deux par deux.
+//
+// POURQUOI C'EST FAIT ICI ET NON SUR LE SERVEUR, car ce n'est pas un caprice d'architecture. Une
+// mosaïque demande de DÉCODER quatre images puis d'en RÉENCODER une. Un Worker Cloudflare n'a ni
+// canvas ni encodeur d'image, et le redimensionnement d'images de Cloudflare est une option
+// payante. Le NAVIGATEUR, lui, a tout : un canvas, un décodeur pour chaque format qu'il affiche,
+// et `toBlob` pour réencoder. On compose donc au moment où l'on crée le lien, une fois, et on range
+// le résultat à côté du dossier. Le serveur n'a plus qu'à servir un fichier déjà prêt.
+//
+// LE COÛT EST BORNÉ ET PAYÉ UNE FOIS : quatre vignettes déjà en cache, un canvas de 600 pixels de
+// côté, un webp d'une vingtaine de kilo-octets. Rien de tout cela n'entre dans le chemin de lecture.
+
+// Six cents pixels de côté : au-dessus du minimum de 300 exigé par les messageries, en dessous du
+// poids qui ferait hésiter un aperçu à se charger. Le carré est le format que toutes recadrent le
+// mieux, contrairement au 1.91:1 qui coupe les bords sur mobile.
+const COTE = 600
+const LISERE = 4        // un filet entre les quatre cases, sinon les photos se touchent et bavent
+
+// Le nom du fichier de couverture. Il commence par un POINT à dessein : `isExposedTreeNode` ne
+// l'expose pas, la couverture n'apparaîtra donc jamais comme une tuile dans le Finder.
+// Le serveur en tient sa propre copie dans `server/share-cover.js` ; un test vérifie qu'elles ne
+// divergent pas, parce qu'un littéral en double finit toujours par se désynchroniser.
+export const COVER_FILE = '.zr-share-cover.json'
+
+/** Le chemin où vit la mosaïque d'un dossier. Déterministe : pas de registre à tenir. */
+export function mosaicPathFor(dir) {
+  return `${dir}/${COVER_FILE}`
+}
+
+// Charge une image en contournant le piège du canvas SOUILLÉ : un canvas qui a reçu une image
+// d'une autre origine sans `crossOrigin` refuse ensuite de rendre ses pixels. Les vignettes
+// viennent tantôt du CDN, tantôt d'une adresse `data:` déchiffrée ; on demande donc le mode
+// anonyme, et l'on renonce proprement si le serveur ne l'accorde pas.
+function chargerImage(url) {
+  return new Promise((resoudre) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => resoudre(img)
+    img.onerror = () => resoudre(null)
+    img.src = url
+  })
+}
+
+// Dessine une image en REMPLISSANT sa case, centrée, sans la déformer — l'équivalent de
+// `object-fit: cover`. Étirer quatre photos de rapports différents dans quatre carrés donnerait une
+// mosaïque écrasée, et c'est exactement ce qu'on veut éviter en montrant des photos.
+function dessinerCouvrant(ctx, img, x, y, w, h) {
+  const rapportCase = w / h
+  const rapportImg = img.naturalWidth / img.naturalHeight
+  let sx = 0, sy = 0, sw = img.naturalWidth, sh = img.naturalHeight
+  if (rapportImg > rapportCase) { sw = sh * rapportCase; sx = (img.naturalWidth - sw) / 2 }
+  else { sh = sw / rapportCase; sy = (img.naturalHeight - sh) / 2 }
+  ctx.drawImage(img, sx, sy, sw, sh, x, y, w, h)
+}
+
+/**
+ * Compose la mosaïque et rend un Blob webp, ou `null` si l'on ne peut pas la faire honnêtement.
+ *
+ * `urls` doit porter au moins quatre adresses : EN DESSOUS ON REND `null` PLUTÔT QU'UNE MOSAÏQUE
+ * INCOMPLÈTE. Trois photos et un carré vide se lisent comme un bogue ; une seule photo en aperçu se
+ * lit comme un choix. C'est la règle que Matthieu a posée, et elle est juste.
+ */
+export async function composeMosaic(urls) {
+  if (!Array.isArray(urls) || urls.length < 4) return null
+  if (typeof document === 'undefined') return null
+  const images = await Promise.all(urls.slice(0, 4).map(chargerImage))
+  if (images.some((i) => !i)) return null
+
+  const canvas = document.createElement('canvas')
+  canvas.width = COTE
+  canvas.height = COTE
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+  // Le fond se voit dans le liséré : un gris très sombre, pour rester lisible sur les fils clairs
+  // comme sombres des messageries.
+  ctx.fillStyle = '#17181b'
+  ctx.fillRect(0, 0, COTE, COTE)
+
+  const c = (COTE - LISERE) / 2
+  const cases = [[0, 0], [c + LISERE, 0], [0, c + LISERE], [c + LISERE, c + LISERE]]
+  images.forEach((img, i) => dessinerCouvrant(ctx, img, cases[i][0], cases[i][1], c, c))
+
+  return new Promise((resoudre) => {
+    // Webp d'abord, JPEG en repli : Safari n'a longtemps pas su encoder le webp, et un aperçu qui
+    // n'existe pas vaut moins qu'un aperçu un peu plus lourd.
+    canvas.toBlob((b) => (b ? resoudre(b) : canvas.toBlob(resoudre, 'image/jpeg', 0.82)), 'image/webp', 0.86)
+  })
+}

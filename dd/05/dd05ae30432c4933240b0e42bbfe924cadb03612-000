@@ -1,0 +1,68 @@
+// AUTO-INDEX DU CONTENU (recherche plein-texte des markdowns + tables, NOUVEAUX inclus).
+//
+// EN CLAIR : la recherche doit trouver un mot tapé À L'INTÉRIEUR d'une page ou d'une table, pas seulement dans
+// son nom. L'index serveur (.zr-search-index.json v3) couvre tout l'EXISTANT. Mais dès qu'on crée ou modifie une
+// page, il faut que son contenu soit cherchable TOUT DE SUITE, sans relancer l'index serveur. On maintient donc
+// un index LOCAL (IndexedDB) : à chaque sauvegarde, on y dépose le texte normalisé de la page/table. La recherche
+// fusionne { contenu serveur } ∪ { contenu local } (le local, plus frais, gagne). Zéro réseau, zéro commit.
+
+const DB = 'zr-content', STORE = 'content', VERSION = 1
+let mem = null            // { [path]: texteNormalisé } — cache mémoire chargé une fois
+let loadPromise = null
+
+// Normalisation alignée sur App.norm (minuscules, accents retirés, espaces compactés) pour que `includes(nq)`
+// matche. On garde la ponctuation light (les requêtes mono-mot suffisent au cas d'usage).
+export const normContent = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().slice(0, 8000)
+
+const openDb = () => new Promise((resolve, reject) => {
+  try {
+    const rq = indexedDB.open(DB, VERSION)
+    rq.onupgradeneeded = () => { const db = rq.result; if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE) }
+    rq.onsuccess = () => resolve(rq.result)
+    rq.onerror = () => reject(rq.error)
+  } catch (e) { reject(e) }
+})
+
+// Charge tout le contenu local en mémoire (une fois). Idempotent.
+export async function loadLocalContent() {
+  if (mem) return mem
+  if (loadPromise) return loadPromise
+  loadPromise = (async () => {
+    const map = {}
+    try {
+      const db = await openDb()
+      await new Promise((resolve) => {
+        const tx = db.transaction(STORE, 'readonly').objectStore(STORE)
+        const cur = tx.openCursor()
+        cur.onsuccess = () => { const c = cur.result; if (c) { map[c.key] = c.value; c.continue() } else resolve() }
+        cur.onerror = () => resolve()
+      })
+    } catch { /* IndexedDB indispo -> map vide, dégradation propre */ }
+    mem = map
+    return mem
+  })()
+  return loadPromise
+}
+
+export function getLocalContent() { return mem || {} }
+
+// Dépose/maj le contenu d'un fichier (path) à partir de son texte brut (markdown ou texte de table).
+export async function putLocalContent(path, rawText) {
+  const txt = normContent(rawText)
+  if (!mem) await loadLocalContent()
+  if (!txt) { delete mem[path] } else { mem[path] = txt }
+  try {
+    const db = await openDb()
+    const st = db.transaction(STORE, 'readwrite').objectStore(STORE)
+    if (!txt) st.delete(path); else st.put(txt, path)
+  } catch { /* persistance best-effort ; le cache mémoire reste valable pour la session */ }
+}
+
+// Texte de table (.db.json) -> chaîne cherchable : nom + colonnes + cellules.
+export function tableToText(db) {
+  try {
+    const heads = (db.columns || []).map((c) => c.name).join(' ')
+    const cells = (db.rows || []).map((r) => Object.values(r.cells || {}).map((v) => (v && typeof v === 'object') ? '' : String(v ?? '')).join(' ')).join(' ')
+    return `${db.name || ''} ${heads} ${cells}`
+  } catch { return '' }
+}

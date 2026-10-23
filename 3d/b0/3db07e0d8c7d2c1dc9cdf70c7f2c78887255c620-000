@@ -1,0 +1,276 @@
+// video-raw-lib.mjs — VIDEO WITHOUT RE-ENCODING ("raw chunks").
+//
+// PRINCIPLE (validated 2026-06-30, replaces the too-slow DASH+HEVC): the ORIGINAL video file is
+// split by SIZE into 95 MB parts (safely under raw.githubusercontent.com's 100 MB limit), pushed
+// as-is to a repo, and served by raw.github. NO transcoding ffmpeg: just one ffprobe (metadata) +
+// 1 poster frame. Quality = source, bitrate = source. Upload = network time only, zero CPU. Cost = 0.
+//
+// PLAYBACK site-side: "range-shim" Service Worker (P2) — the native <video> reads a virtual URL,
+// the SW translates Range requests into fetches of the right parts. HEVC decoded by the OS (none
+// of Chrome's MSE limits).
+//
+// WHY raw.github and not jsDelivr for video: raw.github accepts 100 MB/file (jsDelivr 20). We are
+// few requests (1 viewer) so no throttle. IMAGES stay on jsDelivr (CDN, handles 10k-request
+// galleries; raw.github throttles bursts).
+
+import { open, mkdir, readFile, rm, stat } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
+import { execFile } from 'node:child_process'
+import { createHash, createCipheriv, randomBytes } from 'node:crypto'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+import { mimeForName } from '../src/lib/fileKinds.js'
+import { loadMasterKey } from './lib/img-pipeline.mjs'
+import { makeShardRepo, isPrivateShardName as _isPrivateShardName } from './lib/shard-repo.mjs'
+const execFileP = promisify(execFile)
+
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const PART = 95 * 1024 * 1024            // 95 MB: safe margin under GitHub/raw.github's 100 MB limit
+const SHARD_CAP = 4.0 * 1024 * 1024 * 1024 // internal batch split across fresh repos (LOCAL counter only, never a remote read) — safe margin under GitHub's 5 GB recommendation
+const noop = () => {}
+const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
+// content-address path: ab/cd/<hash>.bin (dedup + balanced tree)
+const partPathFor = (h) => `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.bin`
+const rawUrl = (repo, sha, p) => `https://raw.githubusercontent.com/${OWNER}/${repo}/${sha}/${p}`
+// mimeOf: SINGLE SOURCE shared with the viewer (src/lib/fileKinds.js). Guarantees every future
+// upload stores the SAME mime the preview expects -> no divergence possible. Default application/octet-stream.
+const mimeOf = (f) => mimeForName(path.basename(f))
+
+// Name convention -> visibility (zenrayshards-img-* public, everything else private).
+// Re-exported from shard-repo.mjs to keep this module's public surface unchanged.
+export const isPrivateShardName = _isPrivateShardName
+
+// ── PART ENCRYPTION (2026-07-05) ──────────────────────────────────────────────────────────────────
+// AES-256-GCM, RANDOM 12-byte IV PER part, SAME master key as the rest of the app (chunked-media
+// audio/PDF, private images — server/media-key.js, src/media/crypto.js): one security model, one key.
+// The repo content is unreadable without the key -> "private + encrypted".
+// The on-disk part name derives from the CIPHERTEXT hash (not the plaintext): a part's plaintext is
+// encrypted with a fresh random IV on every attempt, so it is never deterministic -> plaintext-hash
+// can no longer serve as a stable content address (a 2nd attempt after a crash would produce a
+// different ciphertext for the same path, clobbering an earlier manifest whose IV would no longer
+// match the actual bytes). Ciphertext hash = always unique per encryption -> no collision, safe
+// retry after crash. Cost: loss of cross-video dedup on identical content (negligible — two
+// distinct videos never share an identical aligned 95 MB chunk in practice). The POSTER stays in
+// CLEAR (shown via direct <img src> in the Finder; an async decode for a mere thumbnail would be
+// disproportionate).
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+let _mediaKey = null
+function mediaKey() { if (!_mediaKey) _mediaKey = loadMasterKey(REPO_ROOT, { readFileSync }); return _mediaKey }
+function encryptPart(buf) {
+  const iv = randomBytes(12)
+  const c = createCipheriv('aes-256-gcm', mediaKey(), iv)
+  const cipher = Buffer.concat([c.update(buf), c.final(), c.getAuthTag()])
+  return { cipher, iv: iv.toString('base64') }
+}
+
+async function probe(file) {
+  try {
+    const { stdout } = await execFileP('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,codec_name', '-show_entries', 'format=duration', '-of', 'json', file], { timeout: 30000 })
+    const j = JSON.parse(stdout); const s = (j.streams && j.streams[0]) || {}
+    return { width: +s.width || 0, height: +s.height || 0, codec: s.codec_name || '', duration: +((j.format && j.format.duration) || 0) || 0 }
+  } catch { return { width: 0, height: 0, codec: '', duration: 0 } }
+}
+// FASTSTART: the index ('moov' atom) must be AT THE START so playback begins with part 1 alone.
+// Camera files (DJI) put 'moov' at the END -> without this, the player must also fetch the last
+// part. We detect atom order; if 'moov' comes after 'mdat', remux `-c copy +faststart` (LOSSLESS,
+// NO re-encode: video/audio streams copied byte for byte, only the index moves). Otherwise keep the original.
+async function isFaststart(file) {
+  const fd = await open(file, 'r'); const b = Buffer.alloc(16)
+  try {
+    let off = 0
+    for (let i = 0; i < 16; i++) {
+      const { bytesRead } = await fd.read(b, 0, 16, off); if (bytesRead < 8) return true
+      let size = b.readUInt32BE(0); const type = b.toString('latin1', 4, 8)
+      if (type === 'moov') return true          // index before data -> faststart
+      if (type === 'mdat') return false         // data before index -> NOT faststart
+      if (size === 1) size = Number(b.readBigUInt64BE(8)) // 64-bit size
+      if (size < 8) return true
+      off += size
+    }
+  } finally { await fd.close() }
+  return true
+}
+// NON-MP4 CONTAINER (mkv/avi/webm/ts/…): isFaststart() reads ISO-BMFF style atoms (moov/mdat) — on
+// a Matroska/EBML container (a totally different binary structure) the result is undefined and can
+// wrongly report "already faststart", letting a raw .mkv through that NO browser plays natively
+// (the <video> tag does not support Matroska, whatever the inner codec). Found in practice on
+// 2026-07-05 before a real upload of two .mkv episodes. Fix: FORCE the remux to .mp4 for any
+// extension ≠ mp4/mov/m4v, without even calling isFaststart() (the test is only meaningful on an
+// already ISO-BMFF container).
+const MP4_LIKE = new Set(['mp4', 'mov', 'm4v'])
+async function remuxFaststart(file, outDir, log, codec = '') {
+  const ext = path.extname(file).slice(1).toLowerCase()
+  const forceContainerRemux = !MP4_LIKE.has(ext)
+  if (!forceContainerRemux && await isFaststart(file)) { log('  (déjà faststart, pas de remux)'); return file }
+  if (forceContainerRemux) log(`  conteneur .${ext} non lisible nativement par <video> -> remux vers .mp4 (stream copy, aucun réencodage)`)
+  const out = path.join(outDir, 'faststart.mp4')
+  // -map v+a (drop DJI proprietary data tracks, and any secondary audio/subtitle track, which do
+  // not mux cleanly into mp4) — WARNING: if the source has several audio tracks or embedded
+  // subtitles, only the 1st video track + 1st audio track survive; everything else is lost.
+  //
+  // REAL iPhone BUG (2026-07-05, Matthieu, iPhone 15 Pro): without -tag:v, ffmpeg tags remuxed
+  // HEVC as "hev1" — valid per the MP4 spec but REFUSED by Apple/AVFoundation (iOS/Safari require
+  // "hvc1", where codec parameters live in the header, not the stream). Result: HEVC video
+  // unreadable on iPhone although the device decodes H.265 natively. Reproduced then verified via
+  // ffprobe on the real remux: without the flag -> hev1, with -> hvc1. PERMANENT RULE: every
+  // HEVC->MP4 remux carries -tag:v hvc1. (h264 is unaffected; its default avc1 tag is correct everywhere.)
+  const args = ['-y', '-i', file, '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy']
+  if (codec === 'hevc') args.push('-tag:v', 'hvc1')
+  args.push('-movflags', '+faststart', '-f', 'mp4', out)
+  await execFileP('ffmpeg', args, { timeout: 1800000, maxBuffer: 1 << 26 })
+  log(`  faststart : index déplacé au début (lossless, -c copy)${codec === 'hevc' ? ' + tag hvc1 (lecture iPhone/Apple)' : ''} -> démarrage dès la 1re part`)
+  return out
+}
+
+// Poster: 1 frame (middle of the file when duration is known), JPEG (this ffmpeg has no webp encoder). Best-effort.
+async function makePoster(file, outDir, atSec) {
+  const p = path.join(outDir, 'poster.jpg')
+  try { await execFileP('ffmpeg', ['-y', '-ss', String(Math.max(0, atSec || 1)), '-i', file, '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '3', p], { timeout: 60000 }); return existsSync(p) ? p : null } catch { return null }
+}
+
+// ── RAW-VIDEO SHARD CONTEXT ───────────────────────────────────────────────────────────────────────
+// Since the 2026-07-11 refactor the writer is the shared scripts/lib/shard-repo.mjs (one
+// implementation for the img and vid families — fresh random repo per batch, anticipated local
+// rollover, incremental pushes). This factory only sets the vid-family knobs. Public surface
+// unchanged: consumers (upload-vidraw-list, media-ingest, migrate-legacy, upload-blob-all) keep
+// calling openShard/writePart/flush/headSha and reading repo/dir/commitOf/vis.
+export function makeVidRawShardCtx({ token, owner = OWNER, work, log = console.log, type = 'vid', vis = 'private' }) {
+  const ctx = makeShardRepo({
+    token, owner, work, log, type, vis,
+    capBytes: SHARD_CAP,                    // 4.0 GiB
+    // 900 MB (2026-07-11, raised from 400 MB — Matthieu asked for bigger pushes for throughput). Stays
+    // under the empirically-proven <1 GB/push safety line documented in lib/img-pipeline.mjs (a single
+    // multi-GB push HANGS, no timeout catches it in practice) — his suggested 1900 MB would have crossed
+    // it. No visibility trade-off: a video's manifest commits once per whole file regardless (see
+    // ingestVideoRaw's single flush() call), this only governs mid-file push cadence.
+    pushEveryBytes: 900 * 1024 * 1024,
+    pushRetries: 12, pushTimeoutMs: 1800000,
+    gitTimeoutMs: 600000, commitMessage: '+vidraw',
+    rebasePullOnRetry: true, gitPostBuffer: true,
+    readme: `# zenrayshards (${type}, ${vis})\n\nParts de 95 Mo, chiffrees AES-256-GCM, nommees par empreinte. Manifeste sur zenray-data.\n`,
+  })
+  ctx.writePart = ctx.writeBinary // historical name used by every video-family consumer
+  return ctx
+}
+
+// ── ONE RAW VIDEO INGESTION ───────────────────────────────────────────────────────────────────────
+// Splits the ORIGINAL file into 95 MB parts (streamed read, anti-OOM), pushes them through the
+// shard ctx, pushes the poster, and returns the .media.json manifest (type 'video-raw') ready to
+// commit onto zenray-data. ONLINE-CONFIRMED = that manifest committed (the bulk does it), not
+// before. raw.github URLs pinned on the commit.
+export async function ingestVideoRaw(file, { dest, base, vctx, posterCtx = null, workDir = '/tmp/zr_vidraw', log = noop }) {
+  const p = await probe(file)
+  const outDir = path.join(workDir, base.replace(/[^\w.-]/g, '_') + '-' + Date.now().toString(36))
+  await mkdir(outDir, { recursive: true })
+
+  // 0) FASTSTART: index first -> playback starts with part 1. Lossless (-c copy), no encoding.
+  //    We then split THIS file (not the original) so part 1 contains the index.
+  //    p.codec forwarded for the mandatory hvc1 tag when the source is HEVC (iPhone playback).
+  const srcFile = await remuxFaststart(file, outDir, log, p.codec)
+  const total = (await stat(srcFile)).size
+  const nParts = Math.ceil(total / PART)
+  log(`${base} — ${(total / 1073741824).toFixed(2)} Go, ${p.width}x${p.height} ${p.codec}, ${nParts} parts de 95 Mo (AUCUN réencodage)`)
+
+  // 1) poster (1 frame, best-effort) from the original
+  const posterFile = await makePoster(file, outDir, p.duration ? p.duration / 2 : 1)
+
+  // 2) streamed split of the (faststart) file + part-by-part push (never the whole file in RAM)
+  const parts = []           // { idx, repo, path, hash, size, iv }
+  const fd = await open(srcFile, 'r')
+  const b = Buffer.alloc(PART)
+  try {
+    let off = 0, idx = 0
+    while (off < total) {
+      const { bytesRead } = await fd.read(b, 0, PART, off)
+      if (!bytesRead) break
+      const slice = Buffer.from(b.subarray(0, bytesRead)) // copy: writePart is async, we reuse b
+      const { cipher, iv } = encryptPart(slice) // AES-256-GCM, random IV per part (see above)
+      const h = sha256(cipher); const hp = partPathFor(h) // addressed by CIPHERTEXT hash (never plaintext)
+      const repo = await vctx.writePart(hp, cipher)
+      parts.push({ idx, repo, path: hp, hash: h, size: bytesRead, iv })
+      off += bytesRead; idx++
+      if (idx % 5 === 0 || off >= total) log(`  part ${idx}/${nParts} (${(off / 1073741824).toFixed(2)}/${(total / 1073741824).toFixed(2)} Go)`)
+    }
+  } finally { await fd.close() }
+
+  // Poster as a raw part (simple, always available) — small, goes into the current shard.
+  let posterPart = null
+  if (posterFile) {
+    try {
+      const pb = await readFile(posterFile)
+      const h = sha256(pb); const hp = `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.jpg`
+      const repo = await vctx.writePart(hp, pb)
+      posterPart = { repo, path: hp }
+    } catch (e) { log(`  ⚠ poster: ${(e.message || e).toString().slice(0, 80)}`) }
+  }
+
+  // 3) shard flush -> commit SHA known -> pinned raw.github URLs
+  await vctx.flush()
+  const shaOf = (repo) => vctx.commitOf[repo] || vctx.headSha()
+  const isPriv = vctx.vis === 'private'
+  const partUrls = parts.map((pt) => rawUrl(pt.repo, shaOf(pt.repo), pt.path))
+  // POSTER on a PRIVATE repo: an <img src> cannot carry an auth header -> the URL stored in the
+  // manifest goes through /api/raw-proxy (the server, which has the token, fetches the image and
+  // serves it same-origin). Small file (~50 KB), no notable bandwidth impact. Public repo: direct raw URL.
+  const posterRaw = posterPart ? rawUrl(posterPart.repo, shaOf(posterPart.repo), posterPart.path) : null
+  const posterUrl = posterRaw ? (isPriv ? `/api/raw-proxy?u=${encodeURIComponent(posterRaw)}` : posterRaw) : null
+
+  // 4) .media.json manifest (type 'video-raw'). Cumulative offsets (over the PLAINTEXT) -> the
+  // Service Worker maps a Range -> part(s), decrypts each part with its iv, THEN applies these
+  // offsets on the obtained plaintext. private:true -> the player (SW) and the downloader convert
+  // each raw URL into an api.github.com call (Accept: raw + token via /api/raw-token) — the repo
+  // is publicly invisible/unreadable.
+  let acc = 0
+  const partsMeta = parts.map((pt) => { const start = acc; acc += pt.size; return { url: partUrls[pt.idx], start, end: acc - 1, size: pt.size, iv: pt.iv } })
+  const manifest = {
+    // If remuxFaststart() produced a new container, the served bytes are MP4 even when the
+    // logical/source name still ends in .mkv/.avi/…. Advertising the source MIME makes a browser
+    // reject bytes that were otherwise remuxed correctly.
+    type: 'video-raw', v: 1, name: path.basename(file), mime: srcFile === file ? mimeOf(file) : 'video/mp4',
+    size: total, codec: p.codec, width: p.width, height: p.height, duration: p.duration,
+    parts: partsMeta, poster: posterUrl,
+    enc: true, alg: 'AES-GCM', // each part is encrypted (per-part iv above); poster = clear (see above)
+    ...(isPriv ? { private: true } : {}),
+  }
+  const manifestPath = `${dest}/${base}.${path.basename(file).split('.').pop().toLowerCase()}.media.json`
+  await rm(outDir, { recursive: true, force: true }).catch(() => {})
+  return { manifestPath, manifest, posterUrl }
+}
+
+// ── ANY-FILE INGESTION (raw blob) ─────────────────────────────────────────────────────────────────
+// For files NOT directly openable on the site (wav, py, cube, zip, …): split the ORIGINAL file
+// into 95 MB parts (no transformation), push them through the shard ctx, and return a .file.json
+// manifest (type 'blob-raw'). Downloading re-glues the parts in order = BIT-EXACT identical file
+// (cumulative offsets + sizes + per-part digest). No loss. raw.github URLs pinned on the commit.
+export async function ingestBlobRaw(file, { dest, base, vctx, log = noop }) {
+  const total = (await stat(file)).size
+  const nParts = Math.ceil(total / PART) || 1
+  log(`${base} — ${(total / 1048576).toFixed(1)} Mo, ${nParts} part(s) de 95 Mo (fichier brut, aucune transformation)`)
+  const parts = []
+  const fd = await open(file, 'r')
+  const b = Buffer.alloc(PART)
+  try {
+    let off = 0, idx = 0
+    while (off < total) {
+      const { bytesRead } = await fd.read(b, 0, PART, off)
+      if (!bytesRead) break
+      const slice = Buffer.from(b.subarray(0, bytesRead))
+      const h = sha256(slice); const hp = partPathFor(h)
+      const repo = await vctx.writePart(hp, slice)
+      parts.push({ idx, repo, path: hp, hash: h, size: bytesRead })
+      off += bytesRead; idx++
+    }
+  } finally { await fd.close() }
+  if (!total) { // empty file: one empty part for consistency
+    const h = sha256(Buffer.alloc(0)); const hp = partPathFor(h)
+    const repo = await vctx.writePart(hp, Buffer.alloc(0)); parts.push({ idx: 0, repo, path: hp, hash: h, size: 0 })
+  }
+  await vctx.flush()
+  const shaOf = (repo) => vctx.commitOf[repo] || vctx.headSha()
+  let acc = 0
+  const partsMeta = parts.map((pt) => { const start = acc; acc += pt.size; return { url: rawUrl(pt.repo, shaOf(pt.repo), pt.path), start, end: acc - 1, size: pt.size, sha256: pt.hash } })
+  const manifest = { type: 'blob-raw', v: 1, name: path.basename(file), mime: mimeOf(file), size: total, parts: partsMeta, ...(vctx.vis === 'private' ? { private: true } : {}) }
+  const manifestPath = `${dest}/${path.basename(file)}.file.json`
+  return { manifestPath, manifest }
+}

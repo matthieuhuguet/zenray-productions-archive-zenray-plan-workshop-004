@@ -1,0 +1,82 @@
+// ⚠️ DÉPRÉCIÉ (2026-07-21) — BANC D'ESSAI HISTORIQUE, NE REFLÈTE PAS LA POLITIQUE ACTUELLE.
+// Cible la pile ENTIÈREMENT dépréciée : repo zenray-content, endpoint /api/media, service /api/stream
+// (Vercel), chunks NON CHIFFRÉS de 3 Mo EN STOCKAGE. La politique de découpage vivante est dans
+// src/config/chunkPolicy.js (19 MiB jsDelivr <=95 Mo / 95 Mo raw au-delà, chiffré, JAMAIS 3 Mo en stockage).
+// Le CHUNK_SIZE=3 Mo ci-dessous n'est conservé QUE pour reproduire l'ancien banc à l'identique ; ne JAMAIS
+// s'en inspirer pour du code de production. Laissé exécutable (inoffensif si jamais lancé), non recâblé.
+//
+// Banc d'essai C205 : chunke un fichier local, l'uploade dans zenray-content via la Git Data API
+// (même logique que api/media.js), puis mesure le temps de service streaming (api/stream.js).
+// Usage: GITHUB_TOKEN=$(gh auth token) node scripts/stream-bench.mjs <file> [destFolder]
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-content'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const CHUNK_SIZE = 3145728 // 3 Mo brut (cf api/media.js)
+const MAX_WINDOW = 2 * 1024 * 1024
+const TOKEN = process.env.GITHUB_TOKEN
+const file = process.argv[2]
+const destFolder = (process.argv[3] || 'pages/_streamtest').replace(/\/$/, '')
+if (!TOKEN) { console.error('no GITHUB_TOKEN'); process.exit(1) }
+if (!file) { console.error('usage: node stream-bench.mjs <file> [destFolder]'); process.exit(1) }
+
+import { readFile } from 'node:fs/promises'
+const pad = (i) => String(i).padStart(3, '0')
+const gh = (path, init = {}) => fetch(`https://api.github.com/repos/${REPO}/${path}`, {
+  ...init, headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-bench', ...(init.headers || {}) },
+})
+const ms = (t) => `${(performance.now() - t).toFixed(0)}ms`
+
+const buf = await readFile(file)
+const name = file.split('/').pop()
+const size = buf.length
+const count = Math.ceil(size / CHUNK_SIZE)
+console.log(`fichier ${name} — ${(size / 1048576).toFixed(1)} Mo — ${count} chunks de ${(CHUNK_SIZE / 1048576).toFixed(0)} Mo`)
+
+// 1) upload des blobs (séquentiel pour rester sous les limites d'abus GitHub)
+const t0 = performance.now()
+const blobs = []
+for (let i = 0; i < count; i++) {
+  const slice = buf.subarray(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, size))
+  const r = await gh('git/blobs', { method: 'POST', body: JSON.stringify({ content: slice.toString('base64'), encoding: 'base64' }) })
+  if (!r.ok) { console.error('blob', i, await r.text()); process.exit(1) }
+  blobs.push({ i, sha: (await r.json()).sha })
+  process.stdout.write(`\r  upload ${i + 1}/${count}`)
+}
+console.log(`\n  blobs uploadés en ${ms(t0)}`)
+
+// 2) manifest + tree + commit + ref (1 commit atomique)
+const dir = `media/bench-${name.replace(/[^A-Za-z0-9._-]/g, '_')}`
+const parts = blobs.map((b) => pad(b.i))
+const manifest = { type: 'chunked-media', v: 1, name, mime: 'video/mp4', size, chunkSize: CHUNK_SIZE, count, dir, parts, createdAt: new Date().toISOString() }
+const manifestPath = `${destFolder}/${name}.media.json`
+const mr = await gh('git/blobs', { method: 'POST', body: JSON.stringify({ content: Buffer.from(JSON.stringify(manifest, null, 2)).toString('base64'), encoding: 'base64' }) })
+const manifestSha = (await mr.json()).sha
+const headSha = (await (await gh(`git/ref/heads/${BRANCH}`)).json()).object.sha
+const baseTree = (await (await gh(`git/commits/${headSha}`)).json()).tree.sha
+const tree = blobs.map((b) => ({ path: `${dir}/${pad(b.i)}.bin`, mode: '100644', type: 'blob', sha: b.sha }))
+tree.push({ path: manifestPath, mode: '100644', type: 'blob', sha: manifestSha })
+const newTree = (await (await gh('git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree }) })).json()).sha
+const newCommit = (await (await gh('git/commits', { method: 'POST', body: JSON.stringify({ message: `content update ${new Date().toISOString().slice(0, 10)}`, tree: newTree, parents: [headSha] }) })).json()).sha
+await gh(`git/refs/heads/${BRANCH}`, { method: 'PATCH', body: JSON.stringify({ sha: newCommit, force: false }) })
+console.log(`  commit OK → ${manifestPath}`)
+
+// 3) streaming : on réplique api/stream.js. Sert une fenêtre [start, start+2Mo] en allant chercher
+//    SEULEMENT les chunks couvrant l'intervalle (raw GitHub). Mesure le temps de la 1ʳᵉ fenêtre + seeks.
+async function serveWindow(start) {
+  const end = Math.min(start + MAX_WINDOW - 1, size - 1)
+  const first = Math.floor(start / CHUNK_SIZE), last = Math.floor(end / CHUNK_SIZE)
+  const t = performance.now()
+  const parts2 = []
+  for (let i = first; i <= last; i++) {
+    const cr = await gh(`contents/${encodeURI(dir + '/' + pad(i) + '.bin')}?ref=${BRANCH}`, { headers: { Accept: 'application/vnd.github.raw' } })
+    if (!cr.ok) { console.error('chunk', i, cr.status); return }
+    parts2.push(Buffer.from(await cr.arrayBuffer()))
+  }
+  const out = Buffer.concat(parts2).subarray(start - first * CHUNK_SIZE, start - first * CHUNK_SIZE + (end - start + 1))
+  return { time: performance.now() - t, bytes: out.length, chunks: last - first + 1 }
+}
+console.log('\nstreaming (chunks demandés à la volée, comme un <video>) :')
+for (const [label, start] of [['démarrage (0%)', 0], ['seek 50%', Math.floor(size / 2)], ['seek ~fin', Math.max(0, size - MAX_WINDOW)]]) {
+  const r = await serveWindow(start)
+  if (r) console.log(`  ${label.padEnd(16)} ${r.time.toFixed(0)}ms — ${(r.bytes / 1048576).toFixed(1)} Mo servis (${r.chunks} chunk${r.chunks > 1 ? 's' : ''})`)
+}
+console.log(`\nmanifest: ${manifestPath}`)

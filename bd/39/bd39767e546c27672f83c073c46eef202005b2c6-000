@@ -1,0 +1,255 @@
+#!/usr/bin/env node
+// ZenRayMedia — DÉCOUPAGE DES COMPOSANTS : annoter d'abord, découper ensuite.
+//
+//   node scripts/zrm-regions.mjs <theme>            # écrit les images annotées (à valider)
+//   node scripts/zrm-regions.mjs <theme> --cut      # découpe pour de bon, une fois validé
+//
+// POURQUOI CE FICHIER REMPLACE TOUTE LA CHAÎNE PRÉCÉDENTE
+// ------------------------------------------------------
+// Le workflow d'avant produisait un crop par composant, puis des planches pour regarder ces
+// crops. Il ne pouvait pas marcher, et la raison est simple :
+//
+//   UN CROP ISOLÉ NE MONTRE JAMAIS QU'IL A ÉTÉ PRIS AU MAUVAIS ENDROIT.
+//
+// Découpée et affichée seule, une zone fausse reste une image nette, avec du contenu, l'air
+// parfaitement crédible. L'erreur de position n'existe que PAR RAPPORT à la capture entière —
+// une information que le crop a justement jetée. On vérifiait donc la mauvaise chose, très
+// soigneusement, et on la validait.
+//
+// Ici, la vérification se fait AVANT la découpe, sur la capture entière : la source est voilée
+// de blanc, les rectangles sont tracés en rouge dessus, chacun porte son nom. On voit d'un coup
+// d'oeil ce qui est cadré, ce qui déborde, ce qui a été oublié, et ce qui vise un décor au lieu
+// d'une interface. Une seule image par capture, aucun autre fichier généré.
+//
+// LES ZONES PEUVENT SE CHEVAUCHER, ET C'EST VOULU. Un composant contenu dans un autre — un
+// chiffre de poids dans un bandeau, une invite posée sur un panneau — est un composant à part
+// entière. Chaque zone est découpée indépendamment depuis la capture d'origine, aux coordonnées
+// notées : un recouvrement ne coûte rien et ne casse rien. Ne jamais rétrécir ni déplacer un
+// rectangle pour éviter d'en croiser un autre, ce serait sacrifier un cadrage juste à une
+// contrainte qui n'existe pas.
+//
+// SEULE L'INTERFACE SE DÉCOUPE. Jamais un personnage, un décor, un paysage, un rendu 3D de
+// scène : ce sont les seules choses qu'on ne sait pas reproduire en HTML, et les cadrer produit
+// une comparaison qui ne veut rien dire.
+//
+// LES CAPTURES SANS INTERFACE VONT DANS `hors-sujet/`. Sur un lot de soixante-treize captures,
+// vingt étaient des plans cinématiques purs — leur seule mention à l'écran était le filigrane
+// « Captured on PS5 ». Les laisser dans le lot de travail coûte deux fois : on les rouvre à
+// chaque passe, et une image sans zone devient indiscernable d'une image jamais ouverte.
+// Ce dossier n'est donc pas une corbeille, c'est un ÉTAT : « regardée, rien à reproduire ».
+// Les fichiers identiques bit à bit vont dans `doublons/` — sinon la couverture se compte double.
+
+import { readFile, writeFile, mkdir, rm } from 'node:fs/promises'
+import path from 'node:path'
+import { chromium } from 'playwright'
+import { themeDir as themeDirOf, capturesDir, workDir, regionsPath } from './zrm-paths.mjs'
+
+// Le voile : la source reste lisible (on doit reconnaître ce qu'on cadre) mais recule d'un plan,
+// pour que le rouge des rectangles passe devant sans lutter contre le contenu.
+const VEIL = 0.55
+
+// LA MARGE. Matthieu, 2026-07-28 : « elles sont cropées un peu trop serrées, du coup il n'y a pas
+// le truc en entier ». Un cadrage posé au ras du contenu perd toujours quelque chose — la lueur
+// qui déborde d'un bouton, le liseré d'un panneau, la dernière ligne de base d'un texte. Ces
+// débords font partie du composant : sans eux on reproduit une forme amputée.
+//
+// Elle vit ICI et pas dans les coordonnées : `regions.json` garde les bornes VRAIES du composant,
+// lisibles et comparables, et la marge reste un seul réglage qu'on change d'un chiffre. La valeur
+// est donnée pour une capture 1920 et suit la définition, sinon elle serait deux fois plus fine
+// sur une 4K. Une zone peut la surcharger avec son propre champ `pad`.
+const PAD = 12
+
+const padded = (r, pad, W, H) => {
+  const x = Math.max(0, r[0] - pad)
+  const y = Math.max(0, r[1] - pad)
+  return [x, y, Math.min(W - x, r[2] + (r[0] - x) + pad), Math.min(H - y, r[3] + (r[1] - y) + pad)]
+}
+
+// AJUSTEMENT AUTOMATIQUE DES ZONES LUMINEUSES (--fit).
+//
+// Une zone marquée `"glow": "rb" | "bg" | "gr"` voit ses bornes MESURÉES au lieu d'être crues :
+// on balaye une fenêtre autour du rectangle déclaré et on prend l'étendue réelle de la teinte.
+// C'est la leçon du sceau « AWESOME », recadré trois fois à l'oeil et trois fois trop court : un
+// halo s'éteint progressivement, l'oeil place sa limite là où l'image lui paraît finie, donc
+// toujours trop tôt.
+//
+// Le résultat est l'UNION avec le rectangle déclaré, jamais un remplacement : un halo voisin qui
+// entrerait dans la fenêtre peut agrandir la zone à tort, il ne peut jamais la rétrécir et faire
+// perdre le composant.
+const MARGE_MESURE = 40
+
+function fitZone(zs, W, H, measured) {
+  return zs.map((z, i) => {
+    const m = measured[i]
+    if (!m || m.rejet) return z
+    const [x0, y0, w0, h0] = z.rect
+    const x = Math.min(x0, m[0]), y = Math.min(y0, m[1])
+    return { ...z, rect: [x, y, Math.max(x0 + w0, m[0] + m[2]) - x, Math.max(y0 + h0, m[1] + m[3]) - y] }
+  })
+}
+
+async function main() {
+  const id = process.argv[2]
+  if (!id) throw new Error('usage : node scripts/zrm-regions.mjs <T-FF-S-V--slug> [--cut] [--fit]')
+  const cut = process.argv.includes('--cut')
+  const fit = process.argv.includes('--fit')
+
+  const themeDir = themeDirOf(id)
+  const spec = JSON.parse(await readFile(regionsPath(id), 'utf8'))
+  // Le dossier de captures se déduit du thème par son préfixe T-FF-S-V : `regions.json` n'a plus
+  // à porter un chemin en dur, qui devenait faux au premier renommage.
+  const capDir = capturesDir(id)
+  const outDir = path.join(workDir(id), cut ? 'crops' : 'regions')
+  await rm(outDir, { recursive: true, force: true })
+  await mkdir(outDir, { recursive: true })
+
+  const browser = await chromium.launch()
+  const page = await browser.newPage()
+  let total = 0
+
+  for (const [rel, zones] of Object.entries(spec.images)) {
+    const file = path.join(capDir, rel)
+    const buf = await readFile(file)
+    const ext = path.extname(file).slice(1).toLowerCase().replace('jpg', 'jpeg')
+    const src = `data:image/${ext};base64,${buf.toString('base64')}`
+
+    if (fit) {
+      const measured = await page.evaluate(async ([u, zs, M]) => {
+        const img = new Image(); img.src = u; await img.decode()
+        const W = img.naturalWidth, H = img.naturalHeight
+        const c = document.createElement('canvas')
+        c.width = W; c.height = H
+        const g = c.getContext('2d'); g.drawImage(img, 0, 0)
+        const CH = { rb: [0, 2], bg: [2, 1], gr: [1, 0] }
+        const mesure = (z, pick, s, M) => {
+          const X0 = Math.max(0, z.rect[0] - M), Y0 = Math.max(0, z.rect[1] - M)
+          const X1 = Math.min(W, z.rect[0] + z.rect[2] + M), Y1 = Math.min(H, z.rect[1] + z.rect[3] + M)
+          const d = g.getImageData(X0, Y0, X1 - X0, Y1 - Y0).data
+          let x0 = Infinity, y0 = Infinity, x1 = -1, y1 = -1
+          for (let y = 0; y < Y1 - Y0; y++) {
+            for (let x = 0; x < X1 - X0; x++) {
+              const i = (y * (X1 - X0) + x) * 4
+              if (d[i + pick[0]] - d[i + pick[1]] > s) {
+                if (x < x0) x0 = x; if (x > x1) x1 = x
+                if (y < y0) y0 = y; if (y > y1) y1 = y
+              }
+            }
+          }
+          if (x1 < 0) return null
+          // La teinte touche-t-elle un bord de la fenêtre ? Alors elle ne s'arrête pas dedans, et
+          // la mesure ne dit rien de la taille de l'élément.
+          const colle = (x0 === 0 && X0 > 0) || (y0 === 0 && Y0 > 0)
+            || (x1 === X1 - X0 - 1 && X1 < W) || (y1 === Y1 - Y0 - 1 && Y1 < H)
+          return { box: [x0 + X0, y0 + Y0, x1 - x0 + 1, y1 - y0 + 1], colle }
+        }
+
+        return zs.map((z) => {
+          if (!z.glow) return null
+          const pick = CH[typeof z.glow === 'string' ? z.glow : z.glow.canaux] || CH.rb
+          const s = (typeof z.glow === 'object' && z.glow.seuil) || 25
+          // On ÉLARGIT la fenêtre tant que la teinte en touche le bord : c'est la seule façon de
+          // distinguer « l'élément est simplement plus grand que je ne croyais » de « cette teinte
+          // inonde le voisinage ». Un halo isolé finit par s'éteindre et la fenêtre le contient ;
+          // une table holographique verte, un sac de cargo jaune ou une roue entièrement bleue ne
+          // s'arrêtent jamais — et là on REJETTE la mesure au lieu de l'accepter parce qu'elle a
+          // la tête d'un chiffre. C'est ce garde-fou qui distingue mesurer de se raconter.
+          let r = null
+          for (const M of [40, 90, 180]) { r = mesure(z, pick, s, M); if (!r || !r.colle) break }
+          return !r ? null : r.colle ? { rejet: z.name } : r.box
+        })
+      }, [src, zones, MARGE_MESURE])
+      const before = JSON.stringify(zones.map((z) => z.rect))
+      spec.images[rel] = fitZone(zones, 0, 0, measured)
+      const changed = spec.images[rel].filter((z, i) => JSON.stringify(z.rect) !== JSON.stringify(zones[i].rect))
+      if (changed.length) console.log(`  ${rel} → élargie(s) : ${changed.map((z) => z.name).join(', ')}`)
+      const rejets = measured.filter((m) => m && m.rejet).map((m) => m.rejet)
+      if (rejets.length) console.log(`  ${rel} → mesure REJETÉE (teinte non isolée) : ${rejets.join(', ')}`)
+      void before
+      continue
+    }
+
+    // Tout le dessin se fait dans un canvas de la page : pas de dépendance d'image en plus, et
+    // les coordonnées sont celles de la capture, sans facteur d'échelle nulle part.
+    const shots = await page.evaluate(async ([u, zs, veil, doCut, pad, padSrc]) => {
+      const img = new Image(); img.src = u; await img.decode()
+      const W = img.naturalWidth, H = img.naturalHeight
+      // eslint-disable-next-line no-new-func
+      const grow = new Function('return ' + padSrc)()
+      const k = Math.max(1, W / 1920)
+      const boxOf = (z) => grow(z.rect, Math.round((z.pad ?? pad) * k), W, H)
+
+      if (doCut) {
+        // Découpe sur l'ORIGINALE : ni voile, ni trait. Le composant sort propre, marge comprise —
+        // c'est le même rectangle que celui validé en rouge, pas un cadrage plus serré.
+        return zs.map((z) => {
+          const b = boxOf(z)
+          const c = document.createElement('canvas')
+          c.width = b[2]; c.height = b[3]
+          c.getContext('2d').drawImage(img, ...b, 0, 0, b[2], b[3])
+          return { name: z.name, url: c.toDataURL('image/png') }
+        })
+      }
+
+      const c = document.createElement('canvas')
+      c.width = W; c.height = H
+      const g = c.getContext('2d')
+      g.drawImage(img, 0, 0)
+      g.fillStyle = `rgba(255,255,255,${veil})`
+      g.fillRect(0, 0, W, H)
+
+      // Épaisseur et corps de texte proportionnels à la capture : un trait de 3 px sur une
+      // 4K est invisible, le même sur une 720p mange le composant.
+      g.lineWidth = 3 * k
+      g.font = `600 ${17 * k}px -apple-system, BlinkMacSystemFont, sans-serif`
+      g.textBaseline = 'top'
+
+      for (const z of zs) {
+        // On trace la zone MARGE COMPRISE : le rectangle rouge montre exactement ce qui sera
+        // découpé. Un contrôle qui montre autre chose que le résultat ne contrôle rien.
+        const [x, y, w, h] = boxOf(z)
+        g.strokeStyle = '#e0143c'
+        g.strokeRect(x + 0.5, y + 0.5, w, h)
+
+        // L'étiquette se pose au-dessus du rectangle, et bascule à l'intérieur quand il n'y a
+        // plus de place en haut. Sans ça, les composants collés au bord perdent leur nom —
+        // c'est-à-dire exactement ceux qu'on confond le plus (ATH, barres d'invites).
+        const label = z.name
+        const tw = g.measureText(label).width
+        const lh = 22 * k
+        const ly = y - lh - 2 * k >= 0 ? y - lh - 2 * k : y + 2 * k
+        const lx = Math.min(x, W - tw - 12 * k)
+        g.fillStyle = '#e0143c'
+        g.fillRect(lx, ly, tw + 12 * k, lh)
+        g.fillStyle = '#fff'
+        g.fillText(label, lx + 6 * k, ly + 3 * k)
+      }
+      return [{ name: null, url: c.toDataURL('image/png') }]
+    }, [src, zones, VEIL, cut, PAD, padded.toString()])
+
+    // Le nom de fichier porte la CAPTURE D'ORIGINE en préfixe. Sans elle, les 307 zones tombent à
+    // 209 fichiers : « titre-ecran » existe sur quinze écrans différents et chacun écrase le
+    // précédent en silence. Une collision de noms ne lève aucune erreur — elle fabrique juste une
+    // couverture qui paraît complète et ne l'est pas.
+    const stem = rel.replace(/[/\\]/g, '__').replace(/\.(png|jpe?g)$/i, '').replace(/^raw_v2__/, '')
+    for (const s of shots) {
+      const name = s.name ? `${stem}__${s.name}` : rel.replace(/[/\\]/g, '__').replace(/\.(png|jpe?g)$/i, '')
+      await writeFile(path.join(outDir, `${name}.png`), Buffer.from(s.url.split(',')[1], 'base64'))
+      total++
+    }
+    console.log(`  ${rel.padEnd(28)} ${zones.length} zone(s)`)
+  }
+  await browser.close()
+
+  if (fit) {
+    await writeFile(regionsPath(id), JSON.stringify(spec, null, 2) + '\n')
+    console.log(`\nregions.json mis à jour. Relancer sans --fit pour revoir les annotations.`)
+    return
+  }
+
+  console.log(`\n${total} fichier(s) → ${path.relative(process.cwd(), outDir)}`)
+  console.log(cut
+    ? `Composants découpés sur l'originale.`
+    : `REGARDER ces images : chaque rectangle rouge doit tomber sur une interface, entière et sans décor.`)
+}
+
+main().catch((e) => { console.error(e.message || e); process.exit(1) })

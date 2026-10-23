@@ -1,0 +1,166 @@
+// 4 October 2026: merge one collection run into the studio store without ever touching what Matthieu wrote.
+// The engine owns the `engine` block of a vacancy; status, messages, history and notes belong to him.
+// FR : fusionne une collecte dans le fichier des studios sans jamais toucher a ce que Matthieu a ecrit.
+// Le moteur possede le bloc `engine` d'une annonce ; statut, messages, historique et notes sont a lui.
+import { buildOffer, refreshLegacyEngine } from './lib/Offer.mjs'
+import { canonicalUrl, englishDay, isoDay } from './lib/Text.mjs'
+import { studioKey } from '../../src/lib/freelanceStudioKey.js'
+import { postingKey } from './lib/PostingKey.mjs'
+
+const linkKey = (studio) => `${canonicalUrl(studio.link)}|${String(studio.role || '').trim().toLowerCase()}`
+
+/** Which board a vacancy written by the 30 September collector belongs to, read from its first note line. */
+export function inferSource(studio, boards) {
+  if (studio.engine?.source) return studio.engine.source
+  if (!String(studio.id).startsWith('job_')) return ''
+  const first = String(studio.notes || '').split('\n\n')[0]
+  const evidence = (first.match(/Source : (.*?)\.?$/) || [])[1] || ''
+  if (/^AFJV/i.test(evidence)) return 'afjv'
+  if (/^Keywords Studios/i.test(evidence)) return 'keywords'
+  if (/^GamesIndustry/i.test(evidence)) return 'gamesindustry'
+  const board = boards.find((entry) => entry.key.includes(':') && evidence.toLowerCase().startsWith(String(entry.label).toLowerCase() + ','))
+  return board ? board.key : ''
+}
+
+export function isClosed(studio, today = isoDay()) {
+  const engine = studio.engine
+  if (!engine) return false
+  return Boolean(engine.closedAt) || Boolean(engine.validThrough && String(engine.validThrough).slice(0, 10) < today)
+}
+
+/**
+ * @param current  the stored file ({ v, studios })
+ * @param boards   [{ key, label, listings, seenIds, complete }]
+ * @returns { store, report } with `store` a new object; `current` is never mutated
+ */
+export function mergeStore(current, boards, config, { now = new Date() } = {}) {
+  const stored = Array.isArray(current.studios) ? current.studios : Array.isArray(current.applications) ? current.applications : null
+  if (!stored) throw new Error('Unexpected store shape; refusing to replace it')
+  // Earlier records: read their engine facts back from the notes, once, so every vacancy is as usable as a new one.
+  // FR : fiches anterieures : relire leurs faits dans les notes, une fois.
+  const studios = stored.map((studio) => (String(studio.id).startsWith('job_') && (!studio.engine || (studio.engine.legacy && !studio.engine.source))) ? { ...studio, engine: refreshLegacyEngine(studio, config) } : studio)
+  const today = isoDay(now)
+  const byId = new Map(studios.map((studio) => [studio.id, studio]))
+  const keys = new Set(studios.filter((studio) => studio.link).map(linkKey))
+  // A vacancy written before the engine existed is recognised by its address and role, and adopted instead of duplicated.
+  // FR : une annonce ecrite avant le moteur est reconnue par son adresse et son poste, et adoptee au lieu d'etre dupliquee.
+  const byLink = new Map(studios.filter((studio) => studio.link).map((studio) => [linkKey(studio), studio]))
+  const next = new Map(studios.map((studio) => [studio.id, studio]))
+  const report = { added: [], updated: 0, closed: [], reopened: [], boards: {}, duplicates: 0 }
+  // The same posting relisted by an index site is not a new vacancy: the studio's own record (or the first index) keeps it.
+  // FR : la meme annonce republiee par un index n'est pas une nouvelle annonce : la fiche du studio (ou du premier index) la garde.
+  const byPosting = new Set(studios.filter((studio) => !isClosed(studio, isoDay(now))).map((studio) => postingKey(studio.name, studio.role)))
+  const seenBySource = new Map()
+  const seenIds = new Set()
+
+  for (const board of boards) {
+    const seen = new Set(board.seenIds || [])
+    seenBySource.set(board.key, { seen, complete: board.complete })
+    report.boards[board.key] = { label: board.label, listed: board.listed, matched: board.matched, complete: board.complete, partial: Boolean(board.partial), errors: board.errors?.length || 0, added: 0 }
+    for (const listing of board.listings) {
+      const fresh = buildOffer(listing, config, { now })
+      // A recruitment posted under several locations keeps the id of whichever variant the record was first written from.
+      // FR : un recrutement publie sous plusieurs lieux garde l'id du variant d'origine de la fiche.
+      const existing = byId.get(fresh.id) || (listing.variantIds || []).map((id) => byId.get(id)).find(Boolean) || byLink.get(linkKey(fresh))
+      if (existing) {
+        const before = existing.engine || {}
+        const wasClosed = isClosed(existing, today)
+        const engine = { ...before, ...fresh.engine, externalId: before.externalId || fresh.engine.externalId, firstSeenAt: before.firstSeenAt || existing.createdAt || fresh.engine.firstSeenAt, lastSeenAt: today, missedRuns: 0, closedAt: '', letterPath: before.letterPath, validThrough: listing.validThrough || before.validThrough || '' }
+        if (!engine.letterPath) delete engine.letterPath
+        delete engine.lastMissAt
+        delete engine.legacy
+        let nextStudio = { ...existing, engine }
+        if (wasClosed && before.closedAt) {
+          report.reopened.push(existing.id)
+          if (existing.status === 'deprecated') {
+            nextStudio = {
+              ...nextStudio,
+              status: 'to_contact',
+              history: [
+                ...(existing.history || []),
+                { at: today, from: 'deprecated', to: 'to_contact', note: 'Offre republiée sur le site source (07 October 2026)' },
+              ],
+            }
+          }
+        }
+        next.set(existing.id, nextStudio)
+        seenIds.add(existing.id)
+        report.updated += 1
+        continue
+      }
+      // A vacancy that fits his CV by less than the floor is not worth a card, a letter and store bytes; it is counted, not stored.
+      // FR : une annonce qui colle au CV en dessous du plancher ne merite ni fiche, ni lettre, ni octets : elle est comptee, pas stockee.
+      if ((fresh.engine.score ?? 0) < (config.relevance.storeMinScore ?? 0)) { report.belowFloor = (report.belowFloor || 0) + 1; continue }
+      const posting = postingKey(fresh.name, fresh.role)
+      if (String(fresh.engine.source).startsWith('index:') && byPosting.has(posting)) { report.duplicates += 1; continue }
+      const key = linkKey(fresh)
+      if (keys.has(key)) continue
+      byPosting.add(posting)
+      keys.add(key)
+      fresh.engine.validThrough = listing.validThrough || ''
+      next.set(fresh.id, fresh)
+      byId.set(fresh.id, fresh)
+      report.added.push(fresh.id)
+      report.boards[board.key].added += 1
+    }
+  }
+
+  // A vacancy absent from a source that answered in full is flagged after enough missed runs; a source that failed proves nothing.
+  // FR : une annonce absente d'une source qui a repondu en entier est marquee apres assez de passages manques ; une source en panne ne prouve rien.
+  for (const [id, studio] of next) {
+    if (!studio.link && !studio.engine) continue
+    const source = inferSource(studio, boards)
+    const coverage = seenBySource.get(source)
+    if (!coverage || !coverage.complete) continue
+    if (coverage.seen.has(id) || seenIds.has(id)) continue
+    const before = studio.engine || {}
+    // Two passes a minute apart are one observation, not two: a miss counts only after enough time since the last one.
+    // FR : deux passes a une minute d'ecart sont une seule observation : un manque ne compte qu'apres assez de temps.
+    const sinceLastMiss = before.lastMissAt ? now.getTime() - new Date(before.lastMissAt).getTime() : Infinity
+    const counted = sinceLastMiss >= config.life.minHoursBetweenMisses * 3600 * 1000
+    const missed = (before.missedRuns || 0) + (counted ? 1 : 0)
+    const closedAt = before.closedAt || (missed >= config.life.closedAfterMissedRuns ? today : '')
+    if (closedAt && !before.closedAt) report.closed.push(id)
+    let status = studio.status
+    let history = studio.history || []
+    if (closedAt && status === 'to_contact') {
+      status = 'deprecated'
+      history = [
+        ...history,
+        { at: today, from: 'to_contact', to: 'deprecated', note: 'Offre fermée sur le site source (07 October 2026)' },
+      ]
+    }
+    next.set(id, {
+      ...studio,
+      status,
+      history,
+      engine: { source, ...before, missedRuns: missed, lastMissAt: counted ? now.toISOString() : before.lastMissAt, closedAt },
+    })
+  }
+
+  const list = [...next.values()]
+  return { store: { ...current, v: 2, studios: list }, report }
+}
+
+/**
+ * Studios to approach without a vacancy: added once, as uncontacted records Matthieu can edit, drop or write to.
+ * A studio already in the store (same key) is never touched, whatever its status.
+ * FR : studios a demarcher sans annonce : ajoutes une fois, jamais retouches ensuite, quel que soit leur statut.
+ */
+export function addProspects(store, prospects, { now = new Date() } = {}) {
+  const have = new Set(store.studios.map((studio) => studioKey(studio.name)))
+  const today = isoDay(now)
+  const added = []
+  for (const prospect of prospects) {
+    const key = studioKey(prospect.name)
+    if (!key || have.has(key)) continue
+    have.add(key)
+    added.push({
+      id: `prospect_${key}`, name: prospect.name, role: 'Candidature spontanée', link: prospect.careersUrl, city: [prospect.city, prospect.country].filter(Boolean).join(', '),
+      status: 'to_contact', createdAt: today, contactedAt: '', messages: [], history: [],
+      notes: `Studio à démarcher. Page carrières officielle vérifiée le ${englishDay(now)} : ${prospect.careersUrl}. Aucune offre précise à ce jour ; le mail se présente comme une candidature spontanée. (${englishDay(now)})`,
+      engine: { source: 'prospect', sourceLabel: 'Page carrières', externalId: key, kind: 'spontaneous', freelance: false, trainee: false, contract: '', country: prospect.country || '', workplace: '', publishedAt: '', skills: [], yearsRequired: null, score: null, tier: null, scoreWhy: [], applyUrl: prospect.careersUrl, employerUrl: '', contactEmails: [], language: ['FR', 'BE', 'CH'].includes(String(prospect.country).toUpperCase()) ? 'fr' : 'en', firstSeenAt: today, lastSeenAt: today, missedRuns: 0, closedAt: '' },
+    })
+  }
+  return { store: { ...store, studios: [...store.studios, ...added] }, added: added.map((studio) => studio.id) }
+}

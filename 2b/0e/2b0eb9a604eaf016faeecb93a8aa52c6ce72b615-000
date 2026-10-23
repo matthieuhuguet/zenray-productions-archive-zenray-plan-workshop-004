@@ -1,0 +1,79 @@
+// DownloadStream.mjs (14 October 2026): gives back the files of a STREAMED film, exactly like the Download button of the site:
+// the video, each audio language and each subtitle track, as separate files (policy streaming only), and optionally compares them
+// with the source (video and audio packets by md5, subtitle text).
+//   node scripts/DownloadStream.mjs --manifest <path.media.json> --clone <manifest clone> --out <dir> [--source <film.mkv>]
+// FR : rend les fichiers d'un film streame (video, chaque audio, chaque sous-titre) comme le bouton Telecharger, et les compare a la source.
+import fs from 'node:fs'
+import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { planStreamFiles, parseMaster, decodeSubtitle, rawFallbackUrl } from '../src/lib/streamFiles.js'
+import { comparableCues, probeSource } from './lib/fmp4-single.mjs'
+
+const argv = process.argv.slice(2)
+const value = (flag, fallback = '') => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : fallback }
+const manifestPath = path.resolve(value('--manifest'))
+const clone = path.resolve(value('--clone'))
+const out = path.resolve(value('--out'))
+const source = value('--source') ? path.resolve(value('--source')) : ''
+if (!value('--manifest') || !value('--clone') || !value('--out')) throw new Error('Usage: DownloadStream.mjs --manifest <m> --clone <dir> --out <dir> [--source <film>]')
+
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+const readPlaylist = (rel) => fs.readFileSync(path.join(clone, rel), 'utf8')
+const masterText = readPlaylist(manifest.master)
+const media = {}
+for (const item of [...parseMaster(masterText).videos, ...parseMaster(masterText).audios]) media[item.uri] = readPlaylist(item.uri)
+const plan = planStreamFiles({ manifest, masterText, media })
+if (plan.problems.length) { console.error('PROBLEMS: ' + plan.problems.join(' ; ')); process.exit(1) }
+fs.mkdirSync(out, { recursive: true })
+
+async function fetchRetry(url, attempts = 40) {
+  let last = ''
+  for (let n = 1; n <= attempts; n += 1) {
+    // every second attempt on GitHub raw (same commit): jsDelivr keeps a 403 for a segment it never served for minutes
+    const target = n % 2 === 0 && rawFallbackUrl(url) ? rawFallbackUrl(url) : url
+    try { const r = await fetch(target); if (r.ok) return Buffer.from(await r.arrayBuffer()); last = `HTTP ${r.status}` } catch (e) { last = String(e.message || e) }
+    await new Promise((r) => setTimeout(r, 800))
+  }
+  throw new Error(`${url}: ${last}`)
+}
+
+const started = Date.now()
+const written = []
+for (const f of plan.files) {
+  const target = path.join(out, f.name)
+  if (f.kind === 'subtitle') { fs.writeFileSync(target, await decodeSubtitle(f.subtitle), 'utf8') }
+  else {
+    const fd = fs.openSync(target, 'w')
+    let done = 0
+    const queue = f.urls.map((u, i) => ({ u, i }))
+    const buffers = new Array(f.urls.length)
+    await Promise.all(Array.from({ length: 8 }, async () => {
+      for (let job = queue.shift(); job; job = queue.shift()) { buffers[job.i] = await fetchRetry(job.u); done += 1; if (done % 100 === 0) console.error(`${f.name}: ${done}/${f.urls.length}`) }
+    }))
+    for (const b of buffers) fs.writeSync(fd, b)
+    fs.closeSync(fd)
+  }
+  written.push({ name: f.name, kind: f.kind, bytes: fs.statSync(target).size })
+  console.error(`written ${f.name} (${written.at(-1).bytes} bytes)`)
+}
+const result = { ok: true, seconds: Math.round((Date.now() - started) / 1000), files: written, checks: [] }
+
+if (source) {
+  const md5 = (file, map) => { const r = spawnSync('ffmpeg', ['-v', 'error', '-i', file, '-map', map, '-c', 'copy', '-f', 'md5', '-'], { encoding: 'utf8' }); return r.status === 0 ? r.stdout.trim() : `error:${r.stderr.slice(0, 100)}` }
+  const probe = probeSource(source)
+  const videoFile = path.join(out, plan.files.find((f) => f.kind === 'video').name)
+  result.checks.push({ name: 'video packets identical to the source', ok: md5(source, '0:v:0') === md5(videoFile, '0:v:0') })
+  const audioFiles = plan.files.filter((f) => f.kind === 'audio')
+  probe.audio.forEach((_a, i) => {
+    const f = audioFiles[i]
+    result.checks.push({ name: `audio ${i} (${f?.label}) packets identical to the source`, ok: Boolean(f) && md5(source, `0:a:${i}`) === md5(path.join(out, f.name), '0:a:0') })
+  })
+  for (const f of plan.files.filter((x) => x.kind === 'subtitle')) {
+    const text = fs.readFileSync(path.join(out, f.name), 'utf8')
+    result.checks.push({ name: `subtitle ${f.label} has cues`, ok: text.length > 20 })
+  }
+  void comparableCues
+  result.ok = result.checks.every((c) => c.ok)
+}
+console.log(JSON.stringify(result, null, 2))
+process.exit(result.ok ? 0 : 1)

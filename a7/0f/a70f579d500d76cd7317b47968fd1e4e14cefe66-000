@@ -1,0 +1,68 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('../media/crypto.js', () => ({ decryptBytes: async (bytes) => bytes }))
+
+function indexedDbWith(record) {
+  return {
+    open() {
+      const request = {}
+      queueMicrotask(() => {
+        request.result = {
+          objectStoreNames: { contains: () => true },
+          transaction: () => ({
+            objectStore: () => ({
+              get: () => {
+                const getRequest = {}
+                queueMicrotask(() => { getRequest.result = record; getRequest.onsuccess?.() })
+                return getRequest
+              },
+            }),
+          }),
+        }
+        request.onsuccess?.()
+      })
+      return request
+    },
+  }
+}
+
+function encodeJson(value) {
+  return btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(value))))
+}
+
+describe('index de recherche stale-while-revalidate', () => {
+  afterEach(() => { vi.unstubAllGlobals(); vi.resetModules() })
+
+  it('rend IndexedDB sans attendre le réseau de rafraîchissement', async () => {
+    vi.stubGlobal('indexedDB', indexedDbWith({ builtAt: 'cached', paths: ['pages/a.plan.json'], thumbs: {}, content: {} }))
+    let releaseNetwork
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((resolve) => { releaseNetwork = () => resolve({ ok: false }) })))
+    const { loadSearchIndex } = await import('./searchIndexClient.js')
+    const result = await Promise.race([
+      loadSearchIndex(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('réseau attendu à tort')), 100)),
+    ])
+    expect(result.paths).toEqual(['pages/a.plan.json'])
+    releaseNetwork()
+  })
+
+  it('notifie les vues ouvertes quand le rafraîchissement remplace un index périmé', async () => {
+    vi.stubGlobal('indexedDB', indexedDbWith({ builtAt: 'cached|old-delta', paths: ['pages/old.png.file.json'], thumbs: {}, content: {} }))
+    const freshPaths = ['pages/louisiana-bayou/references/FinishedEnviro.png.file.json']
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (String(url).endsWith('/head.json')) return { ok: true, json: async () => ({ builtAt: 'fresh', shards: [{ h: 'one' }] }) }
+      if (String(url).endsWith('/delta.json')) return { ok: true, json: async () => ({ builtAt: 'new-delta', ct: encodeJson({ paths: [] }), iv: 'unused' }) }
+      if (String(url).includes('/s/one.json')) return { ok: true, json: async () => ({ ct: encodeJson({ paths: freshPaths }), iv: 'unused' }) }
+      return { ok: false, json: async () => null }
+    }))
+    const { loadSearchIndex, subscribeSearchIndex } = await import('./searchIndexClient.js')
+    const updates = []
+    const unsubscribe = subscribeSearchIndex((index) => updates.push(index.paths))
+
+    const stale = await loadSearchIndex()
+    expect(stale.paths).toContain('pages/old.png.file.json')
+    await vi.waitFor(() => expect(updates.at(-1)).toContain(freshPaths[0]))
+    expect(updates.at(-1)).not.toContain('pages/old.png.file.json')
+    unsubscribe()
+  })
+})

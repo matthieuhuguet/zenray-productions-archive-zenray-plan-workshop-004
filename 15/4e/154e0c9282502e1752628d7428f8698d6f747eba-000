@@ -1,0 +1,276 @@
+// 10 October 2026, 19:03 CEST: Push encrypted HLS media through bounded Git batches without the Raw GitHub CDN.
+// 12 October 2026: the batches are decided by the push batch policy (lib/push-batch-policy.mjs). A caller hands over the WHOLE list
+// of files; pushFiles splits it by bytes (8 parts at the start, up to 20 parts of 95 MiB = 1 900 MiB, never above), retries a failed
+// batch unchanged twice, falls back to 2 parts at the third failure of the same batch, shrinks after a size refusal, and hashes the
+// next batch while the previous one transfers. Nothing is dropped on a failure: the sources stay where they are.
+// FR : les lots sont decides par la politique ; l'appelant donne la liste ENTIERE, pushFiles la decoupe par octets, rejoue un lot
+// echoue, retombe a 2 parts au 3e echec du meme lot, reduit apres un refus de taille et prepare le lot suivant pendant le transfert.
+import { spawn } from 'node:child_process'
+import { acquirePushToken } from './push-token.mjs'
+import { promisify } from 'node:util'
+import { execFile } from 'node:child_process'
+import { mkdir, rm } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import path from 'node:path'
+import { videoGitAuthEnvironment } from '../video-raw-lib.mjs'
+import {
+  sharedPushController, runPushBatch, parsePushPackBytes, planBatch, PushPermanentRejection, PushExhausted, remoteTipIs,
+} from './push-batch-policy.mjs'
+
+const execFileAsync = promisify(execFile)
+
+export async function openVideoGitShard({ owner, repo, workDir, token, remoteUrl, baseEnv = process.env, log = () => {},
+  pushController = null, sleep = undefined }) {
+  if (!/^[A-Za-z0-9-]+$/.test(owner || '') || !/^[A-Za-z0-9-]+$/.test(repo || '')) throw new Error('Invalid video shard identity')
+  if (!path.isAbsolute(workDir || '')) throw new Error('Video shard work directory must be absolute')
+  const policy = pushController || sharedPushController({ log })
+  const directory = path.join(workDir, repo)
+  const url = remoteUrl || `https://github.com/${owner}/${repo}.git`
+  const env = videoGitAuthEnvironment(baseEnv, token)
+  const run = async (args, timeout = 120000) => execFileAsync('git', ['-C', directory, ...args], {
+    env, timeout, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8',
+  })
+
+  await mkdir(workDir, { recursive: true })
+  await rm(directory, { recursive: true, force: true })
+  await execFileAsync('git', ['clone', '-q', '--filter=blob:none', '--no-checkout', '--depth', '1', '--single-branch', '--branch', 'main', url, directory], {
+    env, timeout: 120000, maxBuffer: 2 * 1024 * 1024, encoding: 'utf8',
+  })
+  await run(['config', 'user.email', 'bot@zenray'])
+  await run(['config', 'user.name', 'zenray-bot'])
+  await run(['config', 'http.version', 'HTTP/1.1'])
+  // Segments video .m4s deja compresses (10 October 2026) : desactiver zlib et delta-search accelere git pack-objects et git add.
+  await run(['config', 'core.compression', '0'])
+  await run(['config', 'pack.window', '0'])
+  await run(['config', 'pack.depth', '0'])
+  await run(['read-tree', 'HEAD'])
+  const { stdout: tree } = await run(['ls-tree', '-r', '--name-only', 'HEAD'])
+  const remotePaths = new Set(tree.split(/\r?\n/).filter(Boolean))
+  const localPaths = new Set()
+  const head = async () => (await run(['rev-parse', 'HEAD'])).stdout.trim()
+  let confirmedHead = await head()   // the last commit CONFIRMED online: every batch starts again from it
+  let queue = Promise.resolve()      // two pushFiles calls on one shard never run at the same time
+
+  function pushFiles(files, options = {}) {
+    const running = queue.then(() => pushFilesNow(files, options))
+    queue = running.catch(() => {})
+    return running
+  }
+
+  async function pushFilesNow(files, { message, onProgress = () => {}, timeout = policy.config.pushTimeoutMs } = {}) {
+    if (!Array.isArray(files) || !files.length) return { commit: await head(), files: [], bytes: 0 }
+    const selected = []
+    const seen = new Set()
+    let bytes = 0
+    for (const file of files) {
+      if (!file || typeof file.path !== 'string' || !file.path || file.path.startsWith('/') || file.path.split('/').some((part) => part === '..' || part === '.')) {
+        throw new Error('Unsafe video shard path')
+      }
+      if (!path.isAbsolute(file.sourcePath || '') || !Number.isSafeInteger(file.size) || file.size < 0) throw new Error('Invalid video shard file')
+      if (file.offset !== undefined && (!Number.isSafeInteger(file.offset) || file.offset < 0 || file.size < 1)) throw new Error('Invalid video shard byte range')
+      if (seen.has(file.path)) throw new Error(`Duplicate video shard path: ${file.path}`)
+      seen.add(file.path)
+      if (remotePaths.has(file.path) || localPaths.has(file.path)) continue
+      selected.push(file)
+      bytes += file.size
+    }
+    if (!selected.length) return { commit: await head(), files: [], bytes: 0 }
+
+    const sizes = selected.map((file) => file.size)
+    const blobs = new Map()          // path -> blob id, hashed ahead of the push that needs it
+    let attemptState = { key: '', commit: null }
+    let index = 0
+    let doneBytes = 0
+    let packBytes = 0
+    let packSeen = false
+    let attempts = 0
+    let batches = 0
+
+    const hashFile = async (file) => {
+      if (file.offset === undefined) {
+        const { stdout } = await run(['hash-object', '-w', '--no-filters', '--', file.sourcePath], timeout)
+        const hash = stdout.trim()
+        if (!/^[a-f0-9]{40}$/.test(hash)) throw new Error(`Git hash failed for ${file.path}`)
+        return hash
+      }
+      return writeGitRange(directory, env, file, timeout)
+    }
+    const prefetch = async (list) => {
+      const todo = list.filter((file) => !blobs.has(file.path))
+      let next = 0
+      const worker = async () => {
+        while (next < todo.length) {
+          const file = todo[next++]
+          if (!blobs.has(file.path)) blobs.set(file.path, await hashFile(file))
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(policy.config.prefetchParallel, todo.length) }, worker))
+    }
+
+    // Builds the commit of one batch on top of the last CONFIRMED commit (never on top of a failed attempt) and returns its id.
+    // An unchanged retry of the same batch reuses the commit already built.
+    // FR : construit le commit d'un lot sur le dernier commit CONFIRME ; un meme lot rejoue reutilise son commit.
+    const stage = async (batch) => {
+      const key = batch.map((file) => file.path).join('\0')
+      if (attemptState.key === key && attemptState.commit) return attemptState.commit
+      // F2 (12 October 2026): when the remote branch already holds the previous attempt (it landed late after a kill or a cut
+      // connection), the new commit is built on top of THAT commit; a sibling of it is rejected "fetch first" on every retry.
+      // FR : si le sommet distant est deja la tentative precedente, on construit dessus ; un commit frere serait rejete.
+      const landed = await remoteTipIs(async () => {
+        const { stdout } = await run(['ls-remote', '-q', 'origin', 'refs/heads/main'], 60000)
+        return /^([0-9a-f]{40})\s/m.exec(stdout || '')?.[1] || null
+      }, attemptState.commit)
+      const baseHead = landed ? attemptState.commit : confirmedHead
+      if ((await head()) !== baseHead) await run(['update-ref', 'HEAD', baseHead])
+      await run(['read-tree', 'HEAD'])
+      const lines = []
+      for (const file of batch) {
+        if (!blobs.has(file.path)) blobs.set(file.path, await hashFile(file))
+        lines.push(`100644 ${blobs.get(file.path)}\t${file.path}\0`)
+      }
+      await gitWithInput(directory, env, ['update-index', '-z', '--index-info'], lines.join(''), timeout)
+      // Plomberie Git (10 October 2026) : write-tree --missing-ok + commit-tree evite que git commit ne declenche un git fetch --stdin de tous les blobs existants du shard partiel (--filter=blob:none).
+      const { stdout: treeOut } = await run(['write-tree', '--missing-ok'], timeout)
+      const { stdout: commitOut } = await run(['commit-tree', treeOut.trim(), '-p', baseHead, '-m',
+        message || `hls media batch (${batch.length})`], timeout)
+      const commit = commitOut.trim()
+      await run(['update-ref', 'HEAD', commit], timeout)
+      attemptState = { key, commit }
+      return commit
+    }
+
+    while (index < selected.length) {
+      const startIndex = index
+      const outcome = await runPushBatch({
+        controller: policy, sizes: sizes.slice(startIndex), headId: `${repo}:${selected[startIndex].path}`, label: repo, log, sleep,
+        attempt: async (plan) => {
+          const batch = selected.slice(startIndex, startIndex + plan.count)
+          // Prepare (hash) the batch that follows while this one transfers.
+          let ahead = null
+          if (policy.config.overlapPrepare) {
+            const following = planBatch(sizes.slice(startIndex + plan.count), policy.budgetBytes())
+            ahead = prefetch(selected.slice(startIndex + plan.count, startIndex + plan.count + following.count)).catch(() => {})
+          }
+          const commit = await stage(batch)
+          const result = await pushPrepared(directory, env, commit, Math.max(timeout, plan.timeoutMs), (percent) => {
+            onProgress(Math.min(100, Math.round(((doneBytes + plan.bytes * percent / 100) / Math.max(1, bytes)) * 100)))
+          })
+          if (ahead) await ahead
+          return result
+        },
+      }).catch((error) => {
+        if (error instanceof PushPermanentRejection) {
+          const failure = new Error(`Video shard Git push failed: ${error.detail.slice(-400)}`)
+          failure.permanent = true
+          throw failure
+        }
+        if (error instanceof PushExhausted) {
+          const failure = new Error(`Video shard Git push failed: ${error.lastMessage.slice(-400)}`)
+          failure.exhausted = true
+          throw failure
+        }
+        throw error
+      })
+      const batch = selected.slice(startIndex, startIndex + outcome.count)
+      confirmedHead = attemptState.commit
+      for (const file of batch) {
+        remotePaths.add(file.path)
+        localPaths.add(file.path)
+        blobs.delete(file.path)
+      }
+      attemptState = { key: '', commit: null }
+      index += outcome.count
+      doneBytes += outcome.bytes
+      attempts += outcome.attempts
+      batches += 1
+      if (outcome.packBytes !== null) { packBytes += outcome.packBytes; packSeen = true }
+      onProgress(Math.min(100, Math.round((doneBytes / Math.max(1, bytes)) * 100)))
+    }
+    const commit = await head()
+    log(`  pushed ${selected.length} HLS objects (${bytes} bytes) to ${repo}@${commit.slice(0, 7)} in ${batches} batch(es), ${attempts} attempt(s)`)
+    return { commit, files: selected, bytes, packBytes: packSeen ? packBytes : null, attempts, batches }
+  }
+
+  return { directory, repo, remotePaths, head, pushFiles, policy }
+}
+
+function gitWithInput(directory, env, args, input, timeout) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', ['-C', directory, ...args], { env, stdio: ['pipe', 'pipe', 'pipe'] })
+    let errorText = ''
+    const timer = setTimeout(() => child.kill('SIGKILL'), timeout)
+    child.stderr.on('data', (chunk) => { errorText = (errorText + chunk.toString()).slice(-2000) })
+    child.on('error', (error) => { clearTimeout(timer); reject(error) })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      if (code === 0) resolve()
+      else reject(new Error(`Git ${args[0]} failed: ${errorText.slice(-400) || `exit ${code}`}`))
+    })
+    child.stdin.on('error', () => {})
+    child.stdin.end(input)
+  })
+}
+
+function writeGitRange(directory, env, file, timeout) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', ['-C', directory, 'hash-object', '-w', '--stdin'], {
+      env, stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let hash = ''
+    let errorText = ''
+    const timer = setTimeout(() => child.kill('SIGKILL'), timeout)
+    child.stdout.on('data', (chunk) => { hash = (hash + chunk.toString()).trim() })
+    child.stderr.on('data', (chunk) => { errorText = (errorText + chunk.toString()).slice(-2000) })
+    child.on('error', (error) => { clearTimeout(timer); reject(error) })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      if (code === 0 && /^[a-f0-9]{40}$/.test(hash)) resolve(hash)
+      else reject(new Error(`Git range staging failed: ${errorText.slice(-400) || `exit ${code}`}`))
+    })
+    const stream = createReadStream(file.sourcePath, { start: file.offset, end: file.offset + file.size - 1 })
+    stream.on('error', (error) => { child.kill('SIGKILL'); reject(error) })
+    stream.pipe(child.stdin)
+  })
+}
+
+// One push of one commit, by id (never HEAD). The shared token (12 October 2026) is taken here and given back as soon as the data
+// is sent ("Writing objects: 100%"). Returns the attempt result the policy engine reads: { status, stderr, packBytes, durationMs,
+// waitMs }; it never rejects for a git failure, the engine classifies the output.
+// FR : une poussee d'un commit, par identifiant ; ne rejette jamais pour un echec git, le moteur classe la sortie.
+async function pushPrepared(directory, env, commit, timeout, onProgress) {
+  const token = await acquirePushToken(`segments push ${path.basename(directory)}`)
+  const startedAt = Date.now()
+  try {
+    return await new Promise((resolve) => {
+      const child = spawn('git', ['-C', directory, 'push', '--progress', 'origin', `${commit}:refs/heads/main`], {
+        env, stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let output = ''
+      let packBytes = null
+      let timedOut = false
+      const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, timeout)
+      child.stderr.on('data', (chunk) => {
+        const text = chunk.toString()
+        output = (output + text).slice(-12000)
+        for (const match of text.matchAll(/Writing objects:\s*(\d+)%/g)) {
+          const percent = Number(match[1])
+          if (percent >= 100) token.release().catch(() => {})
+          onProgress(percent)
+        }
+        const pack = parsePushPackBytes(text)
+        if (pack) packBytes = pack.bytes
+      })
+      const finish = (status, extra = '') => {
+        clearTimeout(timer)
+        resolve({
+          status, stderr: `${output}${extra}`, stdout: '', packBytes: packBytes ?? parsePushPackBytes(output)?.bytes ?? null,
+          durationMs: Date.now() - startedAt, waitMs: token.waitedMs || 0,
+        })
+      }
+      child.on('error', (error) => finish(1, `\n${String(error)}`))
+      child.on('close', (code) => finish(timedOut ? 1 : code, timedOut ? '\nVideo shard Git push timed out' : ''))
+    })
+  } finally {
+    await token.release()
+  }
+}

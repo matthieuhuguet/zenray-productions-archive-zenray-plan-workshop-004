@@ -1,0 +1,82 @@
+// 7 October 2026: robots.txt is obeyed, the crawl delay holds even for parallel callers, and only public https addresses are read.
+import { describe, it, expect } from 'vitest'
+import { parseRobots, isAllowed, createPoliteFetcher, isPublicHttpsUrl } from './lib/Robots.mjs'
+
+const FILE = `# comment
+User-agent: GPTBot
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: *
+Disallow: /actions/
+Disallow: /private
+Allow: /private/open
+Crawl-Delay: 5
+`
+describe('robots.txt', () => {
+  it('uses the star group, reads the delay, longest match wins, Allow beats Disallow on a tie', () => {
+    const rules = parseRobots(FILE, 'zenray vacancy research')
+    expect(rules.delaySeconds).toBe(5)
+    expect(isAllowed(rules, '/jobs/1')).toBe(true)
+    expect(isAllowed(rules, '/actions/x')).toBe(false)
+    expect(isAllowed(rules, '/private/secret')).toBe(false)
+    expect(isAllowed(rules, '/private/open/page')).toBe(true)
+  })
+  it('a named group wins over the star group, and an empty file allows everything', () => {
+    expect(isAllowed(parseRobots(FILE, 'GPTBot'), '/jobs/1')).toBe(false)
+    expect(isAllowed(parseRobots('', 'zenray'), '/anything')).toBe(true)
+    expect(isAllowed(parseRobots('User-agent: *\nDisallow:', 'zenray'), '/anything')).toBe(true)
+  })
+  it('supports wildcards and end anchors', () => {
+    const rules = parseRobots('User-agent: *\nDisallow: /jobs/*/save\nDisallow: /*.pdf$', 'zenray')
+    expect(isAllowed(rules, '/jobs/12/save')).toBe(false)
+    expect(isAllowed(rules, '/jobs/12')).toBe(true)
+    expect(isAllowed(rules, '/a/b.pdf')).toBe(false)
+    expect(isAllowed(rules, '/a/b.pdf.html')).toBe(true)
+  })
+})
+
+describe('polite fetcher', () => {
+  const make = (files, overrides = {}) => {
+    let clock = 1000000; const sleeps = []; const calls = []
+    const http = { text: async (url) => { calls.push(url); if (url.endsWith('/robots.txt')) { const body = files[new URL(url).host]; if (body instanceof Error) throw body; return body ?? '' } return `page:${url}` } }
+    return { calls, sleeps, fetcher: createPoliteFetcher({ http, minGapMs: 1000, maxDelayMs: 10000, sleep: async (ms) => { sleeps.push(ms); clock += ms }, now: () => clock, ...overrides }) }
+  }
+  it('refuses a disallowed path before fetching it', async () => {
+    const { fetcher, calls } = make({ 'a.com': 'User-agent: *\nDisallow: /actions/' })
+    await expect(fetcher.text('https://a.com/actions/x')).rejects.toMatchObject({ code: 'robots' })
+    expect(calls.filter((c) => !c.endsWith('robots.txt'))).toEqual([])
+    expect(await fetcher.text('https://a.com/jobs/1')).toBe('page:https://a.com/jobs/1')
+  })
+  it('spaces requests to one host by the larger of the floor and the Crawl-delay, even from parallel callers', async () => {
+    const { fetcher, sleeps } = make({ 'a.com': 'User-agent: *\nCrawl-Delay: 5', 'b.com': '' })
+    await Promise.all([fetcher.text('https://a.com/1'), fetcher.text('https://a.com/2'), fetcher.text('https://a.com/3'), fetcher.text('https://b.com/1')])
+    expect(sleeps).toEqual([5000, 5000])
+  })
+  it('caps a hostile delay', async () => {
+    const { fetcher, sleeps } = make({ 'a.com': 'User-agent: *\nCrawl-Delay: 99999' })
+    await fetcher.text('https://a.com/1'); await fetcher.text('https://a.com/2')
+    expect(sleeps).toEqual([10000])
+  })
+  it('a 4xx robots.txt means no rules; a server error means unknown, so five seconds', async () => {
+    const e404 = Object.assign(new Error('HTTP 404'), { status: 404 }); const e503 = Object.assign(new Error('HTTP 503'), { status: 503 })
+    const one = make({ 'a.com': e404 }); await one.fetcher.text('https://a.com/1'); await one.fetcher.text('https://a.com/2')
+    expect(one.sleeps).toEqual([1000])
+    const two = make({ 'a.com': e503 }); await two.fetcher.text('https://a.com/1'); await two.fetcher.text('https://a.com/2')
+    expect(two.sleeps).toEqual([5000])
+  })
+  it('a failing request does not break the gap of the next one', async () => {
+    let n = 0; let clock = 1000000
+    const http = { text: async (url) => { if (url.endsWith('/robots.txt')) return ''; n += 1; if (n === 1) throw new Error('boom'); return 'ok' } }
+    const fetcher = createPoliteFetcher({ http, sleep: async (ms) => { clock += ms }, now: () => clock })
+    await expect(fetcher.text('https://a.com/1')).rejects.toThrow('boom')
+    expect(await fetcher.text('https://a.com/2')).toBe('ok')
+  })
+})
+
+describe('public https only', () => {
+  it('accepts public hosts, refuses loopback, private ranges, literals, credentials, ports and plain http', () => {
+    expect(isPublicHttpsUrl('https://www.studio-x.com/careers')).toBe(true)
+    for (const bad of ['http://studio-x.com', 'https://localhost/x', 'https://127.0.0.1/x', 'https://10.0.0.5/x', 'https://192.168.1.2/x', 'https://[::1]/x', 'https://u:p@studio-x.com/', 'https://studio-x.com:8443/', 'https://intranet/x', 'https://printer.local/x', 'javascript:alert(1)', 'not a url']) expect(isPublicHttpsUrl(bad)).toBe(false)
+  })
+})

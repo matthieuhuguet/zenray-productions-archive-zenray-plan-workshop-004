@@ -1,0 +1,257 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react'
+import CanvasNodeViewer from '../components/CanvasNodeViewer.jsx'
+import { captureFiles } from '../capture/universalCapture.js'
+import { getUploadMode } from '../capture/uploadMode.js'
+import { createEmbedNode, parseEmbedUrl } from './embed.js'
+import { clearRefCache } from './resolveRef.js'
+import { poserProvisoire } from './RefBoard.jsx'
+import { notify } from '../components/Notifications.jsx'
+import { PALETTE } from '../theme.js'
+
+// RefBoardHost (lot B) — enveloppe le CanvasNodeViewer du lot A SANS le modifier, et lui ajoute les MÉDIAS :
+//   0) Drag depuis le picker d'images du board (MIME `application/zenray-ref-image`) -> référence à la
+//      position exacte du pointeur (cf. RefImagePicker.jsx).
+//   1) Drag interne depuis Create/Gallery (MIME `application/zenray-page`) -> ajoute une RÉFÉRENCE, ZÉRO re-upload.
+//   2) Drag externe Finder macOS (DataTransfer.files) -> pipeline captureFiles (upload shard + rollover) -> référence.
+//   3) Paste d'une URL YouTube -> crée un .embed.json (jamais de HTML brut) -> référence embed.
+//
+// Le pont vers le board reste l'événement window `zenray-ref-add:<path>` exposé par RefBoard (lot A) : on ne
+// touche donc AUCUN fichier du lot A. Le détail porte { ref, x, y } (coordonnées ÉCRAN du drop — converties
+// en coordonnées page tldraw dans RefBoard.jsx, seul endroit qui a accès à l'instance `editor`).
+//
+// ROUTAGE (bug réel corrigé le 2026-07-19) : ce wrapper n'était monté QUE par l'ancien écran RefApp (retiré
+// de la sidebar) — le double-clic sur un board depuis Create ou Quick Look passait par UnifiedViewer, qui
+// rendait CanvasNodeViewer NU, sans jamais passer ici. Toute la couche drag/drop/paste ci-dessous était donc
+// morte pour le flux principal. UnifiedViewer.jsx importe désormais CE composant pour le type 'canvas'.
+
+const FINDER = (dt) => dt && Array.from(dt.types || []).includes('Files')
+const INTERNAL = (dt) => dt && Array.from(dt.types || []).includes('application/zenray-page')
+// Glisser une cellule du picker d'images (RefImagePicker) sur le board : dépose à la position exacte
+// du pointeur, au lieu du clic qui insère au centre du viewport (cf. RefImagePicker.jsx).
+const PICKER = (dt) => dt && Array.from(dt.types || []).includes('application/zenray-ref-image')
+
+// Dossier projet (ex "pages/Ref/Moodboard") déduit du chemin du board ".../Boards/X.(canvas|ref).json".
+function projectDirOf(boardPath) {
+  const p = String(boardPath || '')
+  const m = p.match(/^(.*)\/Boards\/[^/]+\.(canvas|ref)\.json$/)
+  if (m) return m[1]
+  return p.replace(/\/[^/]+\.(canvas|ref)\.json$/, '') || 'pages/Ref'
+}
+
+// Mesure une image depuis son URL locale : la shape provisoire doit porter le BON rapport de
+// forme dès le lâcher, sinon elle change de proportions quand la vraie image la remplace.
+function mesurerImage(url) {
+  return new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => resolve({ w: img.naturalWidth || 320, h: img.naturalHeight || 240 })
+    img.onerror = () => resolve({ w: 320, h: 240 })
+    img.src = url
+  })
+}
+
+export default function RefBoardHost({ t, path, title, theme = 'light' }) {
+  const [over, setOver] = useState(false)
+  const [busy, setBusy] = useState(null) // texte de progression
+  const [uploads, setUploads] = useState([])   // [{ id, nom, ratio }] — envois en cours
+  const wrapRef = useRef(null)
+  const uploadSeq = useRef(0)
+  const channel = 'zenray-ref-add:' + path
+
+
+  // Ajoute une référence (chemin de nœud Create) au board via l'API événementielle du lot A.
+  const addRef = useCallback((refPath, xy) => {
+    clearRefCache(refPath) // un asset fraîchement créé pourrait être en cache "absent"
+    window.dispatchEvent(new CustomEvent(channel, { detail: { ref: refPath, ...(xy || {}) } }))
+  }, [channel])
+
+  const onDragOver = (e) => {
+    if (FINDER(e.dataTransfer) || INTERNAL(e.dataTransfer) || PICKER(e.dataTransfer)) {
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'copy'
+      if (!over) setOver(true)
+    }
+  }
+  const onDragLeave = (e) => { if (e.currentTarget === e.target) setOver(false) }
+
+  const onDrop = async (e) => {
+    const dt = e.dataTransfer
+    const xy = { x: e.clientX, y: e.clientY }
+    // 0) Glisser une cellule du picker d'images : référence pure, dépose au point de relâche exact.
+    const pickerPath = dt.getData('application/zenray-ref-image')
+    if (pickerPath) {
+      e.preventDefault(); e.stopPropagation(); setOver(false)
+      addRef(pickerPath, xy)
+      return
+    }
+    // 1) Drag interne Create/Gallery : référence pure, pas d'upload.
+    const internal = dt.getData('application/zenray-page')
+    if (internal) {
+      e.preventDefault(); e.stopPropagation(); setOver(false)
+      try { const p = JSON.parse(internal); if (p && p.path) addRef(p.path, xy) } catch {}
+      return
+    }
+    // 2) Drag externe Finder : DÉPÔT INSTANTANÉ puis upload en arrière-plan (refonte 2026-08-07).
+    //    Avant, on attendait la FIN de l'upload pour poser quoi que ce soit : sur une grosse image,
+    //    le board restait vide de longues secondes après le lâcher. Désormais l'image apparaît au
+    //    lâcher, tirée du cache du navigateur, manipulable pendant que l'octet monte.
+    if (FINDER(dt) && dt.files && dt.files.length) {
+      e.preventDefault(); e.stopPropagation(); setOver(false)
+      // Décalage en cascade : sans lui, plusieurs fichiers lâchés ensemble s'empileraient au même
+      // point et se cacheraient les uns les autres.
+      deposerLeLot(Array.from(dt.files), xy, projectDirOf(path) + '/Assets')
+    }
+  }
+
+  // ═══ UN SEUL APPEL POUR TOUT LE LOT, ET C'EST LA CORRECTION DU BUG D'IMPORT (2026-08-30) ═══════
+  //
+  // LE SYMPTOME, signale par Matthieu : « impossible d'uploader des images », et « l'UI stutter, tout
+  // disparait ou ecran blanc complet ». Deux symptomes, une seule cause.
+  //
+  // LA CAUSE. `captureFiles` est concu pour recevoir la LISTE ENTIERE : son commentaire le dit, il
+  // porte un pool interne de quatre ouvriers, une barre de progression globale, et UN SEUL commit
+  // d'index pour tout le lot. Ce fichier l'appelait une fois PAR FICHIER, avec une liste d'un seul
+  // element. Trois degats en decoulaient, et ils expliquent les deux symptomes ensemble :
+  //   1. le pool ne protegeait plus rien, puisqu'il est interne a un appel : vingt fichiers lancaient
+  //      vingt appels concurrents, chacun avec un pool de un, jusqu'a declencher la limite anti-abus
+  //      de GitHub et faire echouer l'import ;
+  //   2. l'index de recherche etait commite N fois au lieu d'une, ce que la brique evitait ;
+  //   3. chaque progression de chaque fichier appelait son propre `setUploads`, qui reconstruit le
+  //      tableau et rerend l'hote, donc TOUT le canevas tldraw. C'est le stutter.
+  //
+  // Create ne fait pas cette erreur : `runCapture` passe `e.dataTransfer.files` en entier a
+  // `captureFiles`. On reprend donc exactement le geste qui marche, plutot que d'en inventer un
+  // second, et le pool redevient ce qu'il est : une borne, pas une decoration.
+  const deposerLeLot = useCallback(async (fichiers, xy, dir) => {
+    const liste = (fichiers || []).filter(Boolean)
+    if (!liste.length) return
+
+    // 1) IMMEDIAT, avant le moindre octet envoye : chaque image apparait au lacher, tiree du cache du
+    //    navigateur, manipulable pendant que l'envoi se fait. Les autres types n'ont pas d'apercu
+    //    possible sans traitement (une video demande un transcodage, un PDF une vignette) et gardent
+    //    l'ancien parcours, envoi d'abord et reference ensuite.
+    const enAttente = await Promise.all(liste.map(async (file, i) => {
+      const estImage = !!(file && file.type && file.type.startsWith('image/'))
+      const pendingId = `att-${Math.random().toString(36).slice(2)}-${uploadSeq.current++}`
+      const point = { x: xy.x + i * 26, y: xy.y + i * 26 }
+      if (!estImage) return { file, estImage, pendingId, point, objectUrl: null }
+      try {
+        const objectUrl = URL.createObjectURL(file)
+        const dim = await mesurerImage(objectUrl)
+        poserProvisoire(pendingId, objectUrl)
+        window.dispatchEvent(new CustomEvent('zenray-ref-pending:' + path, {
+          detail: { pendingId, x: point.x, y: point.y, w: dim.w, h: dim.h, name: file.name, mime: file.type },
+        }))
+        return { file, estImage, pendingId, point, objectUrl }
+      } catch { return { file, estImage, pendingId, point, objectUrl: null } }
+    }))
+
+    // 2) UNE SEULE ENTREE DE PROGRESSION POUR LE LOT, et non une par fichier. `captureFiles` rend
+    //    deja une progression globale ; en tenir N separement multipliait les rendus sans rien
+    //    apprendre de plus a personne.
+    const lotId = `lot-${Math.random().toString(36).slice(2)}`
+    const etiquette = liste.length > 1 ? `${liste.length} fichiers` : liste[0].name
+    setUploads((u) => [...u, { id: lotId, nom: etiquette, ratio: 0 }])
+
+    const retirerProvisoire = (p, ref) => {
+      if (p.estImage && p.objectUrl) {
+        window.dispatchEvent(new CustomEvent('zenray-ref-settle:' + path, { detail: { pendingId: p.pendingId, ref: ref || null, name: p.file.name } }))
+      }
+    }
+
+    try {
+      const resultats = await captureFiles(liste.map((f) => f), {
+        folder: dir, mode: getUploadMode(),
+        onProgress: (r) => setUploads((u) => u.map((x) => (x.id === lotId ? { ...x, ratio: r } : x))),
+      })
+      // `captureFiles` garantit l'ORDRE : `results[i]` correspond a `list[i]`, meme si les fichiers
+      // finissent dans le desordre. C'est ce qui autorise l'appariement par index ci-dessous.
+      let echecs = 0
+      enAttente.forEach((p, i) => {
+        const res = resultats && resultats[i]
+        if (res && res.ok && res.nodePath) {
+          if (p.estImage && p.objectUrl) retirerProvisoire(p, res.nodePath)
+          else addRef(res.nodePath, p.point)
+        } else {
+          echecs++
+          retirerProvisoire(p, null)
+        }
+      })
+      if (echecs) {
+        notify({ icon: 'xmark', tint: PALETTE.red, label: 'Ref · Import', title: `${echecs} fichier${echecs > 1 ? 's' : ''} non ajouté${echecs > 1 ? 's' : ''}`, body: echecs === liste.length ? 'Aucun envoi n’a abouti.' : 'Les autres sont en place.' })
+      }
+    } catch (err) {
+      enAttente.forEach((p) => retirerProvisoire(p, null))
+      notify({ icon: 'xmark', tint: PALETTE.red, label: 'Ref · Import', title: 'Échec de l’envoi', body: String((err && err.message) || err) })
+    } finally {
+      setUploads((u) => u.filter((x) => x.id !== lotId))
+    }
+  }, [path, addRef])
+
+
+  // Paste : URL YouTube -> embed lazy. (Les images presse-papier passent déjà par le pipeline Create ailleurs ;
+  // ici on cible l'usage Ref premier = coller un lien vidéo.) On ne capture QUE si le focus est dans le board.
+  const onPaste = async (e) => {
+    const txt = (e.clipboardData && e.clipboardData.getData('text/plain') || '').trim()
+    if (!txt) return
+    const parsed = parseEmbedUrl(txt)
+    if (!parsed) return
+    e.preventDefault()
+    setBusy('Création de l\'embed…')
+    try {
+      const embedPath = await createEmbedNode(projectDirOf(path), txt)
+      if (embedPath) {
+        addRef(embedPath)
+        notify({ icon: 'play.rectangle', tint: PALETTE.primary, label: 'Ref · Embed', title: 'Vidéo ajoutée', body: 'Carte YouTube lazy créée sur le board.' })
+      }
+    } finally { setBusy(null) }
+  }
+
+  return (
+    <div ref={wrapRef} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop} onPaste={onPaste} tabIndex={0}
+      style={{ position: 'relative', width: '100%', height: '100%', minHeight: 0, outline: 'none' }}>
+      <CanvasNodeViewer t={t} path={path} title={title} theme={theme} />
+      {/* LE BASCULEUR « Upload navigateur / Commande terminal » EST RETIRÉ (2026-08-30). Ses mots :
+          « j'ai le texte Upload navigateur, Commande terminal, dont je n'ai rien à foutre ». Un
+          réglage de transcodage vidéo n'a rien à faire posé en permanence sur un tableau de
+          références visuelles : il occupe le coin, capte le clic, et pose une question à laquelle
+          personne ne veut répondre en travaillant. Le mode reste réglable ailleurs et son défaut
+          (`getUploadMode()`, navigateur) continue d'être lu au moment de l'envoi, ligne ~166. */}
+      {over && (
+        <div style={{ position: 'absolute', inset: 0, zIndex: 900, pointerEvents: 'none', border: `2px dashed ${PALETTE.primary}`, background: 'rgba(10,132,255,0.06)', borderRadius: 12 }} />
+      )}
+      {busy && (
+        <div style={{ position: 'absolute', top: 12, left: 12, zIndex: 1000, fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-xs)', fontWeight: 600, color: '#fff', background: PALETTE.primary, padding: '4px 10px', borderRadius: 999, boxShadow: '0 2px 8px rgba(0,0,0,0.18)' }}>{busy}</div>
+      )}
+      {/* ENVOIS EN COURS · en bas à DROITE, comme demandé. Une ligne par fichier, avec sa barre :
+          l'image est déjà sur le board et manipulable, ceci ne dit que l'état de son envoi vers le
+          drive. La liste disparaît d'elle-même quand tout est monté. */}
+      {uploads.length > 0 && (
+        <div style={{
+          position: 'absolute', right: 12, bottom: 12, zIndex: 1000, width: 236,
+          display: 'flex', flexDirection: 'column', gap: 8,
+          background: 'rgba(28,28,30,.94)', color: '#fff', borderRadius: 12, padding: '11px 13px',
+          boxShadow: '0 14px 34px -10px rgba(0,0,0,.5)', fontFamily: "var(--zr-police-sans)",
+          backdropFilter: 'blur(14px)', WebkitBackdropFilter: 'blur(14px)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'var(--zr-ui-xs)', fontWeight: 600 }}>
+            <span style={{
+              width: 12, height: 12, borderRadius: 999, flexShrink: 0,
+              border: '2px solid rgba(255,255,255,.28)', borderTopColor: '#fff',
+              animation: 'zrRefSpin .7s linear infinite',
+            }} />
+            Envoi vers le drive · {uploads.length}
+          </div>
+          {uploads.map((u) => (
+            <div key={u.id} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ fontSize: 'var(--zr-ui-xs)', opacity: .8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.nom}</span>
+              <span style={{ height: 3, borderRadius: 999, background: 'rgba(255,255,255,.16)', overflow: 'hidden' }}>
+                <span style={{ display: 'block', height: '100%', width: `${Math.round((u.ratio || 0) * 100)}%`, background: PALETTE.primary, transition: 'width .18s ease' }} />
+              </span>
+            </div>
+          ))}
+          <style>{'@keyframes zrRefSpin{to{transform:rotate(360deg)}}'}</style>
+        </div>
+      )}
+    </div>
+  )
+}

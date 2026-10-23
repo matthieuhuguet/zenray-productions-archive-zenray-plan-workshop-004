@@ -1,0 +1,162 @@
+import React from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor, act } from '@testing-library/react'
+import SharedFolderPage, { __resetSharedNodes } from './SharedFolderPage.jsx'
+import { clearPageReadCache } from '../lib/manifestReadCache.js'
+import { QUICKLOOK_ANIM_MS } from '../theme.js'
+
+// A GALLERY OF EAGLE LINKS, which is what Matthieu shares: every entry listed in the folder is a LINK, and the image it stands
+// for lives in another folder. These tests drive the real page through the keyboard exactly as he did.
+const ROOT = 'pages/G'
+const NAMES = ['A', 'B', 'C']
+const link = (n) => `${ROOT}/${n}.JPG.img.json`
+const target = (n) => `pages/M/${n}.JPG.img.json`
+
+function installFetch() {
+  vi.stubGlobal('fetch', vi.fn(async (input) => {
+    const url = new URL(String(input), 'http://localhost')
+    const q = url.searchParams
+    const json = (body, status = 200) => new Response(JSON.stringify(body), { status })
+    if (url.pathname === '/api/share-token') return json({ path: ROOT, kind: 'folder' })
+    if (url.pathname === '/api/page') {
+      const action = q.get('action')
+      if (action === 'tree') return json({ paths: NAMES.map(link) })
+      if (action === 'resolve-link') { const n = q.get('path').split('/').pop()[0]; return json({ ok: true, path: target(n) }) }
+      if (action === 'read') {
+        const p = q.get('path')
+        if (p.startsWith(ROOT)) return json({ markdown: JSON.stringify({ type: 'zenray-eagle-link/v1', resourceId: 'zr_x' }) })
+        return json({ markdown: JSON.stringify({ type: 'image', alg: 'AES-GCM', iv: 'iv', w: 3, h: 4 }) })
+      }
+    }
+    return new Response('', { status: 404 })
+  }))
+}
+
+const press = (key, code = key) => act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key, code, bubbles: true, cancelable: true })) })
+const imgSrcs = () => [...document.querySelectorAll('img')].map((i) => decodeURIComponent(i.getAttribute('src') || ''))
+const currentCounter = () => (document.body.textContent.match(/(\d)\/3/) || [])[1]
+const cardOf = (n) => document.querySelector(`[data-shared-path="${link(n)}"]`)
+const loadImg = (needle) => act(() => { for (const im of document.querySelectorAll('img')) if (decodeURIComponent(im.getAttribute('src') || '').includes(needle)) fireEvent.load(im) })
+const waitClosed = () => waitFor(() => expect(document.body.textContent).not.toContain('Espace/Échap fermer'), { timeout: 1500 })
+
+beforeEach(() => {
+  __resetSharedNodes(); clearPageReadCache()
+  window.history.pushState({}, '', '/folder?d=tok')
+  installFetch()
+})
+afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+async function openFirst() {
+  render(<SharedFolderPage />)
+  await waitFor(() => expect(cardOf('A')).toBeTruthy())
+  fireEvent.click(cardOf('A'))             // select + keyboard focus
+  await press(' ', 'Space')
+  await waitFor(() => expect(document.body.textContent).toContain('Espace/Échap fermer'))
+}
+
+describe('la galerie partagée de liens : le visualiseur au clavier', () => {
+  it('Espace ouvre l’image CIBLE du lien (jamais le lien lui-même)', async () => {
+    await openFirst()
+    await waitFor(() => expect(imgSrcs().some((s) => s.includes(`shared-media?path=${target('A')}&kind=thumb`))).toBe(true))
+    expect(imgSrcs().some((s) => s.includes(`path=${link('A')}`))).toBe(false)
+    expect(currentCounter()).toBe('1')
+  })
+
+  it('flèche droite / gauche : image suivante / précédente, avec bouclage', async () => {
+    await openFirst()
+    await press('ArrowRight'); await waitFor(() => expect(currentCounter()).toBe('2'))
+    await waitFor(() => expect(imgSrcs().some((s) => s.includes(`path=${target('B')}`))).toBe(true))
+    await press('ArrowLeft'); await waitFor(() => expect(currentCounter()).toBe('1'))
+    await press('ArrowLeft'); await waitFor(() => expect(currentCounter()).toBe('3'))   // wraps round to the last one
+    await waitFor(() => expect(imgSrcs().some((s) => s.includes(`path=${target('C')}`))).toBe(true))
+  })
+
+  it('l’ancienne image reste le temps du fondu, puis disparaît (transition croisée)', async () => {
+    await openFirst()
+    await waitFor(() => expect(imgSrcs().some((s) => s.includes(target('A')))).toBe(true))
+    await press('ArrowRight')
+    await waitFor(() => expect(imgSrcs().some((s) => s.includes(target('B')))).toBe(true))
+    // B is mounted but its thumbnail has not arrived: A must STAY on screen (never an empty frame between two photos)
+    expect(imgSrcs().some((s) => s.includes(target('A')))).toBe(true)
+    loadImg(`${target('B')}&kind=thumb`)                                        // B arrives: both fade, then A is dropped
+    await waitFor(() => expect(imgSrcs().some((s) => s.includes(target('A')))).toBe(false), { timeout: QUICKLOOK_ANIM_MS * 6 })
+  })
+
+  it('Espace FERME, puis rouvre la photo qu’on regardait (plus de Espace mort)', async () => {
+    await openFirst()
+    await press('ArrowRight'); await waitFor(() => expect(currentCounter()).toBe('2'))
+    await press(' ', 'Space'); await waitClosed()
+    // the overlay is gone and Space works again, on photo B (where he was), not A (where he clicked)
+    await press(' ', 'Space')
+    await waitFor(() => expect(document.body.textContent).toContain('Espace/Échap fermer'))
+    expect(currentCounter()).toBe('2')
+  })
+
+  it('Échap ferme', async () => {
+    await openFirst()
+    await press('Escape'); await waitClosed()
+  })
+
+  it('le relâchement de Espace est avalé : il ne clique pas la carte focalisée (la sélection survit)', async () => {
+    await openFirst()
+    const up = new KeyboardEvent('keyup', { key: ' ', code: 'Space', bubbles: true, cancelable: true })
+    act(() => { window.dispatchEvent(up) })
+    expect(up.defaultPrevented).toBe(true)
+    await press(' ', 'Space'); await waitClosed()
+    expect(document.body.textContent).toContain('ZIP (1)')                 // still selected, never un-ticked
+  })
+
+  it('sans visualiseur, les flèches déplacent le focus et Espace ouvre la photo focalisée', async () => {
+    render(<SharedFolderPage />)
+    await waitFor(() => expect(cardOf('A')).toBeTruthy())
+    await press('ArrowRight')                                              // no focus yet: lands on the first
+    await press('ArrowRight')                                              // then the second (one column in jsdom)
+    await press(' ', 'Space')
+    await waitFor(() => expect(document.body.textContent).toContain('Espace/Échap fermer'))
+    expect(currentCounter()).toBe('2')
+  })
+
+  it('défilement rapide : seules les vignettes sont demandées, jamais le plein format avant 0,7 s sur la même photo', async () => {
+    await openFirst()
+    for (let i = 0; i < 6; i++) await press('ArrowRight')
+    await waitFor(() => expect(currentCounter()).toBe('1'))                     // 6 steps on 3 photos wraps back to the first
+    const urls = imgSrcs()
+    expect(urls.some((s) => s.includes('kind=full'))).toBe(false)
+    expect(urls.some((s) => s.includes('kind=thumb'))).toBe(true)
+  })
+
+  it('une vignette en échec est retentée, puis propose « Réessayer » (jamais un cadre gris muet)', async () => {
+    await openFirst()
+    const first = [...document.querySelectorAll('img')].find((im) => decodeURIComponent(im.getAttribute('src') || '').includes('kind=thumb'))
+    act(() => { fireEvent.error(first) })
+    await waitFor(() => expect(imgSrcs().some((s) => s.includes('&r=1'))).toBe(true), { timeout: 2500 }) // automatic retry with a cache-busting parameter
+  })
+
+  it('le bouton « Ajouter mes photos » ouvre la fenêtre d’ajout (prénom d’abord)', async () => {
+    localStorage.clear()
+    render(<SharedFolderPage />)
+    await waitFor(() => expect(cardOf('A')).toBeTruthy())
+    fireEvent.click(screen.getByText('Ajouter mes photos'))
+    await waitFor(() => expect(screen.getByRole('dialog', { name: 'Ajouter mes photos' })).toBeTruthy())
+    expect(screen.getByText('Bienvenue')).toBeTruthy()
+    // while the sheet is open the viewer keys do nothing: Space/arrows must not open a photo behind it
+    await press(' ', 'Space'); await press('ArrowRight')
+    expect(document.body.textContent).not.toContain('Espace/Échap fermer')
+  })
+})
+
+describe('un hoquet du serveur ne laisse jamais « Content not found »', () => {
+  it('la liste échoue deux fois puis arrive : le visiteur voit les photos, jamais d\u2019erreur', async () => {
+    let tries = 0
+    const real = globalThis.fetch
+    vi.stubGlobal('fetch', vi.fn(async (input, init) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname === '/api/page' && url.searchParams.get('action') === 'tree') { tries += 1; if (tries <= 2) return new Response('boom', { status: 503 }) }
+      return real(input, init)
+    }))
+    render(<SharedFolderPage />)
+    await waitFor(() => expect(cardOf('A')).toBeTruthy(), { timeout: 8000 })
+    expect(tries).toBe(3)
+    expect(document.body.textContent).not.toContain('Content not found')
+  }, 12000)
+})

@@ -1,0 +1,224 @@
+#!/usr/bin/env node
+// ═══ DÉPRÉCIÉ (2026-07-13) — NE PLUS UTILISER ═══════════════════════════════════════════════════
+// Ce script date de l'ère vignettes 384px/q72, remplacée par le standard 1080px/q60 (makeThumbAt,
+// scripts/img-ingest.mjs). Pour régénérer des vignettes aujourd'hui : scripts/regen-thumbs-bulk.mjs
+// (en masse, association par hash) ou scripts/regen-thumbs-oriented.mjs (correction EXIF).
+// Gardé UNIQUEMENT comme référence historique. Le garde ci-dessous empêche toute exécution accidentelle.
+if (!process.env.ZR_RUN_DEPRECATED) { console.error("DÉPRÉCIÉ : voir l'en-tête du fichier. (ZR_RUN_DEPRECATED=1 pour forcer, déconseillé.)"); process.exit(1) }
+
+// GÉNÉRATION DES VIGNETTES MANQUANTES, EN MODE GIT — objectif B(2).
+//
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// EN UNE PHRASE (pour tout le monde)
+//   Chaque image du drive a (devrait avoir) une mini-aperçu .webp ~6 Ko à côté de son fichier lourd.
+//   Quand l'aperçu manque, la grille n'a rien de léger à montrer. Ce script trouve toutes les images
+//   dont l'aperçu manque, FABRIQUE l'aperçu en local (rapide, 16 cœurs en parallèle), et le range à côté
+//   du fichier lourd dans le bon dépôt. Par défaut il NE TOUCHE À RIEN : il compte et rapporte seulement.
+//   On lit le rapport, et seulement si tout va bien on relance avec --apply.
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// POURQUOI GIT ET PAS L'API REST (contrainte P0 quota) : l'API GitHub plafonne à 5000 requêtes/heure.
+//   Tester l'existence de milliers de .webp puis en pousser des milliers via l'API cramerait le quota et
+//   gèlerait l'app. Le TRANSPORT GIT (clone/push) n'est PAS soumis à cette limite : on clone les dépôts,
+//   on travaille en local (gratuit, parallèle), on pousse en 1 commit par shard.
+//
+// SOURCE DE VÉRITÉ = LES MANIFESTS (pas Eagle). On lit tous les .img.json du dépôt zenray-data (PRIVÉ),
+//   comme reindex-images.mjs / migrate-media-git.mjs. Pour chaque image on déduit (dépôt cible, chemin
+//   binaire) :
+//     - PRIVÉ  : m.repo + m.path        -> shard privé (zenray-media-NN / zenray-img-private-NN)
+//     - PUBLIC : m.cdnRepo + m.cdnPath  -> shard public (zenray-img-public-NN)
+//   La vignette ATTENDUE = même chemin, extension remplacée par .webp (EXACTEMENT la règle de
+//   shardThumbUrl côté front, réimplémentée ici pour rester cohérent). On groupe par shard.
+//
+// DÉTECTION (dry-run, léger) : clone TREELESS du shard (--filter=tree:0 : pas de blobs, pas d'arbres
+//   inutiles) puis `git cat-file -e HEAD:<webppath>` teste l'EXISTENCE du .webp dans l'arbre SANS
+//   télécharger les binaires. Manque = .webp absent alors que le binaire <hash>.<ext> existe. On compte
+//   les manquantes PAR SHARD et on rapporte (c'est ce que B demande pour le dry-run).
+//
+// GÉNÉRATION (--apply) : on a besoin des binaires en clair -> CLONE COMPLET du shard (checkout). Pipeline
+//   natif -P<jobs> : ffmpeg décode (av1/heic/jpg/png/webp) -> scale min(384,iw) -> cwebp q72. Sortie =
+//   <même chemin>.webp à côté du binaire. Puis git add -A (SÛR : binaires checkout = présents, donc add
+//   n'en supprime aucun, cf incident shard 04 documenté dans thumb-backfill) + commit ANONYME + push.
+//
+// PUBLIC / jsDelivr — LIMITE DE CONCEPTION (à arbitrer, pas un bug) : l'URL publique est PINNÉE sur
+//   m.cdnCommit. Ajouter la .webp dans un NOUVEAU commit ne la rend PAS visible à l'ancien commit pinné
+//   -> la vignette publique resterait 404 tant que le manifest n'est pas réécrit avec le nouveau commit.
+//   DÉFAUT de ce script : il ne traite QUE le PRIVÉ (où la vignette est servie par /api/shard, sans pin,
+//   donc immédiatement visible). Le public est listé séparément dans le rapport mais SAUTÉ, sauf si on
+//   passe --public (qui génère + push mais NE réécrit PAS les manifests : à faire dans un second temps).
+//
+// USAGE :
+//   GITHUB_TOKEN=$(gh auth token) node scripts/gen-thumbs-git.mjs                 # dry-run, tous shards privés
+//   GITHUB_TOKEN=$(gh auth token) node scripts/gen-thumbs-git.mjs --shard zenray-media-01
+//   GITHUB_TOKEN=$(gh auth token) node scripts/gen-thumbs-git.mjs --jobs 16
+//   GITHUB_TOKEN=$(gh auth token) node scripts/gen-thumbs-git.mjs --public        # inclut aussi les shards publics (dry-run)
+//   GITHUB_TOKEN=$(gh auth token) node scripts/gen-thumbs-git.mjs --apply         # génère + push (privé seul par défaut)
+
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
+import { mkdir, rm } from 'node:fs/promises'
+import path from 'node:path'
+
+// ---- config / args --------------------------------------------------------
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN manquant (GITHUB_TOKEN=$(gh auth token) ...)'); process.exit(1) }
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const CONTENT_REPO = (process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data').split('/').pop()
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+const args = Object.fromEntries(process.argv.slice(2).map((a) => {
+  const m = a.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [a, true]
+}))
+const APPLY = !!args.apply
+const WITH_PUBLIC = !!args.public // inclure les shards publics (dry-run liste ; apply pousse mais ne réécrit pas les manifests)
+const ONLY_SHARD = args.shard ? String(args.shard) : null
+const JOBS = Math.max(1, parseInt(args.jobs || '16', 10) || 16)
+const WORK = path.resolve(args.workdir || '.thumbs-tmp')
+
+const cloneUrl = (repo) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`
+const redact = (s) => String(s).split(TOKEN).join('***')
+const git = (cwd, ...a) => { try { return execFileSync('git', a, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() } catch (e) { throw new Error('git ' + a[0] + ': ' + redact((e.stderr || e.stdout || e.message).toString().slice(0, 300))) } }
+const human = (b) => b < 1024 ? b + ' o' : b < 1048576 ? (b / 1024).toFixed(0) + ' Ko' : b < 1073741824 ? (b / 1048576).toFixed(1) + ' Mo' : (b / 1073741824).toFixed(2) + ' Go'
+
+// vignette attendue = même chemin, extension -> .webp (règle identique à shardThumbUrl côté front).
+const thumbPathOf = (p) => p.replace(/\.[^./]+$/, '.webp')
+
+// ---- pipeline natif : binaire (quel que soit le format) -> vignette .webp 384px ----
+// Même pattern que thumb-backfill genThumb (éprouvé) : ffmpeg décode -> png scalé -> cwebp q72.
+// ffmpeg gère av1/heic/jpg/png/webp en entrée, donc un seul chemin couvre tous les formats. cwebp = sortie.
+function genThumb(srcBin, outWebp) {
+  return new Promise((resolve) => {
+    const ff = spawn('ffmpeg', ['-y', '-i', srcBin, '-vf', "scale='min(384,iw)':-2", '-f', 'image2pipe', '-c:v', 'png', '-'], { stdio: ['ignore', 'pipe', 'ignore'] })
+    const cw = spawn('cwebp', ['-quiet', '-q', '72', '-o', outWebp, '--', '-'], { stdio: ['pipe', 'ignore', 'ignore'] })
+    ff.stdout.pipe(cw.stdin)
+    cw.on('close', (code) => resolve(code === 0 && existsSync(outWebp)))
+    cw.on('error', () => resolve(false)); ff.on('error', () => resolve(false))
+  })
+}
+
+// pool de N workers sur un tableau (parallélisme CPU local, règle -P16).
+async function pool(items, limit, fn) {
+  let i = 0
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) { const idx = i++; if (idx >= items.length) return; await fn(items[idx], idx) }
+  }))
+}
+
+// ---- 1. clone zenray-data (manifests, PRIVÉ) ------------------------------
+mkdirSync(WORK, { recursive: true })
+const dataDir = path.join(WORK, CONTENT_REPO)
+if (existsSync(path.join(dataDir, '.git'))) { console.log('• zenray-data déjà cloné, fetch…'); git(dataDir, 'fetch', '--depth', '1', 'origin', BRANCH); git(dataDir, 'reset', '--hard', 'origin/' + BRANCH) }
+else { console.log('• clone zenray-data (shallow)…'); git(WORK, 'clone', '--depth', '1', '--branch', BRANCH, cloneUrl(CONTENT_REPO), CONTENT_REPO) }
+
+// ---- 2. parcours des manifests .img.json, regroupement par shard ----------
+// Pour chaque image : { shard, binPath, webpPath, vis }. On groupe les .webp attendues PAR SHARD.
+function walk(dir, out) {
+  let ents = []
+  try { ents = readdirSync(dir, { withFileTypes: true }) } catch { return }
+  for (const e of ents) {
+    const full = path.join(dir, e.name)
+    if (e.isDirectory()) { if (e.name === 'trash') continue; walk(full, out) }
+    else if (e.name.endsWith('.img.json')) out.push(full)
+  }
+}
+const pagesDir = path.join(dataDir, 'pages')
+const manifestFiles = []
+walk(pagesDir, manifestFiles)
+console.log(`${manifestFiles.length} manifest(s) image dans zenray-data.`)
+
+const byShard = new Map() // shard -> [{ binPath, webpPath, vis }]
+let noTarget = 0, parseErr = 0
+for (const f of manifestFiles) {
+  let m = null
+  try { m = JSON.parse(readFileSync(f, 'utf8')) } catch { parseErr++; continue }
+  if (!m || m.type !== 'image') { continue }
+  // cible : public (cdnRepo/cdnPath) sinon privé (repo/path).
+  let shard = null, binPath = null, vis = null
+  if (m.vis === 'public' && m.cdnRepo && m.cdnPath) { shard = m.cdnRepo; binPath = m.cdnPath; vis = 'public' }
+  else if (m.repo && m.path) { shard = m.repo; binPath = m.path; vis = 'private' }
+  if (!shard || !binPath) { noTarget++; continue }
+  if (ONLY_SHARD && shard !== ONLY_SHARD) continue
+  if (!byShard.has(shard)) byShard.set(shard, [])
+  byShard.get(shard).push({ binPath, webpPath: thumbPathOf(binPath), vis })
+}
+
+// sépare public/privé pour le rapport + le traitement.
+const shards = [...byShard.keys()].sort()
+const isPublic = (shard) => /-public-\d+$/.test(shard)
+const privShards = shards.filter((s) => !isPublic(s))
+const pubShards = shards.filter((s) => isPublic(s))
+
+console.log(`\nshards référencés : ${shards.length} (privés ${privShards.length}, publics ${pubShards.length})`)
+if (noTarget) console.log(`  ${noTarget} manifest(s) sans repo/path utilisable (ignorés).`)
+if (parseErr) console.log(`  ${parseErr} manifest(s) illisibles (ignorés).`)
+
+// shards effectivement traités : privés toujours ; publics seulement si --public.
+const targetShards = WITH_PUBLIC ? shards : privShards
+if (pubShards.length && !WITH_PUBLIC) {
+  const pubCount = pubShards.reduce((s, sh) => s + byShard.get(sh).length, 0)
+  console.log(`  ${pubCount} image(s) publique(s) sur ${pubShards.length} shard(s) : SAUTÉES par défaut (URL jsDelivr pinnée — voir entête). Relancer avec --public pour les inclure.`)
+}
+
+// ---- 3. par shard : détecter les .webp manquantes (treeless en dry-run) ---
+const report = [] // { shard, total, missing, missingList }
+let grandMissing = 0
+
+for (const shard of targetShards) {
+  const items = byShard.get(shard)
+  const dir = path.join(WORK, shard)
+
+  // DÉTECTION : en dry-run, clone TREELESS (pas de blobs ni d'arbres lourds) -> cat-file -e teste vite et léger.
+  // En --apply on a besoin des binaires : clone COMPLET (checkout) pour matérialiser <hash>.<ext>.
+  if (!existsSync(path.join(dir, '.git'))) {
+    if (APPLY) {
+      console.log(`\n• clone ${shard} (complet, checkout — binaires nécessaires)…`)
+      git(WORK, 'clone', '--depth', '1', cloneUrl(shard), shard)
+    } else {
+      console.log(`\n• clone ${shard} (treeless, détection seule)…`)
+      git(WORK, 'clone', '--depth', '1', '--filter=tree:0', '--no-checkout', cloneUrl(shard), shard)
+    }
+    try { git(dir, 'config', 'user.email', 'thumb@zenray'); git(dir, 'config', 'user.name', 'zenray-thumb') } catch {}
+  }
+
+  // existence des .webp dans l'arbre HEAD. On liste TOUTES les .webp de l'arbre en UN SEUL `git ls-tree -r`
+  // (treeless : git récupère les arbres à la demande, pas les blobs) puis on compare en mémoire. C'est
+  // bien plus rapide qu'un `cat-file -e` par image (un spawn git par item = lent sur 100k images).
+  let present = new Set()
+  try { present = new Set(execFileSync('git', ['-C', dir, 'ls-tree', '-r', '--name-only', 'HEAD'], { maxBuffer: 1 << 30 }).toString().split('\n').filter((x) => x.endsWith('.webp'))) } catch {}
+  const missing = items.filter((it) => !present.has(it.webpPath))
+  grandMissing += missing.length
+  report.push({ shard, total: items.length, missing: missing.length, list: missing })
+  console.log(`  ${shard} : ${items.length} image(s), ${missing.length} vignette(s) manquante(s)`)
+
+  // GÉNÉRATION + PUSH (apply seulement, et seulement si manquantes).
+  if (APPLY && missing.length) {
+    console.log(`    génération de ${missing.length} vignette(s) (-P${JOBS})…`)
+    let done = 0, fail = 0
+    const t0 = Date.now()
+    await pool(missing, JOBS, async (it) => {
+      const srcBin = path.join(dir, it.binPath)
+      const outWebp = path.join(dir, it.webpPath)
+      if (!existsSync(srcBin)) { fail++; return } // binaire absent du checkout (anormal) -> on saute
+      await mkdir(path.dirname(outWebp), { recursive: true })
+      const ok = await genThumb(srcBin, outWebp); ok ? done++ : fail++
+    })
+    console.log(`    généré ${done}, échecs ${fail} en ${((Date.now() - t0) / 1000).toFixed(0)}s. Push…`)
+    // SÛR : binaires checkout présents -> add -A n'ajoute QUE les .webp, ne supprime aucun binaire.
+    git(dir, 'add', '-A')
+    try {
+      git(dir, 'commit', '-q', '-m', `vignettes ${done} images`) // message ANONYME (aucun nom humain)
+      git(dir, 'push', '-q', 'origin', 'HEAD:main')
+      console.log(`    ${shard} poussé (${done} vignettes).`)
+    } catch (e) { console.log(`    ${shard} rien à pousser ou erreur : ${redact(String(e.message || e)).slice(0, 120)}`) }
+    if (isPublic(shard)) console.log(`    NB public : manifest NON réécrit (cdnCommit inchangé) — vignette jsDelivr visible seulement après réécriture du manifest.`)
+  }
+
+  // borne le disque scratch : on jette le clone treeless de détection (léger) après usage en dry-run.
+  if (!APPLY) { try { await rm(dir, { recursive: true, force: true }) } catch {} }
+}
+
+// ---- 4. récapitulatif -----------------------------------------------------
+console.log(`\n— Récapitulatif (${APPLY ? 'APPLY' : 'DRY-RUN'}) —`)
+for (const r of report) console.log(`  ${r.shard.padEnd(28)} ${String(r.missing).padStart(6)} manquante(s) / ${r.total} image(s)`)
+console.log(`  TOTAL vignettes manquantes : ${grandMissing} sur ${targetShards.length} shard(s) traité(s)`)
+if (!APPLY) console.log(`\n  (DRY-RUN : aucune écriture, aucun push. Relancer avec --apply pour générer + pousser.)`)

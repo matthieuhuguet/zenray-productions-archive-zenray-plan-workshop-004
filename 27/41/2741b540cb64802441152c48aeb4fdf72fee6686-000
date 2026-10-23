@@ -1,0 +1,64 @@
+// File d'attente des vidéos à transcoder LOCALEMENT (mkv/avi/mov et autres formats
+// non lisibles par le navigateur).
+//
+// Pourquoi : un navigateur ne sait lire nativement que mp4/webm/ogg. Une vidéo
+// déposée en .mkv/.avi/.mov ne peut donc pas être chunkée+lue telle quelle ici.
+// Il faut la convertir en mp4 (H264 + audio + sous-titres VTT + probe) AVANT de
+// pouvoir la lire dans l'app. Cette conversion (transcodage) se fait EN LOCAL,
+// sur la machine, via `scripts/video-transcode.mjs` (ffmpeg + pgsrip), JAMAIS
+// dans le navigateur.
+//
+// Le flux complet :
+//  1. Drop d'une vidéo non web-native -> ce module écrit DEUX choses :
+//       (a) un nœud .media.json PLACEHOLDER {transcoding:true} dans le dossier
+//           courant, pour que la vidéo apparaisse tout de suite dans le Finder
+//           avec un statut "en cours de transcodage" (rien de lisible encore).
+//       (b) une entrée dans la FILE persistée pages/.zr-transcode-queue.json,
+//           qui liste toutes les vidéos en attente (nom du fichier + flag
+//           "à transcoder localement" + chemin du nœud placeholder).
+//  2. Plus tard, en local, on lance `scripts/video-transcode.mjs`. Le script lit
+//     cette file, convertit chaque vidéo en mp4, uploade les chunks, REMPLIT le
+//     .media.json final (probe.duration / probe.audio / probe.subs) et retire
+//     l'entrée de la file.
+//
+// La file vit dans zenray-content (PUBLIC) à pages/.zr-transcode-queue.json et
+// est lue/écrite via /api/page (action read / action save).
+
+const QUEUE_PATH = 'pages/.zr-transcode-queue.json'
+
+// Lit la file persistée. Renvoie toujours un tableau (vide si absente/illisible).
+async function readQueue() {
+  try {
+    const r = await fetch(`/api/page?action=read&path=${encodeURIComponent(QUEUE_PATH)}`)
+      .then((x) => x.json())
+      .catch(() => null)
+    if (!r) return []
+    const raw = r.markdown != null ? r.markdown : r.content
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : (Array.isArray(parsed.items) ? parsed.items : [])
+  } catch {
+    return []
+  }
+}
+
+// Réécrit la file complète (action save).
+async function writeQueue(items) {
+  const r = await fetch('/api/page', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'save', path: QUEUE_PATH, markdown: JSON.stringify(items, null, 2) }),
+  }).then((x) => x.json()).catch(() => null)
+  if (!r || r.error || !r.ok) throw new Error('queue save: ' + ((r && r.error) || 'fail'))
+  return r
+}
+
+// Ajoute une vidéo à la file (lecture puis réécriture). Idempotent sur nodePath :
+// si une entrée du même nœud existe déjà, elle est remplacée plutôt que dupliquée.
+export async function enqueueTranscode(entry) {
+  const items = await readQueue()
+  const filtered = items.filter((it) => it && it.nodePath !== entry.nodePath)
+  filtered.push(entry)
+  await writeQueue(filtered)
+  return entry
+}

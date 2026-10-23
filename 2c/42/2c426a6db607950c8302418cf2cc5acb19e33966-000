@@ -1,0 +1,85 @@
+// 12 October 2026, 11:55 CEST: the page's door to the local motion service com.zenray.motion (127.0.0.1:3102), third
+// instance of the bridge pattern after Assets (3100) and Freelance (3101). Absolute origin, because the Vite dev
+// server sends every /api to 3100. When the Mac does not answer, a request is written to the zenray-data queue
+// (pages/ZenRayMotionDesign/_requests/<id>.json) that the service reads at its next pass, even after sleep.
+// FR : la porte de la page vers le service local ; si le Mac dort, la demande part dans la file de zenray-data.
+import { getApiSecret } from './apiAuth.js'
+import { saveJsonWithRetry } from './saveJson.js'
+import { MOTION } from '../config/motion.js'
+
+export class MotionBridgeError extends Error {
+  constructor(message, { code = 'bridge-unavailable', status = 0, cause } = {}) {
+    super(message, { cause })
+    this.name = 'MotionBridgeError'
+    this.code = code
+    this.status = status
+  }
+}
+
+/** req-YYYYMMDD-HHMMSS-xxxxxx, the same shape the service validates. */
+export function newRequestId(now = new Date(), random = () => Math.random()) {
+  const p = (n) => String(n).padStart(2, '0')
+  const day = `${now.getUTCFullYear()}${p(now.getUTCMonth() + 1)}${p(now.getUTCDate())}`
+  const time = `${p(now.getUTCHours())}${p(now.getUTCMinutes())}${p(now.getUTCSeconds())}`
+  const tail = Array.from({ length: 6 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(random() * 36)]).join('')
+  return `req-${day}-${time}-${tail}`
+}
+
+export function createMotionBridge({ origin = MOTION.bridge.origin, fetchImpl = (...args) => fetch(...args) } = {}) {
+  async function request(action, payload = {}, { timeoutMs = MOTION.bridge.timeoutMs, signal } = {}) {
+    const secret = getApiSecret()
+    const timeout = AbortSignal.timeout(timeoutMs)
+    const combined = signal && typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : signal || timeout
+    let response
+    try {
+      response = await fetchImpl(`${origin}${MOTION.bridge.path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [MOTION.bridge.clientHeader]: MOTION.bridge.clientValue, ...(secret ? { 'x-zr-auth': secret } : {}) },
+        body: JSON.stringify({ ...payload, action }), signal: combined,
+      })
+    } catch (cause) {
+      throw new MotionBridgeError('Le service local ZenRay Motion est indisponible (Mac éteint, en veille ou service arrêté).', { cause })
+    }
+    let result
+    try { result = await response.json() } catch (cause) { throw new MotionBridgeError('Réponse du service local illisible.', { cause, status: response.status, code: 'bridge-unreadable' }) }
+    if (!response.ok || result.error) throw new MotionBridgeError(result.error || 'La demande locale échoue.', { code: result.code || 'bridge-request-failed', status: response.status })
+    return result
+  }
+  return {
+    request,
+    status: (o) => request('status', {}, { timeoutMs: MOTION.bridge.probeTimeoutMs, ...o }),
+    catalogue: (o) => request('catalogue', {}, o),
+    // 14 October 2026: the catalogue by pages (offset, limit); the first page also triggers the service's bounded incremental refresh.
+    cataloguePage: (payload, o) => request('catalogue', payload || {}, o),
+    motion: (motionId, version, o) => request('motion', { motionId, ...(version ? { version } : {}) }, o),
+    iterate: (payload, o) => request('request', payload, o),
+    job: (id, o) => request('job', { id }, o),
+    jobs: (o) => request('jobs', {}, o),
+    cancel: (id, o) => request('cancel', { id }, o),
+    montage: (spec, render = true, o) => request('montage', { spec, render }, o),
+    timeline: (motionId, version, o) => request('timeline', { motionId, ...(version ? { version } : {}) }, o),
+    openStudio: (motionId, version, o) => request('open-studio', { motionId, ...(version ? { version } : {}) }, o),
+    load: (motionId, version, o) => request('load', { motionId, ...(version ? { version } : {}) }, o),
+    unload: (motionId, version, o) => request('unload', { motionId, ...(version ? { version } : {}) }, o),
+    publish: (motionId, version, push = false, o) => request('publish', { motionId, ...(version ? { version } : {}), push }, o),
+  }
+}
+
+/**
+ * Send an iteration request: the bridge first, the zenray-data queue when the Mac does not answer.
+ * Returns { via: 'bridge', job } or { via: 'queue', id }; a refusal by the service is NOT turned into a queue write.
+ */
+export async function sendIterationRequest(payload, { bridge = createMotionBridge(), save = saveJsonWithRetry, now = new Date() } = {}) {
+  const id = payload.id || newRequestId(now)
+  try {
+    const { job } = await bridge.iterate({ ...payload, id })
+    return { via: 'bridge', job }
+  } catch (error) {
+    if (!(error instanceof MotionBridgeError) || error.code !== 'bridge-unavailable') throw error
+  }
+  const path = `${MOTION.cloud.requests}/${id}.json`
+  const body = { schemaVersion: 1, kind: 'zenray-motion-request', ...payload, id, createdAt: now.toISOString(), origin: 'site' }
+  const saved = await save(path, (current) => (current && current.id ? current : body), { sha: null, data: null })
+  if (!saved?.ok) throw new MotionBridgeError(`La demande n'a pas pu être déposée dans la file : ${saved?.error || 'échec'}`, { code: 'queue-failed' })
+  return { via: 'queue', id, path }
+}

@@ -1,0 +1,84 @@
+import React from 'react'
+import { cleanup, render } from '@testing-library/react'
+import { act } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import YouTubeWatchPanel from './YouTubeWatchPanel.jsx'
+
+// Retour Matthieu 2026-07-17 : "aucune recommandation YouTube, ni avant, ni pendant, ni après" -- ce test
+// couvre le point le plus critique (et le plus difficile à vérifier à la main dans un vrai navigateur :
+// attendre qu'une vraie vidéo se termine) : la fermeture nette sur ENDED, et le filet de sécurité par timer
+// si l'événement tarde/n'arrive jamais.
+//
+// Pas de `waitFor` ici : avec vi.useFakeTimers() actif (nécessaire pour vi.advanceTimersByTime plus bas),
+// le polling interne de waitFor (basé sur de vrais timers) reste gelé et le test bloque 5s puis time out.
+// loadYouTubeIframeAPI() résout de façon synchrone (Promise.resolve()) quand window.YT.Player existe déjà
+// (cas de ce mock) : un simple flush de microtâches (`await Promise.resolve()`), qui ne dépend d'aucun
+// timer, suffit à laisser le .then() s'exécuter avant l'assertion.
+const flush = () => act(async () => { await Promise.resolve(); await Promise.resolve() })
+
+describe('YouTubeWatchPanel', () => {
+  let players
+  let readyCallback
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    players = []
+    readyCallback = null
+    window.YT = {
+      PlayerState: { ENDED: 0 },
+      Player: vi.fn(function (el, opts) {
+        this.destroy = vi.fn()
+        this.getDuration = vi.fn(() => 10)
+        this._opts = opts
+        players.push(this)
+        // simule l'appel réel de l'IFrame API : onReady async après montage
+        readyCallback = () => opts.events.onReady()
+      }),
+    }
+  })
+
+  afterEach(() => { cleanup(); vi.useRealTimers(); delete window.YT; vi.restoreAllMocks() })
+
+  it('passe rel:0 et modestbranding:1 à l’instanciation (zéro recommandation)', async () => {
+    render(<YouTubeWatchPanel videoId="abc123" onClose={vi.fn()} />)
+    await flush()
+    expect(window.YT.Player).toHaveBeenCalledTimes(1)
+    const opts = players[0]._opts
+    expect(opts.videoId).toBe('abc123')
+    expect(opts.playerVars).toMatchObject({ rel: 0, modestbranding: 1 })
+  })
+
+  it('démonte immédiatement le lecteur et appelle onClose sur ENDED', async () => {
+    const onClose = vi.fn()
+    render(<YouTubeWatchPanel videoId="abc123" onClose={onClose} />)
+    await flush()
+    const player = players[0]
+    act(() => { readyCallback() })
+    act(() => { player._opts.events.onStateChange({ data: window.YT.PlayerState.ENDED }) })
+    expect(player.destroy).toHaveBeenCalledTimes(1)
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('filet de sécurité : ferme via le timer calé sur getDuration si ENDED ne se déclenche jamais', async () => {
+    const onClose = vi.fn()
+    render(<YouTubeWatchPanel videoId="abc123" onClose={onClose} />)
+    await flush()
+    const player = players[0]
+    act(() => { readyCallback() }) // getDuration() = 10s -> timer arme à 10.75s, ENDED jamais envoyé
+    expect(onClose).not.toHaveBeenCalled()
+    act(() => { vi.advanceTimersByTime(10_750) })
+    expect(player.destroy).toHaveBeenCalledTimes(1)
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('ne ferme qu’une fois si ENDED et le timer se déclenchent tous les deux', async () => {
+    const onClose = vi.fn()
+    render(<YouTubeWatchPanel videoId="abc123" onClose={onClose} />)
+    await flush()
+    const player = players[0]
+    act(() => { readyCallback() })
+    act(() => { player._opts.events.onStateChange({ data: window.YT.PlayerState.ENDED }) })
+    act(() => { vi.advanceTimersByTime(20_000) })
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+})

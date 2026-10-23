@@ -1,0 +1,53 @@
+// 3 October 2026, 04:24 CEST: run bounded headless audits sequentially without blocking project inventory or transfers.
+import { execFile as executeFile } from 'node:child_process'
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { promisify } from 'node:util'
+
+export function createSceneAuditRunner({ hythonPath, auditScriptPath, preparationScriptPath, timeoutMs }, { execFile = promisify(executeFile) } = {}) {
+  if (!hythonPath || !auditScriptPath || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('Scene audit runner requires executable, script and positive timeout')
+  let queue = Promise.resolve()
+  // 3 October 2026, 09:08 CEST: preparation shares the bounded serialized process queue with resource audits.
+  const execute = async (scenePath, { signal, preparationPlan } = {}) => {
+    const label = preparationPlan ? 'Scene preparation' : 'Scene audit'
+    if (typeof scenePath !== 'string' || !path.isAbsolute(scenePath)) throw new Error('Scene audit requires an absolute scene path')
+    if (signal?.aborted) throw new Error('Scene audit aborted before launch', { cause: signal.reason })
+    const directory = await mkdtemp(path.join(tmpdir(), 'zenray-scene-audit-'))
+    const outputPath = path.join(directory, 'audit.json')
+    try {
+      let args = [auditScriptPath, scenePath, '--output', outputPath], result
+      if (preparationPlan) {
+        if (!preparationScriptPath) throw new Error('Scene preparation script unavailable')
+        const planPath = path.join(directory, 'plan.json')
+        await writeFile(planPath, JSON.stringify(preparationPlan), { mode: 0o600 })
+        args = [preparationScriptPath, planPath, '--output', outputPath]
+      }
+      try {
+        result = await execFile(hythonPath, args, {
+          timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024, signal,
+        })
+      } catch (error) {
+        const reason = error.code === 'ABORT_ERR' ? 'aborted' : error.killed ? `exceeded ${timeoutMs} ms or its output limit` : `failed with exit ${error.code ?? 'unknown'}`
+        const detail = String(error.stderr || error.message || '').trim().slice(0, 1000)
+        throw new Error(`${label} ${reason}${detail ? `: ${detail}` : ''}`, { cause: error })
+      }
+      let audit
+      try { audit = JSON.parse(await readFile(outputPath, 'utf8')) }
+      catch (error) { throw new Error(`${label} produced unreadable or invalid JSON`, { cause: error }) }
+      const invalid = audit?.schemaVersion !== 1 || !/^[a-f0-9]{64}$/.test(audit.sceneSha256 || '') || audit.portabilityVerified !== false
+        || (preparationPlan ? audit.sceneSha256 !== preparationPlan.sceneSha256 || audit.sceneOpened !== true || audit.savedScene !== false || !Array.isArray(audit.reboundInputs) || !Array.isArray(audit.loadedLibraries) || audit.resourceBytesVerified !== preparationPlan.resources?.length : !Array.isArray(audit.references))
+      if (invalid) throw new Error(`${label} JSON has an invalid evidence shape`)
+      return preparationPlan ? { ...audit, processDiagnostics: String(result?.stderr || '').trim().slice(0, 10000) } : audit
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  }
+  const run = (scenePath, options = {}) => {
+    const job = queue.then(() => execute(scenePath, options))
+    queue = job.catch(() => {})
+    return job
+  }
+  run.prepare = (plan, options = {}) => run(plan.scenePath, { ...options, preparationPlan: plan })
+  return run
+}

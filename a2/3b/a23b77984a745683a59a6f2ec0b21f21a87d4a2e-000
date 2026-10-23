@@ -1,0 +1,271 @@
+// transcode-worker.mjs — WORKER LOCAL de transcodage vidéo (tourne sur le Mac, à côté de local-server.mjs).
+//
+// RÔLE : c'est le « chaînon manquant ». Quand on dépose une vidéo non lisible par le navigateur
+// (mkv/avi/mov…) ou trop lourde, le front écrit juste un placeholder {transcoding:true} + une ligne
+// dans la file pages/.zr-transcode-queue.json, et PERSONNE ne consomme cette file -> la vidéo reste
+// « en cours de transcodage » pour toujours. Ce worker consomme la file : il transcode au format MSE
+// (vidéo H.264 + 1 audio AAC par piste + sous-titres VTT), pousse les chunks HASHÉS sur le shard privé,
+// écrit le manifest mse-av final dans zenray-data, met à jour la progression, puis dépile l'entrée.
+//
+// COMMENT LE WORKER RETROUVE LE FICHIER SOURCE (RISQUE 1 du plan) :
+//   Le drag-drop / Ctrl-V web ne donne PAS de chemin disque fiable au Mac. Deux modes, dans l'ordre :
+//     1. l'entrée de file porte un champ `sourcePath` (chemin absolu local) -> on lit directement.
+//     2. sinon, on cherche un fichier nommé exactement `entry.name` dans le DOSSIER SURVEILLÉ
+//        (--watch <dir>, défaut ~/Movies/ZenRayInbox). C'est le mode « je dépose mon mkv dans un
+//        dossier, le worker le voit et le transcode ». Simple, zéro upload de source, zéro double trafic.
+//   (Le mode « upload de la source brute sur le shard puis re-download côté worker » est une étape
+//    FRONTEND ultérieure ; ce worker le supportera sans changement dès que l'entrée portera
+//    `source:{repo,dir,parts}` — voir resolveSource().)
+//
+// PROGRESSION : le worker met à jour `status` + `progress` (0..100) dans l'entrée de file ET réécrit
+// le .media.json placeholder avec {transcoding:true, progress, stage} pour que le Finder affiche une
+// barre. Pas de SSE : un petit serveur HTTP local expose GET /transcode/status (JSON) pour le polling.
+//
+// LANCEMENT : GITHUB_TOKEN=$(gh auth token) node scripts/transcode-worker.mjs \
+//               [--api http://localhost:3000] [--watch ~/Movies/ZenRayInbox] [--interval 10] [--crf 21] [--t N] [--port 3010]
+//   --api      : base URL du local-server (pour lire/écrire la file via /api/page et résoudre le shard). Défaut http://localhost:3000
+//   --watch    : dossier surveillé où retrouver les sources par nom. Défaut $HOME/Movies/ZenRayInbox
+//   --interval : secondes entre deux polls de la file. Défaut 10
+//   --t N      : limite d'échantillon en secondes (validation rapide). Omis = vidéo complète
+//   --port     : port du serveur de statut HTTP. Défaut 3010
+//
+// SÉCURITÉ : token via env (jamais committé) ; la source vient d'un chemin local connu (sourcePath
+// validé absolu, ou fichier du dossier surveillé), jamais d'un path arbitraire reçu du web -> pas de
+// path traversal. Le worker n'écrit que sur le shard privé (binaires) et zenray-data (manifests).
+
+import http from 'node:http'
+import path from 'node:path'
+import os from 'node:os'
+import { readdir, rm, mkdir, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { transcodeOne, pushToShard } from './video-mse-lib.mjs'
+import { transcodeDash, pushDash } from './video-dash-lib.mjs'
+import { isPrivateShardName } from './video-raw-lib.mjs'
+
+const args = process.argv.slice(2)
+const getArg = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d }
+const TOKEN = process.env.GITHUB_TOKEN
+const API = (getArg('--api', 'http://localhost:3000')).replace(/\/$/, '')
+const WATCH = (getArg('--watch', path.join(os.homedir(), 'Movies', 'ZenRayInbox'))).replace(/^~(?=$|\/)/, os.homedir())
+const INTERVAL = Math.max(3, parseInt(getArg('--interval', '10'), 10)) * 1000
+const CRF = getArg('--crf', '21')
+const SAMPLE = getArg('--t', null)
+const STATUS_PORT = parseInt(getArg('--port', '3010'), 10)
+// MSE H.264/AAC est le défaut UI : compatibilité navigateur et seek précis via
+// fragIndex. DASH reste disponible uniquement pour relire/reprendre un ancien lot.
+const USE_DASH_LEGACY = args.includes('--dash-legacy')
+const QUEUE_PATH = 'pages/.zr-transcode-queue.json'
+const VIDEO_RE = /\.(mkv|mp4|webm|avi|mov|m4v|ts)$/i
+
+if (!TOKEN) { console.error('GITHUB_TOKEN absent. Lancer : GITHUB_TOKEN=$(gh auth token) node scripts/transcode-worker.mjs'); process.exit(1) }
+
+// état en mémoire exposé par le serveur de statut HTTP (polling).
+const state = { current: null, lastDone: null, lastError: null, queueLen: 0, scannedAt: null }
+const log = (...a) => console.log('[worker]', ...a)
+
+// --- file (via /api/page du local-server) -----------------------------------
+async function readQueue() {
+  try {
+    const r = await fetch(`${API}/api/page?action=read&path=${encodeURIComponent(QUEUE_PATH)}`).then((x) => x.json())
+    const raw = r && (r.markdown != null ? r.markdown : r.content)
+    if (!raw) return { items: [], sha: r && r.sha }
+    const parsed = JSON.parse(raw)
+    const items = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.items) ? parsed.items : [])
+    return { items, sha: r && r.sha }
+  } catch { return { items: [], sha: null } }
+}
+async function writeQueue(items, sha) {
+  const r = await fetch(`${API}/api/page`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'save', path: QUEUE_PATH, markdown: JSON.stringify(items, null, 2), ...(sha ? { sha } : {}) }),
+  }).then((x) => x.json()).catch(() => null)
+  if (!r || r.error || !r.ok) throw new Error('queue save: ' + ((r && r.error) || 'fail'))
+  return r
+}
+
+// Met à jour le statut/progress d'UNE entrée dans la file (relit pour le sha frais, réécrit).
+async function updateEntry(nodePath, patch) {
+  const { items, sha } = await readQueue()
+  const idx = items.findIndex((it) => it && it.nodePath === nodePath)
+  if (idx < 0) return
+  items[idx] = { ...items[idx], ...patch }
+  try { await writeQueue(items, sha) } catch (e) { log('maj file échouée (non bloquant):', String(e.message || e).slice(0, 120)) }
+}
+async function dequeue(nodePath) {
+  const { items, sha } = await readQueue()
+  await writeQueue(items.filter((it) => it && it.nodePath !== nodePath), sha)
+}
+
+// Réécrit le .media.json placeholder avec la progression (le Finder lit transcoding/progress/stage).
+async function writePlaceholderProgress(nodePath, entry, progress, stage) {
+  try {
+    const rr = await fetch(`${API}/api/page?action=read&path=${encodeURIComponent(nodePath)}`).then((x) => x.json())
+    let manifest = {}
+    try { manifest = JSON.parse(rr.markdown || '{}') } catch { manifest = {} }
+    manifest = { type: 'chunked-media', v: 1, name: entry.name, mime: entry.mime || 'video/x-matroska', size: entry.size || 0, ...manifest, transcoding: true, progress, stage, probe: manifest.probe || {} }
+    await fetch(`${API}/api/page`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'save', path: nodePath, markdown: JSON.stringify(manifest), sha: rr.sha || undefined }),
+    })
+  } catch { /* progression best-effort */ }
+}
+
+// Réécrit le placeholder en MANIFEST FINAL mse-av (remplace transcoding:true). pushToShard a déjà
+// écrit le manifest au CHEMIN CANONIQUE (dest/<base>.mp4.media.json) ; on écrase ICI le nœud placeholder
+// d'origine (celui visible dans le Finder) avec le même contenu, pour que la vidéo devienne lisible
+// SUR PLACE sans changer son chemin.
+async function finalizePlaceholder(nodePath, manifest) {
+  try {
+    const rr = await fetch(`${API}/api/page?action=read&path=${encodeURIComponent(nodePath)}`).then((x) => x.json())
+    await fetch(`${API}/api/page`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'save', path: nodePath, markdown: JSON.stringify(manifest, null, 2), sha: rr.sha || undefined }),
+    })
+  } catch (e) { log('finalize placeholder échec (le manifest canonique reste écrit):', String(e.message || e).slice(0, 120)) }
+}
+
+// Télécharge la SOURCE brute depuis le shard privé (chunks media/<id>/NNN.bin) et la reconstitue dans
+// un fichier temporaire. C'est le cas DRAG-DROP WEB : le front a uploadé la source chunkée et a noté
+// source:{repo,dir,parts}. /api/shard sert chaque chunk binaire (repo privé via token serveur).
+const TMP_IN = path.join(os.tmpdir(), 'zr_mse', 'in')
+async function downloadShardSource(src, name, log = () => {}) {
+  const repo = String(src?.repo || '')
+  if (!src || !(isPrivateShardName(repo) || /^zenray-media-\d{2,}$/.test(repo)) || !src.dir || !Array.isArray(src.parts) || !src.parts.length) return null
+  if (String(src.dir).includes('..')) return null
+  await mkdir(TMP_IN, { recursive: true })
+  const outPath = path.join(TMP_IN, `${Date.now().toString(36)}_${path.basename(name || 'source.mkv').replace(/[^\w.\- ]+/g, '_')}`)
+  log(`  source via shard ${src.repo} (${src.parts.length} chunks) -> ${outPath}`)
+  const buffers = []
+  for (const part of src.parts) {
+    const rel = `${src.dir}/${part}.bin`
+    const url = `${API}/api/shard?repo=${encodeURIComponent(src.repo)}&path=${encodeURIComponent(rel)}`
+    const r = await fetch(url)
+    if (!r.ok) throw new Error(`shard chunk ${rel}: HTTP ${r.status}`)
+    buffers.push(Buffer.from(await r.arrayBuffer()))
+  }
+  await writeFile(outPath, Buffer.concat(buffers))
+  return outPath
+}
+
+// --- résolution de la SOURCE locale ------------------------------------------
+async function resolveSource(entry) {
+  // 1) chemin absolu explicite dans l'entrée (mode local : sourcePath fourni à la main)
+  if (entry.sourcePath && path.isAbsolute(entry.sourcePath) && !entry.sourcePath.includes('..') && existsSync(entry.sourcePath)) {
+    return entry.sourcePath
+  }
+  // 2) source uploadée sur le shard par le front (drag-drop web) -> on reconstitue dans /tmp
+  if (entry.source) {
+    try { const dl = await downloadShardSource(entry.source, entry.name, log); if (dl) return dl }
+    catch (e) { log('download source shard échec, fallback dossier surveillé:', String(e.message || e).slice(0, 120)) }
+  }
+  // 3) fichier de même nom dans le dossier surveillé (mode --watch)
+  if (entry.name && existsSync(WATCH)) {
+    const direct = path.join(WATCH, path.basename(entry.name))
+    if (existsSync(direct)) return direct
+    // tolérance : même base, extension vidéo différente (ex le nom de nœud a été sanitizé)
+    const baseWanted = path.basename(entry.name).replace(/\.[^.]+$/, '').toLowerCase()
+    try {
+      const files = await readdir(WATCH)
+      const hit = files.find((f) => VIDEO_RE.test(f) && f.replace(/\.[^.]+$/, '').toLowerCase() === baseWanted)
+      if (hit) return path.join(WATCH, hit)
+    } catch { /* dossier illisible */ }
+  }
+  return null
+}
+
+// --- traitement d'une entrée -------------------------------------------------
+async function processEntry(entry) {
+  const nodePath = entry.nodePath
+  log(`traitement: ${entry.name} (${nodePath})`)
+  state.current = { name: entry.name, nodePath, stage: 'resolving', progress: 0 }
+
+  const src = await resolveSource(entry)
+  if (!src) {
+    log(`SOURCE INTROUVABLE pour "${entry.name}". Déposer le fichier dans ${WATCH} (ou renseigner sourcePath). On laisse l'entrée en file.`)
+    await updateEntry(nodePath, { status: 'source-introuvable', sourceHint: WATCH })
+    state.current = null
+    return
+  }
+  log(`  source: ${src}`)
+  await updateEntry(nodePath, { status: 'encoding', progress: 0 })
+
+  // throttle des mises à jour de progression (évite de spammer GitHub à chaque frame).
+  let lastPush = 0
+  const onProgress = (stage, pct) => {
+    state.current = { name: entry.name, nodePath, stage, progress: Math.round(pct) }
+    const now = Date.now()
+    if (now - lastPush > 5000) {
+      lastPush = now
+      updateEntry(nodePath, { status: `encoding ${stage} ${Math.round(pct)}%`, progress: Math.round(pct) })
+      writePlaceholderProgress(nodePath, entry, Math.round(pct), stage)
+    }
+  }
+
+  // 1) transcode local. MSE est le seul défaut d'écriture UI. L'option
+  // --dash-legacy existe pour une reprise volontaire, jamais implicitement.
+  const transcode = USE_DASH_LEGACY ? transcodeDash : transcodeOne
+  const push = USE_DASH_LEGACY ? pushDash : pushToShard
+  const result = await transcode(src, {
+    crf: CRF, sampleSec: SAMPLE, log, onProgress,
+    dest: entry.dest || 'pages/Videos',
+  })
+
+  // 2) push : binaires hashés -> shard privé, manifest (hls ou mse-av) -> zenray-data
+  await updateEntry(nodePath, { status: 'uploading', progress: 99 })
+  state.current = { name: entry.name, nodePath, stage: 'uploading', progress: 99 }
+  const pushed = await push(TOKEN, result, {
+    apiBase: API, onProgress: (stage, pct) => { state.current = { name: entry.name, nodePath, stage, progress: Math.round(pct) } }, log,
+  })
+  const { manifest, manifestPath, commitContent } = pushed
+  const repo = pushed.repo || pushed.publicRepo || 'legacy-dash'
+
+  // 3) le placeholder DEVIENT le manifest mse-av final (lecture sur place) + dépile
+  await finalizePlaceholder(nodePath, manifest)
+  await dequeue(nodePath)
+  try { await rm(result.outDir, { recursive: true, force: true }) } catch { /* nettoyage best-effort */ }
+  // Si la source venait du shard (reconstituée dans /tmp), on la supprime (la copie web-native du dossier
+  // surveillé, elle, n'est jamais touchée).
+  if (src.startsWith(TMP_IN)) { try { await rm(src, { force: true }) } catch { /* best-effort */ } }
+
+  log(`OK ${entry.name} -> mse-av sur ${repo}, manifest ${manifestPath} (content commit ${commitContent.slice(0, 7)})`)
+  state.lastDone = { name: entry.name, repo, manifestPath, at: new Date().toISOString() }
+  state.current = null
+}
+
+// --- boucle de poll ----------------------------------------------------------
+let running = false
+async function tick() {
+  if (running) return
+  running = true
+  try {
+    const { items } = await readQueue()
+    state.queueLen = items.length
+    state.scannedAt = new Date().toISOString()
+    // on prend la 1re entrée encore à traiter (statut non terminal). 'source-introuvable' est sauté
+    // tant que la source n'est pas posée, mais reste en file (réessayé au prochain tour).
+    const todo = items.find((it) => it && it.nodePath && it.status !== 'done' && it.status !== 'encoding-in-flight')
+    if (!todo) return
+    await processEntry(todo)
+  } catch (e) {
+    state.lastError = { msg: String(e.message || e).slice(0, 300), at: new Date().toISOString() }
+    if (state.current) { state.current.error = state.lastError.msg }
+    log('ERREUR:', String(e.message || e).slice(0, 300))
+  } finally {
+    running = false
+  }
+}
+
+// --- serveur de statut (polling) ---------------------------------------------
+http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  if (req.url && req.url.startsWith('/transcode/status')) {
+    res.setHeader('content-type', 'application/json')
+    return res.end(JSON.stringify(state))
+  }
+  res.statusCode = 404; res.end('not found')
+}).listen(STATUS_PORT, () => log(`statut HTTP -> http://localhost:${STATUS_PORT}/transcode/status`))
+
+log(`démarré. pipeline=${USE_DASH_LEGACY ? 'dash-legacy' : 'mse'} api=${API} watch=${WATCH} interval=${INTERVAL / 1000}s${SAMPLE ? ` échantillon=${SAMPLE}s` : ''}`)
+log(`token: ${TOKEN ? 'OK' : 'ABSENT'}`)
+tick()
+setInterval(tick, INTERVAL)

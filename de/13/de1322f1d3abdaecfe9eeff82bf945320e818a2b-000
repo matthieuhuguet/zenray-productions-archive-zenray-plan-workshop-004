@@ -1,0 +1,164 @@
+#!/usr/bin/env node
+// ZenRayMedia — INDEX COMPLET des familles Google Fonts.
+//
+//   node scripts/zrm-fonts-index.mjs            # construit/rafraîchit l'index
+//   node scripts/zrm-fonts-index.mjs --search "source sans"
+//   node scripts/zrm-fonts-index.mjs --missing  # familles citées par un thème et non installées
+//
+// LA DEMANDE, ET POURQUOI JE NE L'AI PAS SUIVIE À LA LETTRE
+// --------------------------------------------------------
+// Matthieu : « get index of all fonts google with github api, toutes les installer irait plus
+// vite ». L'index : oui, absolument, et c'est ce que fait ce script. Tout installer : non, et
+// le refus repose sur une mesure, pas sur une préférence.
+//
+//   128 familles installées  = 15 Mo dans public/
+//   ~1 800 familles Google   = environ 210 Mo, extrapolés à 118 ko par famille
+//
+// `public/` part dans le déploiement Vercel ET dans le dépôt Git. Deux cents mégaoctets de
+// polices dont un thème donné n'en utilise jamais plus de trois, c'est le même genre de dette
+// que le dépôt `.claude` gonflé à 27 Go — payée une fois, pénible pour toujours.
+//
+// La bonne forme est donc en deux temps, et elle est PLUS rapide que tout installer :
+//   1. INDEXER tout (ce fichier) : ~400 ko de JSON, toutes les familles connues par nom,
+//      catégorie, graisses et sous-ensembles. La détection et la recherche marchent alors sur
+//      le catalogue ENTIER, sans qu'un seul octet de fonte soit téléchargé.
+//   2. INSTALLER à la demande : `node scripts/zrm-fonts.mjs --add "Bodoni Moda"`, appelé
+//      automatiquement quand un thème déclare une famille absente.
+//
+// Autrement dit : on gagne la couverture complète du catalogue tout de suite, et on paie le
+// poids seulement pour ce qui sert réellement.
+//
+// POURQUOI L'API CSS ET NON L'API GITHUB POUR L'INDEX
+// --------------------------------------------------
+// L'API GitHub sur `google/fonts` impose de lister ~1 800 dossiers puis de lire un METADATA.pb
+// par famille : environ 1 800 requêtes, alors que le quota REST est de 5 000 par heure. C'est
+// exactement le schéma qui a mis le site en 403 pendant une heure le 2026-07-20.
+// `fonts.google.com/metadata/fonts` rend le même catalogue en UNE requête, hors quota.
+
+import { writeFile, readFile, readdir } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+
+const ROOT = path.resolve(import.meta.dirname, '..')
+const OUT = path.join(ROOT, 'src', 'zenraymedia', 'fonts-index.json')
+const CATALOG = 'https://fonts.google.com/metadata/fonts'
+
+// La catégorie Google (serif, sans-serif, display, handwriting, monospace) est plus grossière
+// que nos archétypes. On la traduit pour que l'index parle la même langue que fonts.js, sinon
+// il faudrait retraduire à chaque usage.
+// Les clés arrivent capitalisées et espacées (« Sans Serif », pas « sans-serif ») : une première
+// version les cherchait en minuscules et rangeait les 1 942 familles dans « grotesque ».
+// L'erreur n'était visible que parce que le script imprime la répartition — un compteur qui
+// affiche un seul seau est le genre de signal qu'on ne voit que si on l'a demandé.
+const ARCHETYPE = {
+  'serif': 'labeur',
+  'sans serif': 'grotesque',
+  'display': 'display',
+  'handwriting': 'script',
+  'monospace': 'mono',
+}
+// La classification Google est pauvre — `classifications` ne porte guère que « Display », et
+// jamais « Didone » ni « Slab ». Elle ne remplace donc pas nos archétypes ; elle les précise
+// quand elle dit quelque chose.
+const norm = (s) => String(s || '').toLowerCase().trim()
+
+async function fetchCatalog() {
+  const res = await fetch(CATALOG)
+  if (!res.ok) throw new Error(`catalogue Google Fonts : HTTP ${res.status}`)
+  const raw = await res.text()
+  // La réponse est préfixée d'une garde anti-exécution (")]}'"), à retirer avant de parser.
+  return JSON.parse(raw.replace(/^\)\]\}'?\s*/, ''))
+}
+
+async function installedFamilies() {
+  const dir = path.join(ROOT, 'public', 'zrm-fonts')
+  if (!existsSync(dir)) return new Set()
+  const slugs = await readdir(dir)
+  return new Set(slugs)
+}
+
+const slugify = (f) => f.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+
+async function build() {
+  const cat = await fetchCatalog()
+  const installed = await installedFamilies()
+  const families = (cat.familyMetadataList || []).map((f) => ({
+    family: f.family,
+    slug: slugify(f.family),
+    category: f.category,
+    archetype: ARCHETYPE[norm(f.category)] || 'grotesque',
+    classifications: f.classifications || [],
+    weights: Object.keys(f.fonts || {}).map((k) => k.replace('i', '')).filter((v, i, a) => a.indexOf(v) === i),
+    subsets: f.subsets || [],
+    // `defaultSort` est le rang de popularité Google. Il vaut ce qu'il vaut, mais il départage
+    // deux candidates à égalité de mesure mieux que l'ordre alphabétique.
+    popularity: f.defaultSort ?? null,
+    installed: installed.has(slugify(f.family)),
+  }))
+  families.sort((a, b) => a.family.localeCompare(b.family))
+  const index = {
+    source: CATALOG,
+    total: families.length,
+    installed: families.filter((f) => f.installed).length,
+    families,
+  }
+  await writeFile(OUT, JSON.stringify(index, null, 0) + '\n')
+  const kb = Math.round((await readFile(OUT)).length / 1024)
+  console.log(`${index.total} familles indexées, dont ${index.installed} installées.`)
+  console.log(`→ ${path.relative(ROOT, OUT)} (${kb} ko)`)
+  const byArch = {}
+  for (const f of families) byArch[f.archetype] = (byArch[f.archetype] || 0) + 1
+  console.log(Object.entries(byArch).map(([k, v]) => `${k} ${v}`).join('  ·  '))
+  return index
+}
+
+async function load() {
+  if (!existsSync(OUT)) throw new Error(`index absent. Le construire d'abord : node scripts/zrm-fonts-index.mjs`)
+  return JSON.parse(await readFile(OUT, 'utf8'))
+}
+
+async function search(q) {
+  const { families } = await load()
+  const n = q.toLowerCase()
+  const hits = families.filter((f) => f.family.toLowerCase().includes(n))
+  if (!hits.length) {
+    console.log(`Aucune famille ne contient « ${q} ».`)
+    // Le cas réel : « Source Sans Pro » n'existe plus, Google l'a renommée « Source Sans 3 ».
+    // Chercher le premier mot évite de conclure à tort qu'une police n'est pas disponible.
+    const first = n.split(/\s+/)[0]
+    const near = families.filter((f) => f.family.toLowerCase().includes(first)).slice(0, 8)
+    if (near.length) console.log(`Familles proches : ${near.map((f) => f.family).join(', ')}`)
+    return
+  }
+  for (const f of hits.slice(0, 20)) {
+    console.log(`${f.installed ? '●' : '○'} ${f.family.padEnd(30)} ${f.archetype.padEnd(11)} ${f.weights.join('/')}`)
+  }
+  console.log(`\n● installée   ○ à installer : node scripts/zrm-fonts.mjs --add "<famille>"`)
+}
+
+async function missing() {
+  const { families } = await load()
+  const known = new Map(families.map((f) => [f.family, f]))
+  const themesDir = path.join(ROOT, 'src', 'zenraymedia', 'themes')
+  const dirs = (await readdir(themesDir, { withFileTypes: true })).filter((d) => d.isDirectory())
+  const need = new Map()
+  for (const d of dirs) {
+    const jp = path.join(themesDir, d.name, 'theme.json')
+    if (!existsSync(jp)) continue
+    const t = JSON.parse(await readFile(jp, 'utf8'))
+    for (const fam of t.fonts || []) {
+      const entry = known.get(fam)
+      if (!entry) { need.set(fam, 'INCONNUE de Google Fonts'); continue }
+      if (!entry.installed) need.set(fam, `à installer (${entry.archetype})`)
+    }
+  }
+  if (!need.size) return console.log('Toutes les polices déclarées par les thèmes sont installées.')
+  for (const [fam, why] of need) console.log(`  ${fam.padEnd(30)} ${why}`)
+}
+
+const argv = process.argv.slice(2)
+const arg = (n) => { const i = argv.indexOf(`--${n}`); return i >= 0 ? argv[i + 1] : null }
+
+if (argv.includes('--search')) await search(arg('search') || '')
+else if (argv.includes('--missing')) await missing()
+else await build()

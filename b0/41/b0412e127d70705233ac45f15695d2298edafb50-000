@@ -1,0 +1,151 @@
+// 7 October 2026: the index family. Fake pages, no network: slugs prefilter, known and seen pages are not read again, expired
+// postings are dropped, one failing site never stops the others, robots refusals are visible, and nothing ever closes a record.
+import { describe, it, expect } from 'vitest'
+import { indexes, parseSitemap, slugWords, listingFromPosting } from './sources/Indexes.mjs'
+import { tolerantJson, jobPosting } from './lib/Text.mjs'
+import { createSeenCache } from './lib/SeenCache.mjs'
+import config from './FreelanceConfig.json'
+
+const NOW = new Date('2026-10-07T10:00:00Z')
+const ld = (posting) => `<html><script type="application/ld+json">${JSON.stringify({ '@context': 'https://schema.org', '@type': 'JobPosting', ...posting })}</script></html>`
+const posting = (title, org = 'Acme Games', extra = {}) => ({ title, hiringOrganization: { name: org }, datePosted: '2026-10-06', description: '<p>We use Houdini and Unreal Engine.</p>', jobLocation: { address: { addressLocality: 'Lyon', addressCountry: 'FR' } }, ...extra })
+const fakeFetcher = (pages) => { const calls = []; return { calls, text: async (url) => { calls.push(url); if (!(url in pages)) { const e = new Error(`HTTP 404 ${url}`); e.status = 404; throw e } const v = pages[url]; if (v instanceof Error) throw v; return v } } }
+const cfg = (sites) => ({ ...config, sources: { ...config.sources, indexes: { ...config.sources.indexes, sites } } })
+const sitemap = (...urls) => `<urlset>${urls.map(([loc, lastmod]) => `<url><loc>${loc}</loc>${lastmod ? `<lastmod>${lastmod}</lastmod>` : ''}</url>`).join('')}</urlset>`
+
+describe('helpers', () => {
+  it('reads sitemaps and indexes, and turns slugs into words without ids', () => {
+    expect(parseSitemap(sitemap(['https://a.com/jobs/x', '2026-10-01'], ['https://a.com/jobs/y']))).toEqual([{ loc: 'https://a.com/jobs/x', lastmod: '2026-10-01' }, { loc: 'https://a.com/jobs/y', lastmod: '' }])
+    expect(slugWords('https://a.com/jobs/keywords-studios-3d-dfac1c36.html')).toBe('jobs keywords studios 3d')
+    expect(slugWords('https://www.gamesjobsdirect.com/job/counterpunch/2d-pixel-artist/361465')).toBe('job counterpunch 2d pixel artist')
+  })
+  it('tolerates the three defects found in real JSON-LD, and still refuses garbage', () => {
+    expect(tolerantJson('{"a":"x\\_y"}')).toEqual({ a: 'x_y' })
+    expect(tolerantJson('{"a":"x\ny"}')).toEqual({ a: 'x y' })
+    expect(tolerantJson('{"a":{"b":"c";}, "d":1;"e":2}')).toEqual({ a: { b: 'c' }, d: 1, e: 2 })
+    expect(tolerantJson('{bad')).toBeNull()
+    expect(jobPosting('<script type="application/ld+json">{"@type":"JobPosting","title":"T";}</script>').title).toBe('T')
+  })
+  it('a posting becomes a listing; expired, nameless or off-topic ones do not', () => {
+    const make = (p) => listingFromPosting(p, { url: 'https://a.com/j/1', site: 's', label: 'S', today: '2026-10-07' })
+    expect(make(posting('Technical Artist'))).toMatchObject({ lane: 'games', name: 'Acme Games', country: 'FR', location: 'Lyon', sourceKey: 'index:s' })
+    expect(make(posting('Technical Artist', 'Acme', { validThrough: '2026-10-06' }))).toBeNull()
+    expect(make({ ...posting('Technical Artist'), hiringOrganization: '' })).toBeNull()
+    expect(make(posting('Chief Marketing Officer'))).toBeNull()
+    expect(make(posting('Technical Artist', 'Acme', { jobLocation: { address: { addressLocality: 'null', addressCountry: 'null' } } }))).toMatchObject({ location: '', country: '' })
+  })
+})
+
+describe('sitemap strategy', () => {
+  const site = { enabled: true, label: 'S', strategy: 'sitemap', sitemaps: ['https://a.com/sitemap.xml'], jobPath: '/jobs/', recencyDays: 30, maxDetails: 2 }
+  const pages = {
+    'https://a.com/sitemap.xml': sitemap(['https://a.com/jobs/acme-technical-artist-aaaa1111.html', '2026-10-06'], ['https://a.com/jobs/acme-vfx-artist-bbbb2222.html', '2026-10-05'], ['https://a.com/jobs/acme-houdini-artist-cccc3333.html', '2026-10-04'], ['https://a.com/jobs/acme-accountant-dddd4444.html', '2026-10-06'], ['https://a.com/jobs/old-environment-artist-eeee5555.html', '2025-01-01']),
+    'https://a.com/jobs/acme-technical-artist-aaaa1111.html': ld(posting('Technical Artist')),
+    'https://a.com/jobs/acme-vfx-artist-bbbb2222.html': ld(posting('Sales Intern')),
+    'https://a.com/jobs/acme-houdini-artist-cccc3333.html': ld(posting('Houdini Artist')),
+  }
+  it('prefilters by slug and recency, respects the cap, newest first, and remembers what it judged irrelevant', async () => {
+    const fetcher = fakeFetcher(pages); const seen = createSeenCache()
+    const [board] = await indexes({ http: {}, config: cfg({ s: site }), fetcher, seen, now: NOW })
+    expect(board.key).toBe('index:s'); expect(board.listed).toBe(5)
+    expect(board.listings.map((l) => l.title)).toEqual(['Technical Artist'])
+    expect(fetcher.calls.filter((c) => c.includes('/jobs/'))).toEqual(['https://a.com/jobs/acme-technical-artist-aaaa1111.html', 'https://a.com/jobs/acme-vfx-artist-bbbb2222.html'])
+    expect(await seen.has('https://a.com/jobs/acme-vfx-artist-bbbb2222.html')).toBe(true)
+    // second pass: the kept page is known by the store, the irrelevant one is remembered, so the cap reaches the next page
+    const again = fakeFetcher(pages)
+    const [second] = await indexes({ http: {}, config: cfg({ s: site }), fetcher: again, seen, known: new Set(['https://a.com/jobs/acme-technical-artist-aaaa1111.html']), now: NOW })
+    expect(again.calls.filter((c) => c.includes('/jobs/'))).toEqual(['https://a.com/jobs/acme-houdini-artist-cccc3333.html'])
+    expect(second.listings.map((l) => l.title)).toEqual(['Houdini Artist'])
+  })
+  it('never closes anything: the board is a window, not a catalogue', async () => {
+    const [board] = await indexes({ http: {}, config: cfg({ s: site }), fetcher: fakeFetcher(pages), seen: createSeenCache(), now: NOW })
+    expect(board.complete).toBe(false); expect(board.partial).toBe(true)
+  })
+  it('ids are stable across passes and a nested sitemap index is followed', async () => {
+    const nested = { 'https://a.com/sitemap.xml': '<sitemapindex><sitemap><loc>https://a.com/sitemap-jobs.xml</loc></sitemap></sitemapindex>', 'https://a.com/sitemap-jobs.xml': pages['https://a.com/sitemap.xml'], ...pages }
+    const one = await indexes({ http: {}, config: cfg({ s: site }), fetcher: fakeFetcher(nested), seen: createSeenCache(), now: NOW })
+    const two = await indexes({ http: {}, config: cfg({ s: site }), fetcher: fakeFetcher(nested), seen: createSeenCache(), now: NOW })
+    expect(one[0].seenIds).toEqual(two[0].seenIds); expect(one[0].seenIds).toHaveLength(1)
+  })
+})
+
+describe('other strategies', () => {
+  it('devquest: one data file, only recent matching jobs, direct links', async () => {
+    const data = { jobs: [
+      { id: 'a', title: 'Technical Artist', studio: 'Riot Games', url: 'https://jobs.lever.co/x/1', firstSeen: '2026-10-05T00:00:00Z', location: 'Paris', workType: 'Full-time', tech: ['Houdini'] },
+      { id: 'b', title: 'Accountant', studio: 'Riot Games', url: 'https://jobs.lever.co/x/2', firstSeen: '2026-10-05T00:00:00Z' },
+      { id: 'c', title: 'VFX Artist', studio: 'Old Studio', url: 'https://jobs.lever.co/x/3', firstSeen: '2025-01-01T00:00:00Z' },
+      { id: 'd', title: 'Level Artist', studio: 'No Link', url: '', firstSeen: '2026-10-05T00:00:00Z' },
+    ] }
+    const fetcher = fakeFetcher({ 'https://devquest.gg/jobs.js': `window.JOBS_DATA = ${JSON.stringify(data)};` })
+    const [board] = await indexes({ http: {}, config: cfg({ dq: { label: 'DevQuest', strategy: 'devquest', dataUrl: 'https://devquest.gg/jobs.js', recencyDays: 60 } }), fetcher, seen: createSeenCache(), now: NOW })
+    expect(board.listed).toBe(4); expect(board.listings.map((l) => l.title)).toEqual(['Technical Artist'])
+    expect(board.listings[0]).toMatchObject({ name: 'Riot Games', url: 'https://jobs.lever.co/x/1', location: 'Paris' })
+  })
+  it('devquest: an unexpected file shape is an error board, not a crash', async () => {
+    const [board] = await indexes({ http: {}, config: cfg({ dq: { label: 'DevQuest', strategy: 'devquest', dataUrl: 'https://devquest.gg/jobs.js', recencyDays: 60 } }), fetcher: fakeFetcher({ 'https://devquest.gg/jobs.js': '<html>blocked</html>' }), seen: createSeenCache(), now: NOW })
+    expect(board.errors[0].error).toMatch(/unexpected shape/); expect(board.partial).toBe(false)
+  })
+  it('pages: strict title filter from the link, details only for matches', async () => {
+    const fetcher = fakeFetcher({
+      'https://g.com/art-jobs': '<a href="/job/acme/technical-artist/1">x</a><a href="/job/acme/cook/2">y</a>',
+      'https://g.com/job/acme/technical-artist/1': ld(posting('Technical Artist')),
+    })
+    const [board] = await indexes({ http: {}, config: cfg({ g: { label: 'G', strategy: 'pages', base: 'https://g.com', pages: ['/art-jobs'], linkPattern: '/job/[^"]+', maxDetails: 5 } }), fetcher, seen: createSeenCache(), now: NOW })
+    expect(board.listed).toBe(2); expect(board.listings).toHaveLength(1)
+    expect(fetcher.calls).not.toContain('https://g.com/job/acme/cook/2')
+  })
+  it('cards: titles come from the cards', async () => {
+    const card = (title, href) => `<a title="${title}" class="card" data-turbo-frame="_top" href="${href}"><h3>x</h3></a>`
+    const fetcher = fakeFetcher({
+      'https://r.com/': card('Acme is hiring Senior Environment Artist (Remote Job)', 'https://r.com/jobs/1') + card('Acme is hiring Cook (Remote Job)', 'https://r.com/jobs/2'),
+      'https://r.com/jobs/1': ld(posting('Senior Environment Artist', 'Acme', { jobLocationType: 'TELECOMMUTE' })),
+    })
+    const [board] = await indexes({ http: {}, config: cfg({ r: { label: 'R', strategy: 'cards', base: 'https://r.com', pages: ['/'], maxDetails: 5 } }), fetcher, seen: createSeenCache(), now: NOW })
+    expect(board.listings).toHaveLength(1); expect(board.listings[0].workplace).toBe('Remote')
+  })
+})
+
+describe('lanes on the game-job boards', () => {
+  it('every role found on a game-job board is a games job, even one the other lane would also claim; a page he gave is sorted by its words', async () => {
+    const pages = { 'https://a.com/sitemap.xml': sitemap(['https://a.com/jobs/acme-unreal-engine-programmer-aaaa1111', '2026-10-06']), 'https://a.com/jobs/acme-unreal-engine-programmer-aaaa1111': ld(posting('Unreal Engine Programmer')),
+      'https://studio-x.com/careers': ld(posting('Unreal Engine Programmer', 'Studio X')) }
+    const site = { label: 'A', strategy: 'sitemap', sitemaps: ['https://a.com/sitemap.xml'], jobPath: '/jobs/', recencyDays: 30, maxDetails: 5 }
+    const boards = await indexes({ http: {}, config: cfg({ a: site }), fetcher: fakeFetcher(pages), seen: createSeenCache(), now: NOW, extraPages: [{ id: 's', label: 'X', url: 'https://studio-x.com/careers' }] })
+    expect(boards[0].listings[0].lane).toBe('games')
+    expect(boards[1].listings[0].lane).toBe('other')
+  })
+})
+
+describe('failure isolation and custom pages', () => {
+  it('one site failing yields its own error board and the others still answer', async () => {
+    const fetcher = fakeFetcher({ 'https://good.com/sitemap.xml': sitemap(['https://good.com/jobs/acme-technical-artist-aaaa1111', '2026-10-06']), 'https://good.com/jobs/acme-technical-artist-aaaa1111': ld(posting('Technical Artist')), 'https://bad.com/sitemap.xml': new Error('HTTP 500') })
+    const site = (host) => ({ label: host, strategy: 'sitemap', sitemaps: [`https://${host}/sitemap.xml`], jobPath: '/jobs/', recencyDays: 30, maxDetails: 5 })
+    const boards = await indexes({ http: {}, config: cfg({ bad: site('bad.com'), good: site('good.com') }), fetcher, seen: createSeenCache(), now: NOW })
+    expect(boards.map((b) => [b.key, b.listings.length, b.errors.length > 0, b.partial])).toEqual([['index:bad', 0, true, false], ['index:good', 1, false, true]])
+  })
+  it('a robots refusal is reported as such, with the reason', async () => {
+    const fetcher = { text: async () => { const e = new Error('robots.txt of a.com refuses /jobs'); e.code = 'robots'; throw e } }
+    const [board] = await indexes({ http: {}, config: cfg({ a: { label: 'A', strategy: 'devquest', dataUrl: 'https://a.com/jobs.js', recencyDays: 1 } }), fetcher, seen: createSeenCache(), now: NOW })
+    expect(board.errors[0].error).toMatch(/robots\.txt refuses/)
+  })
+  it('a page he gives: its own posting, plus the links whose title fits, one level deep, same host only', async () => {
+    const fetcher = fakeFetcher({
+      'https://studio-x.com/careers': `${ld(posting('Pipeline TD', 'Studio X'))}<a href="/careers/technical-artist-1">Technical Artist</a><a href="/careers/chef">Chef</a><a href="https://other.com/jobs/vfx-artist">VFX Artist</a>`,
+      'https://studio-x.com/careers/technical-artist-1': ld(posting('Technical Artist', 'Studio X')),
+    })
+    const boards = await indexes({ http: {}, config: cfg({}), fetcher, seen: createSeenCache(), now: NOW, extraPages: [{ id: 's1', label: 'Studio X', url: 'https://studio-x.com/careers' }] })
+    const custom = boards.at(-1)
+    expect(custom.key).toBe('index:custom-studio-x-com'); expect(custom.listings.map((l) => l.title)).toEqual(['Pipeline TD', 'Technical Artist'])
+    expect(fetcher.calls).not.toContain('https://other.com/jobs/vfx-artist')
+  })
+})
+
+describe('seen cache', () => {
+  it('forgets after its age and survives a corrupt file', async () => {
+    let clock = 1000000000000
+    const cache = createSeenCache({ maxAgeDays: 1, now: () => clock })
+    await cache.add('u'); expect(await cache.has('u')).toBe(true)
+    clock += 2 * 86400000; expect(await cache.has('u')).toBe(false)
+  })
+})

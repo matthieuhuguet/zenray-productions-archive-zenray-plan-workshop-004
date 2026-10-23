@@ -1,0 +1,117 @@
+// rename-shards.mjs — renomme TOUS les repos de contenu média vers la convention zenrayshards-<type>-<hex12>
+// (décision Matthieu 2026-07-05 : noms cryptés façon workflows Claude Code, type de média en premier).
+//
+// SÛRETÉ (vérifiée EMPIRIQUEMENT le 2026-07-05 avant d'écrire ce script, repos de test réels) :
+//   - un rename GitHub pose une redirection permanente ancien-nom -> nouveau-nom ;
+//   - raw.githubusercontent.com/<ancien-nom>/... répond 200 après rename (chemin non caché testé) ;
+//   - cdn.jsdelivr.net/gh/<ancien-nom>@sha/... répond 200 après rename (chemin non caché testé).
+//   => AUCUN manifeste existant (qui portent tous les anciens noms/URLs) ne casse. RÈGLE DURE en retour :
+//   ne JAMAIS recréer un repo avec un ancien nom, ça tuerait la redirection de tout l'historique.
+//
+// EXCLUSIONS (décision Matthieu) : zenray-data et zenray-index-public UNIQUEMENT. Tout le reste du contenu
+// est renommé. La VISIBILITÉ des repos existants n'est PAS touchée ici (les familles servies par jsDelivr
+// doivent rester publiques pour être lisibles ; les nouveaux uploads, eux, naissent privés via pipeline v2).
+//
+// CADENCE : 1 rename/seconde (tick léger demandé explicitement, anti rate-limit). ~286 repos ≈ 5 min.
+// REPRISE : idempotent — un repo déjà en zenrayshards-* est sauté ; relancer reprend où on en était.
+// SORTIE : docs/shard-rename-map.json (mapping complet ancien->nouveau, source de l'INDEX du site) +
+// commit du mapping sur zenray-data:pages/_index/storage-repos.json (consommé par la vue Index).
+//
+// Usage : GITHUB_TOKEN=$(gh auth token) node scripts/rename-shards.mjs [--dry-run]
+import { writeFile, readFile } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const token = process.env.GITHUB_TOKEN
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const DRY = process.argv.includes('--dry-run')
+if (!token) { console.error('GITHUB_TOKEN requis'); process.exit(1) }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+async function api(p, method = 'GET', body = null, tries = 4) {
+  for (let a = 0; a < tries; a++) {
+    try {
+      const r = await fetch('https://api.github.com' + p, {
+        method, headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zr', Accept: 'application/vnd.github+json' },
+        body: body ? JSON.stringify(body) : undefined,
+      })
+      return { status: r.status, json: r.status !== 204 ? await r.json().catch(() => null) : null }
+    } catch (e) { if (a === tries - 1) throw e; await sleep(3000 * (a + 1)) }
+  }
+}
+
+// famille ancien nom -> type de média de la nouvelle convention. L'ordre compte (préfixes imbriqués).
+// doc -> pdf ? NON : doc reste doc (docx/xlsx...), pdf reste pdf — types distincts déjà présents sur le site.
+const FAMILIES = [
+  [/^zenray-vidraw-\d+$/, 'vid'],
+  [/^zenray-vid-public-\d+$/, 'vid'],
+  [/^zenray-vid-\d+$/, 'vid'],
+  [/^zenray-media-\d+$/, 'vid'],                       // legacy chunks vidéo privés
+  [/^zenray-img-public-\d+$/, 'img'],
+  [/^zenray-img-private-\d+$/, 'img'],
+  [/^zenray-pdf-public-\d+$/, 'pdf'],
+  [/^zenray-doc-public-\d+$/, 'doc'],
+  [/^zenray-blob-public-\d+$/, 'blob'],
+  [/^zenray-shelf-img$/, 'img'],
+  [/^zenray-archive-thumbs-public$/, 'img'],
+  [/^zenray-productions-archive-.+$/, 'archive'],
+  [/^zenray-shards-[0-9a-f]{6,}$/, 'backup'],          // miroir backup (déjà crypté-nommé, on normalise le préfixe type)
+]
+const EXCLUDE = new Set(['zenray-data', 'zenray-index-public', 'zenray-prospects'])
+
+const all = []
+for (let page = 1; page <= 10; page++) {
+  const { status, json } = await api(`/user/repos?per_page=100&page=${page}&affiliation=owner`)
+  if (status !== 200 || !Array.isArray(json) || !json.length) break
+  all.push(...json.map((r) => ({ name: r.name, private: r.private })))
+  if (json.length < 100) break
+}
+console.log(`${all.length} repos listés`)
+
+const plan = []
+for (const r of all) {
+  if (EXCLUDE.has(r.name)) continue
+  if (r.name.startsWith('zenrayshards-')) continue // déjà à la convention
+  const fam = FAMILIES.find(([re]) => re.test(r.name))
+  if (!fam) continue // pas un repo de contenu média (code, portfolio, etc.) — jamais touché
+  plan.push({ old: r.name, neu: `zenrayshards-${fam[1]}-${randomBytes(6).toString('hex')}`, private: r.private, type: fam[1] })
+}
+console.log(`${plan.length} repos à renommer (tick 1s ≈ ${Math.ceil(plan.length / 60)} min)${DRY ? ' [DRY-RUN]' : ''}`)
+const byType = {}
+for (const p of plan) byType[p.type] = (byType[p.type] || 0) + 1
+console.log('  par type:', JSON.stringify(byType))
+
+// mapping cumulatif (reprend un éventuel fichier existant d'un run précédent interrompu)
+const mapFile = path.join(ROOT, 'docs', 'shard-rename-map.json')
+let mapping = {}
+try { mapping = JSON.parse(await readFile(mapFile, 'utf8')) } catch {}
+
+let done = 0, failed = 0
+for (const p of plan) {
+  if (DRY) { console.log(`  [dry] ${p.old} -> ${p.neu}`); continue }
+  const { status } = await api(`/repos/${OWNER}/${p.old}`, 'PATCH', { name: p.neu })
+  if (status === 200) {
+    mapping[p.old] = { neu: p.neu, type: p.type, private: p.private, at: new Date().toISOString() }
+    done++
+    console.log(`  ✓ [${done}/${plan.length}] ${p.old} -> ${p.neu}`)
+    if (done % 20 === 0) await writeFile(mapFile, JSON.stringify(mapping, null, 1)) // sauvegarde incrémentale
+  } else {
+    failed++
+    console.log(`  ✗ ÉCHEC HTTP ${status}: ${p.old}`)
+  }
+  await sleep(1000) // tick 1s demandé (anti rate-limit, jamais de batch)
+}
+await writeFile(mapFile, JSON.stringify(mapping, null, 1))
+console.log(`\n✓✓ RENAME COMPLET — ${done} renommés, ${failed} échec(s). Mapping: docs/shard-rename-map.json`)
+
+// pousse le mapping comme index de stockage consommable par le site (vue Index)
+if (!DRY && done > 0) {
+  const idxPath = 'pages/_index/storage-repos.json'
+  const { status: st0, json: j0 } = await api(`/repos/${OWNER}/zenray-data/contents/${encodeURIComponent(idxPath)}`)
+  const body = { message: 'index stockage: mapping rename zenrayshards', content: Buffer.from(JSON.stringify({ updatedAt: new Date().toISOString(), repos: mapping })).toString('base64') }
+  if (st0 === 200 && j0 && j0.sha) body.sha = j0.sha
+  const { status: st1 } = await api(`/repos/${OWNER}/zenray-data/contents/${encodeURIComponent(idxPath)}`, 'PUT', body)
+  console.log(`index stockage committé sur zenray-data: HTTP ${st1}`)
+}

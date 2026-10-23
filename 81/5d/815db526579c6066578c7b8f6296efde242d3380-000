@@ -1,0 +1,267 @@
+// 07 October 2026: Email responder and parser for ZenRay Freelance.
+// Connects to matth.huguet@gmail.com updates:
+// 1. Strictly filters out automated application acknowledgments ("we received your application", etc.)
+// 2. Detects real studio responses (interviews, questions, feedback)
+// 3. Automatically updates studio status (from contacted to replied/interview) and records messages.
+import { toIsoDate, isoDay, setStatus, addMessage } from './freelanceStudios.js'
+
+export const MATTHIEU_EMAIL = 'matth.huguet@gmail.com'
+
+// Common automated receipt acknowledgment phrases (French and English)
+const AUTO_ACK_PATTERNS = [
+  /we\s+(have\s+)?received\s+your\s+application/i,
+  /thank\s+you\s+for\s+(your\s+application|applying)/i,
+  /thanks\s+for\s+applying/i,
+  /application\s+(received|submitted|confirmation)/i,
+  /your\s+application\s+(has\s+been|was)\s+(received|submitted)/i,
+  /confirmation\s+de\s+(réception|candidature)/i,
+  /nous\s+avons\s+(bien\s+)?reçu\s+votre\s+candidature/i,
+  /candidature\s+(bien\s+)?reçue/i,
+  /candidature\s+enregistrée/i,
+  /accusé\s+de\s+réception/i,
+  /accuse\s+de\s+reception/i,
+  /has\s+received\s+your\s+application/i,
+  /automatic(ally)?\s+generated/i,
+  /do\s+not\s+reply/i,
+  /ne\s+pas\s+répondre/i,
+]
+
+// Automated sender addresses and ATS domains that send purely receipt notifications
+const AUTO_SENDER_PATTERNS = [
+  /no-?reply@/i,
+  /do-?not-?reply@/i,
+  /donotreply@/i,
+  /automated@/i,
+  /notifications?@greenhouse\.io/i,
+  /jobs@lever\.co/i,
+  /notifications?@ashbyhq\.com/i,
+  /mailer-daemon@/i,
+  /recruiting-noreply@/i,
+]
+
+// Human interview invitation keywords
+const INTERVIEW_PATTERNS = [
+  /entretien/i,
+  /interview/i,
+  /échange|echange/i,
+  /visio(conférence)?/i,
+  /disponibilit[ée]s?/i,
+  /call/i,
+  /rencontrer/i,
+  /phone\s+screen/i,
+  /time\s+to\s+speak/i,
+  /chat\s+with/i,
+]
+
+// Rejection / declined keywords
+const DECLINED_PATTERNS = [
+  /malheureusement/i,
+  /pas\s+retenu/i,
+  /autre\s+profil/i,
+  /ne\s+donnerons\s+pas\s+suite/i,
+  /unfortunately/i,
+  /not\s+(be\s+)?moving\s+forward/i,
+  /regret\s+to\s+inform/i,
+  /pursue\s+other\s+candidates/i,
+  /decided\s+not\s+to\s+move/i,
+]
+
+/**
+ * Checks if an email is merely an automated acknowledgment of application submission.
+ * Matthieu's explicit rule: "ne pas compter l'email de juste: we received your application, ça on s'en fout."
+ */
+export function isAutoAckEmail(email) {
+  if (!email || typeof email !== 'object') return false
+  const subject = String(email.subject || '').trim()
+  const body = String(email.body || email.text || '').trim()
+  const from = String(email.from || email.sender || '').trim()
+
+  // If sender is a generic no-reply bot and subject matches auto receipt
+  for (const pat of AUTO_ACK_PATTERNS) {
+    if (pat.test(subject) || pat.test(body.slice(0, 500))) return true
+  }
+
+  for (const pat of AUTO_SENDER_PATTERNS) {
+    if (pat.test(from) && (subject.toLowerCase().includes('application') || subject.toLowerCase().includes('candidature'))) {
+      return true
+    }
+  }
+
+  return false
+}
+
+/**
+ * Analyzes the intent of a genuine email reply.
+ */
+export function detectReplyIntent(email) {
+  const content = `${email?.subject || ''} ${email?.body || email?.text || ''}`.trim()
+  for (const pat of INTERVIEW_PATTERNS) {
+    if (pat.test(content)) return 'interview'
+  }
+  for (const pat of DECLINED_PATTERNS) {
+    if (pat.test(content)) return 'declined'
+  }
+  return 'replied'
+}
+
+/**
+ * Extracts a domain stem from an email address or link.
+ */
+function extractStem(str) {
+  if (!str) return ''
+  const clean = String(str).toLowerCase()
+  const domain = clean.includes('@') ? clean.split('@').pop() : clean.replace(/^https?:\/\//, '').split('/')[0]
+  return domain.replace(/^www\./, '').split('.')[0]
+}
+
+/**
+ * Matches an incoming email to a studio in the database.
+ */
+export function matchStudioFromEmail(email, studios) {
+  if (!email || !Array.isArray(studios) || !studios.length) return null
+  const from = String(email.from || email.sender || '').toLowerCase()
+  const subject = String(email.subject || '').toLowerCase()
+  const body = String(email.body || email.text || '').toLowerCase()
+  const senderStem = extractStem(from)
+
+  for (const studio of studios) {
+    if (!studio || !studio.name) continue
+    const sName = studio.name.toLowerCase()
+
+    // 1. Exact or stem match on studio name in sender domain
+    if (senderStem && sName.length > 2 && (senderStem === sName || senderStem.includes(sName) || sName.includes(senderStem))) {
+      return studio
+    }
+
+    // 2. Studio domain match if studio has a link
+    if (studio.link) {
+      const studioStem = extractStem(studio.link)
+      if (studioStem && senderStem && studioStem === senderStem) {
+        return studio
+      }
+    }
+
+    // 3. Name mentioned in subject
+    const wordRegex = new RegExp(`\\b${sName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+    if (wordRegex.test(subject)) {
+      return studio
+    }
+  }
+
+  // 4. Fallback search in body if subject was too generic
+  for (const studio of studios) {
+    if (!studio || !studio.name || studio.name.length < 4) continue
+    const sName = studio.name.toLowerCase()
+    const wordRegex = new RegExp(`\\b${sName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+    if (wordRegex.test(body.slice(0, 400))) {
+      return studio
+    }
+  }
+
+  return null
+}
+
+/**
+ * Processes a single incoming email against the studio roster.
+ * - Auto acknowledgments are ignored ("ça on s'en fout")
+ * - Real human replies are recorded and advance the studio status
+ */
+export function processIncomingEmail(email, studios, today = isoDay(), options = {}) {
+  if (!email) return { action: 'invalid', email }
+  // 12 October 2026: `studio` forces the match (a studio can own several listings, the name alone is ambiguous) and
+  // `snippetLimit` keeps a whole refusal instead of its first 600 characters.
+  // FR : `studio` impose la fiche (un studio peut avoir plusieurs annonces) et `snippetLimit` garde le refus en entier.
+  const { studio: forcedStudio = null, snippetLimit = 600 } = options
+
+  // Step 1: Check auto acknowledgment
+  if (isAutoAckEmail(email)) {
+    return {
+      action: 'ignored',
+      reason: 'auto_acknowledgment',
+      emailSubject: email.subject,
+      emailFrom: email.from,
+    }
+  }
+
+  // Step 2: Match to a studio
+  const studio = forcedStudio || matchStudioFromEmail(email, studios)
+  if (!studio) {
+    return {
+      action: 'unmatched',
+      emailSubject: email.subject,
+      emailFrom: email.from,
+    }
+  }
+
+  // Step 3: Analyze reply intent
+  const intent = detectReplyIntent(email)
+  const emailDate = toIsoDate(email.date) || today
+  const bodyText = String(email.body || email.text || '').trim()
+  const snippet = bodyText.length > snippetLimit ? `${bodyText.slice(0, snippetLimit)}…` : bodyText
+  const messageBody = `[Réponse e-mail de ${email.from || 'studio'}] ${email.subject || 'Sans objet'}\n\n${snippet}`
+
+  // Append incoming message
+  let nextStudio = addMessage(studio, {
+    text: messageBody,
+    channel: 'mail',
+    at: emailDate,
+  })
+
+  // Determine target status
+  let targetStatus = studio.status
+  if (['to_contact', 'contacted'].includes(studio.status)) {
+    targetStatus = intent === 'interview' ? 'interview' : (intent === 'declined' ? 'declined' : 'replied')
+  } else if (studio.status === 'replied' && intent === 'interview') {
+    targetStatus = 'interview'
+  }
+
+  if (targetStatus !== studio.status) {
+    const note = intent === 'interview'
+      ? 'invitation à un entretien détectée par e-mail'
+      : (intent === 'declined' ? 'refus détecté par e-mail' : 'réponse détectée par e-mail')
+    nextStudio = setStatus(nextStudio, targetStatus, emailDate, note)
+  }
+
+  return {
+    action: 'updated',
+    studioId: studio.id,
+    studioName: studio.name,
+    targetStatus,
+    intent,
+    updatedStudio: nextStudio,
+  }
+}
+
+/**
+ * Batch processes an array of incoming emails.
+ * Returns updated studios list and execution report.
+ */
+export function processEmailsBatch(emails, studios, today = isoDay()) {
+  const list = Array.isArray(emails) ? emails : []
+  let currentStudios = Array.isArray(studios) ? [...studios] : []
+  const report = {
+    total: list.length,
+    ignoredAutoAcks: 0,
+    unmatched: 0,
+    updatedCount: 0,
+    updatedStudios: [],
+  }
+
+  for (const email of list) {
+    const res = processIncomingEmail(email, currentStudios, today)
+    if (res.action === 'ignored') {
+      report.ignoredAutoAcks++
+    } else if (res.action === 'unmatched') {
+      report.unmatched++
+    } else if (res.action === 'updated' && res.updatedStudio) {
+      report.updatedCount++
+      report.updatedStudios.push({ name: res.studioName, status: res.targetStatus, intent: res.intent })
+      currentStudios = currentStudios.map((s) => s.id === res.studioId ? res.updatedStudio : s)
+    }
+  }
+
+  return {
+    studios: currentStudios,
+    report,
+  }
+}

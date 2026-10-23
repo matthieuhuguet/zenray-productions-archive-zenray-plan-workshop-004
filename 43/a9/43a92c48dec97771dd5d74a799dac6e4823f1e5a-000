@@ -1,0 +1,40 @@
+// 14 October 2026: while only the delta moves, a refresh must not download and decrypt the shards again, and must not corrupt the base.
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('../media/crypto.js', () => ({ decryptBytes: async (bytes) => bytes }))
+
+const encode = (value) => btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(value))))
+
+describe('shard base reuse', () => {
+  afterEach(() => { vi.unstubAllGlobals(); vi.resetModules() })
+
+  it('fetches each shard once across two loads when only the delta changed, and keeps the base clean', async () => {
+    vi.stubGlobal('indexedDB', undefined)
+    let deltaGeneration = 1
+    const calls = []
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const text = String(url)
+      calls.push(text.replace(/^.*zenray-index-public\/main/, ''))
+      if (text.endsWith('/head.json')) return { ok: true, json: async () => ({ builtAt: 'H1', shards: [{ h: 'one', n: 2 }, { h: 'two', part: 0, n: 1 }] }) }
+      if (text.endsWith('/delta.json')) return { ok: true, json: async () => ({ builtAt: `D${deltaGeneration}`, iv: 'x', ct: encode({ paths: [`pages/delta-${deltaGeneration}.file.json`], thumbs: { [`pages/delta-${deltaGeneration}.file.json`]: { u: 't' } }, rm: [] }) }) }
+      if (text.includes('/s/one.json')) return { ok: true, json: async () => ({ iv: 'x', ct: encode({ paths: ['pages/a.img.json', 'pages/b.img.json'], thumbs: { 'pages/a.img.json': { u: 'a' } } }) }) }
+      if (text.includes('/s/two-0.json')) return { ok: true, json: async () => ({ iv: 'x', ct: encode({ paths: ['pages/c.img.json'] }) }) }
+      return { ok: false, json: async () => null }
+    }))
+    const client = await import('./searchIndexClient.js')
+    const first = await client.loadSearchIndex()
+    expect(first.paths.sort()).toEqual(['pages/a.img.json', 'pages/b.img.json', 'pages/c.img.json', 'pages/delta-1.file.json'])
+    const shardCalls = () => calls.filter((call) => call.includes('/s/')).length
+    expect(shardCalls()).toBe(2)
+
+    // The delta moves: a new load, same shards.
+    deltaGeneration = 2
+    client.invalidateSearchIndex()
+    const second = await client.loadSearchIndex()
+    expect(shardCalls()).toBe(2)
+    expect(second.paths).toContain('pages/delta-2.file.json')
+    expect(second.paths).not.toContain('pages/delta-1.file.json')
+    expect(second.thumbs['pages/delta-1.file.json']).toBeUndefined()
+    expect(second.thumbs['pages/a.img.json']).toEqual({ u: 'a' })
+  })
+})

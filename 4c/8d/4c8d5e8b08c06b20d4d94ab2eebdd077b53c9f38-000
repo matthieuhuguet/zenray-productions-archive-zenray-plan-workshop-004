@@ -1,0 +1,35 @@
+import importlib.util, os, sys, tempfile, pathlib, subprocess, json, time, threading
+os.environ['ZR_UPLOAD_FLOWS'] = '1'
+os.environ['ZR_RETRY_WAITS_S'] = '0.1,0.1,0.1'
+spec = importlib.util.spec_from_file_location('worker', '/Users/zenray/.claude/tmp/tmp-movies-series-upload/Scripts/ProcessFilmsSequentially.py')
+w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
+
+# ---- throttle_pause ----
+assert w.throttle_pause(1) == 60 and w.throttle_pause(3) == 240 and w.throttle_pause(4) == 300 and w.throttle_pause(9) == 300
+assert w.throttle_pause(1, 'creation repo x: HTTP 403 (retry-after=600s message="blocked")') == 605
+assert w.throttle_pause(2, 'retry-after=30s') == 120
+
+# ---- ensure_manifest_online against a real bare remote ----
+tmp = pathlib.Path(tempfile.mkdtemp())
+def git(*a, cwd=None): return subprocess.run(['git', *a], cwd=cwd, capture_output=True, text=True, check=True)
+bare = tmp / 'origin.git'; git('init', '-q', '--bare', '-b', 'main', str(bare))
+clone = tmp / 'clone'; git('clone', '-q', str(bare), str(clone))
+git('config', 'user.name', 't', cwd=clone); git('config', 'user.email', 't@t', cwd=clone)
+(clone / 'pages').mkdir(); m = clone / 'pages' / 'film.mkv.media.json'
+m.write_text('{"a":1}'); git('add', '-A', cwd=clone); git('commit', '-q', '-m', 'init', cwd=clone); git('push', '-q', 'origin', 'HEAD:main', cwd=clone)
+w.CLONE = clone
+w.LOG_FILE = tmp / 'log.txt'
+@w.contextlib.contextmanager
+def nolock(label, **k): yield
+w.clone_lock = nolock
+w.time.sleep = lambda s: None
+w.ensure_manifest_online(m, 'film')                       # already online
+m.write_text('{"a":2}'); git('add', '-A', cwd=clone); git('commit', '-q', '-m', 'local only', cwd=clone)   # committed, never pushed
+w.ensure_manifest_online(m, 'film')                       # the gate pushes it, then passes
+assert git('rev-parse', 'main', cwd=bare).stdout == git('rev-parse', 'HEAD', cwd=clone).stdout
+m.write_text('{"a":3}')                                   # modified, uncommitted: cannot be online
+try:
+    w.ensure_manifest_online(m, 'film'); raise SystemExit('gate must refuse an uncommitted manifest')
+except RuntimeError as e:
+    assert 'not online' in str(e)
+print('gate tests OK')

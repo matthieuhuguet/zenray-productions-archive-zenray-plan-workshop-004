@@ -1,0 +1,72 @@
+// 5 October 2026: public tenders, the "other industries" lane. BOAMP (French public procurement, open data) and TED (European Union,
+// open API). Only notices still open for answers are kept; the deadline is stored as `validThrough`, so the page closes them by itself.
+// FR : appels d'offres publics (BOAMP et TED, API ouvertes). Seuls les avis encore ouverts sont gardes ; la date limite est `validThrough`.
+import { TENDER_PATTERN, offerId } from '../lib/Offer.mjs'
+
+// Buying licences, equipment or maintenance is not a mission he can answer; creating, developing, producing or designing is.
+// FR : acheter des licences, du materiel ou de la maintenance n'est pas une mission ; creer, developper, produire ou concevoir en est une.
+const SUPPLY = /^\s*(acquisition|fourniture|achat|location|maintenance|renouvellement)\b|\blicences?\b/i
+const MAKING = /cr[ée]ation|d[ée]veloppement|conception|r[ée]alisation|production|prestation|mod[ée]lisation|design|development|creation/i
+const isSupply = (text) => SUPPLY.test(text) && !MAKING.test(text)
+const day = (date) => date.toISOString().slice(0, 10)
+const window = (key, label, listings, errors, complete) => ({ key, label, listings, seenIds: listings.map((l) => offerId(l.sourceId)), listed: listings.length, matched: listings.length, errors, complete: false, partial: complete })
+
+export async function boamp({ http, config, now = new Date() }) {
+  const s = config.sources.boamp
+  const today = day(now)
+  const found = new Map(); const errors = []; let complete = true
+  for (const query of s.queries) {
+    try {
+      const where = `datelimitereponse >= date'${today}' AND dateparution >= date'${day(new Date(now.getTime() - s.daysBack * 86400000))}' AND nature = "APPEL_OFFRE" AND search(objet, "${query.replace(/"/g, '')}")`
+      const url = `https://boamp-datadila.opendatasoft.com/api/explore/v2.1/catalog/datasets/boamp/records?limit=${s.maxRows}&order_by=${encodeURIComponent('dateparution desc')}&where=${encodeURIComponent(where)}`
+      const data = await http.json(url)
+      for (const row of data.results || []) if (row.idweb && TENDER_PATTERN.test(String(row.objet || '')) && !isSupply(String(row.objet || ''))) found.set(row.idweb, row)
+    } catch (error) { complete = false; errors.push({ source: `boamp:${query}`, error: error.message }) }
+  }
+  const listings = [...found.values()].map((row) => ({
+    lane: 'other', sourceKey: 'boamp', sourceLabel: 'BOAMP', evidence: 'BOAMP, avis de marché public', name: String(row.nomacheteur || '').trim(), title: String(row.objet || '').trim().slice(0, 220),
+    url: row.url_avis || `https://www.boamp.fr/pages/avis/?q=idweb:${row.idweb}`, applyUrl: row.url_avis || '', sourceId: `boamp:${row.idweb}`, location: String(row.code_departement || '').replace(/[\[\]']/g, ''), country: 'FR',
+    contract: 'Appel d’offres', workplace: 'Voir le règlement de la consultation', published: row.dateparution || '', validThrough: String(row.datelimitereponse || '').slice(0, 10),
+    text: `${row.objet}. Acheteur : ${row.nomacheteur}. Procédure : ${row.procedure_libelle || 'non précisée'}. Descripteurs : ${String(row.descripteur_libelle || '').replace(/[\[\]']/g, '')}.`, careersUrl: '',
+  }))
+  return [window('boamp', 'BOAMP', listings, errors, complete)]
+}
+
+const GOODS = /equipment|machinery|apparatus|projector|screen|furniture|transformer|substation|laboratory|vehicle|event services|advertising|economic research|film|video-tape|printing|catering|cleaning|construction|building|architectural|engineering services|electrical|lighting|medical|chemical/i
+const SOFTWARE = /software|computer|multimedia|simulator|programming|information technology|web|digital|IT services|graphic|animation|virtual/i
+const pick = (value) => {
+  if (!value) return ''
+  if (typeof value === 'string') return value
+  const first = value.eng || Object.values(value)[0]
+  return Array.isArray(first) ? first[0] : first
+}
+
+export async function ted({ http, config, now = new Date() }) {
+  const s = config.sources.ted
+  const today = day(now)
+  const since = day(new Date(now.getTime() - s.daysBack * 86400000)).replace(/-/g, '')
+  const found = new Map(); const errors = []; let complete = true
+  for (const phrase of s.queries) {
+    try {
+      const data = await http.postJson('https://api.ted.europa.eu/v3/notices/search', { query: `FT~("${phrase.replace(/"/g, '')}") AND PD>=${since}`, fields: ['notice-title', 'publication-date', 'buyer-name', 'deadline-receipt-tender-date-lot', 'notice-type'], limit: s.maxRows, page: 1 })
+      for (const notice of data.notices || []) {
+        const deadline = String([].concat(notice['deadline-receipt-tender-date-lot'] || [])[0] || '').slice(0, 10)
+        if (!/^cn-/.test(String(notice['notice-type'] || '')) || !deadline || deadline < today) continue
+        // The title reads "Country – CPV category – object": the object alone must fit, and goods or events are not the work.
+        // FR : le titre se lit « Pays – categorie CPV – objet » : l'objet seul doit convenir, et les fournitures ou evenements ne sont pas le metier.
+        const [, category = '', ...rest] = String(pick(notice['notice-title'])).split(' – ')
+        const object = rest.join(' – ')
+        if ((TENDER_PATTERN.test(object) || SOFTWARE.test(category)) && !GOODS.test(category)) found.set(`${object}|${pick(notice['buyer-name'])}`, { notice, deadline })
+      }
+    } catch (error) { complete = false; errors.push({ source: `ted:${phrase}`, error: error.message }) }
+  }
+  const listings = [...found.values()].map(({ notice, deadline }) => {
+    const number = notice['publication-number']
+    return {
+      lane: 'other', sourceKey: 'ted', sourceLabel: 'TED (Union européenne)', evidence: 'TED, avis de marché de l’Union européenne', name: String(pick(notice['buyer-name'])).trim(), title: String(pick(notice['notice-title'])).trim().slice(0, 220),
+      url: `https://ted.europa.eu/en/notice/${number}/html`, applyUrl: `https://ted.europa.eu/en/notice/${number}/html`, sourceId: `ted:${number}`, location: '', country: '', contract: 'Appel d’offres', workplace: 'Voir les documents de la consultation',
+      published: String(notice['publication-date'] || '').slice(0, 10), validThrough: deadline, text: `${pick(notice['notice-title'])}. Acheteur : ${pick(notice['buyer-name'])}.`, careersUrl: '',
+    }
+  }).filter((listing) => listing.name && listing.title)
+  return [window('ted', 'TED (Union européenne)', listings, errors, complete)]
+}

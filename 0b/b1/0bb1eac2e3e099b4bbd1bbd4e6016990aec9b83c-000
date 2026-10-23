@@ -1,0 +1,103 @@
+// 9 October 2026, 01:34 CEST: Build temporary thumbnails from existing, bounded cloud archives.
+import { makeThumbWebp } from '../capture/thumbnailer.js'
+import { downloadUrls, effectiveManifest } from './archiveChunks.js'
+import { assembleBlobUrl } from './fetchAsset.js'
+import { mimeForName } from './fileKinds.js'
+import { readPageCached } from './manifestReadCache.js'
+
+export const LINKED_GALLERY_THUMB_MAX_BYTES = 16 * 1024 * 1024
+const CACHE_LIMIT = 36
+const MAX_ACTIVE_READS = 2
+const cache = new Map()
+const queue = []
+let activeReads = 0
+
+function runLimited(task) {
+  return new Promise((resolve, reject) => {
+    queue.push({ task, resolve, reject })
+    drainQueue()
+  })
+}
+
+function drainQueue() {
+  while (activeReads < MAX_ACTIVE_READS && queue.length) {
+    const job = queue.shift()
+    activeReads += 1
+    Promise.resolve().then(job.task).then(job.resolve, job.reject).finally(() => {
+      activeReads -= 1
+      drainQueue()
+    })
+  }
+}
+
+function trimCache() {
+  while (cache.size > CACHE_LIMIT) {
+    const oldest = [...cache].find(([, entry]) => !entry.pending)
+    if (!oldest) return
+    cache.delete(oldest[0])
+  }
+}
+
+function remember(key, promise) {
+  const entry = { promise, pending: true }
+  cache.set(key, entry)
+  promise.then((result) => {
+    entry.pending = false
+    if (result.status === 'unavailable' && cache.get(key) === entry) cache.delete(key)
+    trimCache()
+  }, () => {
+    if (cache.get(key) === entry) cache.delete(key)
+  })
+  trimCache()
+  return promise
+}
+
+function imageMime(file, manifest) {
+  const byName = mimeForName(file.name || '')
+  return byName !== 'application/octet-stream' ? byName : (manifest.mime || file.mime || '')
+}
+
+async function buildPreview(file) {
+  const query = `/api/page?action=read&path=${encodeURIComponent(file.contentPath)}`
+  const response = await readPageCached(query)
+  if (!response || response.missing || !response.markdown) return { status: 'unavailable' }
+
+  let sourceManifest
+  try { sourceManifest = JSON.parse(response.markdown) } catch { return { status: 'unavailable' } }
+  if (!sourceManifest || typeof sourceManifest !== 'object') return { status: 'unavailable' }
+
+  const manifest = effectiveManifest(sourceManifest)
+  const mime = imageMime(file, manifest)
+  if (!mime.startsWith('image/')) return { status: 'unsupported' }
+  if (manifest.thumb) return { status: 'remote', src: manifest.thumb }
+  if (manifest.iv || manifest.encrypted) return { status: 'encrypted' }
+
+  const size = Number(manifest.size)
+  if (!Number.isFinite(size) || size < 1) return { status: 'unavailable' }
+  if (size > LINKED_GALLERY_THUMB_MAX_BYTES) return { status: 'too-large' }
+
+  const assembledUrl = await assembleBlobUrl({ urls: downloadUrls(manifest), mime })
+  try {
+    const assetResponse = await fetch(assembledUrl)
+    if (!assetResponse.ok) throw new Error(`Archive preview returned HTTP ${assetResponse.status}`)
+    const original = await assetResponse.blob()
+    if (original.size > LINKED_GALLERY_THUMB_MAX_BYTES) return { status: 'too-large' }
+    const thumbnail = await makeThumbWebp(original)
+    return thumbnail ? { status: 'generated', blob: thumbnail } : { status: 'unavailable' }
+  } finally {
+    if (assembledUrl.startsWith('blob:')) URL.revokeObjectURL(assembledUrl)
+  }
+}
+
+export function loadLinkedGalleryImagePreview(file) {
+  if (!file?.contentPath || !file.contentPath.endsWith('.file.json')) return Promise.resolve({ status: 'unsupported' })
+  const cached = cache.get(file.contentPath)
+  if (cached) {
+    cache.delete(file.contentPath)
+    cache.set(file.contentPath, cached)
+    return cached.promise
+  }
+
+  const promise = runLimited(() => buildPreview(file)).catch(() => ({ status: 'unavailable' }))
+  return remember(file.contentPath, promise)
+}

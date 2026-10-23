@@ -1,0 +1,819 @@
+// Upload d'un binaire vers un SHARD PRIVÉ (zenray-media-NN) avec rollover automatique.
+// Stateless, 3 actions :
+//  - 'active-shard' : renvoie le shard actif {repo}, en crée un nouveau si le courant est plein (>=4,5 Go).
+//  - 'blob'         : crée un git blob dans un shard donné -> {sha}.
+//  - 'commit'       : 1 commit atomique (base_tree+tree+commit+ref) dans le shard avec des files,
+//                     puis incrémente le compteur d'octets dans pages/.zr-drive.json (zenray-data).
+// L'anonymisation est faite côté appelant : il fournit déjà les chemins hashés.
+import { shardRe, parseShard, nextShard, driveStatePath, defaultShard, isPublic } from './shard-naming.js'
+
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const CONTENT_REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const CONTENT_BRANCH = process.env.CONTENT_BRANCH || 'main'
+const SHARD_BRANCH = 'main'
+// CAPS avec MARGE DE CONCURRENCE (audit Z). Sans lock distribué, deux active-shard concurrents peuvent lire le
+// même compteur `bytes` avant de pousser et tous deux dépasser. On baisse donc les seuils pour ABSORBER ce
+// dépassement et rester SOUS les 5 Go GitHub même en cas de course : rollover à 4,3 Go, dur à 4,6 Go (≈0,4 Go
+// de coussin). Le bump du compteur est déjà atomique (sha + retry 409). Un vrai lock = sur-ingénierie ici.
+const ROLLOVER_BYTES = 4.3 * 1024 * 1024 * 1024 // 4,3 Go : bascule sur un nouveau shard au-delà.
+const HARD_BYTES = 4.6 * 1024 * 1024 * 1024 // 4,6 Go : limite dure (marge sous 5 Go pour overshoot concurrent), pré-check `need`.
+// Toute la validation des noms de shard (blob/commit/purge/move/familles) utilise shardRe (server/shard-naming.js),
+// qui accepte le nouveau schéma zenray-<kind>-<vis>-NN ET les legacy zenray-media-NN / zenray-vid-NN.
+
+// --- shards VIDÉO PUBLICS (segments HLS chiffrés, servis par jsDelivr) -------------------------------
+// Jumeaux EXACTS du mécanisme images zenray-media-NN, MAIS : repos PUBLICS (private:false) et état
+// stocké dans un fichier SÉPARÉ pour ne jamais mélanger le comptage images (privé) et vidéo (public).
+const VID_DRIVE_STATE_PATH = 'pages/.zr-vid-drive.json'
+const VID_ROLLOVER_BYTES = 4.3 * 1024 * 1024 * 1024 // 4,3 Go : seuil de bascule du shard vidéo actif (marge concurrence).
+const VID_HARD_CAP_BYTES = 4.6 * 1024 * 1024 * 1024 // 4,6 Go : si la vidéo ferait dépasser ça -> rollover anticipé.
+const VID_SHARD_RE = /^zenray-vid(-public)?-\d{2,}$/ // HARMONISÉ : nouveau zenray-vid-public-NN + legacy
+const VID_DEFAULT_SHARD = process.env.PUBLIC_MEDIA_REPO || 'zenray-vid-01'
+
+const isB64 = (s) => typeof s === 'string' && s.length > 0 && /^[A-Za-z0-9+/=\r\n]+$/.test(s)
+const safePath = (p) => typeof p === 'string' && p.length > 0 && !p.includes('..') && !p.startsWith('/')
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+import { instrument } from './cmdlog.js'
+const ghAbsRaw = (token, path, init = {}) =>
+  fetch(`https://api.github.com/${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) },
+  })
+// Extrait "<repo>" d'un chemin "repos/<owner>/<repo>/..." pour la colonne repo du journal.
+const repoFromAbs = (path) => { const m = /^repos\/[^/]+\/([^/]+)/.exec(path || ''); return m ? m[1] : null }
+const ghAbs = instrument(ghAbsRaw, {
+  repoOf: (args) => repoFromAbs(args[1]),
+  pathOf: (args) => args[1],
+  initOf: (args) => args[2] || {},
+})
+// Appel sur un repo du compte (OWNER/<repo>/...).
+function ghRepo(token, repo, path, init = {}) {
+  return ghAbs(token, `repos/${OWNER}/${repo}/${path}`, init)
+}
+
+// D — 403 GRACIEUX (jumeau de rlInfo dans server/page.js) : détecte un rate-limit GitHub sur une réponse
+// non-ok. GitHub renvoie soit la limite PRIMAIRE (403/429, x-ratelimit-remaining:0, reset à l'heure pile),
+// soit une limite SECONDAIRE/anti-abus (403 avec un header Retry-After, x-ratelimit-remaining pouvant
+// rester > 0 — c'est un throttle de RYTHME de requêtes, indépendant du compteur horaire). Ne détecter QUE
+// remaining:0 rate le cas secondaire — exactement le bug qui a fait échouer un import (2026-07-02) : plusieurs
+// commits concurrents (4 fichiers en parallèle) déclenchent l'anti-abus GitHub bien avant d'épuiser les 5000/h.
+const rlInfo = (r) => {
+  if (!r || !r.headers) return {}
+  const retryAfter = Number(r.headers.get('retry-after'))
+  const rem = r.headers.get('x-ratelimit-remaining')
+  const limited = r.status === 429 || (r.status === 403 && (rem === '0' || Number.isFinite(retryAfter)))
+  if (!limited) return {}
+  const reset = r.headers.get('x-ratelimit-reset')
+  const resetAt = Number.isFinite(retryAfter) && retryAfter > 0
+    ? Date.now() + retryAfter * 1000
+    : reset ? Number(reset) * 1000 : (Date.now() + 60000)
+  return { rateLimited: true, resetAt }
+}
+
+// Retry générique avec backoff progressif. fn renvoie un Response.
+// On retente sur erreur réseau, sur 5xx (panne GitHub) et sur 409/422 (course / ref non encore prête).
+// RATE-LIMIT (2026-07-02) : sur un 403/429 rate-limité, on attend le VRAI temps indiqué par GitHub (Retry-After
+// ou x-ratelimit-reset) au lieu du backoff fixe — mais SEULEMENT si l'attente tient dans le budget de la
+// fonction serverless (maxDuration 60s, cf. vercel.json) ; sinon on abandonne avec la réponse rate-limitée
+// telle quelle (le caller peut alors la détecter via rlInfo() et répondre {rateLimited:true, resetAt} au client,
+// qui sait déjà attendre + reprogrammer un seul re-fetch, cf. markRateLimited côté App.jsx).
+async function ghRetry(fn, { tries = 5, baseMs = 600, retryOn = (r) => r.status >= 500 || r.status === 409 } = {}) {
+  let last = null
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fn()
+      if (r.ok) return r
+      const rl = rlInfo(r)
+      if (rl.rateLimited && i < tries - 1) {
+        const waitMs = rl.resetAt - Date.now()
+        if (waitMs > 0 && waitMs < 20000) { await sleep(waitMs + 250); continue }
+        return r // attente trop longue pour ce budget : on abandonne, le caller lira rlInfo(r) lui-même
+      }
+      if (!retryOn(r)) return r
+      last = r
+    } catch (e) {
+      last = null
+    }
+    if (i < tries - 1) await sleep(baseMs * (i + 1))
+  }
+  return last
+}
+
+// Attend qu'un repo fraîchement créé réponde ET que sa branche main porte un commit (sinon les
+// commits Git Data API échouent : la ref n'existe pas encore). auto_init crée la ref de façon asynchrone.
+async function waitShardReady(token, name, { tries = 12, delayMs = 1500 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    const pr = await ghAbs(token, `repos/${OWNER}/${name}`)
+    if (pr.ok) {
+      const rr = await ghRepo(token, name, `git/ref/heads/${SHARD_BRANCH}`)
+      if (rr.ok) return true
+    }
+    await sleep(delayMs)
+  }
+  return false
+}
+
+const README_BODY = `# ZenRay media shard
+
+Magasin d'assets media **prive** de l'application ZenRay.
+
+Ce depot fait partie d'un drive shorde facon Git-LFS : les fichiers binaires
+(images, chunks media) sont stockes sous des noms **hashes**, repartis sur
+plusieurs depots \`zenray-media-NN\` quand l'un d'eux approche la limite GitHub
+(~5 Go). L'etat de remplissage est suivi dans \`pages/.zr-drive.json\` du depot
+\`zenray-data\`.
+
+Ne rien committer a la main ici : toutes les ecritures passent par l'API
+serveur de ZenRay (Git Data API). Editer ce depot manuellement peut corrompre
+le drive.
+`
+
+// Pose un README.md honnête dans un shard fraîchement créé.
+// auto_init a déjà créé un README par défaut (un SHA existe) : on l'écrase via contents API en passant son sha.
+// Best-effort : un échec ne casse jamais le rollover.
+async function ensureShardReadme(token, name) {
+  try {
+    let sha = null
+    const g = await ghRepo(token, name, `contents/README.md?ref=${SHARD_BRANCH}`)
+    if (g.ok) { try { sha = (await g.json()).sha || null } catch {} }
+    const put = () => ghRepo(token, name, 'contents/README.md', {
+      method: 'PUT',
+      body: JSON.stringify({
+        message: 'shard: README',
+        content: Buffer.from(README_BODY, 'utf8').toString('base64'),
+        branch: SHARD_BRANCH,
+        ...(sha ? { sha } : {}),
+      }),
+    })
+    await ghRetry(put, { tries: 3, retryOn: (r) => r.status >= 500 || r.status === 409 })
+  } catch {}
+}
+
+// NB : l'état img/private (pages/.zr-drive.json) est désormais lu/écrit par readFamilyState/writeFamilyState
+// (driveStatePath(img,private) y pointe). L'ancien trio readDriveState/writeDriveState/nextShardName a été
+// retiré : il était spécifique au nom legacy zenray-media-NN, que l'on n'attribue plus aux FUTURS shards.
+
+// --- état des shards VIDÉO PUBLICS (pages/.zr-vid-drive.json dans zenray-data) -----------------------
+// Copie de readDriveState/writeDriveState/nextShardName, mais sur le fichier d'état vidéo et la regex
+// zenray-vid-NN. Défaut {active:'zenray-vid-01', bytes:0}.
+async function readVidDriveState(token) {
+  const r = await ghAbs(token, `repos/${CONTENT_REPO}/contents/${encodeURI(VID_DRIVE_STATE_PATH)}?ref=${CONTENT_BRANCH}`)
+  if (r.status === 404) return { state: { active: VID_DEFAULT_SHARD, bytes: 0 }, sha: null }
+  if (!r.ok) return null
+  const j = await r.json()
+  let state = { active: VID_DEFAULT_SHARD, bytes: 0 }
+  try { state = { ...state, ...JSON.parse(Buffer.from(j.content || '', 'base64').toString('utf8')) } } catch {}
+  if (!VID_SHARD_RE.test(String(state.active))) state.active = VID_DEFAULT_SHARD
+  if (!Number.isFinite(Number(state.bytes))) state.bytes = 0
+  return { state, sha: j.sha || null }
+}
+
+async function writeVidDriveState(token, state, sha) {
+  const body = {
+    message: 'vid-drive: state ' + state.active,
+    content: Buffer.from(JSON.stringify(state, null, 2), 'utf8').toString('base64'),
+    branch: CONTENT_BRANCH,
+    ...(sha ? { sha } : {}),
+  }
+  return ghAbs(token, `repos/${CONTENT_REPO}/contents/${encodeURI(VID_DRIVE_STATE_PATH)}`, { method: 'PUT', body: JSON.stringify(body) })
+}
+
+const nextVidShardName = (cur) => {
+  const n = parseInt(String(cur).replace('zenray-vid-', ''), 10) || 1
+  return `zenray-vid-${String(n + 1).padStart(2, '0')}`
+}
+
+const VID_README_BODY = `# ZenRay video shard (PUBLIC)
+
+Dépôt **public** d'assets vidéo de l'application ZenRay.
+
+Il stocke des **segments HLS chiffrés (AES-128)**, nommés par leur empreinte SHA-256
+et servis via jsDelivr (cache immuable pinné sur le commit). Les fichiers sont publics
+mais **illisibles sans la clé AES**, qui n'est JAMAIS ici (elle vit dans un dépôt privé).
+
+Quand un shard approche ~5 Go, l'application en crée automatiquement un suivant
+(\`zenray-vid-NN\`). L'état de remplissage est suivi dans \`pages/.zr-vid-drive.json\`
+du dépôt privé \`zenray-data\`.
+
+Ne rien committer à la main ici : toutes les écritures passent par l'API serveur
+(Git Data API).
+`
+
+// README honnête dans un shard VIDÉO public fraîchement créé (best-effort, jumeau d'ensureShardReadme).
+async function ensureVidShardReadme(token, name) {
+  try {
+    let sha = null
+    const g = await ghRepo(token, name, `contents/README.md?ref=${SHARD_BRANCH}`)
+    if (g.ok) { try { sha = (await g.json()).sha || null } catch {} }
+    const put = () => ghRepo(token, name, 'contents/README.md', {
+      method: 'PUT',
+      body: JSON.stringify({
+        message: 'vid-shard: README',
+        content: Buffer.from(VID_README_BODY, 'utf8').toString('base64'),
+        branch: SHARD_BRANCH,
+        ...(sha ? { sha } : {}),
+      }),
+    })
+    await ghRetry(put, { tries: 3, retryOn: (r) => r.status >= 500 || r.status === 409 })
+  } catch {}
+}
+
+// --- ÉTAT GÉNÉRIQUE par famille (kind+vis) -----------------------------------------------------------
+// Un fichier d'état PAR FAMILLE dans zenray-data (privé), chemin déduit par driveStatePath(kind,vis) :
+//   (img,private) -> pages/.zr-drive.json (LEGACY, partagé avec readDriveState ci-dessus)
+//   (vid,public)  -> pages/.zr-vid-drive.json (LEGACY)
+//   sinon         -> pages/.zr-drive-<kind>-<vis>.json
+// Schéma de l'état : { active:'<repo>', bytes:<number> }. Absent (404) -> défaut {active:defaultShard, bytes:0}.
+async function readFamilyState(token, kind, vis) {
+  const path = driveStatePath(kind, vis)
+  const def = { active: defaultShard(kind, vis), bytes: 0 }
+  const r = await ghAbs(token, `repos/${CONTENT_REPO}/contents/${encodeURI(path)}?ref=${CONTENT_BRANCH}`)
+  if (r.status === 404) return { state: { ...def }, sha: null }
+  if (!r.ok) return null
+  const j = await r.json()
+  let state = { ...def }
+  try { state = { ...state, ...JSON.parse(Buffer.from(j.content || '', 'base64').toString('utf8')) } } catch {}
+  // Garde : l'`active` lu doit appartenir à la BONNE famille (sinon on retombe sur le défaut, jamais de mélange).
+  const p = parseShard(String(state.active))
+  if (!p || p.kind !== kind || p.vis !== vis) state.active = def.active
+  if (!Number.isFinite(Number(state.bytes))) state.bytes = 0
+  return { state, sha: j.sha || null }
+}
+
+async function writeFamilyState(token, kind, vis, state, sha) {
+  const path = driveStatePath(kind, vis)
+  const body = {
+    message: 'drive: state ' + state.active,
+    content: Buffer.from(JSON.stringify(state, null, 2), 'utf8').toString('base64'),
+    branch: CONTENT_BRANCH,
+    ...(sha ? { sha } : {}),
+  }
+  return ghAbs(token, `repos/${CONTENT_REPO}/contents/${encodeURI(path)}`, { method: 'PUT', body: JSON.stringify(body) })
+}
+
+// README/description anonymisés pour un shard PUBLIC (toute famille publique, ex zenray-img-public-NN).
+// Aucun nom humain : fichiers nommés par empreinte SHA-256, servis via jsDelivr, écritures par API serveur.
+const PUBLIC_README_BODY = `# ZenRay public shard
+
+Dépôt **public** d'assets ZenRay.
+
+Les fichiers sont nommés par leur **empreinte SHA-256** (\`ab/cd/<hash>.<ext>\`) accompagnés
+d'une vignette \`.webp\`, et servis via **jsDelivr** (cache immuable pinné sur le commit).
+Aucun nom humain n'apparaît : seuls des chemins hashés.
+
+Quand un shard approche ~5 Go, l'application en crée automatiquement un suivant. L'état de
+remplissage est suivi dans un fichier d'état du dépôt privé \`zenray-data\`.
+
+Ne rien committer à la main ici : toutes les écritures passent par l'API serveur (Git Data API).
+`
+
+// README honnête sur un shard fraîchement créé (public OU privé non-legacy). Best-effort.
+async function ensureFamilyReadme(token, name, pub) {
+  try {
+    let sha = null
+    const g = await ghRepo(token, name, `contents/README.md?ref=${SHARD_BRANCH}`)
+    if (g.ok) { try { sha = (await g.json()).sha || null } catch {} }
+    const put = () => ghRepo(token, name, 'contents/README.md', {
+      method: 'PUT',
+      body: JSON.stringify({
+        message: 'shard: README',
+        content: Buffer.from(pub ? PUBLIC_README_BODY : README_BODY, 'utf8').toString('base64'),
+        branch: SHARD_BRANCH,
+        ...(sha ? { sha } : {}),
+      }),
+    })
+    await ghRetry(put, { tries: 3, retryOn: (r) => r.status >= 500 || r.status === 409 })
+  } catch {}
+}
+
+// Incrémente (ou décrémente si delta<0) le compteur d'octets de la BONNE famille, dérivée de `repo`.
+// Best-effort, borné à 4 tentatives (course possible sur le sha). N'incrémente que si `repo` est l'actif
+// de sa famille (sinon ces octets sont sur un shard déjà roulé, plus l'actif).
+async function bumpFamilyBytes(token, repo, delta) {
+  const p = parseShard(repo)
+  if (!p || !Number.isFinite(delta) || delta === 0) return
+  for (let i = 0; i < 4; i++) {
+    const ds = await readFamilyState(token, p.kind, p.vis)
+    if (!ds) break
+    if (ds.state.active !== repo) break
+    const newState = { active: repo, bytes: Math.max(0, Number(ds.state.bytes || 0) + delta) }
+    const wr = await writeFamilyState(token, p.kind, p.vis, newState, ds.sha)
+    if (wr && wr.ok) break
+    if (!wr || (wr.status !== 409 && wr.status < 500)) break
+    await sleep(400 * (i + 1))
+  }
+}
+
+// Commit ATOMIQUE de `treeEntries` ([{path,mode,type,sha}]) sur la branche main de `repo`, avec re-tentative
+// fast-forward (force:false) si HEAD a bougé entre-temps : on reconstruit tree+commit sur le HEAD frais à
+// chaque essai. Renvoie { commit } en succès, { error } sinon. Source de vérité UNIQUE du commit (utilisée par
+// l'action 'commit' ET par 'move-blob'), pour ne pas dupliquer la logique fragile de PATCH ref.
+async function commitFiles(token, repo, treeEntries, message) {
+  let newCommit = null
+  let lastErr = 'ref-update'
+  let lastRl = null // {rateLimited, resetAt} de la dernière réponse rate-limitée rencontrée, propagé si abandon définitif
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const refR = await ghRetry(() => ghRepo(token, repo, `git/ref/heads/${SHARD_BRANCH}`), { tries: 4, retryOn: (r) => r.status >= 500 || r.status === 404 })
+    if (!refR || !refR.ok) { lastErr = 'ref'; if (refR) lastRl = rlInfo(refR); break }
+    const headSha = (await refR.json()).object.sha
+    const commitR = await ghRetry(() => ghRepo(token, repo, `git/commits/${headSha}`), { tries: 3, retryOn: (r) => r.status >= 500 })
+    if (!commitR || !commitR.ok) { lastErr = 'head-commit'; if (commitR) lastRl = rlInfo(commitR); break }
+    const baseTree = (await commitR.json()).tree.sha
+
+    const tr = await ghRetry(() => ghRepo(token, repo, 'git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree: treeEntries }) }), { tries: 3, retryOn: (r) => r.status >= 500 })
+    if (!tr || !tr.ok) { const t = tr ? await tr.text() : 'network'; lastErr = 'tree ' + String(t).slice(0, 120); if (tr) lastRl = rlInfo(tr); break }
+    const newTree = (await tr.json()).sha
+
+    const cr2 = await ghRetry(() => ghRepo(token, repo, 'git/commits', { method: 'POST', body: JSON.stringify({ message, tree: newTree, parents: [headSha] }) }), { tries: 3, retryOn: (r) => r.status >= 500 })
+    if (!cr2 || !cr2.ok) { const t = cr2 ? await cr2.text() : 'network'; lastErr = 'commit ' + String(t).slice(0, 120); if (cr2) lastRl = rlInfo(cr2); break }
+    const candidate = (await cr2.json()).sha
+
+    // PATCH ref EN DERNIER : tant que ce PATCH n'a pas lieu, rien n'est visible (blobs orphelins GC'd).
+    const pr = await ghRepo(token, repo, `git/refs/heads/${SHARD_BRANCH}`, { method: 'PATCH', body: JSON.stringify({ sha: candidate, force: false }) })
+    if (pr.ok) { newCommit = candidate; break }
+    const t = await pr.text(); lastErr = 'ref-update ' + String(t).slice(0, 120)
+    // RATE-LIMIT (2026-07-02) : un PATCH ref concurrent (4 imports en parallèle sur le même shard) déclenche
+    // facilement l'anti-abus GitHub. Avant ce fix, un 403 ici cassait l'import IMMÉDIATEMENT (aucune des
+    // conditions ci-dessous ne matchait un 403 hors quota épuisé) — c'est la cause probable du "Import échoué"
+    // observé en prod sur un batch de plusieurs dizaines de photos. On attend le VRAI temps indiqué si c'est
+    // court, sinon on abandonne proprement en propageant rateLimited/resetAt (au lieu d'un message générique).
+    const rl = rlInfo(pr)
+    if (rl.rateLimited) {
+      lastRl = rl
+      const waitMs = rl.resetAt - Date.now()
+      if (waitMs > 0 && waitMs < 20000) { await sleep(waitMs + 250); continue }
+      break
+    }
+    // 422 = non fast-forward (HEAD a bougé) ; 5xx = panne transitoire -> on refait un tour sur HEAD frais.
+    if (pr.status !== 422 && pr.status < 500) break
+    await sleep(500 * (attempt + 1))
+  }
+  if (newCommit) return { commit: newCommit }
+  return { error: lastErr, ...(lastRl && lastRl.rateLimited ? lastRl : {}) }
+}
+
+export const config = { api: { bodyParser: { sizeLimit: '8mb' } } }
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(200).json({ error: 'no-token' })
+  res.setHeader('Cache-Control', 'no-store')
+  if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return res.status(405).end() }
+
+  let body = req.body
+  if (typeof body === 'string') { try { body = JSON.parse(body) } catch { body = {} } }
+  const action = body && body.action
+
+  try {
+    // 1) active-shard : renvoie le shard actif de la famille (kind,vis), avec rollover auto si plein.
+    //    RÉTRO-COMPAT STRICTE : appel SANS kind/vis = ancien flux EXACT (img/private, .zr-drive.json,
+    //    zenray-media-NN) -> on tombe dans le bloc legacy plus bas, inchangé.
+    if (action === 'active-shard' && body.kind && body.vis) {
+      const kind = String(body.kind)
+      const vis = String(body.vis)
+      const pub = isPublic(vis)
+      const need = Math.max(0, Number(body.need) || 0)
+
+      const ds = await readFamilyState(token, kind, vis)
+      if (!ds) return res.status(200).json({ error: 'github', detail: 'drive-state' })
+      let { state, sha } = ds
+
+      // Pré-check de taille comme la vidéo : on bascule AVANT le push si le shard dépasse le seuil doux
+      // (4,5 Go) OU si y ajouter `need` dépasserait la limite dure (4,9 Go, sous les 5 Go GitHub).
+      if (Number(state.bytes) < ROLLOVER_BYTES && (Number(state.bytes) + need) < HARD_BYTES) {
+        // PREMIÈRE FOIS pour cette famille (aucun fichier d'état -> sha null) : le shard -01 n'existe pas encore
+        // sur GitHub (la création n'avait lieu qu'au rollover). Sans ça, le tout premier upload d'un nouveau type
+        // (doc/audio public…) pousserait vers un repo inexistant -> échec. On crée donc le -01 ici (tolère 422 si
+        // déjà présent), on attend qu'il soit prêt + README, puis on écrit l'état initial.
+        if (!sha) {
+          const description0 = pub
+            ? 'ZenRay drive — shard PUBLIC (fichiers hashés SHA-256, servis via jsDelivr, aucun nom humain)'
+            : 'ZenRay drive — shard privé (fichiers hashés SHA-256)'
+          const cr0 = await ghRetry(
+            () => ghAbs(token, 'user/repos', { method: 'POST', body: JSON.stringify({ name: state.active, private: !pub, description: description0, auto_init: true }) }),
+            { tries: 4, retryOn: (r) => r.status >= 500 }
+          )
+          if (!cr0 || (!cr0.ok && cr0.status !== 422)) { const t = cr0 ? await cr0.text() : 'network'; return res.status(200).json({ error: 'github', detail: 'create-shard ' + String(t).slice(0, 120) }) }
+          await waitShardReady(token, state.active)
+          await ensureFamilyReadme(token, state.active, pub)
+          await writeFamilyState(token, kind, vis, { active: state.active, bytes: 0 }, sha)
+        }
+        return res.status(200).json({ ok: true, repo: state.active, bytes: Number(state.bytes) })
+      }
+
+      // Shard plein : créer le suivant (private:!pub), attendre qu'il soit prêt, README, basculer l'état.
+      const name = nextShard(state.active)
+      const description = pub
+        ? 'ZenRay drive — shard PUBLIC (fichiers hashés SHA-256, servis via jsDelivr, aucun nom humain)'
+        : 'ZenRay drive — shard privé (fichiers hashés SHA-256)'
+      const cr = await ghRetry(
+        () => ghAbs(token, 'user/repos', { method: 'POST', body: JSON.stringify({ name, private: !pub, description, auto_init: true }) }),
+        { tries: 4, retryOn: (r) => r.status >= 500 }
+      )
+      if (!cr || (!cr.ok && cr.status !== 422)) { const t = cr ? await cr.text() : 'network'; return res.status(200).json({ error: 'github', detail: 'create-shard ' + String(t).slice(0, 120) }) }
+
+      const ready = await waitShardReady(token, name)
+      if (!ready) return res.status(200).json({ error: 'github', detail: 'shard-not-ready' })
+
+      await ensureFamilyReadme(token, name, pub)
+
+      let wr = await ghRetry(() => writeFamilyState(token, kind, vis, { active: name, bytes: 0 }, sha), { tries: 3, retryOn: (r) => r.status >= 500 })
+      if (wr && wr.status === 409) {
+        const fresh = await readFamilyState(token, kind, vis)
+        if (fresh) wr = await writeFamilyState(token, kind, vis, { active: name, bytes: 0 }, fresh.sha)
+      }
+      if (!wr || !wr.ok) { const t = wr ? await wr.text() : 'network'; return res.status(200).json({ error: 'github', detail: 'state-write ' + String(t).slice(0, 120) }) }
+      return res.status(200).json({ ok: true, repo: name, bytes: 0, rolledOver: true })
+    }
+
+    // 1) active-shard (LEGACY, sans kind/vis) : renvoie le shard actif img/private, rollover auto si plein.
+    //    RENAME (objectif 1) : ce flux DÉLÈGUE désormais à la logique GÉNÉRIQUE de la famille (img,private).
+    //    Conséquences voulues :
+    //      - le fichier d'état reste pages/.zr-drive.json (driveStatePath(img,private) y pointe) -> ZÉRO
+    //        migration du privé existant ;
+    //      - mais le PROCHAIN shard créé prend le NOUVEAU nom zenray-img-private-NN (via nextShard/defaultShard),
+    //        plus zenray-media-NN. Les anciens zenray-media-NN restent lus (parseShard les accepte).
+    //    Contrat client INCHANGÉ : appel {action:'active-shard'} sans args -> réponse {ok,repo,bytes}.
+    if (action === 'active-shard') {
+      const kind = 'img', vis = 'private'
+      const need = Math.max(0, Number(body.need) || 0)
+
+      const ds = await readFamilyState(token, kind, vis)
+      if (!ds) return res.status(200).json({ error: 'github', detail: 'drive-state' })
+      let { state, sha } = ds
+
+      // Pré-check de taille (aligné sur la branche générique) : on bascule AVANT le push si le shard dépasse
+      // le seuil doux (4,5 Go) OU si y ajouter `need` dépasserait la limite dure (4,9 Go, sous les 5 Go GitHub).
+      if (Number(state.bytes) < ROLLOVER_BYTES && (Number(state.bytes) + need) < HARD_BYTES) {
+        return res.status(200).json({ ok: true, repo: state.active, bytes: Number(state.bytes) })
+      }
+
+      // Shard plein : créer le suivant (zenray-img-private-NN), attendre qu'il soit prêt, README, basculer l'état.
+      const name = nextShard(state.active)
+      const cr = await ghRetry(
+        () => ghAbs(token, 'user/repos', { method: 'POST', body: JSON.stringify({ name, private: true, description: 'ZenRay drive — shard privé (fichiers hashés SHA-256)', auto_init: true }) }),
+        { tries: 4, retryOn: (r) => r.status >= 500 } // pas de retry sur 422 (déjà existant), on l'accepte plus bas.
+      )
+      if (!cr || (!cr.ok && cr.status !== 422)) { const t = cr ? await cr.text() : 'network'; return res.status(200).json({ error: 'github', detail: 'create-shard ' + String(t).slice(0, 120) }) }
+      // 422 = repo déjà existant : on l'accepte et on poursuit.
+
+      const ready = await waitShardReady(token, name)
+      if (!ready) return res.status(200).json({ error: 'github', detail: 'shard-not-ready' })
+
+      // README honnête (best-effort, n'invalide pas le rollover).
+      await ensureFamilyReadme(token, name, false)
+
+      // Bascule de l'état avec retry (course possible sur le sha du fichier .zr-drive.json).
+      let wr = await ghRetry(() => writeFamilyState(token, kind, vis, { active: name, bytes: 0 }, sha), { tries: 3, retryOn: (r) => r.status >= 500 })
+      if (wr && wr.status === 409) {
+        // sha périmé : on relit l'état et on réécrit avec le sha frais.
+        const fresh = await readFamilyState(token, kind, vis)
+        if (fresh) wr = await writeFamilyState(token, kind, vis, { active: name, bytes: 0 }, fresh.sha)
+      }
+      if (!wr || !wr.ok) { const t = wr ? await wr.text() : 'network'; return res.status(200).json({ error: 'github', detail: 'state-write ' + String(t).slice(0, 120) }) }
+      return res.status(200).json({ ok: true, repo: name, bytes: 0, rolledOver: true })
+    }
+
+    // 1bis) active-vid-shard : JUMEAU de active-shard mais pour les shards VIDÉO PUBLICS (zenray-vid-NN).
+    //       Renvoie le shard vidéo actif {repo,bytes}, en crée un nouveau PUBLIC si le courant est plein
+    //       (>=4,5 Go). Lit/écrit l'état SÉPARÉ pages/.zr-vid-drive.json (jamais mélangé aux images).
+    if (action === 'active-vid-shard') {
+      const ds = await readVidDriveState(token)
+      if (!ds) return res.status(200).json({ error: 'github', detail: 'vid-drive-state' })
+      let { state, sha } = ds
+
+      // Pré-check de TAILLE : `need` = octets à pousser (vidéo entière). On bascule AVANT le push si le shard est
+      // déjà au-dessus du seuil doux (4,5 Go) OU si y ajouter cette vidéo dépasserait la limite dure (~4,9 Go, sous
+      // les 5 Go GitHub). Empêche une grosse vidéo de faire exploser un shard presque plein en plein push.
+      const need = Math.max(0, Number(body.need) || 0)
+      const VID_HARD_BYTES = VID_HARD_CAP_BYTES // 4,6 Go : marge concurrence sous les 5 Go GitHub
+      if (Number(state.bytes) < VID_ROLLOVER_BYTES && (Number(state.bytes) + need) < VID_HARD_BYTES) {
+        return res.status(200).json({ ok: true, repo: state.active, bytes: Number(state.bytes) })
+      }
+
+      // Shard plein : créer le suivant en PUBLIC, attendre qu'il soit prêt, poser un README, basculer l'état.
+      const name = nextVidShardName(state.active)
+      const cr = await ghRetry(
+        () => ghAbs(token, 'user/repos', { method: 'POST', body: JSON.stringify({ name, private: false, description: 'ZenRay drive — shard vidéo PUBLIC (segments HLS chiffrés AES-128, servis via jsDelivr)', auto_init: true }) }),
+        { tries: 4, retryOn: (r) => r.status >= 500 } // pas de retry sur 422 (déjà existant), accepté plus bas.
+      )
+      if (!cr || (!cr.ok && cr.status !== 422)) { const t = cr ? await cr.text() : 'network'; return res.status(200).json({ error: 'github', detail: 'create-vid-shard ' + String(t).slice(0, 120) }) }
+      // 422 = repo déjà existant : on l'accepte et on poursuit.
+
+      const ready = await waitShardReady(token, name)
+      if (!ready) return res.status(200).json({ error: 'github', detail: 'vid-shard-not-ready' })
+
+      // README honnête (best-effort, n'invalide pas le rollover).
+      await ensureVidShardReadme(token, name)
+
+      // Bascule de l'état avec retry (course possible sur le sha du fichier .zr-vid-drive.json).
+      let wr = await ghRetry(() => writeVidDriveState(token, { active: name, bytes: 0 }, sha), { tries: 3, retryOn: (r) => r.status >= 500 })
+      if (wr && wr.status === 409) {
+        const fresh = await readVidDriveState(token)
+        if (fresh) wr = await writeVidDriveState(token, { active: name, bytes: 0 }, fresh.sha)
+      }
+      if (!wr || !wr.ok) { const t = wr ? await wr.text() : 'network'; return res.status(200).json({ error: 'github', detail: 'vid-state-write ' + String(t).slice(0, 120) }) }
+      return res.status(200).json({ ok: true, repo: name, bytes: 0, rolledOver: true })
+    }
+
+    // 1ter) vid-commit-bytes : INCRÉMENTE le compteur d'octets du shard vidéo actif APRÈS un push.
+    //        body : { repo, addBytes }. Best-effort, n'incrémente que si `repo` est encore l'actif.
+    if (action === 'vid-commit-bytes') {
+      const repo = String(body.repo || '')
+      if (!VID_SHARD_RE.test(repo)) return res.status(400).json({ error: 'bad-repo' })
+      const addBytes = Number(body.addBytes)
+      if (!Number.isFinite(addBytes) || addBytes <= 0) return res.status(400).json({ error: 'bad-bytes' })
+      for (let i = 0; i < 4; i++) {
+        const ds = await readVidDriveState(token)
+        if (!ds) break
+        // Le compteur suit le shard ACTIF. Si une bascule a déjà fait pointer `active` sur un shard plus
+        // récent, on n'incrémente pas (ces octets sont sur l'ancien shard, plus l'actif).
+        if (ds.state.active !== repo) return res.status(200).json({ ok: true, skipped: 'not-active', active: ds.state.active })
+        const newState = { active: repo, bytes: Number(ds.state.bytes || 0) + addBytes }
+        const wr = await writeVidDriveState(token, newState, ds.sha)
+        if (wr && wr.ok) return res.status(200).json({ ok: true, repo, bytes: newState.bytes })
+        if (!wr || (wr.status !== 409 && wr.status < 500)) break // erreur non récupérable -> best-effort
+        await sleep(400 * (i + 1))
+      }
+      return res.status(200).json({ ok: true, bestEffort: true }) // best-effort : ne casse jamais l'upload
+    }
+
+    // 2) blob : crée UN blob Git dans le shard, renvoie son sha.
+    //    RATE-LIMIT (2026-07-02) : ce point n'avait AUCUN retry (ni sur 5xx, ni sur l'anti-abus GitHub
+    //    déclenché par plusieurs imports en parallèle) — un simple 403 transitoire faisait échouer le fichier
+    //    entier ("Import échoué — réessaie" générique). ghRetry gère maintenant l'attente + retry sur rate-limit.
+    if (action === 'blob') {
+      const repo = String(body.repo || '')
+      if (!shardRe.test(repo)) return res.status(400).json({ error: 'bad-repo' })
+      const b64 = body.b64
+      if (!isB64(b64)) return res.status(400).json({ error: 'bad-b64' })
+      const r = await ghRetry(() => ghRepo(token, repo, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: b64, encoding: 'base64' }) }), { tries: 4 })
+      if (!r || !r.ok) {
+        const rl = r ? rlInfo(r) : {}
+        const t = r ? await r.text() : 'network'
+        return res.status(200).json({ error: 'github', detail: t.slice(0, 160), ...(rl.rateLimited ? rl : {}) })
+      }
+      const j = await r.json()
+      return res.status(200).json({ ok: true, sha: j.sha })
+    }
+
+    // 2bis) assemble-blob : réassemble N blobs-morceaux (créés via l'action 'blob' ci-dessus, chacun sous la
+    //    limite de corps ENTRANT ~4,5 Mo de Vercel) en UN SEUL blob final, pour les fichiers plus gros que cette
+    //    limite (bug 2026-07-02 : une image de 13 Mo échouait car poussée en un seul POST). Le réassemblage
+    //    est ENTIÈREMENT serveur -> GitHub (lecture des morceaux + concat + un blob) : aucune limite de corps
+    //    entrant ici, seul le plafond de 100 Mo des Git Blobs API s'applique (~40 morceaux de 3 Mo = large marge).
+    //    body : { repo, chunkShas:[sha1, sha2, ...] } (ORDRE = ordre des octets, c'est le client qui l'a découpé).
+    if (action === 'assemble-blob') {
+      const repo = String(body.repo || '')
+      if (!shardRe.test(repo)) return res.status(400).json({ error: 'bad-repo' })
+      const chunkShas = Array.isArray(body.chunkShas) ? body.chunkShas : []
+      if (!chunkShas.length || chunkShas.length > 40 || chunkShas.some((s) => typeof s !== 'string' || !/^[0-9a-f]{40}$/i.test(s))) {
+        return res.status(400).json({ error: 'bad-chunks' })
+      }
+      const buffers = new Array(chunkShas.length)
+      for (let i = 0; i < chunkShas.length; i++) {
+        const r = await ghRetry(() => ghRepo(token, repo, `git/blobs/${chunkShas[i]}`), { tries: 4 })
+        if (!r || !r.ok) {
+          const rl = r ? rlInfo(r) : {}
+          return res.status(200).json({ error: 'github', detail: 'read-chunk ' + i, ...(rl.rateLimited ? rl : {}) })
+        }
+        const j = await r.json()
+        // GitHub renvoie le base64 avec des retours à la ligne tous les ~60 caractères -> les retirer avant décodage.
+        buffers[i] = Buffer.from(String(j.content || '').replace(/\n/g, ''), 'base64')
+      }
+      const full = Buffer.concat(buffers)
+      const cr = await ghRetry(() => ghRepo(token, repo, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: full.toString('base64'), encoding: 'base64' }) }), { tries: 4 })
+      if (!cr || !cr.ok) {
+        const rl = cr ? rlInfo(cr) : {}
+        const t = cr ? await cr.text() : 'network'
+        return res.status(200).json({ error: 'github', detail: 'assemble ' + t.slice(0, 160), ...(rl.rateLimited ? rl : {}) })
+      }
+      const cj = await cr.json()
+      return res.status(200).json({ ok: true, sha: cj.sha })
+    }
+
+    // 3) commit : 1 commit atomique des files dans le shard + incrément bytes dans .zr-drive.json.
+    //    body : { repo, files:[{path,sha}], manifest?, manifestPath?, addBytes }
+    if (action === 'commit') {
+      const repo = String(body.repo || '')
+      if (!shardRe.test(repo)) return res.status(400).json({ error: 'bad-repo' })
+      const files = Array.isArray(body.files) ? body.files : []
+      if (!files.length) return res.status(400).json({ error: 'no-files' })
+      for (const f of files) {
+        if (!f || !safePath(f.path) || typeof f.sha !== 'string') return res.status(400).json({ error: 'bad-file-entry' })
+      }
+      const manifestPath = body.manifestPath
+      if (manifestPath != null && !safePath(manifestPath)) return res.status(400).json({ error: 'bad-manifest-path' })
+
+      // tree des files fournis.
+      const tree = files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', sha: f.sha }))
+
+      // manifest optionnel : blob + entrée d'arbre.
+      if (body.manifest && manifestPath) {
+        const mr = await ghRetry(() => ghRepo(token, repo, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: Buffer.from(JSON.stringify(body.manifest, null, 2), 'utf8').toString('base64'), encoding: 'base64' }) }), { tries: 4 })
+        if (!mr || !mr.ok) {
+          const rl = mr ? rlInfo(mr) : {}
+          const t = mr ? await mr.text() : 'network'
+          return res.status(200).json({ error: 'github', detail: 'manifest-blob ' + t.slice(0, 120), ...(rl.rateLimited ? rl : {}) })
+        }
+        const manifestSha = (await mr.json()).sha
+        tree.push({ path: manifestPath, mode: '100644', type: 'blob', sha: manifestSha })
+      }
+
+      // tree/commit/ref atomique avec re-tentative fast-forward (logique centralisée dans commitFiles).
+      const cf = await commitFiles(token, repo, tree, `media ${files.length} file(s)`)
+      if (cf.error) return res.status(200).json({ error: 'github', detail: cf.error, ...(cf.rateLimited ? { rateLimited: cf.rateLimited, resetAt: cf.resetAt } : {}) })
+      const newCommit = cf.commit
+
+      // Incrément du compteur d'octets dans le BON fichier d'état (déduit de `repo` via parseShard),
+      // commit séparé, best-effort. N'invalide pas l'upload si échec. Le compteur suit le shard ACTIF.
+      const addBytes = Number(body.addBytes)
+      if (Number.isFinite(addBytes) && addBytes > 0) await bumpFamilyBytes(token, repo, addBytes)
+
+      return res.status(200).json({ ok: true, repo, commit: newCommit, ...(manifestPath ? { manifestPath } : {}) })
+    }
+
+    // 4) purge-binary : suppression DÉFINITIVE d'un binaire d'IMAGE sur un shard zenray-media-NN,
+    //    AVEC garde de comptage de références (refcount). Le binaire est adressé par son CONTENU
+    //    (chemin ab/cd/<sha>.<ext>) et peut être PARTAGÉ par plusieurs nœuds .img.json (déduplication).
+    //    On ne supprime le binaire QUE si plus AUCUN nœud .img.json VIVANT (sous pages/, hors trash/)
+    //    ne référence cette empreinte. Sinon on garde le binaire (un autre média s'en sert encore).
+    //    body : { repo, hash, paths:[ab/cd/<sha>.ext, ...], decBytes? }
+    //    Renvoie { ok, deleted:[...], kept:[...], refs } ; en cas de doute (scan trop large), on GARDE.
+    if (action === 'purge-binary') {
+      const repo = String(body.repo || '')
+      if (!shardRe.test(repo)) return res.status(400).json({ error: 'bad-repo' })
+      const hash = String(body.hash || '')
+      const paths = (Array.isArray(body.paths) ? body.paths : []).filter((p) => safePath(p) && /^[0-9a-f]{2}\/[0-9a-f]{2}\//.test(p))
+      if (!hash || !/^[0-9a-f]{16,64}$/.test(hash) || !paths.length) return res.status(400).json({ error: 'bad-args' })
+
+      // REFCOUNT : scanner les nœuds .img.json VIVANTS de zenray-data (sous pages/, jamais trash/).
+      // On lit l'arbre récursif puis on relit chaque .img.json pour voir s'il référence encore `hash`.
+      // Borné : si le drive a trop de manifests à lire (> CAP), on REFUSE de supprimer (conservateur).
+      const REF_CAP = 1500
+      const tr = await ghAbs(token, `repos/${CONTENT_REPO}/git/trees/${CONTENT_BRANCH}?recursive=1`)
+      if (!tr.ok) return res.status(200).json({ error: 'github', detail: 'tree' })
+      const treeJson = await tr.json()
+
+      // UN ARBRE TRONQUÉ NE PEUT PAS PROUVER QU'UN BINAIRE EST ORPHELIN (garde ajoutée le 2026-08-29).
+      //
+      // GitHub COUPE `git/trees?recursive=1` quand le dépôt est gros et le dit par `truncated: true`,
+      // sans erreur ni statut d'échec — mesuré ce jour-là sur zenray-data : 34 932 entrées rendues,
+      // largement en deçà du total. Ce code déduit `refs === 0` de l'absence de manifeste citant
+      // l'empreinte, PUIS SUPPRIME le binaire. Sur une liste incomplète, un manifeste bien vivant mais
+      // tombé après la coupure devient invisible, le compte tombe à zéro, et on efface des octets
+      // encore référencés : la photo se change en case grise, définitivement, sans une ligne de log.
+      //
+      // Le même jour, cette troncature a rendu un dossier de 749 photos entièrement vide côté lecture
+      // (page partagée et aperçu WhatsApp). Ici l'enjeu n'est pas un affichage mais une DESTRUCTION,
+      // donc la seule réponse acceptable est de s'abstenir. On garde le binaire : le pire coût est
+      // quelques kilo-octets conservés en trop, contre une image perdue pour toujours.
+      if (treeJson.truncated) {
+        return res.status(200).json({ ok: true, deleted: [], kept: paths, refs: -1, reason: 'tree-truncated' })
+      }
+
+      const tree = treeJson.tree || []
+      const manifests = tree.filter((x) => x.type === 'blob' && x.path.startsWith('pages/') && x.path.endsWith('.img.json'))
+      if (manifests.length > REF_CAP) {
+        // Trop de manifests pour un refcount fiable en une invocation : on conserve le binaire (jamais de casse).
+        return res.status(200).json({ ok: true, deleted: [], kept: paths, refs: -1, reason: 'refcount-cap' })
+      }
+      let refs = 0
+      for (const m of manifests) {
+        const r = await ghAbs(token, `repos/${CONTENT_REPO}/contents/${encodeURI(m.path)}?ref=${CONTENT_BRANCH}`, { headers: { Accept: 'application/vnd.github.raw' } })
+        if (!r.ok) continue
+        let txt = ''
+        try { txt = await r.text() } catch { continue }
+        // Le binaire principal est ab/cd/<hash>.<ext> : tester la présence de l'empreinte dans le .path du manifest.
+        try {
+          const j = JSON.parse(txt)
+          if (j && typeof j.path === 'string' && j.path.includes(hash)) refs++
+          // Eagle placement: the lightweight stub deliberately carries no blob
+          // hash. Follow its stable registry to the canonical descriptor before
+          // deciding that a shard binary is orphaned.
+          else if (j?.type === 'zenray-eagle-link/v1' && typeof j.resourceId === 'string') {
+            const registryPath = `pages/.zr-resources/${j.resourceId}.json`
+            const gr = await ghAbs(token, `repos/${CONTENT_REPO}/contents/${encodeURI(registryPath)}?ref=${CONTENT_BRANCH}`, { headers: { Accept: 'application/vnd.github.raw' } })
+            if (gr.ok) {
+              const registry = JSON.parse(await gr.text())
+              if (typeof registry.sourcePath === 'string') {
+                const cr = await ghAbs(token, `repos/${CONTENT_REPO}/contents/${encodeURI(registry.sourcePath)}?ref=${CONTENT_BRANCH}`, { headers: { Accept: 'application/vnd.github.raw' } })
+                if (cr.ok) { const canonical = JSON.parse(await cr.text()); if (typeof canonical.path === 'string' && canonical.path.includes(hash)) refs++ }
+              }
+            }
+          }
+        }
+        catch { if (txt.includes(hash)) refs++ }
+      }
+      // refs > 0 : un autre nœud vivant partage ce binaire -> on NE supprime PAS.
+      if (refs > 0) return res.status(200).json({ ok: true, deleted: [], kept: paths, refs })
+
+      // refs == 0 : binaire orphelin -> on le supprime du shard (chaque variante : binaire + vignette .webp).
+      const deleted = []
+      for (const p of paths) {
+        const cr = await ghRepo(token, repo, `contents/${encodeURI(p)}?ref=${SHARD_BRANCH}`)
+        if (!cr.ok) continue
+        let sha = null
+        try { sha = (await cr.json()).sha } catch {}
+        if (!sha) continue
+        const dr = await ghRepo(token, repo, `contents/${encodeURI(p)}`, { method: 'DELETE', body: JSON.stringify({ message: 'media purge (orphan)', sha, branch: SHARD_BRANCH }) })
+        if (dr.ok) deleted.push(p)
+      }
+      // Décrémente best-effort le compteur d'octets de la BONNE famille (uniquement si encore l'actif).
+      const decBytes = Number(body.decBytes)
+      if (deleted.length && Number.isFinite(decBytes) && decBytes > 0) await bumpFamilyBytes(token, repo, -decBytes)
+      return res.status(200).json({ ok: true, deleted, kept: [], refs: 0 })
+    }
+
+    // 5) move-blob : DÉPLACE UN binaire haché (+ sa vignette .webp) d'un shard SOURCE vers un shard CIBLE
+    //    du MÊME type ET de la MÊME visibilité. Opération PETITE (1-2 fichiers) -> API REST autorisée.
+    //    body : { srcRepo, dstRepo, paths:[ab/cd/<hash>.<ext>, ...], hash, sizeBytes? }
+    //    Ordre IMPÉRATIF (jamais inversé, sinon casse d'un média partagé par déduplication) :
+    //      (1) COPIER les blobs sur la cible + 1 commit cible ; (2) PAS de réécriture de manifest (modèle
+    //      PROXY AUTO-RÉSILIENT : le manifest garde son ancien `repo`, c'est /api/shard qui retrouve le binaire
+    //      sur un shard frère) ; (3) SEULEMENT si la copie réussit, SUPPRIMER les blobs sur la source. À la
+    //      moindre erreur avant l'étape 3, on n'efface RIEN côté source (le média reste servi).
+    //      Renvoie {ok:true, moved, deleted, dstRepo}. Sur échec : {error:...} (status 200, jamais ok:false).
+    if (action === 'move-blob') {
+      const srcRepo = String(body.srcRepo || '')
+      const dstRepo = String(body.dstRepo || '')
+      if (!shardRe.test(srcRepo) || !shardRe.test(dstRepo)) return res.status(400).json({ error: 'bad-repo' })
+      if (srcRepo === dstRepo) return res.status(400).json({ error: 'same-repo' })
+      const ps = parseShard(srcRepo), pd = parseShard(dstRepo)
+      // MÊME type ET MÊME visibilité : interdit un privé->public (fuite) et tout mélange de familles.
+      if (!ps || !pd || ps.kind !== pd.kind || ps.vis !== pd.vis) return res.status(400).json({ error: 'kind-mismatch' })
+      const hash = String(body.hash || '')
+      if (!hash || !/^[0-9a-f]{16,64}$/.test(hash)) return res.status(400).json({ error: 'bad-hash' })
+      const paths = (Array.isArray(body.paths) ? body.paths : []).filter((p) => safePath(p) && /^[0-9a-f]{2}\/[0-9a-f]{2}\//.test(p))
+      // Contrat réel : binaire principal + au plus 1 vignette .webp (cf. client DriveDashboard onFileDragStart).
+      if (!paths.length || paths.length > 2) return res.status(400).json({ error: 'bad-paths' })
+
+      // (1) COPIE vers la cible : lire chaque blob source (raw) -> créer le blob cible -> 1 commit atomique.
+      //     Idempotent : un chemin haché identique pointe sur le même contenu, GitHub renvoie un blob identique.
+      const tree = []
+      for (const p of paths) {
+        const gr = await ghRepo(token, srcRepo, `contents/${encodeURI(p)}?ref=${SHARD_BRANCH}`, { headers: { Accept: 'application/vnd.github.raw' } })
+        if (!gr.ok) {
+          // Le binaire principal DOIT exister ; une vignette .webp manquante est tolérée (on la saute).
+          if (p.endsWith('.webp')) continue
+          return res.status(200).json({ error: 'src-missing', detail: p })
+        }
+        const buf = Buffer.from(await gr.arrayBuffer())
+        const br = await ghRepo(token, dstRepo, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: buf.toString('base64'), encoding: 'base64' }) })
+        if (!br.ok) { const t = await br.text(); return res.status(200).json({ error: 'github', detail: 'dst-blob ' + String(t).slice(0, 120) }) }
+        tree.push({ path: p, mode: '100644', type: 'blob', sha: (await br.json()).sha })
+      }
+      if (!tree.length) return res.status(200).json({ error: 'nothing-to-move' })
+      const cf = await commitFiles(token, dstRepo, tree, `media relocate ${tree.length} file(s)`)
+      if (cf.error) return res.status(200).json({ error: 'github', detail: 'dst-commit ' + cf.error })
+
+      // (2) PAS DE RÉÉCRITURE DE MANIFEST ICI (modèle PROXY AUTO-RÉSILIENT).
+      //     Retrouver, parmi des dizaines de milliers de manifests, celui qui référence ce hash est impossible
+      //     à coût raisonnable via l'API (scan = quota ; code-search = n'indexe pas ce gros repo). Donc le manifest
+      //     garde son ancien `repo` ; c'est /api/shard qui, sur 404, retrouve le binaire au même chemin haché sur
+      //     un shard frère de la même famille et mémorise sa localisation. Le déplacement n'a donc qu'à copier
+      //     vers la cible puis supprimer la source : l'image reste servie sans interruption.
+
+      // (3) SUPPRESSION SOURCE (copie OK) : DELETE chaque blob déplacé sur srcRepo (GET sha puis DELETE).
+      const deleted = []
+      for (const e of tree) {
+        const cr = await ghRepo(token, srcRepo, `contents/${encodeURI(e.path)}?ref=${SHARD_BRANCH}`)
+        if (!cr.ok) continue
+        let sha = null
+        try { sha = (await cr.json()).sha } catch {}
+        if (!sha) continue
+        const dr = await ghRepo(token, srcRepo, `contents/${encodeURI(e.path)}`, { method: 'DELETE', body: JSON.stringify({ message: 'media relocate (remove source)', sha, branch: SHARD_BRANCH }) })
+        if (dr.ok) deleted.push(e.path)
+      }
+
+      // (4) COMPTEURS d'octets best-effort : +bytes côté cible, -bytes côté source (n'agit que sur l'actif de
+      //     chaque famille ; sinon no-op). N'invalide jamais le move.
+      const sizeBytes = Number(body.sizeBytes)
+      if (Number.isFinite(sizeBytes) && sizeBytes > 0) {
+        await bumpFamilyBytes(token, dstRepo, sizeBytes)
+        await bumpFamilyBytes(token, srcRepo, -sizeBytes)
+      }
+
+      // (5) RÉAMORÇAGE DU CACHE PROXY (drive-2) : /api/shard (server/shard.js) garde un cache partagé
+      //     globalThis.__zrPathRepo (path -> repo réel) pour servir un binaire déplacé sans le re-scanner.
+      //     Sans cette ligne, le PREMIER accès post-move repart de l'ancien `repo` du manifest (shard source
+      //     désormais vide) -> 404 -> re-scan de ~40 shards frères. On pointe directement chaque chemin déplacé
+      //     sur la cible : le premier accès coûte 1 requête au lieu de 40. Mono-process local = même globalThis.
+      try {
+        const map = (globalThis.__zrPathRepo = globalThis.__zrPathRepo || new Map())
+        const neg = (globalThis.__zrPath404 = globalThis.__zrPath404 || new Map())
+        for (const e of tree) { map.set(e.path, dstRepo); neg.delete(e.path) }
+      } catch {}
+
+      // sourceKept (drive-1) : la copie a réussi mais une ou plusieurs suppressions source ont échoué
+      // (DELETE en `continue` silencieux ci-dessus). Le binaire existe alors EN DOUBLE : le client doit
+      // afficher un état distinct du succès vert, pas un "Déplacé" trompeur qui laisse croire l'espace libéré.
+      const sourceKept = deleted.length < tree.length
+      return res.status(200).json({ ok: true, moved: tree.map((e) => e.path), deleted, dstRepo, sourceKept })
+    }
+
+    return res.status(400).json({ error: 'bad-action' })
+  } catch (e) {
+    return res.status(200).json({ error: 'fetch' })
+  }
+}

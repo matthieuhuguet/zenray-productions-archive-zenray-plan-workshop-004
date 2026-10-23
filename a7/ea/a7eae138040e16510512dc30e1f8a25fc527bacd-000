@@ -1,0 +1,469 @@
+import React, { useEffect, useRef, useState, useMemo } from 'react'
+import * as THREE from 'three'
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+
+// Visualiseur WebGL PBR leger avec isolation des calques (canaux).
+// Concu pour Adobe Substance 3D Designer et Houdini Copernicus.
+// Respect strict des regles de typographie ZenRay (InterVariable, AnthropicSerif, AnthropicMono).
+// Zero tiret cadratin.
+
+const P = {
+  serif: 'var(--zr-police-serif)',
+  sans: 'var(--zr-police-sans)',
+  mono: 'var(--zr-police-mono)',
+  serifWeight: 350,
+  numberWeight: 400,
+  accent: '#9A5B3C',
+  radius: 8,
+}
+
+// Generateur procedural de textures de repli douces en memoire vive (evite toute texture manquante)
+function createFallbackTexture(type, colorHex = '#888888') {
+  const canvas = document.createElement('canvas')
+  canvas.width = 512
+  canvas.height = 512
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return new THREE.Texture()
+
+  ctx.fillStyle = colorHex
+  ctx.fillRect(0, 0, 512, 512)
+
+  if (type === 'normal') {
+    // Normal map par defaut : vecteur tangent (0, 0, 1) -> RGB (128, 128, 255)
+    ctx.fillStyle = 'rgb(128, 128, 255)'
+    ctx.fillRect(0, 0, 512, 512)
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.08)'
+    for (let i = 0; i < 512; i += 64) {
+      ctx.fillRect(i, 0, 1, 512)
+      ctx.fillRect(0, i, 512, 1)
+    }
+  } else if (type === 'roughness') {
+    ctx.fillStyle = 'rgb(140, 140, 140)'
+    ctx.fillRect(0, 0, 512, 512)
+  } else if (type === 'metallic') {
+    ctx.fillStyle = 'rgb(20, 20, 20)'
+    ctx.fillRect(0, 0, 512, 512)
+  } else if (type === 'ao') {
+    ctx.fillStyle = 'rgb(240, 240, 240)'
+    ctx.fillRect(0, 0, 512, 512)
+  } else if (type === 'height') {
+    const grad = ctx.createLinearGradient(0, 0, 512, 512)
+    grad.addColorStop(0, 'rgb(30, 30, 30)')
+    grad.addColorStop(1, 'rgb(220, 220, 220)')
+    ctx.fillStyle = grad
+    ctx.fillRect(0, 0, 512, 512)
+  }
+
+  const texture = new THREE.CanvasTexture(canvas)
+  texture.wrapS = THREE.RepeatWrapping
+  texture.wrapT = THREE.RepeatWrapping
+  return texture
+}
+
+export default function PbrMaterialViewer({ material, t, onBack }) {
+  const mountRef = useRef(null)
+  const [activeLayer, setActiveLayer] = useState('pbr') // 'pbr', 'albedo', 'normal', 'roughness', 'metallic', 'height', 'ao', 'emission'
+  const [shape, setShape] = useState('sphere') // 'sphere', 'cube', 'plane', 'cylinder'
+  const [tiling, setTiling] = useState(2)
+  const [displacementScale, setDisplacementScale] = useState(0.06)
+  const [autoRotate, setAutoRotate] = useState(true)
+  const [wireframe, setWireframe] = useState(false)
+
+  const texturesRef = useRef({})
+  const sceneRef = useRef(null)
+  const meshRef = useRef(null)
+  const rendererRef = useRef(null)
+  const controlsRef = useRef(null)
+  const animIdRef = useRef(0)
+
+  // Creation des geometries standards d'inspection
+  const geometries = useMemo(() => ({
+    sphere: new THREE.SphereGeometry(1.2, 128, 128),
+    cube: new THREE.BoxGeometry(1.9, 1.9, 1.9, 64, 64, 64),
+    plane: new THREE.PlaneGeometry(2.4, 2.4, 128, 128),
+    cylinder: new THREE.CylinderGeometry(1.0, 1.0, 2.2, 64, 64),
+  }), [])
+
+  // Initialisation du contexte WebGL Three.js
+  useEffect(() => {
+    const container = mountRef.current
+    if (!container) return
+
+    const width = container.clientWidth || 640
+    const height = container.clientHeight || 480
+
+    const scene = new THREE.Scene()
+    scene.background = new THREE.Color(t.bg === '#ffffff' ? 0xf5f5f7 : 0x141416)
+    sceneRef.current = scene
+
+    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100)
+    camera.position.set(0, 0.4, 3.8)
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' })
+    renderer.setSize(width, height)
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    renderer.toneMapping = THREE.ACESFilmicToneMapping
+    renderer.toneMappingExposure = 1.05
+    container.innerHTML = ''
+    container.appendChild(renderer.domElement)
+    rendererRef.current = renderer
+
+    const controls = new OrbitControls(camera, renderer.domElement)
+    controls.enableDamping = true
+    controls.dampingFactor = 0.05
+    controls.maxDistance = 8
+    controls.minDistance = 1.5
+    controlsRef.current = controls
+
+    // Eclairage studio 3 points doux
+    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x333344, 0.8)
+    hemiLight.position.set(0, 10, 0)
+    scene.add(hemiLight)
+
+    const keyLight = new THREE.DirectionalLight(0xfffbf0, 1.8)
+    keyLight.position.set(4, 5, 4)
+    scene.add(keyLight)
+
+    const fillLight = new THREE.DirectionalLight(0xddeeff, 0.9)
+    fillLight.position.set(-4, 2, -2)
+    scene.add(fillLight)
+
+    const rimLight = new THREE.DirectionalLight(0xffffff, 0.6)
+    rimLight.position.set(0, -3, -4)
+    scene.add(rimLight)
+
+    // Chargement ou creation des textures du materiau
+    const textureLoader = new THREE.TextureLoader()
+    const loadedMaps = {}
+
+    const mapsSpec = [
+      { key: 'albedo', url: material.maps?.albedo, type: 'albedo', color: '#8a725e' },
+      { key: 'normal', url: material.maps?.normal, type: 'normal', color: '#8080ff' },
+      { key: 'roughness', url: material.maps?.roughness, type: 'roughness', color: '#777777' },
+      { key: 'metallic', url: material.maps?.metallic, type: 'metallic', color: '#151515' },
+      { key: 'height', url: material.maps?.height, type: 'height', color: '#555555' },
+      { key: 'ao', url: material.maps?.ao, type: 'ao', color: '#e0e0e0' },
+      { key: 'emission', url: material.maps?.emission, type: 'albedo', color: '#000000' },
+    ]
+
+    mapsSpec.forEach((spec) => {
+      if (spec.url) {
+        const tex = textureLoader.load(spec.url)
+        tex.wrapS = THREE.RepeatWrapping
+        tex.wrapT = THREE.RepeatWrapping
+        tex.repeat.set(tiling, tiling)
+        loadedMaps[spec.key] = tex
+      } else {
+        const fallback = createFallbackTexture(spec.type, spec.color)
+        fallback.repeat.set(tiling, tiling)
+        loadedMaps[spec.key] = fallback
+      }
+    })
+    texturesRef.current = loadedMaps
+
+    // Mesh initial
+    const initialMesh = new THREE.Mesh(geometries[shape], new THREE.MeshStandardMaterial())
+    scene.add(initialMesh)
+    meshRef.current = initialMesh
+
+    // Boucle de rendu
+    let isDisposed = false
+    const animate = () => {
+      if (isDisposed) return
+      animIdRef.current = requestAnimationFrame(animate)
+
+      if (autoRotate && meshRef.current) {
+        meshRef.current.rotation.y += 0.005
+      }
+
+      controls.update()
+      renderer.render(scene, camera)
+    }
+    animate()
+
+    // Redimensionnement
+    const handleResize = () => {
+      if (!container || !renderer || !camera) return
+      const w = container.clientWidth
+      const h = container.clientHeight
+      camera.aspect = w / h
+      camera.updateProjectionMatrix()
+      renderer.setSize(w, h)
+    }
+    window.addEventListener('resize', handleResize)
+
+    return () => {
+      isDisposed = true
+      cancelAnimationFrame(animIdRef.current)
+      window.removeEventListener('resize', handleResize)
+      controls.dispose()
+      renderer.dispose()
+      if (container.contains(renderer.domElement)) {
+        container.removeChild(renderer.domElement)
+      }
+    }
+  }, [material, geometries, t.bg])
+
+  // Mise a jour de la geometrie choisie
+  useEffect(() => {
+    if (!meshRef.current || !geometries[shape]) return
+    meshRef.current.geometry = geometries[shape]
+  }, [shape, geometries])
+
+  // Mise a jour du tiling UV
+  useEffect(() => {
+    const maps = texturesRef.current
+    Object.values(maps).forEach((tex) => {
+      if (tex && tex.repeat) {
+        tex.repeat.set(tiling, tiling)
+        tex.needsUpdate = true
+      }
+    })
+  }, [tiling])
+
+  // Application du mode d'isolation du calque (Layer Isolation)
+  useEffect(() => {
+    const mesh = meshRef.current
+    if (!mesh) return
+    const maps = texturesRef.current
+
+    let nextMat = null
+
+    if (activeLayer === 'pbr') {
+      // Rendu physique PBR complet
+      nextMat = new THREE.MeshStandardMaterial({
+        map: maps.albedo || null,
+        normalMap: maps.normal || null,
+        roughnessMap: maps.roughness || null,
+        metalnessMap: maps.metallic || null,
+        aoMap: maps.ao || null,
+        displacementMap: (shape === 'plane' || shape === 'sphere') ? (maps.height || null) : null,
+        displacementScale: (shape === 'plane' || shape === 'sphere') ? displacementScale : 0,
+        emissiveMap: maps.emission || null,
+        roughness: 1.0,
+        metalness: 1.0,
+        wireframe,
+      })
+    } else if (activeLayer === 'albedo') {
+      // Isolation Albedo : non eclairee pour inspection de la couleur pure
+      nextMat = new THREE.MeshBasicMaterial({
+        map: maps.albedo || null,
+        wireframe,
+      })
+    } else if (activeLayer === 'normal') {
+      // Isolation Normal : visualisation de la carte de normales comme couleur RGB
+      nextMat = new THREE.MeshBasicMaterial({
+        map: maps.normal || null,
+        wireframe,
+      })
+    } else if (activeLayer === 'roughness') {
+      // Isolation Rugosite : niveaux de gris purs
+      nextMat = new THREE.MeshBasicMaterial({
+        map: maps.roughness || null,
+        wireframe,
+      })
+    } else if (activeLayer === 'metallic') {
+      // Isolation Metallic : niveaux de gris purs
+      nextMat = new THREE.MeshBasicMaterial({
+        map: maps.metallic || null,
+        wireframe,
+      })
+    } else if (activeLayer === 'height') {
+      // Isolation Carte de hauteur / Deplacement
+      nextMat = new THREE.MeshBasicMaterial({
+        map: maps.height || null,
+        wireframe,
+      })
+    } else if (activeLayer === 'ao') {
+      // Isolation Occlusion Ambiante
+      nextMat = new THREE.MeshBasicMaterial({
+        map: maps.ao || null,
+        wireframe,
+      })
+    } else if (activeLayer === 'emission') {
+      // Isolation Emission
+      nextMat = new THREE.MeshBasicMaterial({
+        map: maps.emission || null,
+        wireframe,
+      })
+    }
+
+    if (nextMat) {
+      mesh.material.dispose()
+      mesh.material = nextMat
+    }
+  }, [activeLayer, displacementScale, wireframe, shape])
+
+  // Liste des boutons d'isolation de canaux
+  const layers = [
+    { id: 'pbr', label: 'PBR Complet', short: 'Lit' },
+    { id: 'albedo', label: 'Base Color', short: 'Albedo' },
+    { id: 'normal', label: 'Normal', short: 'Normale' },
+    { id: 'roughness', label: 'Roughness', short: 'Rugosité' },
+    { id: 'metallic', label: 'Metallic', short: 'Métal' },
+    { id: 'height', label: 'Height', short: 'Hauteur' },
+    { id: 'ao', label: 'Ambient Occlusion', short: 'AO' },
+    { id: 'emission', label: 'Emission', short: 'Émission' },
+  ]
+
+  const shapes = [
+    { id: 'sphere', label: 'Sphère' },
+    { id: 'cube', label: 'Cube' },
+    { id: 'plane', label: 'Plan' },
+    { id: 'cylinder', label: 'Cylindre' },
+  ]
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 20, fontFamily: P.sans, color: t.textPrimary }}>
+      {/* En-tete du visualiseur avec navigation retour */}
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 16, flexWrap: 'wrap', borderBottom: `1px solid ${t.border}`, paddingBottom: 14 }}>
+        <button type="button" onClick={onBack}
+          style={{ border: 0, background: 'transparent', padding: 0, cursor: 'pointer', color: t.textSecondary, fontFamily: P.sans, fontSize: 13 }}>
+          ← Retour à la collection
+        </button>
+        <span style={{ fontSize: 10.5, letterSpacing: '0.13em', textTransform: 'uppercase', color: P.accent }}>
+          {material.sourceTool || 'PBR Material'}
+        </span>
+        <h2 style={{ fontFamily: P.serif, fontWeight: P.serifWeight, fontSize: 24, margin: 0, letterSpacing: '-0.015em' }}>
+          {material.name}
+        </h2>
+        <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 13, color: t.textSecondary, marginLeft: 'auto' }}>
+          {material.resolution || '2048 × 2048'}
+        </span>
+      </div>
+
+      {/* Zone centrale : Viewport WebGL 3D + Panneau de controle */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 320px', gap: 24, alignItems: 'start' }}>
+        {/* Conteneur WebGL Three.js */}
+        <div style={{ position: 'relative', width: '100%', height: 540, borderRadius: P.radius, overflow: 'hidden', border: `1px solid ${t.border}`, background: t.cardBg || t.bg }}>
+          <div ref={mountRef} style={{ width: '100%', height: '100%', display: 'block', cursor: 'grab' }} />
+
+          {/* Badge indicateur du calque actif en surimpression */}
+          <div style={{ position: 'absolute', top: 14, left: 14, background: 'rgba(20, 20, 24, 0.75)', backdropFilter: 'blur(10px)',
+            color: '#ffffff', padding: '5px 12px', borderRadius: 999, fontSize: 11.5, letterSpacing: '0.08em', textTransform: 'uppercase', pointerEvents: 'none' }}>
+            Canal : <strong style={{ color: P.accent }}>{layers.find((l) => l.id === activeLayer)?.label}</strong>
+          </div>
+
+          {/* Bouton rapide d'auto-rotation */}
+          <button type="button" onClick={() => setAutoRotate((v) => !v)}
+            style={{ position: 'absolute', bottom: 14, right: 14, background: 'rgba(20, 20, 24, 0.75)', backdropFilter: 'blur(10px)',
+              color: autoRotate ? '#ffffff' : 'rgba(255, 255, 255, 0.5)', border: `1px solid ${autoRotate ? P.accent : 'transparent'}`,
+              borderRadius: 6, padding: '5px 10px', fontSize: 11.5, cursor: 'pointer', fontFamily: P.sans }}>
+            {autoRotate ? 'Rotation active' : 'Rotation arrêtée'}
+          </button>
+        </div>
+
+        {/* Panneau lateral de controles et d'isolation de calques */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+          {/* Section 1 : Isolation des calques PBR */}
+          <div style={{ padding: '16px 18px', borderRadius: P.radius, border: `1px solid ${t.border}`, background: t.cardBg || t.bg }}>
+            <div style={{ fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase', color: t.textSecondary, marginBottom: 12 }}>
+              Isoler un canal (Layer)
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 8 }}>
+              {layers.map((l) => {
+                const on = activeLayer === l.id
+                return (
+                  <button key={l.id} type="button" onClick={() => setActiveLayer(l.id)}
+                    style={{ border: `1px solid ${on ? P.accent : t.border}`, borderRadius: 6, background: on ? 'rgba(154, 91, 60, 0.12)' : 'transparent',
+                      color: on ? P.accent : t.textPrimary, padding: '8px 10px', cursor: 'pointer', textAlign: 'left', fontFamily: P.sans, fontSize: 12 }}>
+                    <div style={{ fontWeight: on ? 500 : 400 }}>{l.label}</div>
+                    <div style={{ fontSize: 10.5, color: t.textSecondary, marginTop: 2 }}>{l.short}</div>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Section 2 : Geometrie et repétition UV */}
+          <div style={{ padding: '16px 18px', borderRadius: P.radius, border: `1px solid ${t.border}`, background: t.cardBg || t.bg }}>
+            <div style={{ fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase', color: t.textSecondary, marginBottom: 12 }}>
+              Géométrie et répétition
+            </div>
+
+            {/* Selecteur de forme */}
+            <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+              {shapes.map((s) => {
+                const on = shape === s.id
+                return (
+                  <button key={s.id} type="button" onClick={() => setShape(s.id)}
+                    style={{ flex: 1, border: `1px solid ${on ? P.accent : t.border}`, borderRadius: 6, background: on ? P.accent : 'transparent',
+                      color: on ? '#ffffff' : t.textPrimary, padding: '6px 0', fontSize: 11.5, cursor: 'pointer', fontFamily: P.sans }}>
+                    {s.label}
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* Curseur Tiling UV */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                <span style={{ color: t.textSecondary }}>Répétition UV (Tiling)</span>
+                <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, color: P.accent }}>{tiling}×</span>
+              </div>
+              <input type="range" min="1" max="8" step="1" value={tiling} onChange={(e) => setTiling(Number(e.target.value))}
+                style={{ width: '100%', accentColor: P.accent, cursor: 'pointer' }} />
+            </div>
+
+            {/* Curseur Deplacement Relief */}
+            {(shape === 'plane' || shape === 'sphere') && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                  <span style={{ color: t.textSecondary }}>Intensité relief (Displacement)</span>
+                  <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, color: P.accent }}>{displacementScale.toFixed(2)}</span>
+                </div>
+                <input type="range" min="0" max="0.2" step="0.01" value={displacementScale} onChange={(e) => setDisplacementScale(Number(e.target.value))}
+                  style={{ width: '100%', accentColor: P.accent, cursor: 'pointer' }} />
+              </div>
+            )}
+
+            {/* Bascule Filaire / Wireframe */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: t.textSecondary, cursor: 'pointer' }}>
+              <input type="checkbox" checked={wireframe} onChange={(e) => setWireframe(e.target.checked)} style={{ accentColor: P.accent }} />
+              Afficher le maillage filaire (Wireframe)
+            </label>
+          </div>
+
+          {/* Section 3 : Base de sauvegarde et telechargements */}
+          <div style={{ padding: '16px 18px', borderRadius: P.radius, border: `1px solid ${t.border}`, background: t.cardBg || t.bg }}>
+            <div style={{ fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase', color: t.textSecondary, marginBottom: 10 }}>
+              Sauvegarde et fichiers sources
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {material.sourceFile && (
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 12 }}>
+                  <span style={{ color: t.textSecondary }}>Fichier source :</span>
+                  <span style={{ fontFamily: P.mono, fontSize: 11.5, color: t.textPrimary }}>{material.sourceFile}</span>
+                </div>
+              )}
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 12 }}>
+                <span style={{ color: t.textSecondary }}>Moteur :</span>
+                <span>{material.sourceTool || 'Substance / Copernicus'}</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 12 }}>
+                <span style={{ color: t.textSecondary }}>Cartes présentes :</span>
+                <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight }}>{Object.keys(material.maps || {}).length} textures</span>
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                {material.archiveUrl ? (
+                  <a href={material.archiveUrl} download
+                    style={{ flex: 1, textAlign: 'center', background: P.accent, color: '#ffffff', textDecoration: 'none',
+                      borderRadius: 6, padding: '7px 12px', fontSize: 12, fontWeight: 500 }}>
+                    Télécharger le pack complet (ZIP)
+                  </a>
+                ) : (
+                  <button type="button" onClick={() => alert('Archive synchronisée sur le drive ZenRay Assets')}
+                    style={{ flex: 1, border: `1px solid ${t.border}`, borderRadius: 6, background: 'transparent',
+                      color: t.textPrimary, padding: '7px 12px', fontSize: 12, cursor: 'pointer', fontFamily: P.sans }}>
+                    Sauvegardé sur ZenRay Assets
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

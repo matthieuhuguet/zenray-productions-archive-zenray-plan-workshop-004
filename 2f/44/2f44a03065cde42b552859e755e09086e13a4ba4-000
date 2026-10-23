@@ -1,0 +1,254 @@
+import React, { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, forwardRef } from 'react'
+import { createPortal } from 'react-dom'
+import Icon from '../components/Icon.jsx'
+import { PLAN_CSS_VARIABLES, PLAN_UI } from './planUiConfig.js'
+import { trouverScroller } from '../lib/scrollAnime.js'
+import { takePlanOrigin } from './planOpenOrigin.js'
+
+// Plan day focus (23 October 2026, 19:30 Paris), design "Focus" chosen by Matthieu in the plan-lab workshop.
+// Step 1 travels to the week (the travel is handed over to the real scroll, only a light zoom stays on the
+// camera) while the other weeks fade like a depth of field; step 2 lifts the day out of its cell into a
+// centered widget built from the Plan's own recipe. Clicking beside it plays the same motion backwards
+// (ping pong) and lands on the exact normal view. Every value lives in PLAN_UI.focus.
+// FR : mode Focus choisi par Matthieu. Étape 1 vers la semaine (le déplacement est rendu au vrai défilement,
+// seul un léger zoom reste sur la caméra), les autres semaines s'estompent ; étape 2 le jour sort de sa case
+// en widget centré, recette du Plan. Un clic à côté rejoue le geste à l'envers et revient à la vue normale exacte.
+
+const F = PLAN_UI.focus
+const reduced = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
+const dur = (ms) => (reduced() ? 1 : ms)
+const tf = (T) => `translate(${T.x}px, ${T.y}px) scale(${T.s})`
+const ID = { x: 0, y: 0, s: 1 }
+const rectOf = (el) => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height } }
+const done = (a) => a.finished.catch(() => {})
+const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Visible part of the scroller, where "the center of the screen" is. / partie visible du conteneur qui défile.
+function visibleRect(scroller) {
+  const vw = window.innerWidth, vh = window.innerHeight
+  if (!scroller || scroller === document.scrollingElement || scroller === document.documentElement || scroller === document.body) return { x: 0, y: 0, w: vw, h: vh }
+  const r = scroller.getBoundingClientRect()
+  const x = Math.max(0, r.left), y = Math.max(0, r.top)
+  return { x, y, w: Math.min(vw, r.right) - x, h: Math.min(vh, r.bottom) - y }
+}
+
+const PlanDayFocus = forwardRef(function PlanDayFocus({ rootRef, path, dark, enabled, playOnOpen, renderTasks, onAdd }, ref) {
+  const [day, setDay] = useState(null) // { iso, weekday, label, num, today }
+  const [mounted, setMounted] = useState(false)
+  const layer = useRef(null), scrim = useRef(null), widget = useRef(null)
+  const S = useRef({ T: ID, open: false, busy: false, cell: null, dimmed: [] })
+
+  const cam = () => rootRef.current
+  const move = (T, d, easing = F.ease) => {
+    const a = cam().animate([{ transform: tf(S.current.T) }, { transform: tf(T) }], { duration: dur(d), easing, fill: 'forwards' })
+    S.current.T = T
+    return done(a)
+  }
+  const cellsOf = () => [...(cam()?.querySelectorAll('.zrp-grid > .zrp-day') || [])]
+
+  // Container transform: the widget scales uniformly, clipped to the cell; a ghost of the cell crossfades.
+  // FR : transformation de conteneur, le widget grandit sans se déformer, un fantôme de la case se fond dedans.
+  const morph = (cell, r, base, d, easing, open) => {
+    const w = widget.current, ww = w.offsetWidth, wh = w.offsetHeight, L = w.offsetLeft, Tp = w.offsetTop
+    const k = r.w / ww, cut = Math.max(0, wh - r.h / k)
+    const small = { transform: `translate(${r.x - L}px, ${r.y - Tp}px) scale(${k})`, clipPath: `inset(0px 0px ${cut}px 0px round ${F.cellRadius / k}px)` }
+    const big = { transform: 'none', clipPath: `inset(0px 0px 0px 0px round ${F.widgetRadius}px)` }
+    const ghost = cell.cloneNode(true)
+    ghost.removeAttribute('style'); ghost.removeAttribute('role'); ghost.removeAttribute('tabindex')
+    Object.assign(ghost.style, { position: 'absolute', left: '0px', top: '0px', margin: 0, width: base.w + 'px', height: base.h + 'px', transformOrigin: '0 0', pointerEvents: 'none', boxSizing: 'border-box', overflow: 'hidden' })
+    layer.current.appendChild(ghost)
+    const gSmall = { transform: `translate(${r.x}px, ${r.y}px) scale(${r.w / base.w}, ${r.h / base.h})` }
+    const gBig = { transform: `translate(${L}px, ${Tp}px) scale(${ww / base.w}, ${wh / base.h})` }
+    const opts = { duration: dur(d), easing, fill: 'forwards' }
+    cell.animate([{ opacity: 0 }, { opacity: 0 }], { duration: 1, fill: 'forwards' })
+    const a = w.animate(open ? [{ ...small, opacity: 0 }, { opacity: 1, offset: .35 }, { ...big, opacity: 1 }] : [{ ...big, opacity: 1 }, { opacity: 1, offset: .55 }, { ...small, opacity: 0 }], opts)
+    const g = ghost.animate(open ? [{ ...gSmall, opacity: 1 }, { opacity: 0, offset: .45 }, { ...gBig, opacity: 0 }] : [{ ...gBig, opacity: 0 }, { opacity: 0, offset: .4 }, { ...gSmall, opacity: 1 }], opts)
+    const drop = () => ghost.remove()
+    if (open) g.finished.then(drop, drop)
+    else a.finished.then(() => requestAnimationFrame(drop), drop)
+    return [done(a), done(g)]
+  }
+
+  // Back to the untouched Plan: no transform, no leftover animation. / retour au Plan intact.
+  const reset = () => {
+    const st = S.current, root = cam()
+    if (root) { root.getAnimations().forEach((a) => a.cancel()); root.style.transform = ''; root.style.transformOrigin = '' }
+    st.T = ID
+    cellsOf().forEach((c) => c.getAnimations().forEach((a) => { if (!(a instanceof CSSAnimation)) a.cancel() }))
+    st.dimmed = []
+    if (widget.current) { widget.current.getAnimations().forEach((a) => a.cancel()); widget.current.style.display = 'none' }
+    scrim.current?.getAnimations().forEach((a) => a.cancel())
+    layer.current?.classList.remove('zrp-focus-on')
+    layer.current?.querySelectorAll('.zrp-day').forEach((g) => g.remove())
+    st.open = false
+  }
+
+  const open = async (cell) => {
+    const st = S.current, root = cam()
+    if (!root || !cell || st.busy || st.open) return
+    st.busy = true
+    reset()
+    root.style.transformOrigin = '0 0'
+    st.cell = cell
+    const scroller = trouverScroller(cell) || document.scrollingElement
+    const view = visibleRect(scroller)
+    const base = rectOf(root), c = rectOf(cell)
+    const week = cellsOf().filter((x) => x.style.gridRow === cell.style.gridRow)
+    const rs = week.map(rectOf)
+    const wr = { x: Math.min(...rs.map((r) => r.x)), y: Math.min(...rs.map((r) => r.y)) }
+    wr.w = Math.max(...rs.map((r) => r.x + r.w)) - wr.x; wr.h = Math.max(...rs.map((r) => r.y + r.h)) - wr.y
+    const iso = cell.dataset.iso
+    setDay({ iso, weekday: F.weekdays[(parseInt(cell.style.gridColumn, 10) || 1) - 1], label: cell.title, num: cell.querySelector('.zrp-day-num')?.textContent || '', today: cell.classList.contains('zrp-today') })
+
+    // Step 1: frame the week (light zoom, never past what fits), the other weeks fade. / étape 1.
+    const s = Math.max(1, Math.min(F.weekZoom, (view.h - 2 * F.margin) / wr.h, (view.w - 2 * F.margin) / wr.w))
+    const cx = view.x + view.w / 2, cy = view.y + view.h / 2
+    const py = Math.min(wr.y + wr.h / 2, wr.y + (view.h / 2 - F.margin) / s)
+    const T1 = { x: cx - base.x - s * (wr.x + wr.w / 2 - base.x), y: cy - base.y - s * (py - base.y), s }
+    st.dimmed = cellsOf().filter((x) => !week.includes(x))
+    st.dimmed.forEach((x) => { x.dataset.zrpFocusOpacity = getComputedStyle(x).opacity })
+    st.dimmed.forEach((x) => x.animate([{ opacity: x.dataset.zrpFocusOpacity, filter: 'blur(0px)' }, { opacity: F.dimOpacity, filter: `blur(${F.dimBlur}px)` }], { duration: dur(F.step1Ms), easing: F.ease, fill: 'forwards' }))
+    await move(T1, F.step1Ms)
+
+    // Hand the vertical travel to the real scroll, so closing lands on a natural view of this week.
+    // FR : le déplacement vertical passe au vrai défilement, la fermeture revient donc sur une vue naturelle.
+    if (scroller && T1.y !== 0) {
+      const before = scroller.scrollTop
+      scroller.scrollTop = before - T1.y
+      const moved = scroller.scrollTop - before
+      const T1b = { x: T1.x, y: T1.y + moved, s }
+      root.getAnimations().forEach((a) => a.cancel())
+      root.style.transform = tf(T1b)
+      st.T = T1b
+    }
+    await wait(dur(F.pauseMs))
+
+    // Step 2: the day lifts out of its cell. / étape 2 : le jour sort de sa case.
+    const from = rectOf(cell)
+    st.cellBaseSize = { w: c.w, h: c.h }
+    layer.current.classList.add('zrp-focus-on')
+    const w = widget.current
+    w.style.display = 'block'
+    const L = view.x + (view.w - w.offsetWidth) / 2, Tp = Math.max(view.y + F.margin, view.y + (view.h - w.offsetHeight) / 2)
+    Object.assign(w.style, { left: L + 'px', top: Tp + 'px' })
+    const jobs = morph(cell, from, st.cellBaseSize, F.step2Ms, F.spring, true)
+    jobs.push(done(scrim.current.animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur(F.step2Ms), easing: 'ease-out', fill: 'forwards' })))
+    await Promise.all(jobs)
+    st.open = true
+    st.busy = false
+  }
+
+  // Ping pong: the same motion backwards, ending on the exact normal view. / le même geste à l'envers.
+  const close = async () => {
+    const st = S.current
+    if (!st.open || st.busy) return
+    st.busy = true
+    const d = F.step2Ms, s = st.T.s, root = cam()
+    // Where the cell will be once the camera is back at identity. / où la case sera, caméra au repos.
+    const now = rectOf(st.cell), base = rectOf(root)
+    const to = { x: base.x - st.T.x + (now.x - base.x) / s, y: base.y - st.T.y + (now.y - base.y) / s, w: now.w / s, h: now.h / s }
+    const jobs = [move(ID, d, F.ease), ...morph(st.cell, to, st.cellBaseSize, d, F.ease, false)]
+    jobs.push(done(scrim.current.animate([{ opacity: 1 }, { opacity: 0 }], { duration: dur(d), easing: F.ease, fill: 'forwards' })))
+    st.dimmed.forEach((x) => x.animate([{ opacity: F.dimOpacity, filter: `blur(${F.dimBlur}px)` }, { opacity: x.dataset.zrpFocusOpacity || 1, filter: 'blur(0px)' }], { duration: dur(d), easing: F.ease, fill: 'forwards' }))
+    await Promise.all(jobs)
+    reset()
+    st.busy = false
+  }
+  const closeThen = (fn) => close().then(() => requestAnimationFrame(() => fn && fn()))
+
+  useImperativeHandle(ref, () => ({ open, close, closeThen, isOpen: () => S.current.open }))
+
+  // Double click on a day opens the focus; Escape closes it. / double-clic ouvre, Échap ferme.
+  useEffect(() => {
+    if (!enabled) return undefined
+    const root = cam()
+    const onDbl = (e) => {
+      const cell = e.target.closest?.('.zrp-grid > .zrp-day')
+      if (!cell || e.target.closest('.zrp-task, .zrp-detail, input, textarea, button')) return
+      open(cell)
+    }
+    // Space works like Quick Look (23 October 2026): it opens the selected day (else today) and closes it again.
+    // Never while typing, nor while a task detail or the composer is open. / Espace comme Quick Look, jamais en saisie.
+    const typing = (el) => !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))
+    const onKey = (e) => {
+      if (e.key === 'Escape' && S.current.open) { e.stopPropagation(); close(); return }
+      if (e.key !== F.quickLookKey || e.repeat || e.metaKey || e.ctrlKey || e.altKey || typing(e.target)) return
+      if (S.current.open) { e.preventDefault(); e.stopPropagation(); close(); return }
+      const root = cam()
+      if (!root || S.current.busy || document.querySelector('.zrp-detail.zrp-visible, .zrp-popover')) return
+      const cell = root.querySelector('.zrp-grid > .zrp-day.zrp-selected') || root.querySelector('.zrp-grid > .zrp-day.zrp-today')
+      if (!cell) return
+      e.preventDefault(); e.stopPropagation()
+      open(cell)
+    }
+    root?.addEventListener('dblclick', onDbl)
+    window.addEventListener('keydown', onKey, true)
+    return () => { root?.removeEventListener('dblclick', onDbl); window.removeEventListener('keydown', onKey, true) }
+  }, [enabled]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Step 0 (23 October 2026): the Plan zooms out of the card that was clicked (or auto opened), 350 ms, then
+  // steps 1 and 2 follow on today. Hidden before the first paint so the full Plan never flashes first.
+  // FR : étape 0, le Plan sort en zoomant de la carte Matthieu 2026, puis les étapes 1 et 2 sur aujourd'hui.
+  const entry = useRef({ played: false, origin: undefined })
+  useLayoutEffect(() => {
+    const root = cam()
+    if (!enabled || !playOnOpen || entry.current.played || !root) return
+    if (entry.current.origin === undefined) entry.current.origin = takePlanOrigin(path)
+    root.style.opacity = '0'
+  }, [enabled, playOnOpen]) // eslint-disable-line react-hooks/exhaustive-deps
+  const zoomIn = async () => {
+    const root = cam(), o = entry.current.origin
+    const r = rectOf(root)
+    root.style.transformOrigin = '0 0'
+    let from
+    if (o) {
+      const k = o.w / r.w
+      from = { transform: `translate(${o.x - r.x}px, ${o.y - r.y}px) scale(${k})`, clipPath: `inset(0px 0px ${Math.max(0, r.h - o.h / k)}px 0px round ${F.widgetRadius / k}px)`, opacity: 0 }
+    } else {
+      from = { transform: `scale(${F.entryScale})`, opacity: 0 }
+    }
+    root.style.opacity = ''
+    const a = root.animate([from, { opacity: 1, offset: .4 }, { transform: 'none', clipPath: 'inset(0px 0px 0px 0px round 0px)', opacity: 1 }], { duration: dur(F.step0Ms), easing: F.ease })
+    await done(a)
+  }
+  useEffect(() => {
+    if (!enabled || !playOnOpen || mounted) return undefined
+    setMounted(true)
+    let alive = true
+    ;(async () => {
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
+      if (!alive || !cam()) return
+      await zoomIn()
+      entry.current.played = true
+      await wait(dur(F.pauseMs))
+      if (alive) open(cam()?.querySelector('.zrp-grid > .zrp-day.zrp-today'))
+    })()
+    return () => { alive = false; if (cam()) cam().style.opacity = '' }
+  }, [enabled, playOnOpen]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => () => { const root = rootRef.current; if (root) { root.getAnimations().forEach((a) => a.cancel()); root.style.transform = '' } }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  return createPortal(
+    <div ref={layer} className={`zrp-focus-layer ${dark ? 'zr-dark ' : ''}zrp-shell${dark ? '' : ' zrp-light'}`} style={{ ...PLAN_CSS_VARIABLES, position: 'fixed', inset: 0, padding: 0 }}>
+      <div className="zrp-focus-scrim" ref={scrim} onClick={close} />
+      <div className="zrp-focus-day" ref={widget} role="dialog" aria-label={day ? day.label : 'Day'}>
+        {day && (
+          <div className="zrp-focus-in">
+            <header className="zrp-focus-head">
+              <span className={`zrp-day-num${day.today ? ' zrp-focus-today-num' : ''}`}>{day.num}</span>
+              <span className="zrp-focus-weekday">{day.weekday}</span>
+              <span className="zrp-focus-date">{day.label}</span>
+              {day.today && <span className="zrp-focus-badge">Today</span>}
+              <button type="button" className="zrp-btn zrp-primary zrp-new" title="New goal" aria-label="New goal"
+                onClick={() => { const cell = S.current.cell; closeThen(() => onAdd(day.iso, cell)) }}><Icon name="plus" size={18} weight={1.9} /></button>
+            </header>
+            <div className="zrp-focus-tasks">{renderTasks(day.iso, closeThen)}</div>
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  )
+})
+
+export default PlanDayFocus

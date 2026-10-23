@@ -1,0 +1,411 @@
+#!/usr/bin/env node
+// >>> MÉTHODE CANONIQUE images = docs/image-backup-canonical.md + Scripts/lib/img-pipeline.mjs (public+chiffré+jsDelivr+index). Ne pas réinventer.
+// MIGRATION « PRIVÉ -> PUBLIC + CHIFFRÉ » EN MODE GIT (pas l'API REST). Voir docs/media-public-encrypted-design.md §6.4.
+//
+// EN UNE PHRASE (pour tout le monde) : aujourd'hui nos images vivent en CLAIR sur des dépôts GitHub PRIVÉS,
+// que notre serveur doit aller chercher lui-même (lent, limité). Ce script les recopie CHIFFRÉES sur des
+// dépôts PUBLICS. Public = n'importe qui peut télécharger les octets, mais ce ne sont que du charabia sans
+// la clé. Un CDN mondial gratuit (jsDelivr) sert alors le charabia à toute vitesse, et le navigateur de
+// l'utilisateur déchiffre chez lui avec la clé (servie par un petit point d'accès privé). Image mentale :
+// on range ses affaires dans un casier transparent en pleine rue, mais tout est dans des boîtes verrouillées.
+//
+// POURQUOI GIT ET PAS L'API REST : l'API REST GitHub plafonne à 5000 requêtes/heure. Migrer des milliers
+// d'images via l'API cramerait le quota en une passe ET gèlerait l'app. Le TRANSPORT GIT (clone/push) n'est
+// PAS soumis à cette limite : on clone les dépôts sur disque, on chiffre + copie en local (gratuit, rapide),
+// et on pousse en 1 commit par dépôt. Quelques opérations git au lieu de milliers d'appels API.
+//
+// SCHÉMA DE CHIFFREMENT — FIGÉ PAR LA TÂCHE A (src/capture/universalCapture.js), À RESPECTER À L'IDENTIQUE :
+//   - Algo : AES-GCM 256 bits. La même clé maître que celle servie par /api/media-key (server/media-key.js).
+//   - IV DÉTERMINISTE : 12 premiers octets du SHA-256 du CLAIR du fichier (= 24 premiers caractères hex).
+//     Conséquence VOULUE : même clair -> même IV -> même ciphertext -> même sha de blob -> GitHub dédoublonne,
+//     et la migration est IDEMPOTENTE (relancer ne crée pas de doublon). L'IV n'est pas secret ; sa seule
+//     exigence (unicité par fichier sous une même clé) tient car deux clairs distincts ont des SHA distincts.
+//   - WebCrypto (navigateur) renvoie ciphertext||tag concaténés. Node `aes-256-gcm` sépare le tag : on le
+//     RÉAPPEND donc (cipher = update||final||authTag) pour produire un octet-pour-octet identique au client.
+//   - VIGNETTE .webp : chiffrée AVEC SON PROPRE IV, dérivé du SHA-256 du CLAIR DE LA VIGNETTE (contenu distinct
+//     de l'image). Stocké dans le manifest sous `thumbIv`.
+//   - CHEMIN : adresse de contenu = hash du CLAIR (ab/cd/<hash>.<ext>). Stable privé/public/migration : le
+//     chemin sur le dépôt public est IDENTIQUE au chemin privé. Aucun nom humain (P0 anti-fuite).
+//
+// MANIFEST RÉÉCRIT (.img.json) : on ajoute vis:'public', cdnRepo/cdnPath/cdnCommit (pour buildJsDelivrUrl)
+//   + alg:'AES-GCM', iv, et thumbIv si une vignette chiffrée a bien été poussée. Forme EXACTEMENT alignée sur
+//   le manifest public produit par captureImage (tâche A) et lue par ImageNodeViewer / build-search-index.
+//
+// SÉCURITÉ ET GARDE-FOUS (P0, verbatim design §8) :
+//   - DRY-RUN PAR DÉFAUT : sans --apply, le script ne clone QUE zenray-data (shallow), n'écrit ni ne pousse
+//     RIEN, et affiche EXACTEMENT ce qu'il ferait (plan détaillé par dépôt source). --apply manuel par Matthieu.
+//   - CLÉ MAÎTRE : lue depuis env ZENRAY_MEDIA_KEY ou fichier local .zenray-media-key. JAMAIS générée ici
+//     (générer une nouvelle clé rendrait tout indéchiffrable par l'app). JAMAIS committée ni poussée.
+//   - JAMAIS DE PLAINTEXT poussé sur un dépôt public : on ne copie que du ciphertext.
+//   - NON DESTRUCTIF : ne supprime JAMAIS les binaires privés source tant que le public n'est pas vérifié.
+//     Ils deviennent orphelins (purge séparée, manuelle, plus tard). Trace de rollback écrite sur disque.
+//   - LOG migré / sauté / échoué, avec la raison de chaque saut/échec.
+//
+// USAGE :
+//   GITHUB_TOKEN=$(gh auth token) node scripts/migrate-encrypt-public.mjs                 # DRY-RUN, tout le média privé
+//   GITHUB_TOKEN=$(gh auth token) node scripts/migrate-encrypt-public.mjs --folders=pages/References/Games
+//   GITHUB_TOKEN=$(gh auth token) ZENRAY_MEDIA_KEY=<b64> node scripts/migrate-encrypt-public.mjs --apply
+//   options : --target=zenray-img-public-01   --workdir=.migrate-encrypt-tmp   --limit=N (cap nb images, debug)
+
+import { execFileSync } from 'node:child_process'
+import {
+  readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync,
+} from 'node:fs'
+import { createHash, createCipheriv } from 'node:crypto'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// ---- config / args --------------------------------------------------------
+const TOKEN = process.env.GITHUB_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN manquant (GITHUB_TOKEN=$(gh auth token) ...)'); process.exit(1) }
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const CONTENT_REPO = (process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data').split('/').pop()
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+const args = Object.fromEntries(process.argv.slice(2).map((a) => {
+  const m = a.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [a, true]
+}))
+const APPLY = !!args.apply
+const TARGET = (args.target || 'zenray-img-public-01').toString()
+const WORK = path.resolve(args.workdir || '.migrate-encrypt-tmp')
+const ONLY_FOLDERS = args.folders ? String(args.folders).split(',').map((s) => s.replace(/\/+$/, '')) : null
+const LIMIT = args.limit ? Math.max(1, parseInt(args.limit, 10) || 0) : 0
+// Plafond par dépôt public : GitHub recommande < ~5 Go/dépôt et jsDelivr sert mal au-delà. On éclate donc le
+// binaire public sur plusieurs shards zenray-img-public-NN, chacun plafonné ici (défaut 4,5 Go). Réglable via
+// --shard-cap-gb=N. Le côté privé est déjà éclaté pour la même raison ; on réplique ce sharding.
+const SHARD_CAP = (args['shard-cap-gb'] ? parseFloat(args['shard-cap-gb']) : 4.3) * 1073741824
+const THUMB_EST = 30 * 1024 // estimation de la taille d'une vignette .webp, pour la PLANIFICATION de capacité
+
+const cloneUrl = (repo) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`
+// Nommage des shards publics dérivé de --target (ex. 'zenray-img-public-01' -> base 'zenray-img-public-', n=1,
+// largeur 2). shardName(3) === 'zenray-img-public-03'. On démarre au numéro de --target et on incrémente au rollover.
+const _tgtM = TARGET.match(/^(.*?)(\d+)$/)
+const SHARD_BASE = _tgtM ? _tgtM[1] : 'zenray-img-public-'
+const SHARD_W = _tgtM ? _tgtM[2].length : 2
+const SHARD_START = _tgtM ? parseInt(_tgtM[2], 10) : 1
+const shardName = (i) => SHARD_BASE + String(i).padStart(SHARD_W, '0')
+const redact = (s) => String(s).split(TOKEN).join('***') // ne JAMAIS logger le token
+const git = (cwd, ...a) => { try { return execFileSync('git', a, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() } catch (e) { throw new Error('git ' + a[0] + ': ' + redact((e.stderr || e.stdout || e.message).toString().slice(0, 300))) } }
+const human = (b) => b < 1024 ? b + ' o' : b < 1048576 ? (b / 1024).toFixed(0) + ' Ko' : b < 1073741824 ? (b / 1048576).toFixed(1) + ' Mo' : (b / 1073741824).toFixed(2) + ' Go'
+
+// ---- 0. clé maître (lue, JAMAIS générée) ----------------------------------
+// Doit être EXACTEMENT la clé servie par /api/media-key, sinon le client ne pourra pas déchiffrer.
+// On la lit donc à la SOURCE (env puis fichier local), sans jamais en générer une nouvelle.
+function loadMasterKey() {
+  const env = process.env.ZENRAY_MEDIA_KEY
+  if (env && /^[A-Za-z0-9+/=]{40,}$/.test(env.trim())) return Buffer.from(env.trim(), 'base64')
+  const keyFile = path.join(ROOT, '.zenray-media-key')
+  if (existsSync(keyFile)) {
+    const v = readFileSync(keyFile, 'utf8').trim()
+    if (v) return Buffer.from(v, 'base64')
+  }
+  return null
+}
+const KEY = APPLY ? loadMasterKey() : null
+if (APPLY) {
+  if (!KEY || KEY.length !== 32) {
+    console.error('CLÉ MAÎTRE introuvable ou invalide. Fournis ZENRAY_MEDIA_KEY (base64 de 32 octets) ou un')
+    console.error('fichier ' + path.join(ROOT, '.zenray-media-key') + ' valide. Le script NE GÉNÈRE JAMAIS de clé')
+    console.error('(une nouvelle clé rendrait tout le média migré indéchiffrable par l\'app).')
+    process.exit(1)
+  }
+}
+
+// IV DÉTERMINISTE = 12 premiers octets du SHA-256 du clair. Identique à deriveIvBytes (tâche A).
+const sha256Hex = (buf) => createHash('sha256').update(buf).digest('hex')
+const ivFromHash = (hashHex) => Buffer.from(hashHex.slice(0, 24), 'hex') // 12 octets
+
+// Chiffre un Buffer clair -> { cipher: Buffer, iv: base64 }. Le ciphertext est ciphertext||authTag,
+// pour reproduire octet-pour-octet la sortie de WebCrypto (encryptBytesDeterministic, tâche A).
+function encryptDeterministic(clearBuf, hashHex) {
+  const iv = ivFromHash(hashHex)
+  const c = createCipheriv('aes-256-gcm', KEY, iv)
+  const body = Buffer.concat([c.update(clearBuf), c.final()])
+  const tag = c.getAuthTag() // 16 octets, à concaténer (WebCrypto les inclut dans la sortie)
+  return { cipher: Buffer.concat([body, tag]), iv: iv.toString('base64') }
+}
+
+// ---- 1. clone zenray-data (manifests) -------------------------------------
+mkdirSync(WORK, { recursive: true })
+const dataDir = path.join(WORK, CONTENT_REPO)
+if (existsSync(path.join(dataDir, '.git'))) { console.log('• zenray-data déjà cloné, fetch…'); git(dataDir, 'fetch', '--depth', '1', 'origin', BRANCH); git(dataDir, 'reset', '--hard', 'origin/' + BRANCH) }
+else { console.log('• clone zenray-data (shallow)…'); git(WORK, 'clone', '--depth', '1', '--branch', BRANCH, cloneUrl(CONTENT_REPO), CONTENT_REPO) }
+
+// ---- 2. collecte des .img.json PRIVÉS encore non migrés --------------------
+// Cible : toute image dont le manifest pointe un binaire PRIVÉ/legacy (m.repo + m.path) et qui n'est PAS
+// déjà publique (vis !== 'public'). On ignore les manifests déjà migrés (idempotence). Aucun filtre de
+// visibilité de DOSSIER ici : la migration concerne TOUT le binaire média (design §6.4), pas seulement les
+// dossiers marqués publics. --folders permet de restreindre par sous-arbre (migration progressive).
+const candidates = [] // { manifestAbs, manifestRel, dirRel, m }
+function walk(absDir, relDir) {
+  let entries = []
+  try { entries = readdirSync(absDir, { withFileTypes: true }) } catch { return }
+  for (const e of entries) {
+    const abs = path.join(absDir, e.name)
+    const rel = relDir + '/' + e.name
+    if (e.isDirectory()) {
+      if (ONLY_FOLDERS && !ONLY_FOLDERS.some((f) => rel === f || rel.startsWith(f + '/') || f.startsWith(rel + '/'))) continue
+      walk(abs, rel)
+    } else if (e.name.endsWith('.img.json')) {
+      if (ONLY_FOLDERS && !ONLY_FOLDERS.some((f) => relDir === f || relDir.startsWith(f + '/'))) continue
+      let m = null; try { m = JSON.parse(readFileSync(abs, 'utf8')) } catch {}
+      if (!m) continue
+      if (m.vis === 'public') continue // déjà migré -> idempotent
+      if (!m.repo || !m.path) continue // pas de source binaire privée connue
+      candidates.push({ manifestAbs: abs, manifestRel: rel, dirRel: relDir, m })
+    }
+  }
+}
+walk(path.join(dataDir, 'pages'), 'pages')
+if (LIMIT && candidates.length > LIMIT) candidates.length = LIMIT
+
+// ---- répartition MULTI-SHARD (rollover, SÛR EN BATCH) ----------------------
+// Affectation gloutonne dans l'ordre des candidats : on remplit un shard public jusqu'au plafond SHARD_CAP,
+// puis on roule au suivant (-02, -03…). Estimation par image = clair + 16 o (tag GCM) + vignette.
+// CLÉ POUR LE BATCH : on SEED le compteur de chaque shard avec sa TAILLE RÉELLE ACTUELLE sur GitHub (gh api,
+// taille en Ko). Ainsi, relancer le script en plusieurs fois (--limit / --folders) CONTINUE de remplir le bon
+// shard au lieu de tout réempiler sur -01. Sans réseau / repo absent -> 0 (premier run). Stocke c._shard.
+// Taille actuelle d'un shard public, SANS API REST (robuste au rate-limit). Priorité :
+//   1) clone local présent (cas normal en batch, workdir persistant) -> mesure du .git sur disque (du).
+//   2) sinon, tentative API REST .size (peut renvoyer 0 si quota épuisé).
+// Le .git d'un dépôt = ses blobs packés ≈ la taille rapportée par GitHub : bon proxy pour le plafond de shard.
+// SEED AUTORITAIRE = somme RÉELLE des octets des blobs du HEAD (arbre git, 1 appel). NE PAS utiliser le .git
+// local (gonflé par l'historique) ni .size (qui renvoie 0 sous rate-limit/lag -> faisait re-remplir un shard
+// déjà plein -> public-01 à 8 Go). Arbre tronqué = shard énorme -> considéré PLEIN. Repo absent -> 0.
+const shardExistingBytes = (name) => {
+  try {
+    const j = JSON.parse(execFileSync('gh', ['api', `repos/${OWNER}/${name}/git/trees/main?recursive=1`], { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1 << 28 }).toString())
+    if (j.truncated) return SHARD_CAP // tronqué -> trop gros -> traité comme plein (on n'y ajoute rien)
+    return (j.tree || []).filter((x) => x.type === 'blob').reduce((s, x) => s + (x.size || 0), 0)
+  } catch { return 0 } // repo absent (premier shard d'une famille) -> vide
+}
+let _shardIdx = SHARD_START
+let _shardBytes = shardExistingBytes(shardName(_shardIdx))
+const byShard = new Map() // shardName -> { count, bytes (estimés, ajoutés ce run) }
+for (const c of candidates) {
+  const est = (Number(c.m.size) || 0) + 16 + THUMB_EST
+  // while (pas if) : saute TOUT shard déjà plein (existant >= CAP) jusqu'à en trouver/créer un avec de la place.
+  while (_shardBytes + est > SHARD_CAP) { _shardIdx++; _shardBytes = shardExistingBytes(shardName(_shardIdx)) }
+  c._shard = shardName(_shardIdx)
+  _shardBytes += est
+  const sh = byShard.get(c._shard) || { count: 0, bytes: 0 }
+  sh.count++; sh.bytes += est; byShard.set(c._shard, sh)
+}
+
+// ---- plan ------------------------------------------------------------------
+const bySource = new Map() // sourceRepo -> { count, bytes }
+let totalBytes = 0
+for (const c of candidates) {
+  const s = bySource.get(c.m.repo) || { count: 0, bytes: 0 }
+  s.count++; s.bytes += Number(c.m.size) || 0; totalBytes += Number(c.m.size) || 0
+  bySource.set(c.m.repo, s)
+}
+console.log('\n=== PLAN MIGRATION CHIFFRÉE (' + (APPLY ? 'APPLY' : 'DRY-RUN') + ') ===')
+console.log('Dossiers ciblés       :', ONLY_FOLDERS ? ONLY_FOLDERS.join(', ') : 'tout le média privé')
+console.log('Images à migrer       :', candidates.length + (LIMIT ? ' (plafonné par --limit=' + LIMIT + ')' : ''))
+console.log('Octets binaires clair  :', human(totalBytes), '(images source ; + vignettes .webp en plus, + ~16 o de tag GCM/fichier)')
+console.log('Dépôts privés source   :')
+for (const [repo, s] of bySource) console.log('   -', repo, ':', s.count, 'img,', human(s.bytes))
+console.log('Dépôts publics cible   :', byShard.size, 'shard(s), plafond', human(SHARD_CAP), 'chacun (rollover auto)')
+for (const [repo, s] of byShard) console.log('   +', OWNER + '/' + repo, ':', s.count, 'img, ~' + human(s.bytes), '(ciphertext estimé)')
+// Code de sortie 7 = « PLUS RIEN À MIGRER » (sentinelle pour la boucle migrate-all.sh : un batch réussi sort 0,
+// donc il faut un code distinct pour signaler la fin). Tout est public, ou aucun manifest privé sous le périmètre.
+if (!candidates.length) { console.log('\nRien à migrer (tout est déjà public, ou aucun manifest privé sous le périmètre).'); process.exit(7) }
+
+if (!APPLY) {
+  console.log('\n— DRY-RUN : aucun clone de binaire, aucun chiffrement réel, aucune écriture, aucun push. —')
+  console.log('Ce qui serait fait avec --apply :')
+  console.log('  1. cloner les', bySource.size, 'dépôt(s) privé(s) source ci-dessus + les', byShard.size, 'dépôt(s) public(s) cible(s)')
+  console.log('  2. pour chaque image : lire le clair, vérifier son hash, CHIFFRER (AES-GCM, IV dérivé du hash),')
+  console.log('     écrire le ciphertext sur SON shard public au MÊME chemin haché ; idem vignette .webp (IV propre)')
+  console.log('  3. pousser CHAQUE shard public (1 commit/shard) et récupérer son commit (pin jsDelivr immuable par shard)')
+  console.log('  4. réécrire', candidates.length, 'manifest(s) -> vis:public + cdnRepo(=shard)/cdnPath/cdnCommit + alg/iv/thumbIv ; pousser zenray-data')
+  console.log('  5. écrire une trace de rollback', path.join(WORK, 'rollback-<horodatage>.json'))
+  console.log('\nClé maître : ' + (loadMasterKey() ? 'présente (OK)' : '⚠️ ABSENTE — --apply échouera tant qu\'elle n\'est pas fournie'))
+  console.log('Relance avec --apply pour exécuter (manuel, Matthieu uniquement).')
+  process.exit(0)
+}
+
+// ---- 4. APPLY : dépôt public + clone shards source + chiffrement + copie ----
+// EXISTENCE via git ls-remote (transport GIT, HORS quota REST). gh repo view échouait en 403 sous rate-limit
+// et le faisait passer pour "absent" -> tentative de re-créer un dépôt existant -> crash. ls-remote, lui, ne
+// consomme pas le quota et dit la vérité même quota épuisé.
+function repoExists(repo) {
+  try { execFileSync('git', ['ls-remote', cloneUrl(repo), 'HEAD'], { stdio: ['ignore', 'ignore', 'ignore'], timeout: 60000 }); return true } catch { return false }
+}
+// Création RÉSILIENTE : seul appel REST incontournable (créer un dépôt). Si le quota est épuisé, on ATTEND le
+// reset (rate_limit ne compte pas dans le quota) puis on réessaie -> la migration non surveillée s'auto-répare
+// au lieu de planter. Avant chaque essai on re-teste l'existence (un autre run a pu le créer entre-temps).
+function ghCreateRepoResilient(repo) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    if (repoExists(repo)) return
+    try {
+      console.log('• création du dépôt public', repo, '…')
+      execFileSync('gh', ['repo', 'create', OWNER + '/' + repo, '--public', '--description', 'ZenRay drive — shard image PUBLIC chiffré (binaires hashes AES-GCM, servis via jsDelivr)'], { stdio: 'inherit' })
+      return
+    } catch (e) {
+      const msg = String((e && (e.stderr || e.message)) || e)
+      if (!/rate limit|API rate|\b403\b/i.test(msg)) throw e
+      let waitS = 90
+      try { const reset = parseInt(execFileSync('gh', ['api', 'rate_limit', '--jq', '.resources.core.reset'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(), 10); const now = Math.floor(Date.now() / 1000); if (Number.isFinite(reset)) waitS = Math.max(30, Math.min(1200, reset - now + 15)) } catch {}
+      console.log(`• quota API épuisé pour créer ${repo} — attente ${waitS}s puis réessai (auto-heal)…`)
+      try { execFileSync('sleep', [String(waitS)], { stdio: 'ignore' }) } catch {}
+    }
+  }
+  throw new Error('création de ' + repo + ' impossible après plusieurs essais (quota REST ?)')
+}
+// Prépare CHAQUE shard public utilisé (création si absent, clone/refresh, branche main avec >=1 commit).
+const targetDirs = new Map() // shardName -> dir local
+for (const repo of byShard.keys()) {
+  ghCreateRepoResilient(repo)
+  const d = path.join(WORK, repo)
+  if (existsSync(path.join(d, '.git'))) { git(d, 'fetch', 'origin'); try { git(d, 'reset', '--hard', 'origin/main') } catch {} }
+  else { console.log('• clone dépôt public cible', repo, '…'); git(WORK, 'clone', cloneUrl(repo), repo) }
+  try { git(d, 'rev-parse', 'HEAD') } catch {
+    writeFileSync(path.join(d, 'README.md'), '# ZenRay public image shard (chiffré)\n\nBinaires CHIFFRÉS (AES-GCM), chemins hashes ab/cd/<sha>.<ext> + vignettes .webp, servis via jsDelivr. Aucun nom humain, aucun plaintext.\n')
+    git(d, 'add', '-A'); git(d, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-m', 'init public encrypted image shard'); git(d, 'branch', '-M', 'main')
+  }
+  targetDirs.set(repo, d)
+}
+
+// clone PARTIEL (blob:none) + SPARSE-CHECKOUT des shards privés source : on ne télécharge QUE les fichiers
+// exacts à migrer (binaire + vignette), pas le dépôt entier ni son historique. Un run ciblé (--limit/--folders)
+// ne tire alors que quelques Mo au lieu de plusieurs Go. La migration complète tire bien tous les octets, mais
+// sans l'historique. On écrit la liste des chemins dans .git/info/sparse-checkout (pas d'argv géant).
+const needPaths = new Map() // repo source -> Set(chemins binaire + vignette)
+for (const c of candidates) {
+  const set = needPaths.get(c.m.repo) || new Set()
+  set.add(c.m.path); set.add(c.m.path.replace(/\.[^./]+$/, '.webp'))
+  needPaths.set(c.m.repo, set)
+}
+const shardDirs = new Map()
+for (const repo of bySource.keys()) {
+  const d = path.join(WORK, repo)
+  const paths = [...needPaths.get(repo)]
+  // Garde-fou : un clone partiel/cassé d'un run précédent (HEAD invalide) est supprimé et re-cloné proprement.
+  let okClone = existsSync(path.join(d, '.git'))
+  if (okClone) { try { git(d, 'rev-parse', 'HEAD') } catch { console.log('• clone source incomplet, on nettoie', repo); rmSync(d, { recursive: true, force: true }); okClone = false } }
+  if (!okClone) {
+    console.log('• clone partiel shard source', repo, '(' + paths.length + ' fichiers)…')
+    git(WORK, 'clone', '--depth', '1', '--filter=blob:none', '--no-checkout', cloneUrl(repo), repo)
+  } else { git(d, 'fetch', '--depth', '1', 'origin', 'main'); try { git(d, 'reset', '--hard', 'origin/main') } catch {} }
+  git(d, 'config', 'core.sparseCheckout', 'true')
+  mkdirSync(path.join(d, '.git', 'info'), { recursive: true })
+  writeFileSync(path.join(d, '.git', 'info', 'sparse-checkout'), paths.map((p) => '/' + p).join('\n') + '\n')
+  git(d, 'checkout', 'main') // --filter=blob:none -> seuls les blobs des chemins sparse sont réellement téléchargés
+  shardDirs.set(repo, d)
+}
+
+// chiffrement + écriture du ciphertext (image + vignette) sur le dépôt public, chemins hashés identiques.
+// On RE-HASHE le clair lu sur disque (on ne fait pas confiance au hash implicite du chemin) : l'IV doit
+// dériver des octets réels. Si le hash recalculé ne matche pas le chemin source, on SAUTE (corruption).
+const migrated = [] // { manifestRel, repo, path, iv, thumbIv|null }
+const skipped = []  // { manifestRel, reason }
+const failed = []   // { manifestRel, reason }
+let pathHashMismatch = 0 // images dont le hash recalculé ≠ hash inscrit dans le chemin (legacy : hash d'upload calculé autrement). NON bloquant : l'IV dérive du VRAI hash recalculé et est stocké dans le manifest, donc le déchiffrement reste correct.
+for (const c of candidates) {
+  const src = shardDirs.get(c.m.repo)
+  const binRel = c.m.path                          // ab/cd/<sha>.<ext>
+  const thumbRel = binRel.replace(/\.[^./]+$/, '.webp')
+  const expectedHash = (binRel.match(/\/([0-9a-f]{16,})\.[^./]+$/) || [])[1] || null
+  try {
+    const fromBin = path.join(src, binRel)
+    if (!existsSync(fromBin)) { skipped.push({ manifestRel: c.manifestRel, reason: 'binaire source introuvable: ' + binRel }); continue }
+    const clear = readFileSync(fromBin)
+    const hash = sha256Hex(clear)
+    // Le chemin legacy n'encode PAS forcément sha256(clair) (vieux imports hachés autrement). Ce n'est PAS de la
+    // corruption : on chiffre avec l'IV dérivé du hash RÉEL recalculé (stocké dans le manifest), le chemin est
+    // conservé tel quel. On compte juste l'écart pour info, on ne bloque pas.
+    if (expectedHash && expectedHash !== hash && !hash.startsWith(expectedHash)) pathHashMismatch++
+    const { cipher, iv } = encryptDeterministic(clear, hash)
+    const tdir = targetDirs.get(c._shard)
+    const toBin = path.join(tdir, binRel)
+    mkdirSync(path.dirname(toBin), { recursive: true })
+    writeFileSync(toBin, cipher)
+
+    // vignette : best-effort. Chiffrée avec SON propre IV (hash de SON clair). Absente -> manifest sans thumbIv.
+    let thumbIv = null
+    const fromThumb = path.join(src, thumbRel)
+    if (existsSync(fromThumb)) {
+      const tClear = readFileSync(fromThumb)
+      const tHash = sha256Hex(tClear)
+      const enc = encryptDeterministic(tClear, tHash)
+      thumbIv = enc.iv
+      const toThumb = path.join(tdir, thumbRel)
+      mkdirSync(path.dirname(toThumb), { recursive: true })
+      writeFileSync(toThumb, enc.cipher)
+    }
+    migrated.push({ manifestRel: c.manifestRel, repo: c._shard, path: binRel, iv, thumbIv, _c: c })
+  } catch (e) {
+    failed.push({ manifestRel: c.manifestRel, reason: redact(String((e && e.message) || e)).slice(0, 200) })
+  }
+}
+console.log('• chiffrés/copiés :', migrated.length, '| sautés :', skipped.length, '| échecs :', failed.length, pathHashMismatch ? '| hash≠chemin (legacy, OK) : ' + pathHashMismatch : '')
+
+// push de CHAQUE shard public, puis pin du commit PAR shard (jsDelivr immuable, distinct par dépôt)
+const commitOf = new Map() // shardName -> commit sha
+for (const [repo, d] of targetDirs) {
+  git(d, 'add', '-A')
+  if (git(d, 'status', '--porcelain')) {
+    git(d, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-m', 'add encrypted hashed blobs')
+    console.log('• push', repo, '…')
+    // Retry : les HTTP 500 de GitHub sur gros pack sont souvent transitoires. Garder --limit modéré par run pour
+    // que chaque push reste petit (le cap empêche le shard de dépasser 4,3 Go, mais un run unique peut pousser
+    // jusqu'à --limit images d'un coup).
+    let ok = false
+    for (let i = 0; i < 5 && !ok; i++) { try { git(d, 'push', 'origin', 'HEAD:main'); ok = true } catch (e) { if (i === 4) throw e; console.log('  push', repo, 'retry', i + 1) } }
+  }
+  commitOf.set(repo, git(d, 'rev-parse', 'HEAD'))
+  console.log('• commit pin', repo, '=', commitOf.get(repo))
+}
+
+// ---- 5. réécriture des manifests + trace rollback + push zenray-data -------
+// NON DESTRUCTIF : on garde repo/path source dans la trace de rollback (et on ne supprime aucun binaire privé).
+const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+const rollback = { ts: stamp, targets: [...commitOf.keys()], commits: Object.fromEntries(commitOf), items: [] }
+let rewritten = 0
+for (const item of migrated) {
+  const c = item._c
+  const before = { ...c.m } // état AVANT (pour rollback : remettre vis/repo/path, retirer cdn*/alg/iv)
+  const next = {
+    ...c.m, vis: 'public', cdnRepo: item.repo, cdnPath: item.path, cdnCommit: commitOf.get(item.repo),
+    alg: 'AES-GCM', iv: item.iv, ...(item.thumbIv ? { thumbIv: item.thumbIv } : {}),
+  }
+  writeFileSync(c.manifestAbs, JSON.stringify(next))
+  rollback.items.push({ manifestRel: item.manifestRel, before })
+  rewritten++
+}
+// trace de rollback écrite sur disque AVANT de pousser (survit à une coupure ; permet de réverter les manifests).
+const rollbackPath = path.join(WORK, 'rollback-' + stamp + '.json')
+writeFileSync(rollbackPath, JSON.stringify(rollback, null, 2))
+console.log('• trace de rollback écrite :', rollbackPath)
+
+git(dataDir, 'add', '-A')
+const dataDirty = git(dataDir, 'status', '--porcelain')
+// PUSH RÉSILIENT de zenray-data : la migration dure plusieurs minutes (chiffrement de milliers d'images) ;
+// pendant ce temps l'APP et l'auto-sync poussent leurs propres commits sur zenray-data -> au moment du push,
+// origin/main a bougé -> rejet non-fast-forward (« fetch first ») et le batch saute. On boucle donc :
+// push ; si rejeté -> fetch + rebase de NOTRE commit (réécriture de manifests) sur le nouveau tip, puis retry.
+// Conflit rare (l'app a touché le MÊME manifeste pendant la migration) -> on garde la version migrée (public chiffré).
+function pushDataResilient(tries = 6) {
+  for (let i = 0; i < tries; i++) {
+    try { git(dataDir, 'push', 'origin', 'HEAD:' + BRANCH); return }
+    catch (e) {
+      if (i === tries - 1) throw e
+      console.log('• push zenray-data rejeté (le distant a avancé), fetch + rebase + retry…')
+      git(dataDir, 'fetch', 'origin', BRANCH)
+      try { git(dataDir, 'rebase', 'origin/' + BRANCH) }
+      catch { try { git(dataDir, 'rebase', '--abort') } catch {} git(dataDir, 'rebase', '-X', 'theirs', 'origin/' + BRANCH) }
+    }
+  }
+}
+if (dataDirty) { git(dataDir, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-m', 'reindex ' + rewritten + ' image manifests -> public encrypted CDN'); console.log('• push zenray-data…'); pushDataResilient() }
+
+console.log('\n✅ MIGRATION CHIFFRÉE TERMINÉE :', rewritten, 'manifest(s) -> public, sur', commitOf.size, 'shard(s) :', [...commitOf.keys()].join(', '))
+if (skipped.length) { console.log('— sautés (' + skipped.length + ') :'); for (const s of skipped.slice(0, 20)) console.log('   ·', s.manifestRel, '→', s.reason) }
+if (failed.length) { console.log('— échecs (' + failed.length + ') :'); for (const f of failed.slice(0, 20)) console.log('   ·', f.manifestRel, '→', f.reason) }
+console.log('⚠️  VIDE LE CACHE Create (bouton "Vider le cache") puis recharge : sinon l\'app sert les anciennes URLs en cache.')
+console.log('ℹ️  Les binaires privés source ne sont PAS supprimés (orphelins). Vérifie l\'affichage public AVANT toute purge.')
+console.log('ℹ️  Rollback : ré-applique les manifests `before` de', rollbackPath, 'dans zenray-data si besoin.')

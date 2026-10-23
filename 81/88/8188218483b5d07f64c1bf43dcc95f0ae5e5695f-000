@@ -1,0 +1,183 @@
+// 12 October 2026, 13:10 CEST: the Motion Design tab (R06 sections 2.3 and 9). A YouTube-like gallery of the motions
+// published in pages/ZenRayMotionDesign/catalogue.json (one display read, out of quota, never one read per card), an
+// inner rail (Home, On this Mac, Requests, Montage), the page of one motion with its versions, and the local montage
+// view. The local service com.zenray.motion is probed while the tab is visible; when it does not answer, the cloud
+// gallery still works and iteration requests go to the zenray-data queue.
+// FR : l'onglet Motion Design : galerie du catalogue publie, rail interieur, page d'un motion, montage local.
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import { MOTION } from '../config/motion.js'
+import { useLang, useT } from '../i18n/useT.js'
+import { createMotionBridge } from '../lib/motionBridge.js'
+import { cardsOf, isLocalCatalogue, isMotionCatalogue } from './motionCatalogue.js'
+import MotionGallery, { MotionState } from './MotionGallery.jsx'
+import MotionPage, { readCloudJson } from './MotionPage.jsx'
+import MotionMontage from './MotionMontage.jsx'
+import './motion.css'
+
+const RAIL = ['studio', 'home', 'local', 'requests', 'montage']
+
+const readCache = () => { try { const v = JSON.parse(localStorage.getItem(MOTION.cacheKey) || 'null'); return isMotionCatalogue(v) ? v : null } catch { return null } }
+const writeCache = (v) => { try { localStorage.setItem(MOTION.cacheKey, JSON.stringify(v)) } catch {} }
+const readRail = () => { try { const v = localStorage.getItem(MOTION.viewKey); return RAIL.includes(v) ? v : 'studio' } catch { return 'studio' } }
+
+/** 15 October 2026: does the ZenRay Motion Design app answer on this Mac (port 3104)? CORS and the private network header come from it. */
+export async function probeStudio(fetchImpl = fetch) {
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), MOTION.studio.probeTimeoutMs)
+  try {
+    const r = await fetchImpl(MOTION.studio.origin + MOTION.studio.statusPath, { signal: ctl.signal, cache: 'no-store', targetAddressSpace: 'local' })
+    const j = await r.json()
+    return j?.ok === true
+  } catch { return false } finally { clearTimeout(timer) }
+}
+
+/** The whole application, as on the Mac: every change made there shows here at once (it reloads itself when its code changes). */
+export function MotionStudio({ tr, probe = probeStudio }) {
+  const [up, setUp] = useState(null)
+  useVisibleInterval(() => { probe().then(setUp) }, MOTION.revalidateMs / 3, [probe])
+  if (up === null) return <MotionState testId="motion-studio-wait" title={tr('motion.state.loading')} />
+  if (!up) return <MotionState testId="motion-studio-away" title={tr('motion.state.studioAway')} hint={tr('motion.state.studioHint')} />
+  return (
+    <iframe className="zrm-studio" data-testid="motion-studio" title="ZenRay Motion Design" src={MOTION.studio.origin + MOTION.studio.startPath} allow={MOTION.studio.allow} />
+  )
+}
+
+/** Runs fn now and every `ms` while the tab is visible (never polls a hidden tab). */
+function useVisibleInterval(fn, ms, deps) {
+  useEffect(() => {
+    let timer = null
+    const run = () => { if (document.visibilityState !== 'hidden') fn() }
+    run()
+    timer = setInterval(run, ms)
+    const onVisible = () => { if (document.visibilityState === 'visible') fn() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisible) }
+  }, deps) // eslint-disable-line react-hooks/exhaustive-deps
+}
+
+/**
+ * 14 October 2026: the Mac's catalogue by PAGES. The first page shows at once, the next ones are appended as they arrive, and a failure
+ * is a named state with a retry: it used to wait for the whole catalogue (22 s) with a 20 s timeout and swallow the failure, so
+ * "Loading the catalogue" never ended. FR : le catalogue du Mac par pages ; un echec est un etat nomme avec reessayer.
+ */
+export function useLocalCatalogue(bridge, enabled) {
+  const [state, setState] = useState({ rows: [], total: null, status: 'idle', error: null })
+  const [nonce, setNonce] = useState(0)
+  useEffect(() => {
+    if (!enabled) return undefined
+    let live = true
+    const fetchPage = (payload) => (bridge.cataloguePage ? bridge.cataloguePage(payload, { timeoutMs: MOTION.bridge.pageTimeoutMs }) : bridge.catalogue({ timeoutMs: MOTION.bridge.pageTimeoutMs }))
+    ;(async () => {
+      setState((s) => ({ ...s, status: s.rows.length ? 'loading-more' : 'loading', error: null }))
+      let offset = 0
+      let rows = []
+      try {
+        for (;;) {
+          const r = await fetchPage({ offset, limit: MOTION.localPageSize })
+          if (!live) return
+          if (!isLocalCatalogue(r.catalog)) throw new Error('catalogue illisible')
+          const page = r.catalog.motions
+          rows = offset === 0 ? page : rows.concat(page)
+          const more = r.catalog.hasMore === true && page.length > 0
+          setState({ rows, total: Number.isInteger(r.catalog.total) ? r.catalog.total : rows.length, status: more ? 'loading-more' : 'ready', error: null })
+          if (!more) break
+          offset += page.length
+        }
+      } catch (error) {
+        if (live) setState((s) => ({ ...s, status: s.rows.length ? 'partial' : 'error', error: error.message }))
+      }
+    })()
+    return () => { live = false }
+  }, [enabled, bridge, nonce])
+  return { ...state, retry: () => setNonce((n) => n + 1) }
+}
+
+export default function MotionDesignView({ t, reader = readCloudJson, bridgeFactory = createMotionBridge }) {
+  const tr = useT()
+  const [lang] = useLang()
+  const bridge = useMemo(() => bridgeFactory(), [bridgeFactory])
+  const [rail, setRailState] = useState(readRail)
+  const setRail = (v) => { setRailState(v); try { localStorage.setItem(MOTION.viewKey, v) } catch {} }
+  const [cloud, setCloud] = useState(() => ({ catalogue: readCache(), status: readCache() ? 'ready' : 'loading' }))
+  const [bridgeUp, setBridgeUp] = useState(false)
+  const [jobs, setJobs] = useState([])
+  const [chip, setChip] = useState('all')
+  const [selected, setSelected] = useState(null)
+
+  const loadCloud = useCallback(async () => {
+    try {
+      const value = await reader(MOTION.cloud.catalogue)
+      if (value === null) { setCloud((s) => ({ catalogue: s.catalogue, status: s.catalogue ? 'ready' : 'empty' })); return }
+      if (!isMotionCatalogue(value)) { setCloud({ catalogue: null, status: 'unreadable' }); return }
+      writeCache(value)
+      setCloud({ catalogue: value, status: 'ready' })
+    } catch {
+      // A transient failure keeps the last valid catalogue and is never shown as "no motion".
+      setCloud((s) => ({ catalogue: s.catalogue, status: s.catalogue ? 'ready' : 'error' }))
+    }
+  }, [reader])
+  useVisibleInterval(loadCloud, MOTION.revalidateMs, [loadCloud])
+
+  const probe = useCallback(async () => {
+    try { await bridge.status(); setBridgeUp(true) } catch { setBridgeUp(false) }
+  }, [bridge])
+  useVisibleInterval(probe, MOTION.revalidateMs, [probe])
+
+  const local = useLocalCatalogue(bridge, bridgeUp && ['local', 'montage'].includes(rail))
+  useEffect(() => {
+    if (!bridgeUp || rail !== 'requests') return undefined
+    let live = true
+    bridge.jobs().then((r) => { if (live) setJobs(r.jobs || []) }).catch(() => {})
+    return () => { live = false }
+  }, [bridgeUp, rail, bridge])
+
+  const cloudCards = useMemo(() => cardsOf(cloud.catalogue), [cloud.catalogue])
+  const localCards = useMemo(() => cardsOf({ schema: 'zrmd/catalog@1', motions: local.rows }), [local.rows])
+
+  // Deep link ?view=motion&motion=<id>&v=V_008 (read once the cards exist).
+  useEffect(() => {
+    if (selected) return
+    const q = new URLSearchParams(window.location.search)
+    const id = q.get('motion')
+    if (!id) return
+    const card = cloudCards.find((c) => c.id === id) || localCards.find((c) => c.id === id)
+    if (card) setSelected({ card, version: /^V_\d{3}$/.test(q.get('v') || '') ? q.get('v') : null })
+  }, [cloudCards, localCards, selected])
+
+  const open = (card) => setSelected({ card, version: card.version })
+  let content
+  if (selected) {
+    content = <MotionPage t={t} card={selected.card} initialVersion={selected.version} bridge={bridgeUp ? bridge : null} bridgeUp={bridgeUp} tr={tr} lang={lang} onBack={() => setSelected(null)} reader={reader} />
+  } else if (rail === 'studio') {
+    content = <MotionStudio tr={tr} />
+  } else if (rail === 'home') {
+    content = <MotionGallery cards={cloudCards} status={cloud.status} chip={chip} onChip={setChip} onOpen={open} tr={tr} lang={lang} />
+  } else if (rail === 'local') {
+    content = bridgeUp ? <MotionGallery cards={localCards} status={local.status === 'idle' ? 'loading' : local.status} total={local.total} onRetry={local.retry} chip={chip} onChip={setChip} onOpen={open} tr={tr} lang={lang} />
+      : <MotionState testId="motion-away" title={tr('motion.state.bridgeAway')} hint={tr('motion.state.bridgeHint')} />
+  } else if (rail === 'requests') {
+    content = !bridgeUp ? <MotionState testId="motion-away" title={tr('motion.state.bridgeAway')} hint={tr('motion.state.bridgeHint')} />
+      : jobs.length ? (
+        <div className="zrm-panel" data-testid="motion-jobs">
+          <ol className="zrm-steps">{jobs.map((j) => <li key={j.id}><span className="zrm-mono">{j.id}</span> {j.kind} {j.motionId || ''} : {j.state}{j.error ? ` (${j.error})` : ''}</li>)}</ol>
+        </div>
+      ) : <MotionState testId="motion-jobs-empty" title={tr('motion.requests.empty')} />
+  } else {
+    content = <MotionMontage cards={localCards} bridge={bridge} bridgeUp={bridgeUp} tr={tr} lang={lang} />
+  }
+
+  return (
+    <div className="zrm" data-testid="motion-view">
+      <nav className="zrm-rail" aria-label="Motion Design">
+        {RAIL.map((key) => (
+          <button key={key} type="button" className={`zrm-rail-item${rail === key && !selected ? ' is-on' : ''}`} onClick={() => { setSelected(null); setChip('all'); setRail(key) }} data-testid={`motion-rail-${key}`}>
+            {tr(`motion.rail.${key}`)}
+          </button>
+        ))}
+        <div className="zrm-rail-sep" />
+        <div className="zrm-rail-note" data-testid="motion-bridge-state">{bridgeUp ? 'com.zenray.motion · 3102' : tr('motion.rail.macAway')}</div>
+      </nav>
+      <main style={{ minWidth: 0 }}>{content}</main>
+    </div>
+  )
+}

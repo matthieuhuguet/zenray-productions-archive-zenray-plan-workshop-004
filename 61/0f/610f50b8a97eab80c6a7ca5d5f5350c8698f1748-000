@@ -1,0 +1,194 @@
+#!/usr/bin/env node
+// Public encrypted audio ingestion for Create.
+// Data plane is 100% Git transport; GitHub REST is used once per fresh shard (control plane).
+// Plain chunks are capped at 19 MiB - 16 bytes so AES-GCM ciphertext NEVER exceeds 19 MiB.
+
+import { createReadStream, existsSync, readFileSync } from 'node:fs'
+import { mkdir, open, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash, randomBytes } from 'node:crypto'
+import { execFileSync, spawnSync } from 'node:child_process'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { encryptDeterministic, loadMasterKey, sha256Hex, GIT_ENV } from './lib/img-pipeline.mjs'
+import { mimeForName } from '../src/lib/fileKinds.js'
+import { appendPublicDelta } from '../server/page.js'
+import { buildAudioManifestV3 } from '../src/audio/audioManifest.js'
+import { CDN_CHUNK, CDN_CHUNK_ENC } from '../src/config/chunkPolicy.js' // source unique 19 Mo / 19 Mo-16
+import { sharedBatchAdapter } from './lib/push-batch-policy.mjs'
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const TOKEN = process.env.GITHUB_TOKEN
+const ZDATA = process.env.ZR_ZDATA_CLONE || path.join(process.env.HOME, '.zr-thumb-bulk', 'zdata-clone')
+const CAP = Math.floor(4.3 * 1073741824)
+export const AUDIO_CLEAR_CHUNK_BYTES = CDN_CHUNK_ENC // 19 MiB - 16 (tag GCM), source unique chunkPolicy.js
+// 14 October 2026: the incremental push follows the push batch policy instead of a fixed 900 MiB. FR : suit la politique de lots.
+const batchPolicy = sharedBatchAdapter()
+const WORK = path.join(process.env.HOME, '.zr-audio-work', `run-${process.pid}-${Date.now().toString(36)}`)
+const GENV = { ...process.env, ...GIT_ENV }
+
+const argv = process.argv.slice(2)
+const dest = argv.shift()
+let coverFile = ''
+let dryRun = false
+let baseDir = ''
+const files = []
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--cover') coverFile = argv[++i] || ''
+  else if (argv[i] === '--dry-run') dryRun = true
+  else if (argv[i] === '--base') baseDir = argv[++i] || ''
+  else files.push(argv[i])
+}
+if (!TOKEN || !dest || !dest.startsWith('pages/') || !files.length) {
+  console.error('usage: GITHUB_TOKEN=… node scripts/upload-audio-list-git.mjs "pages/Music/..." <audio...> [--cover cover.jpg] [--base dir] [--dry-run]')
+  process.exit(2)
+}
+if (!existsSync(path.join(ZDATA, '.git'))) throw new Error(`clone zenray-data absent: ${ZDATA}`)
+for (const f of files) if (!existsSync(f)) throw new Error(`fichier absent: ${f}`)
+if (coverFile && !existsSync(coverFile)) throw new Error(`pochette absente: ${coverFile}`)
+
+const git = (dir, args, timeout = 600000) => execFileSync('git', ['-C', dir, ...args], { env: GENV, encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'pipe'] })
+const remote = (repo) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const hashFile = (f) => new Promise((resolve, reject) => { const h = createHash('sha256'); createReadStream(f).on('data', (b) => h.update(b)).on('error', reject).on('end', () => resolve(h.digest('hex'))) })
+const safe = (s) => String(s).replace(/[\\/:*?\"<>|]/g, '-').trim()
+const manifestPathOf = (file) => {
+  if (baseDir) {
+    const rel = path.relative(baseDir, file)
+    const relDir = path.dirname(rel).split(path.sep).map(safe).join('/')
+    const safeBase = safe(path.basename(file))
+    const sub = (relDir && relDir !== '.') ? `${relDir}/${safeBase}` : safeBase
+    return `${dest}/${sub}.media.json`
+  }
+  return `${dest}/${safe(path.basename(file))}.media.json`
+}
+const guess = (name) => { const b = path.basename(name, path.extname(name)).replace(/^\s*\d+\s*[-.]\s*/, ''); const m = b.match(/^(.+?)\s*(?:[：:]|\s[-–—]\s)\s*(.+?)\s*$/); return m ? { artist: m[1].trim(), title: m[2].trim() } : { artist: '', title: b.trim() } }
+const probe = (f) => { try { return JSON.parse(execFileSync(process.env.ZR_FFPROBE || '/opt/homebrew/bin/ffprobe', ['-v','error','-show_entries','format=duration:format_tags=title,artist,album,track','-of','json',f], { encoding: 'utf8', timeout: 30000 })) } catch { return {} } }
+
+// Prévol AVANT toute création de shard : clone propre, à jour, inventaire/hash et collisions.
+const dirtyBefore = git(ZDATA, ['status','--porcelain']).trim()
+if (dirtyBefore) throw new Error(`clone zenray-data sale avant inventaire; refus de mélanger:\n${dirtyBefore.slice(0,500)}`)
+git(ZDATA, ['pull','--rebase','-q'])
+const inventory = []
+for (const file of files) {
+  const info = await stat(file)
+  const mime = mimeForName(file)
+  if (!info.isFile() || info.size <= 0) throw new Error(`audio vide ou non régulier: ${file}`)
+  if (!String(mime || '').startsWith('audio/')) throw new Error(`format non audio refusé avant upload: ${file} (${mime || 'mime inconnu'})`)
+  const fullHash = await hashFile(file)
+  const manifestPath = manifestPathOf(file)
+  let action = 'upload'
+  if (existsSync(path.join(ZDATA, manifestPath))) {
+    const old = JSON.parse(await readFile(path.join(ZDATA, manifestPath), 'utf8'))
+    if (old.contentHash === fullHash) action = 'skip'
+    else throw new Error(`collision: ${manifestPath} existe avec un autre contentHash; renommer ou déplacer explicitement la source`)
+  }
+  const metadata = probe(file)
+  inventory.push({ file, fullHash, size: info.size, mime, manifestPath, action, metadata })
+}
+console.table(inventory.map((x) => ({ source: path.basename(x.file), manifest: x.manifestPath, hash: x.fullHash.slice(0,12), bytes: x.size, action: x.action })))
+const candidates = inventory.filter((x) => x.action === 'upload')
+if (dryRun) { console.log(`DRY-RUN: ${candidates.length} upload(s), ${inventory.length - candidates.length} skip(s), aucune écriture`); process.exit(0) }
+if (!candidates.length) { console.log('rien à uploader (manifestes exacts déjà présents), aucun shard créé'); process.exit(0) }
+
+const ctx = { repo: '', dir: '', bytes: 0, pending: 0, commits: {}, dirs: [] }
+async function openShard() {
+  ctx.repo = `zenrayshards-audio-${randomBytes(6).toString('hex')}`
+  ctx.dir = path.join(WORK, ctx.repo); ctx.dirs.push(ctx.dir)
+  await mkdir(ctx.dir, { recursive: true })
+  git(ctx.dir, ['init', '-q']); git(ctx.dir, ['branch', '-M', 'main']); git(ctx.dir, ['config','user.email','bot@zenray']); git(ctx.dir, ['config','user.name','zenray-bot']); git(ctx.dir, ['config','http.version','HTTP/1.1']); git(ctx.dir, ['config','http.postBuffer','524288000'])
+  await writeFile(path.join(ctx.dir, 'README.md'), '# ZenRayShards Audio\n\nAES-256-GCM encrypted, content-addressed audio chunks. No human filenames.\n')
+  const cr = spawnSync('curl', ['-s','-o','/dev/null','-w','%{http_code}','-X','POST','-H',`Authorization: Bearer ${TOKEN}`,'https://api.github.com/user/repos','-d',JSON.stringify({ name: ctx.repo, private: false })], { encoding: 'utf8' })
+  if ((cr.stdout || '').trim() !== '201') throw new Error(`création ${ctx.repo}: HTTP ${cr.stdout || '?'}`)
+  git(ctx.dir, ['add','README.md']); git(ctx.dir, ['commit','-q','-m','init']); git(ctx.dir, ['remote','add','origin',remote(ctx.repo)]); git(ctx.dir, ['push','-q','origin','HEAD:main'], 180000)
+  ctx.bytes = 0; ctx.pending = 0
+  console.log(`  repo public chiffré ${ctx.repo}`)
+}
+async function pushShard() {
+  if (!git(ctx.dir, ['status','--porcelain']).trim()) { ctx.commits[ctx.repo] = git(ctx.dir, ['rev-parse','HEAD']).trim(); return }
+  git(ctx.dir, ['add','-A']); git(ctx.dir, ['commit','-q','-m','+audio'])
+  const sent = ctx.pending
+  const track = batchPolicy.track(sent)
+  for (let a = 0; a < 8; a++) {
+    const startedAt = Date.now()
+    try { git(ctx.dir, ['push','-q','origin','HEAD:main'], Math.max(1200000, batchPolicy.timeoutMs(sent))); track.ok(Date.now() - startedAt); ctx.commits[ctx.repo] = git(ctx.dir, ['rev-parse','HEAD']).trim(); ctx.pending = 0; return }
+    catch (e) { track.fail(Date.now() - startedAt, String(e && e.message || e)); if (a === 7) throw e; await sleep(2500 * (a + 1)) }
+  }
+}
+async function writeCipher(hashedPath, cipher) {
+  if (!ctx.repo) await openShard()
+  if (ctx.bytes && ctx.bytes + cipher.length > CAP) { await pushShard(); await openShard() }
+  const out = path.join(ctx.dir, hashedPath); await mkdir(path.dirname(out), { recursive: true }); await writeFile(out, cipher)
+  const repo = ctx.repo; ctx.bytes += cipher.length; ctx.pending += cipher.length
+  if (ctx.pending >= batchPolicy.budgetBytes()) await pushShard()
+  return repo
+}
+
+const key = loadMasterKey(ROOT, { readFileSync })
+if (!key) throw new Error('clé maître média absente')
+await mkdir(WORK, { recursive: true })
+const pending = []
+try {
+  let coverPending = null
+  if (coverFile) {
+    const tmp = path.join(WORK, 'cover.webp')
+    execFileSync(process.env.ZR_MAGICK || '/opt/homebrew/bin/magick', [coverFile, '-auto-orient', '-resize', '1600x1600>', '-quality', '90', tmp], { timeout: 120000 })
+    const b = await readFile(tmp); const h = sha256Hex(b); const rel = `cover/${h.slice(0,2)}/${h}.webp`; const repo = await writeCipher(rel, b)
+    coverPending = { repo, path: rel }
+  }
+  for (const candidate of candidates) {
+    const { file, fullHash, mime, metadata: p } = candidate
+    const st = { size: candidate.size }
+    const fh = await open(file, 'r'); const parts = []; let off = 0; let i = 0
+    try {
+      while (off < st.size) {
+        const n = Math.min(AUDIO_CLEAR_CHUNK_BYTES, st.size - off); const clear = Buffer.allocUnsafe(n); await fh.read(clear, 0, n, off)
+        const h = sha256Hex(clear); const { cipher, iv } = encryptDeterministic(clear, key, h)
+        if (cipher.length > CDN_CHUNK) throw new Error('invariant 19 MiB violé')
+        const rel = `${fullHash.slice(0,2)}/${fullHash.slice(2,4)}/${fullHash}-${String(i).padStart(4,'0')}.bin`
+        const repo = await writeCipher(rel, cipher)
+        parts.push({ repo, path: rel, start: off, end: off + n - 1, size: n, iv })
+        off += n; i++; process.stdout.write(`\r  ${path.basename(file)} ${Math.round(off / st.size * 100)}%`)
+      }
+    } finally { await fh.close() }
+    process.stdout.write('\n')
+    const tags = p.format?.tags || {}; const g = guess(file)
+    pending.push({ file, fullHash, parts, size: st.size, duration: Number(p.format?.duration || 0), title: tags.title || g.title, artist: tags.artist || g.artist, album: tags.album || '', trackNo: tags.track || '', mime, coverPending, manifestPath: candidate.manifestPath })
+  }
+  await pushShard()
+
+  // Resolve immutable CDN URLs only after every involved repo has its final commit.
+  const manifests = pending.map((p) => {
+    const parts = p.parts.map((x) => ({ url: `https://cdn.jsdelivr.net/gh/${OWNER}/${x.repo}@${ctx.commits[x.repo]}/${x.path}`, start: x.start, end: x.end, size: x.size, iv: x.iv }))
+    const cover = p.coverPending ? `https://cdn.jsdelivr.net/gh/${OWNER}/${p.coverPending.repo}@${ctx.commits[p.coverPending.repo]}/${p.coverPending.path}` : ''
+    return {
+      path: p.manifestPath || `${dest}/${safe(path.basename(p.file))}.media.json`,
+      data: buildAudioManifestV3({
+        name: path.basename(p.file), title: p.title, artist: p.artist, album: p.album,
+        track: p.trackNo, mime: p.mime, size: p.size, duration: p.duration,
+        chunkSize: AUDIO_CLEAR_CHUNK_BYTES, parts, cover, contentHash: p.fullHash,
+      }),
+    }
+  })
+
+  // Safety: never absorb unrelated work from the shared sparse clone.
+  const dirty = git(ZDATA, ['status','--porcelain']).trim()
+  if (dirty) throw new Error(`clone zenray-data sale avant écriture; refus de mélanger:\n${dirty.slice(0,500)}`)
+  git(ZDATA, ['pull','--rebase','-q'])
+  for (const m of manifests) { const abs = path.join(ZDATA, m.path); await mkdir(path.dirname(abs), { recursive: true }); await writeFile(abs, JSON.stringify(m.data, null, 2) + '\n') }
+  git(ZDATA, ['add','--', ...manifests.map((m) => m.path)])
+  git(ZDATA, ['commit','-q','-m',`add: audio manifests (${manifests.length})`])
+  for (let a = 0; a < 5; a++) { try { git(ZDATA, ['push','-q','origin','HEAD:main'], 600000); break } catch (e) { if (a === 4) throw e; git(ZDATA, ['pull','--rebase','-q']) } }
+
+  // One CDN verification per immutable repo commit.
+  const seen = new Set()
+  for (const m of manifests) for (const p of m.data.parts) { const k = (p.url.match(/\/gh\/[^/]+\/[^/@]+@[^/]+/) || [p.url])[0]; if (seen.has(k)) continue; seen.add(k); let ok = false; for (let a = 0; a < 6 && !ok; a++) { ok = await fetch(p.url, { headers: { Range: 'bytes=0-0' } }).then((r) => r.ok).catch(() => false); if (!ok) await sleep(2500) } if (!ok) throw new Error(`jsDelivr non propagé: ${p.url}`) }
+  try {
+    const addedPaths = manifests.map((x) => x.path)
+    const indexOk = await appendPublicDelta(TOKEN, addedPaths, {})
+    console.log(`  index-add: ${indexOk ? addedPaths.length : 0}/${addedPaths.length} audio(s) cherchable(s)`)
+  } catch (e) { console.log(`  ⚠ index-add échoué, rattrapable: ${String(e.message || e).slice(0,120)}`) }
+  console.log(`✓ ${manifests.length} audio(s), ${seen.size} commit(s) CDN vérifié(s), chunks ciphertext <=19 MiB`)
+} finally {
+  await rm(WORK, { recursive: true, force: true }).catch(() => {})
+}

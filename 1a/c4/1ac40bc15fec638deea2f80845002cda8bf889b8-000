@@ -1,0 +1,141 @@
+// 7 October 2026, 14:10 CEST: `node scripts/Assets/FindInProject.mjs <project id | local path> "<phrase>" [--limit 10] [--json]`
+// EN: finds the file a person means from a sentence ("resume from the concept where we set the materials"), with no model: it ranks the project's live inventory (every file the service tracks) by the words of the sentence, French and English synonyms included, and boosts the files that the project's own memory (FEEDBACK.md, Project1.md, ConversationIndex.md) names in the passages that match the sentence. Each answer carries its reasons, so any LLM or person can check it.
+// FR : retrouve le fichier dont on parle a partir d'une phrase, sans modele : classe l'inventaire vivant du projet par les mots de la phrase (synonymes francais et anglais) et renforce les fichiers que la memoire du projet cite dans les passages qui correspondent. Chaque reponse donne ses raisons.
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+
+// One place for the vocabulary (HDA rule): each group is a family of words that mean the same thing in this studio.
+export const SYNONYMS = [
+  ['material', 'materials', 'materiau', 'materiaux', 'matiere', 'mat', 'shader', 'shading', 'texture', 'textures', 'texturing', 'copernicus', 'cop', 'basecolor', 'roughness', 'normal', 'height', 'albedo', 'pbr'],
+  ['concept', 'idee', 'idea', 'moodboard', 'reference', 'references', 'ref', 'refs', 'board', 'inspiration', 'sketch', 'esquisse', 'planche', 'sheet'],
+  ['scene', 'hip', 'hiplc', 'houdini', 'graph', 'graphe', 'network', 'reseau'],
+  ['render', 'rendu', 'rendus', 'karma', 'lumen', 'frame', 'frames', 'image', 'images', 'capture', 'captures', 'screenshot', 'viewport'],
+  ['video', 'videos', 'film', 'montage', 'edit', 'mov', 'mp4', 'reel', 'short', 'shorts', 'clip'],
+  ['thumbnail', 'thumbnails', 'miniature', 'vignette', 'cover', 'couverture', 'poster'],
+  ['version', 'versions', 'iteration', 'iterations', 'snapshot', 'snapshots', 'etape', 'step', 'stage'],
+  ['wood', 'bois', 'planche', 'plank', 'facade', 'shingles', 'tuile', 'tuiles', 'roof', 'toit'],
+  ['window', 'fenetre', 'shutter', 'shutters', 'volet', 'volets'],
+  ['stairs', 'escalier', 'escaliers', 'marche', 'porch', 'porche'],
+  ['light', 'lighting', 'lumiere', 'eclairage', 'lights', 'sky', 'ciel'],
+  ['camera', 'cameras', 'plan', 'plans', 'shot', 'shots', 'orbit', 'orbite', 'travelling', 'sequence', 'cinematics'],
+  ['unreal', 'ue', 'ue5', 'level', 'niveau', 'content'],
+  ['post', 'posts', 'article', 'publication', 'caption', 'legende'],
+]
+const STOP = new Set('a au aux avec ce ces dans de des du en et il je la le les leur ma mes moi mon ne nous on ou par pas pour que qui sa se ses son sur ta tes ton tu un une vous y avait avais ete etait fait faire depuis comme ou donc alors veux voudrais aimerais reprendre reprend repartir retrouver trouve trouver ouvre ouvrir mis mettre fichier fichiers dossier the of to and in on for from where we had set file folder open resume find'.split(' '))
+const fold = text => String(text).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+export const words = text => fold(String(text).replace(/([a-z])([A-Z])/g, '$1 $2')).split(/[^a-z0-9]+/).filter(word => word.length > 1 && !STOP.has(word))
+const stem = word => word.length > 4 ? word.replace(/(ations|ation|ements|ement|ings|ing|ees|ee|es|s|x)$/, '') : word
+const familyOf = new Map(SYNONYMS.flatMap((group, index) => group.map(word => [stem(fold(word)), index])))
+
+// The query becomes concepts: each concept is a set of equivalent stems; a file scores once per concept it satisfies.
+export function queryConcepts(phrase) {
+  const concepts = new Map()
+  for (const word of words(phrase)) {
+    const root = stem(word), family = familyOf.get(root)
+    const key = family === undefined ? `w:${root}` : `f:${family}`
+    concepts.set(key, family === undefined ? new Set([root]) : new Set(SYNONYMS[family].map(item => stem(fold(item)))))
+  }
+  return [...concepts.entries()].map(([key, stems]) => ({ key, stems }))
+}
+const matches = (stems, tokenStems) => [...stems].some(item => tokenStems.has(item) || [...tokenStems].some(token => token.length > 4 && item.length > 4 && (token.startsWith(item) || item.startsWith(token))))
+
+// Memory passages (paragraphs, list items) that match the sentence, with the file names they cite.
+export function matchingPassages(text, concepts, source) {
+  const passages = String(text).split(/\n(?=\s*(?:[-*]|#{1,4}|\d+\.)\s)|\n\s*\n/).map(item => item.trim()).filter(Boolean)
+  return passages.map(passage => {
+    const tokenStems = new Set(words(passage).map(stem)), hit = concepts.filter(concept => matches(concept.stems, tokenStems))
+    const cited = [...passage.matchAll(/[\w./-]+\.(?:hiplc|hip|hda|otl|usd|usda|uasset|umap|png|jpe?g|webp|exr|tif|mov|mp4|json|md|py|mjs|html|bgeo\.sc|blend|fbx|abc|vdb|psd)\b/gi)].map(match => path.basename(match[0]).toLowerCase())
+    const date = passage.match(/\b\d{1,2} (?:January|February|March|April|May|June|July|August|September|October|November|December) 20\d\d\b|\b20\d\d-\d\d-\d\d\b/)?.[0] || null
+    return { source, score: hit.length, concepts: hit.map(item => item.key), cited: [...new Set(cited)], date, text: passage.replace(/\s+/g, ' ').slice(0, 280) }
+  }).filter(item => item.score > 0)
+}
+
+export function rankProjectFiles({ phrase, files, passages = [], limit = 10, now = Date.now() }) {
+  const concepts = queryConcepts(phrase)
+  if (!concepts.length) throw new Error('The sentence has no searchable word')
+  const best = Math.max(0, ...passages.map(item => item.score)), strong = passages.filter(item => item.score === best && best > 0)
+  const citedBy = new Map()
+  for (const passage of strong) for (const name of passage.cited) (citedBy.get(name) || citedBy.set(name, []).get(name)).push(passage)
+  const newest = Math.max(0, ...files.map(file => file.mtimeMs || 0))
+  const ranked = files.map(file => {
+    // 7 October 2026: studio prefixes carry meaning (Unreal M_ = material, T_ = texture, SM_ = static mesh).
+    const named = file.relativePath.replace(/(^|[/_\-])M_/g, '$1material ').replace(/(^|[/_\-])T_/g, '$1texture ').replace(/(^|[/_\-])SM_/g, '$1mesh ')
+    const tokenStems = new Set(words(named).map(stem)), hit = concepts.filter(concept => matches(concept.stems, tokenStems))
+    const memory = citedBy.get(path.basename(file.relativePath).toLowerCase()) || []
+    const recency = newest ? Math.max(0, 1 - (newest - (file.mtimeMs || 0)) / (90 * 86400000)) : 0
+    // 7 October 2026: a restored LOAD copy is a duplicate of an original; the original wins.
+    const copy = /\/AssetsWorkspaces\/[^/]+\/loads\//.test(file.localPath || '') ? 8 : 0
+    const score = hit.length * 10 + (hit.length === concepts.length ? 5 : 0) + (memory.length ? 20 * Math.min(2, memory.length) : 0) + recency - copy
+    return { score: Math.round(score * 100) / 100, relativePath: file.relativePath, localPath: file.localPath, sourceId: file.sourceId, size: file.size, modified: file.mtimeMs ? new Date(file.mtimeMs).toISOString() : null,
+      matched: hit.map(item => item.key), coverage: `${hit.length}/${concepts.length}`, citedInMemory: memory.map(item => ({ source: item.source, date: item.date, text: item.text })) }
+  }).filter(item => item.matched.length || item.citedInMemory.length).sort((left, right) => right.score - left.score || String(right.modified).localeCompare(String(left.modified)))
+  // A work unit is one folder (a snapshot version, a render folder): people mean a step of work, not one of its three files.
+  const units = new Map()
+  for (const item of ranked) {
+    const key = `${item.sourceId}:${path.dirname(item.relativePath)}`
+    const unit = units.get(key) || units.set(key, { unit: path.dirname(item.relativePath), sourceId: item.sourceId, folder: path.dirname(item.localPath || ''), score: 0, files: [] }).get(key)
+    unit.files.push(item); unit.score = Math.max(unit.score, item.score)
+  }
+  const grouped = [...units.values()].map(unit => ({ ...unit, score: Math.round((unit.score + Math.min(3, unit.files.length - 1) * 0.5) * 100) / 100, files: unit.files.slice(0, 4) }))
+    .sort((left, right) => right.score - left.score)
+  return { concepts: concepts.map(item => item.key), total: files.length, units: grouped.slice(0, limit), results: ranked.slice(0, limit), passages: strong.slice(0, 5) }
+}
+
+async function main() {
+  const { config } = await import('./BridgeClient.mjs')
+  const { projectIdFromLocalPath } = await import('../../src/lib/projectContextIndex.js')
+  const args = process.argv.slice(2), option = name => { const at = args.indexOf(name); return at === -1 ? undefined : args[at + 1] }
+  const positional = args.filter((value, at) => !value.startsWith('--') && !['--limit'].includes(args[at - 1]))
+  const [target, phrase] = positional
+  if (!target || !phrase) { console.error('Usage: FindInProject.mjs <project id | local path> "<sentence>" [--limit 10] [--json]'); process.exit(2) }
+  const stateDir = config.storage.stateDir, index = JSON.parse(await readFile(path.join(stateDir, 'GlobalProjectIndex.json'), 'utf8'))
+  const projectId = target.includes('/') ? projectIdFromLocalPath(index, path.resolve(target)) : target
+  if (!projectId || !index.projects?.[projectId]) { console.error(`Unknown project: ${target}. Known: ${Object.keys(index.projects || {}).join(', ')}`); process.exit(2) }
+  const state = JSON.parse(await readFile(path.join(stateDir, `Project-${projectId}.json`), 'utf8'))
+  const files = state.inventory?.localFiles || []
+  const concepts = queryConcepts(phrase), passages = []
+  // Every markdown note the project's memory sources hold (feedback, knowledge, posts, conversation index), read from the live inventory.
+  for (const file of files.filter(item => /\.md$/i.test(item.relativePath) && (index.projects[projectId].locations?.memory || []).some(location => location.sourceId === item.sourceId))) {
+    try { passages.push(...matchingPassages(await readFile(file.localPath, 'utf8'), concepts, path.basename(file.localPath))) } catch (error) { if (error.code !== 'ENOENT') throw error }
+  }
+  const result = rankProjectFiles({ phrase, files, passages, limit: Number(option('--limit') || 10) })
+  const checkedAt = state.inventory?.checkedAt || null
+  if (args.includes('--json')) { console.log(JSON.stringify({ projectId, inventoryCheckedAt: checkedAt, ...result }, null, 1)); return }
+  console.log(`Project ${projectId}: ${result.total} files in the live inventory (checked ${checkedAt}); concepts: ${result.concepts.join(', ')}\n`)
+  if (!result.results.length) console.log('No file matches. Zero means no match in names or memory, not proof that the file does not exist.')
+  for (const [rank, unit] of result.units.entries()) {
+    console.log(`${rank + 1}. ${unit.folder}  [${unit.sourceId}]  score ${unit.score}`)
+    for (const item of unit.files) {
+      console.log(`   - ${path.basename(item.relativePath)}  words ${item.coverage} (${item.matched.join(', ') || 'memory'}), modified ${item.modified?.slice(0, 10)}`)
+      for (const cite of item.citedInMemory.slice(0, 1)) console.log(`     named in ${cite.source}${cite.date ? ` (${cite.date})` : ''}: ${cite.text.slice(0, 150)}`)
+    }
+  }
+  if (result.passages.length) { console.log('\nMemory passages that match the sentence:'); for (const item of result.passages) console.log(`- ${item.source}${item.date ? ` (${item.date})` : ''}: ${item.text.slice(0, 200)}`) }
+}
+if (process.argv[1] && path.resolve(process.argv[1]) === new URL(import.meta.url).pathname) main().catch(error => { console.error(error.message); process.exitCode = 1 })
+
+// 7 October 2026, 14:40 CEST: FileMap.md, the readable map of every work unit (folder) of a project, so that ANY model or person understands the project in one read.
+// EN: written into the project memory by the service after each inventory, only when its content changes; it excludes itself and the conversation index so that writing it never retriggers itself.
+// FR : carte lisible de chaque dossier de travail du projet, ecrite par le service apres chaque inventaire, seulement si elle change.
+export const MAP_EXCLUDED = /(^|\/)(FileMap\.md|ConversationIndex\.(md|json))$/
+const day = ms => ms ? new Date(ms).toISOString().slice(0, 10) : '?'
+export function renderFileMap(projectId, files, locations = {}) {
+  const kept = files.filter(file => !MAP_EXCLUDED.test(file.relativePath)), units = new Map()
+  for (const file of kept) {
+    const key = `${file.sourceId}\u0000${path.dirname(file.relativePath)}`
+    const unit = units.get(key) || units.set(key, { sourceId: file.sourceId, folder: path.dirname(file.relativePath), count: 0, bytes: 0, types: new Map(), first: Infinity, last: 0, names: [] }).get(key)
+    unit.count += 1; unit.bytes += file.size || 0
+    const type = (path.extname(file.relativePath).slice(1) || 'none').toLowerCase(); unit.types.set(type, (unit.types.get(type) || 0) + 1)
+    unit.first = Math.min(unit.first, file.mtimeMs || Infinity); unit.last = Math.max(unit.last, file.mtimeMs || 0); unit.names.push(path.basename(file.relativePath))
+  }
+  const roots = Object.fromEntries(Object.values(locations).flat().map(location => [location.sourceId, location.localPath]))
+  const lines = [`# File map of ${projectId}`, '', `Generated by the ZenRay Assets service from the live inventory: ${kept.length} files in ${units.size} folders. Do not edit: it is rewritten when files change. To find the file a sentence means: \`node scripts/Assets/FindInProject.mjs ${projectId} "<sentence>"\`.`, '',
+    '| Source | Folder | Files | Types | Modified | Examples |', '|---|---|---|---|---|---|']
+  const ordered = [...units.values()].sort((left, right) => right.last - left.last || left.folder.localeCompare(right.folder) || left.sourceId.localeCompare(right.sourceId))
+  for (const unit of ordered) {
+    const folder = unit.folder === '.' ? '' : unit.folder, base = roots[unit.sourceId] ? `${roots[unit.sourceId]}/${folder}`.replace(/\/$/, '') : folder
+    const types = [...unit.types.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0])).map(([type, count]) => `${type} ${count}`).join(', ')
+    lines.push(`| ${unit.sourceId} | \`${base.replace(/\|/g, '/')}\` | ${unit.count} | ${types} | ${day(unit.first === Infinity ? 0 : unit.first)} to ${day(unit.last)} | ${unit.names.sort().slice(0, 4).join(', ').replace(/\|/g, '/')} |`)
+  }
+  return { markdown: lines.join('\n') + '\n', files: kept.length, folders: units.size, counted: ordered.reduce((sum, unit) => sum + unit.count, 0) }
+}

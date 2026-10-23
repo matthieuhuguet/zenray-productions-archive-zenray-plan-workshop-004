@@ -1,0 +1,198 @@
+// audioQuickCache.js: cache memoire synchrone et prechauffage audio pour QuickLook.
+// Concu le 06 October 2026 pour rendre le streaming audio quasi instantane dans QuickLook.
+// Les manifestes et URLs virtuelles sont conserves en RAM (Map) pour reponse en 0 ms.
+
+import { readPageCached } from '../lib/manifestReadCache.js'
+import { registerRawMedia, prefetchRawMedia } from '../lib/vidStream.js'
+import { downloadUrls } from '../lib/archiveChunks.js'
+import { assembleBlobUrl } from '../lib/fetchAsset.js'
+import { mimeForName } from '../lib/fileKinds.js'
+import { decryptToObjectUrl } from '../media/crypto.js'
+
+const enc = encodeURIComponent
+const manifestCache = new Map()
+const resolvedUrlCache = new Map()
+const prefetchingSet = new Set()
+
+// Detection unifiee d'une entree audio (nom, mime ou chemin)
+export function isAudioEntry(item) {
+  if (!item) return false
+  const name = item.name || ''
+  const contentPath = item.contentPath || ''
+  if (/\.(mp3|wav|m4a|aac|flac|ogg|opus|aiff|alac)$/i.test(name)) return true
+  if (item.type === 'media' && /\.(mp3|wav|m4a|aac|flac|ogg|opus|aiff|alac)\.media\.json$/i.test(contentPath)) return true
+  if (item.type === 'file' && /\.(mp3|wav|m4a|aac|flac|ogg|opus|aiff|alac)\.file\.json$/i.test(contentPath)) return true
+  if (item.mime && item.mime.startsWith('audio/')) return true
+  const mime = mimeForName(name)
+  if (mime && mime.startsWith('audio/')) return true
+  return false
+}
+
+// Lecture synchrone du manifeste audio s'il est deja present en RAM
+export function getCachedAudioManifest(path) {
+  return (path && manifestCache.get(path)) || null
+}
+
+export function setCachedAudioManifest(path, manifest) {
+  if (path && manifest) manifestCache.set(path, manifest)
+}
+
+// URL synchrone si deja resolue et prete pour le composant audio
+export function getCachedAudioUrl(path) {
+  return (path && resolvedUrlCache.get(path)) || null
+}
+
+export function setCachedAudioUrl(path, url) {
+  if (path && url) resolvedUrlCache.set(path, url)
+}
+
+export function clearAudioQuickCache() {
+  manifestCache.clear()
+  resolvedUrlCache.clear()
+  prefetchingSet.clear()
+}
+
+// Lecture asynchrone avec mise en cache du manifeste
+export async function readAudioManifestCached(contentPath) {
+  if (!contentPath) return null
+  const cached = manifestCache.get(contentPath)
+  if (cached) return cached
+  try {
+    const j = await readPageCached(`/api/page?action=read&path=${enc(contentPath)}`)
+    if (!j || !j.markdown) return null
+    const m = JSON.parse(j.markdown)
+    manifestCache.set(contentPath, m)
+    return m
+  } catch {
+    return null
+  }
+}
+
+// Resolution prioritaire de l'URL lisible pour QuickLook
+export async function resolveAudioUrlFast(item, manifestPassed = null) {
+  if (!item || !item.contentPath) return null
+  const contentPath = item.contentPath
+  const cachedUrl = resolvedUrlCache.get(contentPath)
+  if (cachedUrl) return cachedUrl
+
+  const m = manifestPassed || (await readAudioManifestCached(contentPath))
+  if (!m) {
+    const fallback = `/api/stream?path=${enc(contentPath)}`
+    resolvedUrlCache.set(contentPath, fallback)
+    return fallback
+  }
+
+  // Cas 1 : type 'media' (.media.json) public
+  if (item.type === 'media' || contentPath.endsWith('.media.json')) {
+    // Si la piste est publique et tient en une seule part chiffree (<= 19 Mo, 99.9% des SFX et morceaux) :
+    // Dechiffrement direct en RAM avec WebCrypto AES-GCM -> Object URL Blob instantane (0 ms reseau SW)
+    if (m.vis === 'public' && Array.isArray(m.parts) && m.parts.length === 1 && m.parts[0]?.url && m.parts[0]?.iv) {
+      try {
+        const res = await fetch(m.parts[0].url)
+        if (res.ok) {
+          const cipher = await res.arrayBuffer()
+          const mime = m.mime || mimeForName(item.name) || 'audio/mpeg'
+          const blobUrl = await decryptToObjectUrl(cipher, m.parts[0].iv, mime)
+          if (blobUrl) {
+            resolvedUrlCache.set(contentPath, blobUrl)
+            return blobUrl
+          }
+        }
+      } catch {
+        // En cas d'erreur de dechiffrement direct, basculer sur le Service Worker
+      }
+    }
+
+    if (m.vis === 'public' && Array.isArray(m.parts) && m.parts.length) {
+      try {
+        const swUrl = await registerRawMedia(m, contentPath)
+        if (swUrl) {
+          resolvedUrlCache.set(contentPath, swUrl)
+          return swUrl
+        }
+      } catch {
+        // En cas d'indisponibilite du Service Worker, repli sur le proxy stream
+      }
+    }
+    const fallback = `/api/stream?path=${enc(contentPath)}`
+    resolvedUrlCache.set(contentPath, fallback)
+    return fallback
+  }
+
+  // Cas 2 : type 'file' (.file.json archive universelle)
+  if (item.type === 'file' || contentPath.endsWith('.file.json')) {
+    try {
+      const urls = (m.type === 'blob-raw' && Array.isArray(m.parts) && m.parts.length && m.parts[0]?.url)
+        ? m.parts.map((p) => p.url)
+        : downloadUrls(m)
+      const mime = m.mime || mimeForName(item.name) || 'audio/mpeg'
+      const blobUrl = await assembleBlobUrl({ urls, mime })
+      if (blobUrl) {
+        resolvedUrlCache.set(contentPath, blobUrl)
+        return blobUrl
+      }
+    } catch {
+      // Ignorer l'erreur d'assemblage
+    }
+  }
+
+  const fallback = `/api/stream?path=${enc(contentPath)}`
+  resolvedUrlCache.set(contentPath, fallback)
+  return fallback
+}
+
+// Prechauffage transparent d'une piste audio en arriere-plan
+export async function prefetchAudioItem(item) {
+  if (!item || !item.contentPath || prefetchingSet.has(item.contentPath)) return
+  prefetchingSet.add(item.contentPath)
+  try {
+    const m = await readAudioManifestCached(item.contentPath)
+    if (!m) return
+    if (m.vis === 'public' && Array.isArray(m.parts) && m.parts.length === 1 && m.parts[0]?.url && m.parts[0]?.iv) {
+      try {
+        const res = await fetch(m.parts[0].url)
+        if (res.ok) {
+          const cipher = await res.arrayBuffer()
+          const mime = m.mime || mimeForName(item.name) || 'audio/mpeg'
+          const blobUrl = await decryptToObjectUrl(cipher, m.parts[0].iv, mime)
+          if (blobUrl) {
+            resolvedUrlCache.set(item.contentPath, blobUrl)
+            return
+          }
+        }
+      } catch {
+        // Echec silencieux
+      }
+    }
+    if (m.vis === 'public' && Array.isArray(m.parts) && m.parts.length) {
+      const swUrl = await registerRawMedia(m, item.contentPath).catch(() => null)
+      if (swUrl) resolvedUrlCache.set(item.contentPath, swUrl)
+      // Demander au SW de chauffer le premier part CDN pour demarrage sans latence
+      prefetchRawMedia([m], 1).catch(() => {})
+    } else if (item.type === 'file' && (m.size == null || m.size <= 25 * 1024 * 1024)) {
+      // Archive legere de moins de 25 Mo : assembler le blob d'avance
+      resolveAudioUrlFast(item, m).catch(() => {})
+    }
+  } catch {
+    // Echec silencieux de prechargement
+  }
+}
+
+// Prechauffage des pistes audio voisines dans la liste
+export function prefetchAudioNeighbors(list, currentIndex, radius = 4) {
+  if (!Array.isArray(list) || currentIndex < 0 || list.length < 2) return
+  const len = list.length
+  const neighbors = []
+  for (let d = 1; d <= radius; d++) {
+    const nextItem = list[(currentIndex + d) % len]
+    const prevItem = list[(currentIndex - d + len) % len]
+    if (nextItem && isAudioEntry(nextItem)) neighbors.push(nextItem)
+    if (prevItem && isAudioEntry(prevItem)) neighbors.push(prevItem)
+  }
+  // Lancer le prechauffage avec un leger decalage non bloquant
+  setTimeout(() => {
+    for (const item of neighbors) {
+      prefetchAudioItem(item)
+    }
+  }, 35)
+}

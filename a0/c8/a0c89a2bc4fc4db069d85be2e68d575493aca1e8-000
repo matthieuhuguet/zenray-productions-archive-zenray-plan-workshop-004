@@ -1,0 +1,360 @@
+#!/usr/bin/env node
+// AttachVideoCmafDashHls.mjs (10 October 2026) : empaquette une video en CMAF (DASH .mpd + HLS .m3u8) en un seul passage,
+// pousse les segments .m4s sur le shard public zenray-vid-public-NN par Git (zero quota REST/raw.github),
+// et attache master (.m3u8) + mpd (.mpd) au manifeste .media.json existant tout en conservant parts[] (archive originale chiffree).
+import fs from 'node:fs'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { openVideoGitShard } from './lib/video-git-shard.mjs'
+// 12 October 2026 (D4): the fallback copy4 -> copy2 -> transcode bitrate ladder lives in lib/cmaf-packaging.mjs.
+// FR : le repli copy4 -> copy2 -> echelle de debits du transcodage vit dans lib/cmaf-packaging.mjs.
+import { probeStreams, packageWithFallback, cmafConfigFromEnv, mergeAudioGroups } from './lib/cmaf-packaging.mjs'
+// 12 October 2026: the rewriters live in lib/cmaf-rewrite.mjs, shared with scripts/Motion/PublishMotions.mjs.
+import { rewriteMediaPlaylist, rewriteMasterPlaylist, rewriteDashMpd, verifyJsDelivrSegment } from './lib/cmaf-rewrite.mjs'
+import { PUBLIC_SHARD, allocatePublicShard, persistPublicShardState, resolveToken } from './lib/public-shard.mjs'
+import { withCloneLock } from './lib/clone-lock.mjs'
+import { canonicalRel } from './lib/canonical-rel.mjs'
+import { acquireDirectoryLock, directoryLockOptions } from './lib/directory-lock.mjs'
+import { FILM_POSTER, isPublicPosterUrl, makeFilmPoster, verifyPublicPoster } from './lib/film-poster.mjs'
+// 14 October 2026: --stage-only packages the film and keeps the result on disk without any network step; a later run without the flag
+// finds the stage and only publishes. FR : --stage-only empaquette et garde le resultat sur disque, sans reseau ; la passe suivante publie.
+import { readStage, writeStage, removeStage } from './lib/cmaf-stage.mjs'
+
+const PUBLIC_VIDEO_SHARD_BIN_BYTES = Math.floor(4.2 * 1024 ** 3) // (10 October 2026) rotation shard public a 4.2 Gio
+const GH_OWNER = 'matthieuhuguet'
+// (14 October 2026) BATCH_STAGE_LIMIT_BYTES removed: the push batch policy cuts the list. Old note: lot Git de 350 Mio pour pousser un episode en un seul pack sans multiplier les git push
+
+function parseArgs(argv) {
+  const args = {}
+  for (let i = 2; i < argv.length; i += 1) {
+    const token = argv[i]
+    if (!token.startsWith('--')) continue
+    const key = token.slice(2)
+    const next = argv[i + 1]
+    if (!next || next.startsWith('--')) {
+      args[key] = true
+    } else {
+      args[key] = next
+      i += 1
+    }
+  }
+  return args
+}
+
+async function main() {
+  const args = parseArgs(process.argv)
+  const sourcePath = args.source ? path.resolve(args.source) : ''
+  const manifestPath = args.manifest ? path.resolve(args.manifest) : ''
+  const manifestClone = path.resolve(args['manifest-clone'] || '/Users/zenray/.claude/tmp/tmp-movies-series-upload/ManifestClone')
+  const workRoot = path.resolve(args['work-root'] || '/Users/zenray/.claude/tmp/tmp-movies-series-upload/HlsDashWork')
+  const shardCacheRoot = path.resolve(args['shard-cache-root'] || '/Users/zenray/.claude/tmp/tmp-movies-series-upload/GitShards')
+  const stageRoot = path.resolve(args['stage-root'] || process.env.ZR_CMAF_STAGE_ROOT || '/Users/zenray/.claude/tmp/tmp-movies-series-upload/CmafStaged')
+  const stageOnly = Boolean(args['stage-only'])
+  // 14 October 2026: PublishStagedBatch.mjs pushes SEVERAL staged films in one list (every push filled to the policy size) and then
+  // calls this script per film with the repository and the commit it got; this script then only attaches. FR : le lot a deja pousse.
+  const pushedRepo = args['pushed-repo'] ? String(args['pushed-repo']) : ''
+  const pushedCommit = args['pushed-commit'] ? String(args['pushed-commit']) : ''
+  const shardAddBytes = Number(args['shard-add-bytes'] || 0)
+
+  if (!sourcePath || !fs.existsSync(sourcePath)) {
+    throw new Error(`Missing or non-existent --source: ${sourcePath}`)
+  }
+  if (!manifestPath || !fs.existsSync(manifestPath)) {
+    throw new Error(`Missing or non-existent --manifest: ${manifestPath}`)
+  }
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  // 12 October 2026: the case comes from the disk, because git pathspecs are case-sensitive and APFS is not (House Of The Dragon).
+  // FR : la casse vient du disque ; sinon `git commit -- chemin` ne trouve pas le manifeste suivi et le nettoyage le supprimait.
+  const relManifestPath = canonicalRel(manifestClone, manifestPath)
+  if (!relManifestPath.startsWith('pages/')) {
+    throw new Error(`Manifest must be inside ManifestClone/pages/: ${relManifestPath}`)
+  }
+
+  // Si HLS+DASH est deja attache et present dans ManifestClone, on renvoie directement le resultat (10 October 2026)
+  if (
+    // FMP4-SINGLE (14 October 2026): `master` and `mpd` mean separate renditions (video, one per audio language). A film packaged as one
+    // downloadable fMP4 (scripts/PackageMuxedFmp4.mjs) would carry `manifest.download` instead; both must be recognised here.
+    manifest.hlsDashVerified &&
+    isPublicPosterUrl(manifest.poster) &&
+    manifest.master &&
+    manifest.mpd &&
+    manifest.publicRepo &&
+    manifest.commitPublic &&
+    fs.existsSync(path.join(manifestClone, manifest.master)) &&
+    fs.existsSync(path.join(manifestClone, manifest.mpd))
+  ) {
+    console.log(JSON.stringify({
+      ok: true,
+      alreadyAttached: true,
+      manifestPath,
+      master: manifest.master,
+      mpd: manifest.mpd,
+      publicRepo: manifest.publicRepo,
+      commitPublic: manifest.commitPublic,
+    }, null, 2))
+    return
+  }
+
+  const token = resolveToken()
+  // 14 October 2026: the key of a stage is the manifest path of the film, like the video id of the shard.
+  const stageDir = path.join(stageRoot, crypto.createHash('sha1').update(relManifestPath).digest('hex').slice(0, 12))
+  const stage = readStage(stageDir, sourcePath)
+  if (stageOnly && stage) {
+    // already packaged and still valid: nothing to redo (a transcode lasts minutes). FR : deja empaquete et valide.
+    console.log(JSON.stringify({ ok: true, staged: true, reused: true, stageDir, packagingMode: stage.packaged.mode, segmentCount: stage.packaged.names.length, segmentBytes: stage.packaged.totalBytes }))
+    return
+  }
+  const workDir = stage ? stage.filesDir : path.join(workRoot, 'current')
+  let published = false
+  const probe = probeStreams(sourcePath)
+
+  try {
+    // 12 October 2026 (D4): packet-scan prediction first, then copy4, copy2 and the transcode bitrate ladder (4K: 16, 8, 4, 2
+    // Mbit/s; other: 8, 4, 2). The real segment check stays the final gate of every pass; progress goes to stderr so
+    // stdout stays the JSON receipt.
+    // FR : prediction par balayage des paquets, puis copy4, copy2 et l'echelle de debits ; le controle reel des segments
+    // reste la barriere de chaque passe ; la progression va sur stderr, stdout reste le recu JSON.
+    const cmafConfig = cmafConfigFromEnv()
+    // 14 October 2026: a real time percentage of the packaging pass, written to <work-root>/progress.json (the worker shows it in the
+    // upload queue). FR : pourcentage en temps reel de la passe, ecrit dans progress.json pour la file d'envoi.
+    const progressJson = path.join(workRoot, 'progress.json')
+    const writeProgress = (data) => { try { const tmp = `${progressJson}.tmp`; fs.writeFileSync(tmp, JSON.stringify({ ...data, updatedAt: new Date().toISOString() })); fs.renameSync(tmp, progressJson) } catch { /* never breaks the upload */ } }
+    const packaged = stage ? stage.packaged : await packageWithFallback(sourcePath, workDir, probe, {
+      config: cmafConfig,
+      progressFile: path.join(workRoot, 'ffmpeg-progress.txt'),
+      onProgress: (p) => { try { const tmp = `${progressJson}.tmp`; fs.writeFileSync(tmp, JSON.stringify({ phase: 'package', percent: p.percent, mode: p.mode, bitrateMbit: p.bitrateMbit, updatedAt: new Date().toISOString() })); fs.renameSync(tmp, progressJson) } catch { /* never breaks packaging */ } },
+      onAttempt: (a) => console.error(`cmaf pass ${a.mode}${a.bitrateMbit ? `@${a.bitrateMbit}Mbit/s` : ''}: ${a.ok ? 'ok' : `failed (${String(a.reason).slice(0, 120)})`}`),
+    })
+    if (!packaged.ok) {
+      throw new Error(`CMAF packaging failed for ${sourcePath}: ${packaged.reason}`)
+    }
+    const packagingMode = packaged.mode
+    const attemptLabels = packaged.attempts.map((a) => `${a.mode}${a.bitrateMbit ? `@${a.bitrateMbit}` : ''}:${a.ok ? 'ok' : String(a.reason).split(':')[0]}`)
+
+    // 11 October 2026: the poster is a clear jpg in the SAME public shard as the segments (jsDelivr, no token, no raw.github).
+    // FR : le poster part dans le meme shard public que les segments ; une URL /api/raw-proxy (shard prive) sortait noire.
+    const posterFile = stage ? stage.posterFile : path.join(workRoot, 'poster-current.jpg')
+    if (!stage) {
+      fs.rmSync(posterFile, { force: true })
+      const posterOk = [probe.duration, FILM_POSTER.fallbackAtSec * 2, 0].some((at) => makeFilmPoster(sourcePath, posterFile, at))
+      if (!posterOk) throw new Error(`Poster extraction failed for ${sourcePath}`)
+    }
+    const posterBytes = fs.statSync(posterFile).size
+
+    if (stageOnly) {
+      // 14 October 2026: nothing leaves this machine. The segments, the playlists and the poster are kept for the publish step.
+      // FR : rien ne quitte la machine ; les segments, playlists et l'affiche sont gardes pour la publication.
+      const kept = writeStage({ stageDir, workDir, posterFile, sourcePath, packaged })
+      console.log(JSON.stringify({ ok: true, staged: true, stageDir: kept.dir, packagingMode, bitrateMbit: packaged.bitrateMbit, segmentCount: packaged.names.length, segmentBytes: packaged.totalBytes, attempts: packaged.attempts }, null, 2))
+      return
+    }
+
+    // 12 October 2026: SEVERAL films may be packaged (and transcoded: 20 to 40 minutes each) at the same time, but the public
+    // shard is a single remote ref and a single byte counter: the part from the allocation to the commit is serialised by a
+    // lock, the long ffmpeg work above it is not.
+    // FR : plusieurs films peuvent etre empaquetes en meme temps ; seule la partie allocation -> commit est serialisee.
+    const shardLock = await acquireDirectoryLock(`${shardCacheRoot}.shard-lock`, directoryLockOptions('long', `cmaf publish ${path.basename(manifestPath)}`))
+    let publicRepo, statePath, shardState, commitPublic, posterUrl, vidId, urlMap, masterRelPath, mpdRelPath
+    try {
+    // 12 October 2026: the byte counter is NOT written now; the push below lasts minutes and a counter modified in the clone
+    // would make every concurrent writer refuse to start ("clone is dirty"). It is written inside the commit section.
+    if (pushedCommit) {
+      statePath = path.join(manifestClone, PUBLIC_SHARD.stateFile)
+      let previous = {}
+      try { previous = JSON.parse(fs.readFileSync(statePath, 'utf8')) } catch { /* no counter yet */ }
+      publicRepo = pushedRepo
+      shardState = { active: pushedRepo, bytes: (previous.active === pushedRepo ? Number(previous.bytes || 0) : 0) + shardAddBytes }
+    } else {
+      ;({ repo: publicRepo, statePath, state: shardState } = await allocatePublicShard(manifestClone, packaged.totalBytes + posterBytes, token, { persist: false }))
+    }
+    const vidHash = crypto.createHash('sha1').update(relManifestPath).digest('hex').slice(0, 12)
+    const baseSlug = path.basename(manifestPath, '.media.json').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 48)
+    vidId = `${baseSlug}-${vidHash}`
+
+    // Push des segments .m4s par lots Git pour limiter l'empreinte disque locale (10 October 2026)
+    const shard = pushedCommit ? null : await openVideoGitShard({
+      owner: GH_OWNER,
+      repo: publicRepo,
+      token,
+      workDir: shardCacheRoot,
+    })
+
+    commitPublic = pushedCommit || null
+    try {
+      if (!pushedCommit) {
+      // 14 October 2026: ONE list, the push batch policy cuts it (up to 1 900 MiB per push, sized by the measured line). A fixed
+      // 350 MiB stage limit used to cut every push of the segments to 350 MiB whatever the line: measured 14 October 2026, 20 pushes
+      // of 351 MiB at 9.5 MB/s with an idle gap between each. FR : une seule liste, la politique la decoupe ; l'ancienne limite fixe
+      // de 350 Mio coupait chaque push a 350 Mio quelle que soit la ligne.
+      const allFiles = [{ path: `${vidId}/${FILM_POSTER.fileName}`, sourcePath: posterFile, size: posterBytes }]
+      for (const segName of packaged.names) {
+        const segAbs = path.join(workDir, segName)
+        allFiles.push({ path: `${vidId}/${segName}`, sourcePath: segAbs, size: fs.statSync(segAbs).size })
+      }
+      const resPush = await shard.pushFiles(allFiles, { message: `cmaf(${vidId}): ${packaged.names.length} segments`, onProgress: (percent) => writeProgress({ phase: 'push', percent }) })
+      commitPublic = resPush.commit
+      }
+    } finally {
+      // Nettoyage immediat du clone shard public pour ne jamais encombrer les 29 Gio libres (10 October 2026)
+      if (shard) fs.rmSync(shard.directory, { recursive: true, force: true })
+    }
+
+    const cdnBaseUrl = `https://cdn.jsdelivr.net/gh/${GH_OWNER}/${publicRepo}@${commitPublic}/${vidId}/`
+    // 11 October 2026: a manifest is never written with a poster the CDN does not serve as an image.
+    posterUrl = `${cdnBaseUrl}${FILM_POSTER.fileName}`
+    const posterCheck = await verifyPublicPoster(posterUrl)
+    if (!posterCheck.ok) throw new Error(`Poster verification failed for ${posterUrl}: ${posterCheck.reason}`)
+    urlMap = {}
+    for (const segName of packaged.names) {
+      urlMap[segName] = `${cdnBaseUrl}${segName}`
+    }
+
+    // 12 October 2026: every write to the shared clone happens inside ONE lock acquisition (the archive upload of the
+    // next film runs at the same time and also commits to this clone).
+    // FR : toute ecriture dans le clone partage tient dans une seule prise du verrou.
+    ;({ masterRelPath, mpdRelPath } = await withCloneLock(manifestClone, `cmaf attach ${path.basename(manifestPath)}`, async () => {
+      const relDir = path.posix.dirname(relManifestPath)
+      const streamRelDir = `${relDir}/.streams/${vidId}`
+      const streamAbsDir = path.join(manifestClone, streamRelDir)
+      fs.mkdirSync(streamAbsDir, { recursive: true })
+
+      // Ecriture des playlists media_*.m3u8, master.m3u8 et manifest.mpd dans ManifestClone (10 October 2026)
+      const mediaPlaylists = fs.readdirSync(workDir).filter((n) => /^media_\d+\.m3u8$/i.test(n)).sort()
+      persistPublicShardState(statePath, shardState)
+      const writtenRelPaths = [path.relative(manifestClone, statePath).split(path.sep).join('/')]
+
+      for (const plName of mediaPlaylists) {
+        const rawPl = fs.readFileSync(path.join(workDir, plName), 'utf8')
+        const rewrittenPl = rewriteMediaPlaylist(rawPl, urlMap)
+        const destPl = path.join(streamAbsDir, plName)
+        fs.writeFileSync(destPl, rewrittenPl)
+        writtenRelPaths.push(`${streamRelDir}/${plName}`)
+      }
+
+      const rawMaster = fs.readFileSync(path.join(workDir, 'master.m3u8'), 'utf8')
+      const vCodec = packagingMode === 'transcode' ? 'h264' : String(probe.video?.codec_name || 'h264').toLowerCase()
+      // 11 October 2026: one HLS rendition per audio track of the source, all in a single group, with language and label.
+      const mergedAudio = mergeAudioGroups(rawMaster, probe.audios)
+      const rewrittenMaster = rewriteMasterPlaylist(mergedAudio.text, streamRelDir, vCodec)
+      const masterRelPath = `${streamRelDir}/master.m3u8`
+      fs.writeFileSync(path.join(manifestClone, masterRelPath), rewrittenMaster)
+      writtenRelPaths.push(masterRelPath)
+
+      const rawMpd = fs.readFileSync(path.join(workDir, 'manifest.mpd'), 'utf8')
+      const rewrittenMpd = rewriteDashMpd(rawMpd, cdnBaseUrl)
+      const mpdRelPath = `${streamRelDir}/manifest.mpd`
+      fs.writeFileSync(path.join(manifestClone, mpdRelPath), rewrittenMpd)
+      writtenRelPaths.push(mpdRelPath)
+
+      // Mise a jour du manifeste .media.json en conservant type:'video-raw' et parts[] pour l'archive originale (10 October 2026)
+      // 12 October 2026: re-read under the lock, so a change made by another writer since the start of this run is kept.
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+      manifest.master = masterRelPath
+      manifest.mpd = mpdRelPath
+      manifest.publicRepo = publicRepo
+      manifest.poster = posterUrl
+      manifest.commitPublic = commitPublic
+      manifest.hlsDashVerified = true
+      manifest.streamingProtocols = ['hls', 'dash']
+      manifest.cmafPackagingMode = packagingMode
+      // 12 October 2026 (D4): the rung of a transcode (null for a stream copy), the source class, the mode the packet scan
+      // predicted (null when it was not available) and the passes that were run, for the agreement statistics.
+      manifest.cmafBitrateMbit = packaged.bitrateMbit
+      manifest.cmafSourceClass = packaged.sourceClass
+      manifest.cmafPredictedMode = packaged.predictedMode
+      manifest.cmafAttempts = attemptLabels
+      manifest.cmafSegmentCount = packaged.names.length
+      manifest.cmafBytes = packaged.totalBytes
+      // 11 October 2026: the audio tracks the player can offer, in file order (same shape as the clipsub reference).
+      manifest.audio = probe.audios.map((t) => ({ lang: t.lang, label: t.label, default: t.default, codec: t.codec, channels: t.channels }))
+      manifest.probe = { ...(manifest.probe || {}), audio: manifest.audio }
+      if (!manifest.duration && probe.duration > 0) {
+        manifest.duration = Math.round(probe.duration * 100) / 100
+      }
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+      writtenRelPaths.push(relManifestPath)
+
+      // Commit et push dans ManifestClone (zenray-data) avec rebase automatique si besoin (10 October 2026)
+      // 12 October 2026: a failure here must not leave the shared clone dirty (the next film's upload refuses a dirty clone).
+      try {
+      execFileSync('git', ['-C', manifestClone, 'add', '--', ...writtenRelPaths], { stdio: 'pipe' })
+      const statusOut = execFileSync('git', ['-C', manifestClone, 'status', '--porcelain', '--', ...writtenRelPaths], { encoding: 'utf8' }).trim()
+      if (statusOut) {
+        execFileSync('git', [
+          '-C', manifestClone,
+          '-c', 'user.name=ZenRay Bot',
+          '-c', 'user.email=bot@zenray.local',
+          'commit', '-m', `cmaf(hls+dash): ${path.basename(manifestPath, '.media.json')}`,
+          '--', ...writtenRelPaths,
+        ], { stdio: 'pipe' })
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          const pushRes = spawnSync('git', ['-C', manifestClone, 'push', 'origin', 'HEAD:main'], { encoding: 'utf8' })
+          if (pushRes.status === 0) break
+          execFileSync('git', ['-C', manifestClone, 'pull', '--rebase', 'origin', 'main'], { stdio: 'pipe' })
+          if (attempt === 3) {
+            throw new Error(`Failed to push ManifestClone: ${pushRes.stderr || pushRes.stdout}`)
+          }
+        }
+      }
+      } catch (error) {
+        // uncommitted leftovers of THIS attempt only: tracked files go back to HEAD, new files are removed
+        for (const rel of writtenRelPaths) {
+          const tracked = spawnSync('git', ['-C', manifestClone, 'ls-files', '--error-unmatch', '--', rel], { stdio: 'pipe' }).status === 0
+          try {
+            if (tracked) execFileSync('git', ['-C', manifestClone, 'checkout', 'HEAD', '--', rel], { stdio: 'pipe' })
+            else fs.rmSync(path.join(manifestClone, rel), { force: true })
+          } catch {}
+        }
+        throw error
+      }
+
+      return { masterRelPath, mpdRelPath }
+    }))
+    } finally {
+      await shardLock.release()
+    }
+
+    const firstSegUrl = urlMap[packaged.names[0]]
+    const cdnCheck = await verifyJsDelivrSegment(firstSegUrl)
+    if (!cdnCheck.ok) {
+      throw new Error(`jsDelivr segment verification failed for ${firstSegUrl}`)
+    }
+
+    console.log(JSON.stringify({
+      ok: true,
+      manifestPath,
+      master: masterRelPath,
+      mpd: mpdRelPath,
+      publicRepo,
+      commitPublic,
+      packagingMode,
+      bitrateMbit: packaged.bitrateMbit,
+      sourceClass: packaged.sourceClass,
+      predictedMode: packaged.predictedMode,
+      attempts: packaged.attempts,
+      skippedModes: packaged.skipped,
+      segmentCount: packaged.names.length,
+      segmentBytes: packaged.totalBytes,
+      verifiedSegmentUrl: firstSegUrl,
+      poster: posterUrl,
+      fromStage: Boolean(stage),
+    }, null, 2))
+    published = true
+  } finally {
+    // A stage is the only copy of a long packaging pass: it is removed after a successful publish, never after a failure.
+    // FR : une reserve est la seule copie d'un long empaquetage : retiree apres une publication reussie, jamais apres un echec.
+    if (stage) {
+      if (published) removeStage(stageDir)
+    } else if (!stageOnly || !fs.existsSync(path.join(stageDir, 'stage.json'))) {
+      fs.rmSync(workDir, { recursive: true, force: true })
+      fs.rmSync(path.join(workRoot, 'poster-current.jpg'), { force: true })
+    }
+  }
+}
+
+main().catch((err) => {
+  console.error(err?.stack || err?.message || String(err))
+  process.exit(1)
+})

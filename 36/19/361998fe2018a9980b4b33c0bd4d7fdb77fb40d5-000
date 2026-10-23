@@ -1,0 +1,114 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { readJson, saveJson } from './content.js'
+import { mergeCanvas } from './mergeCanvas.js'
+import { normalizeCanvas } from './schema.js'
+
+// Autosave d'un board Ref vers GitHub (zenray-data) via /api/page.
+//
+// Garde-fous (plan §13 P0 "LocalStorage est un faux ami" + "deux onglets") :
+//  - GitHub-backed, pas localStorage (localStorage = seulement cache viewport, hors scope ici).
+//  - Débounce : on coalesce les rafales de modifs (drag, resize) en UN save (plan §7.4 write amplification).
+//  - Conflit : si GitHub renvoie 409, on relit le remote, on MERGE par updatedAt, on re-save. Aucune perte.
+//  - BroadcastChannel : prévient les autres onglets du même board qu'une version fraîche existe.
+//
+// Statut exposé : 'idle' | 'saving' | 'saved' | 'conflict' | 'offline' | 'error'.
+// Retour : { status, save(canvas), flush(), lastSavedAt }.
+//   save(canvas) = enregistre l'état à sauvegarder et arme le débounce.
+//   flush()      = force la sauvegarde immédiate (à appeler sur pointerup / blur / unmount).
+
+const DEBOUNCE_MS = 1200
+
+export function useRefAutosave(path, { debounceMs = DEBOUNCE_MS } = {}) {
+  const [status, setStatus] = useState('idle')
+  const [lastSavedAt, setLastSavedAt] = useState(null)
+  const shaRef = useRef(null)         // sha GitHub courant du fichier
+  const pendingRef = useRef(null)     // dernier canvas à sauvegarder
+  const timerRef = useRef(null)
+  const savingRef = useRef(false)
+  const rerunRef = useRef(false)      // un doSave a été demandé pendant une écriture -> relancer après
+  const doSaveRef = useRef(null)      // référence stable vers doSave (évite une dépendance circulaire)
+  const bcRef = useRef(null)
+
+  // Canal inter-onglets : un autre onglet qui save le même board nous notifie (on pourra recharger).
+  useEffect(() => {
+    if (!path || typeof BroadcastChannel === 'undefined') return
+    const bc = new BroadcastChannel('zenray-ref:' + path)
+    bcRef.current = bc
+    return () => { try { bc.close() } catch {} ; bcRef.current = null }
+  }, [path])
+
+  // Initialise le sha en lisant l'existant (sans écraser pendingRef si déjà armé).
+  const primeSha = useCallback(async () => {
+    if (shaRef.current || !path) return
+    const { sha } = await readJson(path)
+    if (sha) shaRef.current = sha
+  }, [path])
+
+  const doSave = useCallback(async () => {
+    // PERTE DE TRAVAIL corrigée (2026-07-22, durcissement démo) : une modification survenant PENDANT une
+    // sauvegarde en vol était avalée deux fois -- (a) doSave sortait immédiatement (savingRef) sans jamais
+    // re-planifier, (b) à la fin, `pendingRef.current = null` effaçait la modif arrivée entre-temps. On
+    // mémorise donc la version réellement envoyée : si `pending` a changé depuis, on ne l'efface pas et on
+    // relance un cycle. Un trait dessiné pendant l'écriture précédente ne peut plus disparaître.
+    if (savingRef.current) { rerunRef.current = true; return }
+    if (!pendingRef.current || !path) return
+    savingRef.current = true
+    setStatus('saving')
+    const sent = pendingRef.current
+    const canvas = { ...pendingRef.current, updatedAt: new Date().toISOString() }
+    let res = await saveJson(path, canvas, shaRef.current)
+
+    // Conflit : relire -> merger -> resauver (une passe suffit dans 99% des cas, on tente 2x).
+    for (let i = 0; i < 2 && res.conflict; i++) {
+      setStatus('conflict')
+      const remote = await readJson(path)
+      const merged = mergeCanvas(canvas, remote.data ? normalizeCanvas(remote.data) : null)
+      shaRef.current = remote.sha
+      pendingRef.current = merged
+      res = await saveJson(path, merged, remote.sha)
+    }
+
+    savingRef.current = false
+    if (res.ok) {
+      shaRef.current = res.sha
+      // N'efface la file QUE si rien de neuf n'est arrivé pendant l'écriture (comparaison par référence).
+      const changedDuringSave = pendingRef.current !== sent
+      if (!changedDuringSave) pendingRef.current = null
+      setStatus('saved'); setLastSavedAt(Date.now())
+      try { bcRef.current && bcRef.current.postMessage({ type: 'saved', at: Date.now() }) } catch {}
+      // Une modif est arrivée pendant l'écriture (ou un doSave a été demandé et refusé) -> nouveau cycle.
+      if (changedDuringSave || rerunRef.current) { rerunRef.current = false; doSaveRef.current && doSaveRef.current() }
+    } else if (res.conflict) {
+      setStatus('conflict')
+    } else if (res.error === 'network') {
+      setStatus('offline')
+    } else {
+      setStatus('error')
+    }
+  }, [path])
+
+  doSaveRef.current = doSave
+
+  const save = useCallback((canvas) => {
+    pendingRef.current = canvas
+    primeSha()
+    if (timerRef.current) clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => { doSave() }, debounceMs)
+  }, [doSave, primeSha, debounceMs])
+
+  const flush = useCallback(async () => {
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
+    await doSave()
+  }, [doSave])
+
+  // Flush au démontage : on ne perd jamais une modif en attente quand on quitte le board.
+  useEffect(() => () => {
+    if (timerRef.current) clearTimeout(timerRef.current)
+    if (pendingRef.current) doSave()
+  }, [doSave])
+
+  // Permet au board de fixer le sha connu après un premier chargement.
+  const setSha = useCallback((s) => { shaRef.current = s }, [])
+
+  return { status, save, flush, lastSavedAt, setSha }
+}

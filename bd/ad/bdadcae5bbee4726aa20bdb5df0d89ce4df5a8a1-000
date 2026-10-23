@@ -1,0 +1,128 @@
+import { useEffect, useRef, useState } from 'react'
+
+// Extrait de App.jsx (batch refactor structurel 2026-07-16, item 1 du batch "App.jsx — large
+// structural refactor" : virtualiser la vue liste au lieu du rendu incrémental listShow).
+//
+// Dimensions de tuile Finder (style macOS) — PARTAGÉES par la grille virtuelle ET la grille CSS, pour
+// que chaque cellule ait la MÊME hauteur (jamais de chevauchement texte/vignette). La vignette est un
+// carré dont la taille suit le zoom ; sous elle, le nom sur 2 lignes max (clamp), centré.
+export const TILE_GAP = 14
+export const tileThumbSize = (zoom) => Math.max(44, Math.min(Math.round(zoom - 30), 220))
+export const tileRowH = (zoom) => tileThumbSize(zoom) + 56 // vignette + nom 2 lignes + paddings
+
+// Hauteur fixe d'une ligne en vue liste (icône 20px + padding 6px haut/bas). Partagée par le calcul de
+// fenêtre ET par le style de ligne côté Pages() -> jamais de dérive entre la mesure et le rendu.
+export const LIST_ROW_H = 34
+
+// Fenêtrage de scroll partagé par VirtualIconGrid (grille) et VirtualList (liste) : lit scrollTop dans
+// UN SEUL requestAnimationFrame par frame (coalescé), calcule un overscan adaptatif à la vitesse/direction
+// du défilement (biaisé dans le sens du scroll), et ne pousse un nouvel état que si la fenêtre de lignes
+// [first,last] a réellement changé (quantifié à la ligne, pas au pixel). Écrit une seule fois (2026-06-11
+// pour la grille), désormais partagé pour ne jamais dupliquer cette mécanique anti-freeze 100k+.
+function useVirtualWindow(scrollRef, rowHeight, { overscan = 3, overscanMax = 8 } = {}) {
+  const [width, setWidth] = useState(0)
+  const [viewH, setViewH] = useState(800)
+  const [win, setWin] = useState({ first: 0, last: 0 })
+  const rafRef = useRef(0)
+  const lastTopRef = useRef(0)        // dernier scrollTop lu (mesure de vitesse)
+  const lastWinRef = useRef({ first: -1, last: -1 })
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    // Recalcule la fenêtre depuis le scrollTop courant + la vitesse (delta depuis la dernière frame).
+    const recompute = () => {
+      const top = el.scrollTop
+      const h = el.clientHeight || viewH
+      const vel = Math.abs(top - lastTopRef.current)        // px/frame -> proxy de vitesse
+      const dir = top >= lastTopRef.current ? 1 : -1         // sens du défilement
+      lastTopRef.current = top
+      // overscan croît avec la vitesse (borné), biaisé dans le sens du scroll : on peint plus loin DEVANT.
+      const grow = Math.min(overscanMax, overscan + Math.round(vel / rowHeight) * 2)
+      const ahead = dir > 0 ? grow : overscan
+      const behind = dir > 0 ? overscan : grow
+      const first = Math.max(0, Math.floor(top / rowHeight) - behind)
+      const last = Math.ceil((top + h) / rowHeight) + ahead
+      const lw = lastWinRef.current
+      if (first !== lw.first || last !== lw.last) { lastWinRef.current = { first, last }; setWin({ first, last }) }
+    }
+    const onScroll = () => {
+      if (rafRef.current) return
+      rafRef.current = requestAnimationFrame(() => { rafRef.current = 0; recompute() })
+    }
+    const measure = () => { setWidth(el.clientWidth - 32); setViewH(el.clientHeight); recompute() } // -32 = padding 16 g+d
+    measure()
+    el.addEventListener('scroll', onScroll, { passive: true })
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null
+    if (ro) ro.observe(el)
+    window.addEventListener('resize', measure)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); rafRef.current = 0; el.removeEventListener('scroll', onScroll); if (ro) ro.disconnect(); window.removeEventListener('resize', measure) }
+  }, [scrollRef, rowHeight, overscan, overscanMax])
+  return { win, width, viewH }
+}
+
+// Grille d'icônes VIRTUALISÉE (rendu fenêtré). Au-delà de ~200 tuiles, peindre tout le DOM rame :
+// ici on ne monte QUE les rangées visibles dans le conteneur scrollable + une marge (overscan).
+// Hauteur totale simulée par un conteneur vide, le bloc rendu est décalé en translateY.
+// F (fluidité 10k-1M items). Quatre leviers concrets sur cette grille fenêtrée :
+//  1. SCROLL COALESCÉ via rAF (voir useVirtualWindow) -> fini la pluie de re-renders.
+//  2. OVERSCAN ADAPTATIF (vitesse + direction) : 3 rangées au repos, jusqu'à 8 en fling, biaisé dans le SENS du
+//     défilement (plus de rangées devant que derrière). Strictement borné -> jamais de blanc, jamais 1M tuiles.
+//  3. CONTAINMENT CSS sur chaque tuile (voir renderIconTile) -> le navigateur saute layout/paint des tuiles overscan.
+//  4. onWindow(slicePaths) : on remonte au parent la liste exacte des chemins rendus, pour piloter le préchargement
+//     plein-format SUR LA FENÊTRE visible au lieu de tout le dossier (cf. effet _imgPaths).
+export function VirtualIconGrid({ entries, zoom, scrollRef, renderTile, onWindow, isAudioGrid = false }) {
+  const GAP = TILE_GAP
+  const ROW_H = isAudioGrid ? (46 + GAP) : (tileRowH(zoom) + GAP)
+  const { win, width } = useVirtualWindow(scrollRef, ROW_H, { overscan: 3, overscanMax: 8 })
+  // Grille audio (06 October 2026) : 3 colonnes maximum par ligne pour afficher les noms SFX en entier
+  const cols = isAudioGrid
+    ? Math.max(1, Math.min(3, Math.floor(((width || 1200) + GAP) / 320)))
+    : (Math.max(1, Math.floor((width + GAP) / (zoom + GAP))) || 1)
+  const totalRows = Math.ceil(entries.length / cols)
+  const totalH = totalRows * ROW_H
+  const firstRow = Math.max(0, Math.min(win.first, totalRows))
+  const lastRow = Math.min(totalRows, win.last)
+  const start = firstRow * cols
+  const slice = entries.slice(start, lastRow * cols)
+  // Remonte au parent les chemins rendus (préchargement plein-format piloté par la fenêtre, pas par le dossier entier).
+  useEffect(() => {
+    if (!onWindow) return
+    onWindow(slice.filter((e) => e && e.contentPath).map((e) => e.contentPath))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [start, lastRow, cols, entries])
+  return (
+    <div data-zr-virtual-grid style={{ position: 'relative', height: totalH }}>
+      <div style={{ position: 'absolute', top: firstRow * ROW_H, left: 0, right: 0, display: 'grid', gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`, gap: GAP, contain: 'layout style' }}>
+        {slice.map((e) => renderTile(e))}
+      </div>
+    </div>
+  )
+}
+
+// Vue liste VIRTUALISÉE (2026-07-16) — remplace l'ancien rendu INCRÉMENTAL (listShow lignes + bouton
+// "Afficher 2000 de plus") qui montait quand même jusqu'à listShow nœuds DOM d'un coup (2000, 4000, 6000…
+// jamais purgés). Ici, comme la grille, on ne monte QUE les lignes visibles + overscan : le DOM reste
+// borné à quelques dizaines de lignes même sur un dossier de 100k+ éléments, la barre de scroll a
+// immédiatement la bonne taille (plus besoin de cliquer "afficher plus" pour l'atteindre), et le calcul de
+// fenêtre est PARTAGÉ avec la grille (useVirtualWindow) plutôt que dupliqué. Une ligne est 6x moins
+// coûteuse à peindre qu'une tuile icône (pas de vignette) -> overscan par défaut plus généreux.
+export function VirtualList({ entries, rowHeight = LIST_ROW_H, scrollRef, renderRow, onWindow }) {
+  const { win } = useVirtualWindow(scrollRef, rowHeight, { overscan: 8, overscanMax: 32 })
+  const totalRows = entries.length
+  const totalH = totalRows * rowHeight
+  const first = Math.max(0, Math.min(win.first, totalRows))
+  const last = Math.min(totalRows, win.last)
+  const slice = entries.slice(first, last)
+  useEffect(() => {
+    if (!onWindow) return
+    onWindow(slice.filter((e) => e && e.contentPath).map((e) => e.contentPath))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [first, last, entries])
+  return (
+    <div data-zr-virtual-list style={{ position: 'relative', height: totalH }}>
+      <div style={{ position: 'absolute', top: first * rowHeight, left: 0, right: 0 }}>
+        {slice.map((e) => renderRow(e))}
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,54 @@
+// IN-MEMORY TWIN OF server/githubGraphql.js (2 October 2026), used by the guest-upload tests and the browser-uploader tests.
+// It keeps real GitHub semantics where they matter to us: a commit names the head it was built on and fails with a typed `stale`
+// error when the head moved; an identical re-commit still creates a commit; blobs are text or bytes; trees exist when a file lives
+// under them. Faults can be injected: `faults.commit` is a queue consumed one entry per commit attempt ('stale' | 'down' | 'lose' | null),
+// where 'lose' APPLIES the commit and then throws (the reply was lost: the case that makes retries dangerous).
+import { GhError } from '../githubGraphql.js'
+
+export function makeFakeGitHub({ owner = 'matthieuhuguet' } = {}) {
+  const repos = new Map()
+  const short = (r) => r.split('/').pop()
+  const repo = (name) => { const n = short(name); if (!repos.has(n)) repos.set(n, { files: new Map(), seq: 0, head: 'c0000', commits: 0 }); return repos.get(n) }
+  const gh = {
+    owner, dataRepo: `${owner}/zenray-data`, repos,
+    faults: { commit: [], read: [] },
+    stats: { reads: 0, commits: 0, shards: 0, byRepo: {} },
+    hooks: { beforeCommit: null },
+    async read(name, paths = []) {
+      gh.stats.reads++
+      const f = gh.faults.read.shift(); if (f) throw new GhError(f, f)
+      const r = repo(name)
+      let bytes = 0
+      for (const v of r.files.values()) bytes += v.text != null ? v.text.length : v.bytes.length
+      const items = paths.map((p) => {
+        const v = r.files.get(p)
+        if (v) return { kind: 'blob', text: v.text != null ? v.text : null, size: v.text != null ? v.text.length : v.bytes.length }
+        for (const k of r.files.keys()) if (k.startsWith(`${p}/`)) return { kind: 'tree', text: null, size: 0 }
+        return { kind: null, text: null, size: 0 }
+      })
+      return { oid: r.head, diskUsageKb: Math.round(bytes / 1024) + (r.extraKb || 0), items }
+    },
+    async commit(name, { expectedHeadOid, headline, additions }) {
+      const r = repo(name)
+      if (gh.hooks.beforeCommit) await gh.hooks.beforeCommit(short(name), r)
+      if (expectedHeadOid !== r.head) throw new GhError('stale', 'stale')            // a real stale commit never consumes an injected fault
+      const fault = gh.faults.commit.shift()
+      if (fault === 'down') throw new GhError('down', 'injected')
+      if (fault === 'stale') { r.seq++; r.head = `c${String(r.seq).padStart(4, '0')}x`; throw new GhError('stale', 'stale') }   // somebody else committed first
+      for (const a of additions) r.files.set(a.path, a.text != null ? { text: a.text } : { bytes: new Uint8Array(a.bytes) })
+      r.seq++; r.head = `c${String(r.seq).padStart(4, '0')}`; r.commits++
+      gh.stats.commits++; gh.stats.byRepo[short(name)] = (gh.stats.byRepo[short(name)] || 0) + 1
+      if (fault === 'lose') throw new GhError('down', 'reply lost')
+      return r.head
+    },
+    async readText(name, path) { const v = repo(name).files.get(path); return v && v.text != null ? v.text : null },
+    async createShard() {
+      gh.stats.shards++
+      const name = `zenrayshards-img-${String(gh.stats.shards).padStart(12, '0').replace(/./g, (c) => (Number(c) < 10 ? c : 'a'))}`
+      repo(name); return name
+    },
+    file(name, path) { return repo(name).files.get(path) || null },
+    listPaths(name, prefix = '') { return [...repo(name).files.keys()].filter((k) => k.startsWith(prefix)).sort() },
+  }
+  return gh
+}

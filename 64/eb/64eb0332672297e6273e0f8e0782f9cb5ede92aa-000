@@ -1,0 +1,127 @@
+// LOT IMAGES — vignette intelligente, instantanée et fluide.
+//
+// EN CLAIR POUR TOUS : une seule "brique" de vignette à réutiliser partout (Finder, galerie).
+// Elle ne charge l'image que quand elle approche de l'écran (économie réseau sur 10000 items),
+// elle réapparaît INSTANTANÉMENT si on l'a déjà vue (cache mémoire), et elle apparaît en douceur
+// (léger fondu, façon "blur-up") au lieu de surgir d'un coup. Comme une grille Eagle.
+//
+// TECHNIQUE : s'appuie sur les modules existants imageCache (LRU borné en RAM), imageQueue
+// (file priorisée, concurrence bornée) et useThumb/useInView (IntersectionObserver partagé).
+// - Si l'URL est déjà décodée dans le cache : on PEINT le pixel décodé dans un <canvas> => 0 ms,
+//   pas de re-décodage, pas d'aller-retour réseau.
+// - Sinon : on pose un <img> (loading lazy + decode async) qui se chargera via la file, et au
+//   décodage on bascule sur le canvas pour les futurs re-rendus instantanés.
+// Repli (fallback) : si l'URL principale échoue (ex. vignette .webp pas encore générée), on
+// bascule sur l'URL pleine fournie via `fullUrl`.
+//
+// OBJECTIF B(1) — NE JAMAIS retomber sur l'image pleine dans la GRILLE/RECHERCHE. Une vignette
+// manquante (.webp absente) déclenchait un onError -> bascule sur l'AVIF/image PLEINE = téléchargement
+// du binaire complet par tuile (lourd, ce que B interdit). Quand `noFullFallback` est vrai (cas grille),
+// l'échec affiche un PLACEHOLDER propre (le fond gris du wrap + une icône image neutre) et NE relance
+// AUCUN fetch. Le repli plein-format reste légitime UNIQUEMENT pour le viewer plein écran (qui assume
+// de charger l'image pleine et passe `noFullFallback` à false, le défaut).
+
+import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { imageCache, paintCover } from './imageCache.js'
+import { persistUrl } from './imageCacheIDB.js'
+import { useThumb } from './useImageThumb.js'
+
+export default function SmartThumb({
+  url,            // URL de la vignette légère (webp)
+  fullUrl = null, // URL plein-format (repli si la vignette manque)
+  noFullFallback = false, // B(1) : si vrai, échec vignette -> placeholder propre, JAMAIS l'image pleine (grille/recherche)
+  onMissing,      // T(2) : appelé quand la vignette .webp échoue (404) en mode grille -> backfill client-side
+
+  width = '100%',
+  height = 54,
+  radius = 7,
+  priority = false,
+  fit = 'cover',
+  bg = 'rgba(128,128,128,0.12)',
+  alt = '',
+  onClick,
+  onIntrinsicSize,
+  style = {},
+}) {
+  const [active, setActive] = useState(url) // URL réellement tentée (bascule sur fullUrl en cas d'erreur)
+  const [failed, setFailed] = useState(false) // B(1) : vignette manquante en mode grille -> placeholder, zéro fetch
+  useEffect(() => { setActive(url); setFailed(false) }, [url])
+
+  const { ref, src, ready } = useThumb(active, { priority })
+  const canvasRef = useRef(null)
+  const [loaded, setLoaded] = useState(false)
+  const [painted, setPainted] = useState(false)
+
+  // hauteur numérique connue -> on peut peindre dans un canvas net (devicePixelRatio)
+  const numH = typeof height === 'number' ? height : 0
+
+  // Peint depuis le cache dès que l'image est décodée et qu'on a une taille pixel.
+  const paint = useCallback(() => {
+    if (!numH || !active) return false
+    const bmp = imageCache.get(active)
+    const cv = canvasRef.current
+    if (!bmp || !cv) return false
+    const dpr = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1)
+    const cw = cv.clientWidth || cv.width
+    const wantW = Math.max(1, Math.round(cw * dpr))
+    const wantH = Math.max(1, Math.round(numH * dpr))
+    if (cv.width !== wantW) cv.width = wantW
+    if (cv.height !== wantH) cv.height = wantH
+    if (paintCover(cv, bmp)) { setPainted(true); return true }
+    return false
+  }, [active, numH])
+
+  useEffect(() => { setLoaded(false); setPainted(false) }, [active])
+  useEffect(() => { if (ready) paint() }, [ready, paint])
+
+  // Sur échec de la vignette :
+  //  - GRILLE/RECHERCHE (noFullFallback) : on N'ouvre PAS l'image pleine -> placeholder propre, zéro fetch (B(1)).
+  //  - VIEWER plein écran (défaut) : repli légitime sur le plein-format si fourni.
+  const onImgError = useCallback(() => {
+    if (noFullFallback) { setFailed(true); if (onMissing) { try { onMissing() } catch {} } return }
+    if (fullUrl && active !== fullUrl) setActive(fullUrl)
+    else setFailed(true)
+  }, [noFullFallback, fullUrl, active, onMissing])
+
+  // Quand le <img> finit de décoder, on alimente le cache puis on peint (futurs rendus instantanés).
+  const onImgLoad = useCallback((event) => {
+    if (!active) return
+    const image = event && event.currentTarget
+    setLoaded(true)
+    if (onIntrinsicSize && image && image.naturalWidth > 0 && image.naturalHeight > 0) {
+      onIntrinsicSize({ width: image.naturalWidth, height: image.naturalHeight })
+    }
+    // Objectif C : toute vignette VUE doit être persistée sur disque (survit au reload).
+    // serving-quota-8 : si numH est défini, imageCache.load(active) re-fetch ET persiste déjà les octets
+    // (idbPut, imageCache.js). Appeler persistUrl en plus = DEUX fetch de la même URL immuable au 1er affichage.
+    // -> on ne persiste manuellement QUE dans la branche sans canvas (où load n'est pas emprunté).
+    if (numH) imageCache.load(active).then(() => paint())
+    else persistUrl(active)
+  }, [active, numH, onIntrinsicSize, paint])
+
+  const wrap = { position: 'relative', width, height, borderRadius: radius, overflow: 'hidden', background: bg, cursor: onClick ? 'zoom-in' : 'default', flex: width === '100%' ? undefined : '0 0 auto', ...style }
+
+  return (
+    <div ref={ref} onClick={onClick} style={wrap}>
+      {/* Canvas net peint depuis le cache (instantané sur re-render). Visible une fois peint. */}
+      {numH > 0 && (
+        <canvas ref={canvasRef} aria-hidden style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: painted ? 1 : 0, transition: 'opacity 200ms ease' }} />
+      )}
+      {/* <img> de secours : sert le 1er chargement (et le cas height non numérique). Pas monté si échec définitif. */}
+      {src && !failed && (
+        <img
+          src={src} alt={alt} loading="lazy" decoding="async"
+          onLoad={onImgLoad} onError={onImgError}
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: fit, opacity: loaded && !painted ? 1 : 0, transition: 'opacity 200ms ease' }}
+        />
+      )}
+      {/* B(1) : placeholder propre quand la vignette manque (icône image neutre, AUCUN fetch d'image pleine). */}
+      {failed && !painted && (
+        <svg aria-hidden viewBox="0 0 24 24" style={{ position: 'absolute', inset: 0, margin: 'auto', width: '38%', height: '38%', opacity: 0.32, color: 'currentColor' }}>
+          <path fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" d="M3 5.5h18v13H3zM3 16l5-5 4 4 3-3 6 6" />
+          <circle cx="8" cy="9" r="1.6" fill="currentColor" stroke="none" />
+        </svg>
+      )}
+    </div>
+  )
+}

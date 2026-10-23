@@ -1,0 +1,961 @@
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { PALETTE, RADII } from '../theme.js'
+import Icon from './Icon.jsx'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+import { fileToWebp, ingestShelfImage, searchShelfPosters } from '../api.js'
+import { useInView } from '../media/useImageThumb.js' // lazy partagé de Create (IntersectionObserver, préchargement +400px)
+import { POSTER_POLICY, posterCandidates } from '../lib/posterFallback.js' // poster : cache d'edge d'abord, jsDelivr en secours
+import { notify } from './Notifications.jsx'
+
+// ════════════════════════════════════════════════════════════════════════
+// SHELF — bibliothèque personnelle façon Apple TV (jeux · anime/manga · films/séries/docs).
+// Greenfield. Monté par App.jsx dans la sidebar (zone Système). Export par défaut <Shelf t={...} />.
+//
+// Données : seed = public/shelf/<cat>.json (fetch direct). Écritures (notes/status/score/ajout/image)
+// persistées via le MÊME mécanisme que SfxView (Audio.jsx) : saveJsonWithRetry('shelf/<cat>.json', mutate)
+// (read-modify-write par identité, retry 409, append-compatible). Au chargement, on lit d'abord la version
+// LIVE via /api/page?action=read ; si absente (jamais éditée), on retombe sur le seed public/.
+//
+// UI : grille auto-fill de POSTERS portrait 2:3, coins ~12px, gap ~18px, hover = léger zoom (signature
+// Apple TV). Carte = image plein cadre + vignette dégradée sombre en bas, score en haut-gauche, titre en
+// SERIF (AnthropicSerif) en bas, pastille de status. Sans image -> dégradé élégant + titre lisible.
+// ════════════════════════════════════════════════════════════════════════
+
+const FONTS = { sans: "var(--zr-police-sans)", serif: "var(--zr-police-serif)" }
+
+const CATS = [
+  { key: 'games', label: 'Games', path: 'shelf/games.json' },
+  { key: 'anime-manga', label: 'Anime & Manga', path: 'shelf/anime-manga.json' },
+  { key: 'movies', label: 'Movies, Series & Docs', path: 'shelf/movies.json' },
+  // Books (2026-07-08, demande Matthieu) : seed initial = les 213 livres de son export Notion (Memory/
+  // Culture/Culture1.md, section Livres), généré une fois par scripts/build-shelf-books.mjs — jamais
+  // regénéré automatiquement (ce serait écraser les modifs faites depuis dans l'app). Portrait 2:3 comme
+  // anime/movies (pas de mode paysage dédié, une couverture de livre est déjà portrait).
+  { key: 'books', label: 'Books', path: 'shelf/books.json' },
+]
+const catByKey = (k) => CATS.find((c) => c.key === k) || CATS[0]
+
+// Status : ordre canonique + couleur de pastille (in_progress=bleu, backlog=gris, done=vert, dropped=rouge fané).
+const STATUS = {
+  in_progress: { label: 'In Progress', color: PALETTE.primary, order: 0 },
+  backlog: { label: 'Backlog', color: '#8E8E93', order: 1 },
+  done: { label: 'Done', color: PALETTE.green, order: 2 },
+  dropped: { label: 'Dropped', color: '#9B5A57', order: 3 },
+}
+const STATUS_ORDER = ['in_progress', 'backlog', 'done', 'dropped']
+const st = (s) => STATUS[s] || STATUS.backlog
+
+// Source d'une image stockée dans le drive (shard privé/public) — même résolveur que le reste de l'app.
+const imgSrc = (p) => `/api/img?path=${encodeURIComponent(p)}`
+// URL d'affichage d'un poster : kind 'url' = direct, kind 'shard' = via /api/img. null -> pas d'image.
+const posterUrl = (image) => {
+  if (!image) return null
+  if (typeof image === 'string') return image // tolère un champ image = URL brute
+  if (image.kind === 'url') return image.ref
+  if (image.kind === 'shard') return imgSrc(image.ref)
+  return null
+}
+
+// ANTI-IMAGE-NOIRE : jsDelivr peut mettre quelques minutes à mettre en cache un commit TOUT NEUF (404 transitoire
+// -> carte noire alors que l'image EST bien sur GitHub). On bascule alors sur raw.githubusercontent.com, qui sert
+// le même commit IMMÉDIATEMENT (repo public, pas de propagation CDN). Conversion d'URL équivalente, même sha :
+//   https://cdn.jsdelivr.net/gh/<owner>/<repo>@<ref>/<path>  ->  https://raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>
+const jsdelivrToRaw = (u) => {
+  const m = (u || '').match(/^https:\/\/cdn\.jsdelivr\.net\/gh\/([^/]+)\/([^@/]+)@([^/]+)\/(.+)$/)
+  return m ? `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}/${m[4]}` : null
+}
+
+// Dégradé déterministe (carte sans poster) : la même œuvre garde toujours la même couleur. Hash simple du id.
+const FALLBACK_GRADS = [
+  ['#3a3a52', '#15151f'], ['#4a2f3a', '#1a0f14'], ['#2f4a45', '#0f1a18'], ['#42385a', '#16111f'],
+  ['#5a4a2f', '#1f180f'], ['#2f3f5a', '#0f151f'], ['#503a4a', '#1c1118'], ['#3a5a4a', '#111f18'],
+  ['#5a3a3a', '#1f1111'], ['#3a4a5a', '#11171f'],
+]
+const hashStr = (s) => { let h = 0; for (let i = 0; i < (s || '').length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return Math.abs(h) }
+const fallbackGrad = (id) => { const [a, b] = FALLBACK_GRADS[hashStr(id) % FALLBACK_GRADS.length]; return `linear-gradient(160deg, ${a} 0%, ${b} 100%)` }
+
+const fmtScore = (n) => (n === 0 || n ? String(n) : '—')
+const nowIso = () => new Date().toISOString()
+
+// ── Cache local durable (anti-perte au refresh immédiat) ──────────────────────
+// Le commit GitHub est async (~1-3 s) et abortable par un F5. On écrit donc CHAQUE mutation en localStorage
+// SYNCHRONEMENT (instantané, survit au refresh) avec un flag `pending`. Au rechargement, si le cache porte une
+// écriture non confirmée, on la restaure ET on la re-commite. Confirmé (res.ok) -> pending:false. Zéro perte.
+const LS_KEY = (path) => `zr-shelf-v1:${path}`
+const lsRead = (path) => { try { return JSON.parse(localStorage.getItem(LS_KEY(path)) || 'null') } catch { return null } }
+const lsWrite = (path, obj) => { try { localStorage.setItem(LS_KEY(path), JSON.stringify(obj)) } catch {} }
+const slugify = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 48) || 'item'
+const newId = (name) => `${slugify(name)}-${Math.random().toString(16).slice(2, 6)}`
+
+// ── Export client (CSV / Markdown / JSON) ─────────────────────────────────
+const download = (filename, text, mime) => {
+  const blob = new Blob([text], { type: mime })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+const csvCell = (v) => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s }
+const exportCSV = (cat, items) => {
+  const head = ['Name', 'Score', 'Status', 'Tags', 'Extra', 'Image', 'Notes']
+  const rows = items.map((i) => [i.name, fmtScore(i.score), st(i.status).label, (i.tags || []).join('; '), JSON.stringify(i.extra || {}), posterUrl(i.image) || '', (i.notes || '').replace(/\n/g, '\\n')])
+  download(`shelf-${cat.key}.csv`, [head, ...rows].map((r) => r.map(csvCell).join(',')).join('\n'), 'text/csv')
+}
+const exportJSON = (cat, items) => download(`shelf-${cat.key}.json`, JSON.stringify({ v: 1, category: cat.key, label: cat.label, items }, null, 2), 'application/json')
+const exportMD = (cat, items) => {
+  const lines = [`# ${cat.label}`, '']
+  for (const g of STATUS_ORDER) {
+    const sub = items.filter((i) => i.status === g)
+    if (!sub.length) continue
+    lines.push(`## ${st(g).label}`, '')
+    for (const i of sub) {
+      lines.push(`### ${i.name}${(i.score === 0 || i.score) ? ` — ${i.score}` : ''}`)
+      if ((i.tags || []).length) lines.push(`*Tags:* ${i.tags.join(', ')}`)
+      const ex = Object.entries(i.extra || {}).filter(([, v]) => v)
+      for (const [k, v] of ex) lines.push(`*${k}:* ${v}`)
+      if (i.notes) lines.push('', i.notes)
+      lines.push('')
+    }
+  }
+  download(`shelf-${cat.key}.md`, lines.join('\n'), 'text/markdown')
+}
+
+// ════════════════════════════════════════════════════════════════════════
+export default function Shelf({ t }) {
+  const [cat, setCat] = useState('games')
+  // Sélecteur de catégorie « capsule repliée » (2026-07-08, demande Matthieu, précise la 1re tentative
+  // qui grossissait juste la cellule active sans jamais cacher les autres) : au repos, SEULE la capsule
+  // active est visible ; hover (desktop) ou clic (mobile, pas de hover tactile) déplie les autres à côté
+  // pour choisir ; choisir une catégorie replie aussitôt sur la nouvelle capsule seule. Clic en dehors =
+  // repli sans changer (même patron que Pop dans uiPrefs.jsx, mais inline dans la barre au lieu d'un menu
+  // flottant en dessous — ces capsules restent DANS le flux de la barre, jamais un popover superposé).
+  // LA PASTILLE SE MESURE, elle ne se devine pas. Aucune regle CSS ne connait la largeur d'un libelle :
+  // « Movies, Series & Docs » et « Books » n'ont pas la meme, donc une pastille a largeur fixe serait
+  // fausse trois fois sur quatre. On releve la geometrie de l'onglet actif et on la pose en variables sur
+  // le conteneur, d'ou la transition part toute seule.
+  const tabsRef = useRef(null)
+  useLayoutEffect(() => {
+    const placer = () => {
+      const boite = tabsRef.current
+      if (!boite) return
+      const actif = boite.querySelector('.zr-shelf-tab[aria-pressed="true"]')
+      if (!actif) return
+      const b = boite.getBoundingClientRect()
+      const a = actif.getBoundingClientRect()
+      boite.style.setProperty('--pastille-x', `${Math.round(a.left - b.left)}px`)
+      boite.style.setProperty('--pastille-l', `${Math.round(a.width)}px`)
+      boite.style.setProperty('--pastille-h', `${Math.round(a.height)}px`)
+    }
+    placer()
+    // Les polices arrivent apres le premier rendu : sans ce second passage, la pastille garde la largeur
+    // du texte mesure en police de repli, donc quelques pixels de trop ou de moins.
+    const id = setTimeout(placer, 350)
+    window.addEventListener('resize', placer)
+    if (document.fonts?.ready) document.fonts.ready.then(placer).catch(() => {})
+    return () => { clearTimeout(id); window.removeEventListener('resize', placer) }
+  }, [cat])
+  const [q, setQ] = useState('')
+  const [sel, setSel] = useState(null)       // id de l'œuvre ouverte dans le panneau détail
+  const [selRect, setSelRect] = useState(null) // rect de la carte cliquée -> on ancre le modal DESSUS
+  const openItem = (id, rect) => { setSel(id); setSelRect(rect || null) }
+  const [adding, setAdding] = useState(false)
+  const [addSeed, setAddSeed] = useState(null) // pré-remplissage (deep link Chrome/bookmarklet) : {name, image}
+  const [exportOpen, setExportOpen] = useState(false)
+  const [dragActive, setDragActive] = useState(false) // un drag est en cours ? pilote le nettoyage GARANTI du surlignage (tirets)
+
+  // État par catégorie : { items, sha, loaded, live }. live = la version drive existait (vs seed public/).
+  const [store, setStore] = useState({})
+  const cur = store[cat] || { items: null, sha: null }
+
+  // Chargement paresseux par catégorie : LIVE (drive) d'abord, sinon SEED (public/). Une seule fois par cat.
+  useEffect(() => {
+    if (store[cat]) return
+    let alive = true
+    const c = catByKey(cat)
+    setStore((s) => ({ ...s, [cat]: { items: null, sha: null } }))
+    ;(async () => {
+      const live = await fetch(`/api/page?action=read&path=${encodeURIComponent(c.path)}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+      let items = null, sha = null, isLive = false
+      if (live && live.markdown && !live.missing) {
+        try { const j = JSON.parse(live.markdown); items = j.items || []; sha = live.sha || null; isLive = true } catch { items = null }
+      }
+      if (items === null) {
+        const seed = await fetch(`/${c.path}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+        items = (seed && seed.items) || []
+      }
+      // RÉCONCILIATION : si le cache local porte une écriture NON confirmée (refresh juste après une modif,
+      // commit jamais atterri), on restaure le local ET on re-commite vers le drive. Sinon, le drive fait foi.
+      const cached = lsRead(c.path)
+      if (cached && cached.pending && Array.isArray(cached.items)) {
+        if (alive) setStore((s) => ({ ...s, [cat]: { items: cached.items, sha: sha ?? cached.sha ?? null, live: true } }))
+        saveJsonWithRetry(c.path, (obj) => ({ v: 1, category: c.key, label: c.label, ...obj, items: cached.items }),
+          { sha: sha ?? cached.sha ?? null, data: { v: 1, category: c.key, label: c.label, items } })
+          .then((res) => {
+            if (res.ok) { lsWrite(c.path, { items: res.data.items || cached.items, sha: res.sha, pending: false, savedAt: Date.now() }); if (alive) setStore((s) => ({ ...s, [cat]: { items: res.data.items || cached.items, sha: res.sha, live: true } })) }
+          })
+        return
+      }
+      if (alive) { setStore((s) => ({ ...s, [cat]: { items, sha, live: isLive } })); lsWrite(c.path, { items, sha, pending: false, savedAt: Date.now() }) }
+    })()
+    return () => { alive = false }
+  }, [cat]) // eslint: store volontairement non-listé (garde init unique par cat)
+
+  // DEEP LINK : App.jsx a déposé un payload {image,name,cat} (clic droit extension Chrome / bookmarklet).
+  // On bascule sur la bonne catégorie et on ouvre la modale Ajouter pré-remplie. L'image (URL externe) sera
+  // téléchargée + stockée en public à la soumission (déjà géré par AddModal.submit).
+  useEffect(() => {
+    let seed = null
+    try { const raw = localStorage.getItem('zr:shelf:add'); if (raw) { seed = JSON.parse(raw); localStorage.removeItem('zr:shelf:add') } } catch {}
+    if (!seed || !seed.image) return
+    if (seed.cat && CATS.some((c) => c.key === seed.cat)) setCat(seed.cat)
+    setAddSeed({ name: seed.name || '', image: seed.image }); setAdding(true)
+  }, [])
+
+  // Pile d'annulation par catégorie : avant CHAQUE mutation on empile l'état précédent (Ctrl/Cmd+Z restaure).
+  const undoStacks = useRef({})
+
+  // Persistance d'une mutation sur la catégorie courante. Optimiste + saveJsonWithRetry (retry 409).
+  // Le manifeste écrit conserve TOUT le schéma seed ({v,category,label,items}) pour rester relisable.
+  const persist = async (mutate, { snapshot = true } = {}) => {
+    const c = catByKey(cat)
+    const before = cur.items || []
+    if (snapshot) { const stk = (undoStacks.current[cat] || (undoStacks.current[cat] = [])); stk.push(before); if (stk.length > 60) stk.shift() }
+    const local = mutate(before)
+    setStore((s) => ({ ...s, [cat]: { ...s[cat], items: local } }))
+    lsWrite(c.path, { items: local, sha: cur.sha, pending: true, savedAt: Date.now() }) // durable AVANT le réseau
+    const res = await saveJsonWithRetry(
+      c.path,
+      (obj) => ({ v: 1, category: c.key, label: c.label, ...obj, items: mutate(obj.items || (cur.items || [])) }),
+      { sha: cur.sha, data: { v: 1, category: c.key, label: c.label, items: before } },
+    )
+    if (res.ok) { setStore((s) => ({ ...s, [cat]: { items: (res.data.items) || local, sha: res.sha, live: true } })); lsWrite(c.path, { items: res.data.items || local, sha: res.sha, pending: false, savedAt: Date.now() }) }
+    // res.ok=false -> on laisse pending:true : la prochaine ouverture de la catégorie re-commitera tout seul.
+    return res.ok
+  }
+
+  const items = cur.items
+  const setItem = (id, patch) => persist((arr) => arr.map((x) => x.id === id ? { ...x, ...patch, updatedAt: nowIso() } : x))
+  const addItem = (it) => persist((arr) => [{ ...it, id: newId(it.name), createdAt: nowIso(), updatedAt: nowIso() }, ...arr])
+  const removeItem = (id) => persist((arr) => arr.filter((x) => x.id !== id))
+
+  // Annulation (Ctrl/Cmd+Z) : restaure le dernier instantané de la catégorie courante et le persiste.
+  // Ignoré quand le panneau détail est ouvert (on laisse l'annulation native du textarea de notes).
+  const undo = useCallback(() => {
+    const stk = undoStacks.current[cat]; if (!stk || !stk.length) return
+    const prev = stk.pop()
+    setStore((s) => ({ ...s, [cat]: { ...s[cat], items: prev } }))
+    const c = catByKey(cat)
+    lsWrite(c.path, { items: prev, sha: cur.sha, pending: true, savedAt: Date.now() })
+    saveJsonWithRetry(c.path, (obj) => ({ v: 1, category: c.key, label: c.label, ...obj, items: prev }),
+      { sha: cur.sha, data: { v: 1, category: c.key, label: c.label, items: cur.items || [] } })
+      .then((res) => { if (res.ok) { setStore((s) => ({ ...s, [cat]: { items: res.data.items || prev, sha: res.sha, live: true } })); lsWrite(c.path, { items: res.data.items || prev, sha: res.sha, pending: false, savedAt: Date.now() }) } })
+  }, [cat, cur.items, cur.sha])
+  useEffect(() => {
+    const onKey = (e) => { if ((e.metaKey || e.ctrlKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) { if (sel) return; e.preventDefault(); undo() } }
+    window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey)
+  }, [undo, sel])
+  // Filet ultime pour un drag ANNULÉ (drop hors zone, Échap) : la carte source n'est PAS démontée -> son dragend
+  // remonte jusqu'ici et remet dragActive à false. (Sur un drop réussi, dropOn l'a déjà fait, même quand la carte
+  // change de section et que sa source est démontée — cas où dragend ne se déclenche jamais.)
+  useEffect(() => { const off = () => setDragActive(false); window.addEventListener('dragend', off); return () => window.removeEventListener('dragend', off) }, [])
+  // DRAG entre status : glisser une carte sur une autre SECTION (ou sur une carte) la déplace là ET lui donne le
+  // status cible. Le tri par score range ensuite ; à score égal, l'ordre du tableau (placement manuel) tient car
+  // le sort est stable. Image de drag = un vrai poster arrondi (pas le ghost plat du navigateur).
+  const dragId = useRef(null)
+  const dragApi = {
+    start: (id, e) => {
+      setDragActive(true)
+      dragId.current = id
+      const it = (items || []).find((x) => x.id === id); const u = it && posterUrl(it.image)
+      const ls = cat === 'games'; const gw = ls ? 174 : 116, gh = ls ? 116 : 174 // image fantôme au bon format (paysage pour Games)
+      const g = document.createElement('div')
+      g.style.cssText = `position:fixed;top:-9999px;left:0;width:${gw}px;height:${gh}px;border-radius:12px;overflow:hidden;box-shadow:0 18px 44px -8px rgba(0,0,0,0.65);background:${u ? '#15151f' : '#2c2c30'}`
+      if (u) { const im = document.createElement('img'); im.src = u; im.style.cssText = 'width:100%;height:100%;object-fit:cover'; g.appendChild(im) }
+      document.body.appendChild(g)
+      e.dataTransfer.effectAllowed = 'move'
+      try { e.dataTransfer.setDragImage(g, gw / 2, gh / 2) } catch {}
+      setTimeout(() => g.remove(), 0)
+    },
+    dropOn: (targetId, targetStatus, after = false) => {
+      setDragActive(false) // efface le surlignage de TOUTES les sections — tourne sur CHAQUE drop (carte ou section)
+      const from = dragId.current; dragId.current = null
+      if (!from || from === targetId) return
+      persist((arr) => {
+        const a = [...arr]; const fi = a.findIndex((x) => x.id === from); if (fi < 0) return arr
+        const moved = { ...a[fi], status: targetStatus, updatedAt: nowIso() }
+        a.splice(fi, 1)
+        const ti = targetId ? a.findIndex((x) => x.id === targetId) : -1
+        // Insertion À GAUCHE (avant la cible) ou À DROITE (après) selon le côté du drop.
+        if (ti >= 0) a.splice(after ? ti + 1 : ti, 0, moved); else a.push(moved)
+        return a
+      })
+    },
+  }
+
+  // Filtre + tri. Score = décroissant (null en bas). Status = groupé dans l'ordre canonique, score décroissant dedans.
+  const qn = q.trim().toLowerCase()
+  const filtered = useMemo(() => {
+    let a = items || []
+    if (qn) a = a.filter((x) => `${x.name} ${(x.tags || []).join(' ')}`.toLowerCase().includes(qn))
+    return a
+  }, [items, qn])
+
+  // Score décroissant ; à score ÉGAL, l'ordre du tableau est conservé (sort stable) = le placement manuel par drag.
+  const byScore = (a, b) => (b.score ?? -1) - (a.score ?? -1)
+  // Split par statut (+ tri du « Done » par score), memoïsé sur `filtered` : sinon les 4 listes sont re-filtrées
+  // à CHAQUE render — y compris à chaque survol de section pendant un drag (coût inutile sur ~348 cartes).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const byStatus = useMemo(() => STATUS_ORDER.map((g) => {
+    const list = filtered.filter((x) => x.status === g)
+    return { g, list: g === 'done' ? [...list].sort(byScore) : list }
+  }), [filtered])
+
+  const selItem = useMemo(() => (items || []).find((x) => x.id === sel) || null, [items, sel])
+
+  const accent = (t && t.accent) || PALETTE.primary
+  const landscape = cat === 'games' // Games = cartes PAYSAGE 3:2 (art RAWG horizontal) ; anime & movies restent PORTRAIT 2:3
+
+  return (
+    <div style={{ fontFamily: FONTS.sans, color: '#ECECEA', display: 'flex', flexDirection: 'column', gap: 16 }}>
+      {/* Pulse discret (2026-07-08, demande Matthieu, corrigé même jour : le pulse en boucle automatique ne
+          répondait à aucune interaction réelle -> aucun signal quand on survolait. Le pulse se déclenche
+          maintenant UNIQUEMENT au survol (:hover pur CSS, pas de JS) de la capsule repliée : 0,33 s (scale
+          1 -> 1,05 -> 1) à chaque entrée de souris. S'arrête dès que la barre est dépliée (classe retirée). */}
+      <style>{`@keyframes shelfTabHint{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+        .shelf-tab-hint:hover{animation:shelfTabHint .33s ease-in-out}
+        /* LA PASTILLE GLISSANTE. Posee sous les libelles, elle se deplace vers l'onglet actif au lieu
+           d'apparaitre dessus : c'est le mouvement, et lui seul, qui fait comprendre qu'on change de
+           section plutot qu'on allume un autre bouton. La courbe depasse legerement puis revient, ce
+           qui donne le geste sur de lui plutot que le glissement mou. */
+        .zr-shelf-pastille{position:absolute;left:4px;top:50%;pointer-events:none;border-radius:99px;
+          width:var(--pastille-l,0);height:var(--pastille-h,0);
+          transform:translate(var(--pastille-x,0),-50%);
+          transition:transform .38s cubic-bezier(.34,1.56,.64,1),width .38s cubic-bezier(.34,1.56,.64,1)}
+        .zr-shelf-tab{z-index:1}
+        .zr-shelf-tab:hover{transform:translateY(-1px)}
+        .zr-shelf-tab[aria-pressed="true"]:hover{transform:none}
+        @media (prefers-reduced-motion: reduce){.zr-shelf-pastille{transition-duration:.01ms}}`}</style>
+      {/* En-tête : titre + onglets catégories + recherche */}
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 16, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 14 }}>
+          <div style={{ fontFamily: FONTS.serif, fontSize: 30, fontWeight: 500, color: (t && t.textPrimary) || '#ECECEA', letterSpacing: 0.2 }}>Shelf</div>
+        </div>
+        {/* Recherche : verre Liquid Glass "Normal" (réf. Design/LiquidGlass-Themes) au lieu d'un fond plat —
+            2026-07-04, demande explicite de Matthieu de coller au style verre du reste du site. */}
+        <div className="zr-glass" style={{ marginLeft: 'auto', borderRadius: 99, width: 240, maxWidth: '45%' }}>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Rechercher…"
+            style={{ background: 'transparent', color: (t && t.textPrimary) || '#ECECEA', border: 'none', borderRadius: 99, padding: '8px 16px', fontSize: 'var(--zr-ui-md)', outline: 'none', width: '100%', boxSizing: 'border-box', fontFamily: FONTS.sans }} />
+        </div>
+      </div>
+
+      {/* CAPSULE TOUJOURS OUVERTE (2026-08-28, revirement explicite de Matthieu : « la capsule partagée
+          Games / Anime doit être toujours ouverte, c'est plus clair »). Elle était REPLIÉE depuis le
+          2026-07-08, à sa demande d'alors, et seule la catégorie active existait dans le DOM au repos.
+          Je note le revirement plutôt que de retourner la décision en silence : la version repliée
+          économisait de la place, celle-ci montre qu'il existe quatre étagères, ce qui est l'information
+          qui manquait.
+
+          LE JUICE DIT QU'ON PEUT CHANGER, et c'est le vrai sujet de la demande. Trois choses s'en
+          chargent, et aucune n'est décorative. La pastille active GLISSE d'un onglet à l'autre au lieu
+          d'apparaître ailleurs, ce qui fait voir un seul objet qui se déplace ; un filet sépare les
+          onglets et s'efface autour de l'actif, ce qui dit « un choix parmi quatre » plutôt que « quatre
+          boutons » ; et le survol lève légèrement l'onglet visé. */}
+      <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+        <div ref={tabsRef} className="zr-glass zr-shelf-tabs" style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', borderRadius: 99, padding: 4 }}>
+          {CATS.map((c, i) => {
+            const on = cat === c.key
+            const precedentActif = i > 0 && cat === CATS[i - 1].key
+            return (
+              <React.Fragment key={c.key}>
+                {i > 0 && (
+                  <span aria-hidden="true" style={{ width: 1, height: 16, flex: 'none',
+                    background: (t && t.textSecondary) || '#8E8E93',
+                    opacity: on || precedentActif ? 0 : 0.28,
+                    transition: 'opacity .2s ease' }} />
+                )}
+                <button onClick={() => { if (!on) { setCat(c.key); setSel(null) } }}
+                  aria-pressed={on}
+                  className="zr-shelf-tab"
+                  style={{ position: 'relative', padding: '8px 16px', borderRadius: 99, border: 'none', cursor: on ? 'default' : 'pointer',
+                    fontFamily: FONTS.sans, fontSize: 13.5, fontWeight: on ? 600 : 500, whiteSpace: 'nowrap',
+                    background: 'transparent', color: on ? '#fff' : ((t && t.textSecondary) || '#8E8E93'),
+                    transition: 'color .22s ease, transform .18s cubic-bezier(.34,1.56,.64,1)' }}>
+                  {c.label}
+                </button>
+              </React.Fragment>
+            )
+          })}
+          {/* LA PASTILLE QUI GLISSE. Elle est posée EN DESSOUS des libellés, en position absolue, et sa
+              largeur comme sa position se calculent depuis l'onglet actif. Un fond porté par le bouton
+              lui-même ne pourrait pas glisser : il apparaîtrait ici et disparaîtrait là, ce qui se lit
+              comme deux objets et non comme un seul qui se déplace. */}
+          <span aria-hidden="true" className="zr-shelf-pastille" style={{ background: accent }} />
+        </div>
+
+        <button onClick={() => setAdding(true)}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: accent, color: '#fff', border: 'none', borderRadius: 99, padding: '8px 15px', fontSize: 'var(--zr-ui-md)', fontWeight: 700, cursor: 'pointer', fontFamily: FONTS.sans }}>
+          <Icon name="plus" size={15} color="#fff" />Ajouter
+        </button>
+
+        {/* Export — un seul bouton discret qui révèle CSV / MD / JSON */}
+        <div style={{ display: 'inline-flex', gap: 6, marginLeft: 'auto', alignItems: 'center' }}>
+          {exportOpen && [['CSV', exportCSV], ['MD', exportMD], ['JSON', exportJSON]].map(([lbl, fn]) => (
+            <button key={lbl} onClick={() => { fn(catByKey(cat), items || []); setExportOpen(false) }}
+              style={{ background: 'transparent', color: (t && t.textSecondary) || '#8E8E93', border: `1px solid ${(t && t.border) || '#3A3A38'}`, borderRadius: 99, padding: '4px 10px', fontSize: 'var(--zr-ui-xs)', fontWeight: 600, cursor: 'pointer', fontFamily: FONTS.sans }}>{lbl}</button>
+          ))}
+          <button onClick={() => setExportOpen((o) => !o)} title="Exporter (CSV · MD · JSON)" className={exportOpen ? 'zr-glass' : undefined}
+            style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 30, height: 30, borderRadius: 99, border: exportOpen ? 'none' : `1px solid ${(t && t.border) || '#3A3A38'}`, background: exportOpen ? undefined : 'transparent', color: (t && t.textSecondary) || '#8E8E93', cursor: 'pointer' }}><Icon name="square.and.arrow.down" size={14} color="currentColor" /></button>
+        </div>
+      </div>
+
+      {/* Contenu : toujours groupé par statut. Dans « Done », tri auto par score décroissant (meilleur en haut) ;
+          les autres sections gardent l'ordre manuel (drag & drop). */}
+      {items === null && <div style={{ color: (t && t.textSecondary) || '#8E8E93', padding: 40, textAlign: 'center', fontSize: 'var(--zr-ui-lg)' }}>chargement…</div>}
+      {items && filtered.length === 0 && (
+        <div style={{ color: (t && t.textSecondary) || '#8E8E93', padding: 48, textAlign: 'center', lineHeight: 1.6 }}>
+          {qn ? 'Aucune œuvre ne correspond.' : <><b style={{ color: (t && t.textPrimary) || '#ECECEA' }}>Étagère vide.</b><br />Clique sur « Ajouter » pour démarrer.</>}
+        </div>
+      )}
+
+      {items && filtered.length > 0 && byStatus.map(({ g, list }, gi) => (
+        <StatusSection key={g} g={g} gi={gi}
+          list={list}
+          onOpen={openItem} t={t} drag={dragApi} landscape={landscape} dragActive={dragActive} cat={cat} />
+      ))}
+
+      {selItem && (
+        <DetailPanel item={selItem} t={t} cat={cat} rect={selRect} onClose={() => setSel(null)}
+          onChange={(patch) => setItem(selItem.id, patch)}
+          onDelete={() => { removeItem(selItem.id); setSel(null) }} />
+      )}
+
+      {adding && (
+        <AddModal t={t} cat={catByKey(cat)} initialName={addSeed && addSeed.name} initialImage={addSeed && addSeed.image}
+          onClose={() => { setAdding(false); setAddSeed(null) }}
+          onAdd={(it) => { addItem(it); setAdding(false); setAddSeed(null) }} />
+      )}
+    </div>
+  )
+}
+
+// ── Section d'un status (titre + grille) = ZONE DE DÉPÔT pour le drag inter-status ──
+// Glisser une carte ici lui donne ce status. La zone se surligne pendant le survol (compteur enter/leave
+// robuste : pas de scintillement quand on passe d'une carte à l'autre). Gros espace entre sections (44px).
+// Repli/dépli par section (2026-07-08, demande Matthieu) : chevron façon Notion, état persistant par
+// catégorie+statut (localStorage) — replier « Done » dans Games ne replie pas « Done » dans Books.
+const shelfCollapseKey = (cat, g) => `zr-shelf-collapse:${cat}:${g}`
+function StatusSection({ g, gi, list, onOpen, t, drag, landscape, dragActive, cat }) {
+  const [over, setOver] = useState(false)
+  const depth = useRef(0)
+  const s = st(g)
+  const [shut, setShut] = useState(() => { try { return localStorage.getItem(shelfCollapseKey(cat, g)) === '1' } catch { return false } })
+  const toggle = () => setShut((v) => { const n = !v; try { localStorage.setItem(shelfCollapseKey(cat, g), n ? '1' : '0') } catch {}; return n })
+  const onEnter = () => { depth.current += 1; setOver(true) }
+  const onLeave = () => { depth.current = Math.max(0, depth.current - 1); if (depth.current === 0) setOver(false) }
+  const onDrop = (e) => { e.preventDefault(); depth.current = 0; setOver(false); drag.dropOn(null, g) }
+  // Nettoyage GARANTI des tirets : dès que le drag se termine (dragActive -> false, posé par dropOn sur CHAQUE drop
+  // ou par le dragend d'une annulation), on efface le surlignage. Robuste même quand la carte déposée change de
+  // section et que sa carte source est démontée (cas où dragend/drop ne remontaient jamais jusqu'ici).
+  useEffect(() => { if (!dragActive) { depth.current = 0; setOver(false) } }, [dragActive])
+  return (
+    // Le drop reste actif MÊME repliée (les handlers vivent sur cette <section>, jamais démontés par shut).
+    <section onDragEnter={onEnter} onDragLeave={onLeave} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}
+      style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: gi === 0 ? 6 : 44, padding: '10px 12px', marginLeft: -12, marginRight: -12, borderRadius: 16, background: over ? `${s.color}14` : 'transparent', outline: `2px dashed ${over ? `${s.color}88` : 'transparent'}`, transition: 'background .15s, outline-color .15s' }}>
+      <button onClick={toggle} title={shut ? 'Déplier' : 'Replier'} style={{ display: 'flex', alignItems: 'center', gap: 9, background: 'transparent', border: 'none', cursor: 'pointer', padding: 0, textAlign: 'left' }}>
+        <Icon name={shut ? 'chevron.right' : 'chevron.down'} size={12} color={(t && t.textSecondary) || '#8E8E93'} />
+        <span style={{ width: 9, height: 9, borderRadius: 99, background: s.color, boxShadow: `0 0 8px ${s.color}66` }} />
+        <h3 style={{ margin: 0, fontFamily: FONTS.serif, fontSize: 19, fontWeight: 500, color: (t && t.textPrimary) || '#ECECEA' }}>{s.label}</h3>
+        <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: (t && t.textSecondary) || '#8E8E93' }}>{list.length}</span>
+      </button>
+      {!shut && (list.length > 0
+        ? <PosterGrid items={list} onOpen={onOpen} t={t} drag={drag} landscape={landscape} cat={cat} />
+        : <div style={{ border: `1.5px dashed ${(t && t.border) || '#3A3A38'}`, borderRadius: 12, padding: 18, textAlign: 'center', color: (t && t.textSecondary) || '#8E8E93', fontSize: 'var(--zr-ui-sm)' }}>Glisse une carte ici pour la passer en « {s.label} »</div>)}
+    </section>
+  )
+}
+
+// ── Image de poster LAZY + PROGRESSIVE ─────────────────────────────────────
+// Réutilise le lazy de Create (useInView : un seul IntersectionObserver partagé, préchargement +400px avant
+// l'entrée à l'écran). L'image n'est montée que lorsqu'elle approche du viewport, puis apparaît en fondu doux
+// (blur-up léger : scale 1.04 -> 1 + opacité) une fois décodée. `priority` = les premières cartes chargent direct.
+function PosterImg({ url, priority }) {
+  const [seen, setSeen] = useState(!!priority)
+  const [loaded, setLoaded] = useState(false)
+  // Ordre d'essai figé par poster : [cache d'edge /api/shelf-poster, jsDelivr]. step = origine en cours.
+  const [cands, setCands] = useState(() => posterCandidates(url))
+  const [step, setStep] = useState(0)
+  const onVis = useCallback(() => setSeen(true), [])
+  const { ref } = useInView(onVis)
+  useEffect(() => { setCands(posterCandidates(url)); setStep(0); setLoaded(false) }, [url])
+  const next = () => { if (step === 0 && cands[1]) setStep(1) } // première origine muette ou en erreur -> la seconde
+  // Anti-attente : une origine muette n'envoie ni load ni error. Délai puis seconde origine.
+  useEffect(() => {
+    if (!seen || loaded || step !== 0 || !cands[1]) return undefined
+    const id = setTimeout(next, POSTER_POLICY.edgeFirstByteMs)
+    return () => clearTimeout(id)
+  }, [seen, loaded, step, cands, url]) // eslint-disable-line react-hooks/exhaustive-deps
+  const src = cands[step] || cands[0]
+  if (!url) return null
+  return (
+    <span ref={ref} aria-hidden style={{ position: 'absolute', inset: 0, display: 'block' }}>
+      {seen && src && (
+        <img src={src} alt="" decoding="async" fetchPriority={priority ? 'high' : 'auto'}
+          onLoad={() => setLoaded(true)} onError={next}
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: loaded ? 1 : 0, transform: loaded ? 'scale(1)' : 'scale(1.04)', transition: 'opacity .35s ease, transform .45s ease' }} />
+      )}
+    </span>
+  )
+}
+
+// ── Grille de posters auto-fill ───────────────────────────────────────────
+function PosterGrid({ items, onOpen, t, drag, landscape, cat }) {
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${landscape ? 240 : 150}px, 1fr))`, gap: 18 }}>
+      {items.map((it, i) => <PosterCard key={it.id} item={it} onOpen={onOpen} t={t} drag={drag} idx={i} landscape={landscape} cat={cat} />)}
+    </div>
+  )
+}
+
+// ── Carte poster (portrait 2:3, hover zoom signature Apple TV) ─────────────
+// Racine = <div role="button"> (et NON <button>) : un <button draggable> n'amorce pas le drag de façon fiable
+// selon les navigateurs. Pendant le drag : la carte source s'atténue (opacity .45) et l'image fantôme est un
+// vrai poster arrondi (dragApi.start). Survolée par un drag, elle s'entoure d'un liseré accent (cible d'insertion).
+const PosterCard = React.memo(function PosterCard({ item, onOpen, t, drag, idx = 0, landscape, cat }) {
+  const [hover, setHover] = useState(false)
+  const [overSide, setOverSide] = useState(null) // 'left' | 'right' | null : côté où la carte glissée s'insérera
+  const [dragging, setDragging] = useState(false)
+  // Filet de sécurité : à la fin de TOUT drag (drop ou annulation, capté n'importe où) on efface la barre
+  // d'insertion et l'atténuation de la carte source. Garantit qu'aucun marqueur ne reste collé après un déplacement.
+  useEffect(() => {
+    const clear = () => { setOverSide(null); setDragging(false) }
+    window.addEventListener('dragend', clear); window.addEventListener('drop', clear)
+    return () => { window.removeEventListener('dragend', clear); window.removeEventListener('drop', clear) }
+  }, [])
+  const url = posterUrl(item.image)
+  const accent = (t && t.accent) || PALETTE.primary
+  const open = (e) => onOpen(item.id, e.currentTarget.getBoundingClientRect())
+  const sideOf = (e) => { const r = e.currentTarget.getBoundingClientRect(); return e.clientX > r.left + r.width / 2 ? 'right' : 'left' }
+  return (
+    <div role="button" tabIndex={0} className="zr-liquid-rim"
+      onClick={open}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(e) } }}
+      onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
+      title={item.name}
+      draggable={!!drag}
+      onDragStart={drag ? (e) => { setDragging(true); drag.start(item.id, e) } : undefined}
+      onDragEnd={drag ? () => { setDragging(false); setOverSide(null) } : undefined}
+      onDragOver={drag ? (e) => { e.preventDefault(); setOverSide(sideOf(e)) } : undefined}
+      onDragLeave={drag ? () => setOverSide(null) : undefined}
+      onDrop={drag ? (e) => { e.preventDefault(); e.stopPropagation(); const after = sideOf(e) === 'right'; setOverSide(null); drag.dropOn(item.id, item.status, after) } : undefined}
+      style={{ position: 'relative', display: 'block', width: '100%', aspectRatio: landscape ? '3 / 2' : '2 / 3', border: 'none', padding: 0, cursor: drag ? 'grab' : 'pointer', borderRadius: 12, overflow: 'hidden', background: fallbackGrad(item.id), boxShadow: `inset 1.5px 1.5px 1px rgba(255,255,255,0.58), inset -1.5px -1.5px 1px rgba(0,0,0,0.22), ${hover ? '0 14px 36px -10px rgba(0,0,0,0.6)' : '0 4px 14px -6px rgba(0,0,0,0.45)'}`, transform: dragging ? 'scale(0.97)' : (hover ? 'scale(1.05)' : 'scale(1)'), opacity: dragging ? 0.45 : 1, transition: 'transform .22s cubic-bezier(0.25,1,0.5,1), box-shadow .22s, opacity .15s', zIndex: hover || overSide ? 3 : 1, fontFamily: 'inherit', textAlign: 'left', userSelect: 'none' }}>
+      {/* Barre d'insertion lumineuse (bord gauche ou droit) montrant où la carte va se placer pendant un drag */}
+      {overSide && <span aria-hidden style={{ position: 'absolute', top: 6, bottom: 6, [overSide]: 2, width: 4, borderRadius: 4, background: accent, boxShadow: `0 0 12px 1px ${accent}`, zIndex: 6 }} />}
+      <PosterImg url={url} priority={idx < POSTER_POLICY.eagerCards} />
+
+      {/* Vignette dégradée sombre en bas (lisibilité du titre) */}
+      <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(to top, rgba(0,0,0,0.82) 0%, rgba(0,0,0,0.42) 28%, rgba(0,0,0,0) 56%)' }} />
+
+      {/* Score en haut-gauche (chiffre gras, pastille discrète) */}
+      {(item.score === 0 || item.score) && (
+        <div style={{ position: 'absolute', top: 8, left: 8, minWidth: 26, height: 24, padding: '0 7px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 8, background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', color: '#fff', fontFamily: FONTS.sans, fontWeight: 800, fontSize: 'var(--zr-ui-md)', lineHeight: 1, border: '0.5px solid rgba(255,255,255,0.18)' }}>{item.score}</div>
+      )}
+
+      {/* Bulle si une note/commentaire est écrit */}
+      {item.notes && <span title="Note" style={{ position: 'absolute', top: 8, right: 8, width: 18, height: 18, borderRadius: 7, background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: '0.5px solid rgba(255,255,255,0.18)' }}><Icon name="text.bubble" size={11} color="#fff" /></span>}
+
+      {/* TRACKER ÉPISODES (animes In Progress, opt-in) : pastille liquid glass top-centre = prochain épisode À VOIR. */}
+      {cat === 'anime-manga' && item.status === 'in_progress' && (() => {
+        const tk = item.extra && item.extra.tracker
+        if (!tk || !tk.enabled || !Array.isArray(tk.unseen) || !tk.unseen.length) return null
+        const next = Math.min(...tk.unseen)
+        const pad = (n) => String(n).padStart(2, '0')
+        return (
+          <span title={`${tk.unseen.length} épisode(s) à voir`} onClick={open}
+            style={{ position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)', display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 10px', borderRadius: 99, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', fontWeight: 600, color: '#fff', whiteSpace: 'nowrap', zIndex: 5, cursor: 'pointer',
+              background: 'linear-gradient(150deg, rgba(10,132,255,0.42), rgba(10,132,255,0.24))', backdropFilter: 'blur(14px) saturate(180%)', WebkitBackdropFilter: 'blur(14px) saturate(180%)', border: '1px solid rgba(255,255,255,0.38)', boxShadow: 'inset 1px 1px 0.5px rgba(255,255,255,0.5), 0 4px 12px -4px rgba(0,0,0,0.5)' }}>
+            S{pad(tk.season || 1)}E{pad(next)}{tk.unseen.length > 1 ? <span style={{ opacity: 0.85 }}>·{tk.unseen.length}</span> : null}
+          </span>
+        )
+      })()}
+
+      {/* Titre en bas-centre — Anthropic Sans medium, lisible sur la vignette */}
+      <div style={{ position: 'absolute', left: 10, right: 10, bottom: 10, fontFamily: FONTS.sans, fontWeight: 500, fontSize: 'var(--zr-ui-md)', lineHeight: 1.25, color: '#fff', textAlign: 'center', textShadow: '0 1px 6px rgba(0,0,0,0.7)', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{item.name}</div>
+    </div>
+  )
+}, (a, b) => a.item === b.item && a.idx === b.idx && a.landscape === b.landscape && a.t === b.t && a.cat === b.cat)
+
+// ── Panneau détail (slide-over Notion-like) ───────────────────────────────
+function DetailPanel({ item, t, cat, rect, onClose, onChange, onDelete }) {
+  const [uploading, setUploading] = useState(false)
+  const [picking, setPicking] = useState(false) // affiche/masque le picker de couverture (recherche auto)
+  const [imgMenu, setImgMenu] = useState(false)  // menu centralisé des 4 fonctions image
+  const [pasting, setPasting] = useState(false)
+  const fileRef = useRef(null)
+  const [notes, setNotes] = useState(item.notes || '')
+  const [scoreDraft, setScoreDraft] = useState(item.score === 0 || item.score ? String(item.score) : '')
+  const dirtyRef = useRef(false)
+
+  // Re-synchronise si on ouvre une AUTRE œuvre sans avoir démonté le panneau.
+  useEffect(() => { setNotes(item.notes || ''); setScoreDraft(item.score === 0 || item.score ? String(item.score) : ''); dirtyRef.current = false }, [item.id])
+
+  const border = (t && t.border) || '#3A3A38'
+  const textP = (t && t.textPrimary) || '#ECECEA'
+  const textS = (t && t.textSecondary) || '#8E8E93'
+  const accent = (t && t.accent) || PALETTE.primary
+
+  const saveNotes = () => { if (notes !== (item.notes || '')) onChange({ notes: notes || null }) }
+  const importImage = async (file) => {
+    if (!file) return
+    setUploading(true)
+    // Fichier local -> webp -> ingestion (stockage public jsDelivr) au lieu de l'ancien /api/upload (repo assets
+    // non configuré -> dataURL géant embarqué dans le JSON = commit qui échoue). Repli : dataURL si l'ingestion casse.
+    try { const dataUrl = await fileToWebp(file); if (dataUrl) { const cdn = await ingestShelfImage({ dataUrl, name: item.name, cat }); onChange({ image: { kind: 'url', ref: cdn || dataUrl } }) } } catch {}
+    setUploading(false)
+  }
+  // Coller une image depuis le presse-papier (ex : copiée depuis Google Images dans ton navigateur) -> ingestion.
+  const pasteImage = async () => {
+    setImgMenu(false); setPasting(true)
+    try {
+      const items = await navigator.clipboard.read()
+      let blob = null
+      for (const it of items) { const type = it.types.find((ty) => ty.startsWith('image/')); if (type) { blob = await it.getType(type); break } }
+      if (!blob) { setPasting(false); notify({ kind: 'error', title: 'Presse-papier vide', body: 'Copie d\'abord une image (clic droit > Copier l\'image).' }); return }
+      // COMPRESSION OBLIGATOIRE : une image du presse-papier (capture plein écran) fait souvent plusieurs Mo en
+      // PNG -> l'ingestion brute échouait (payload trop gros) et la carte restait noire / non sauvée. fileToWebp
+      // la réduit (webp, max 1600px) -> petit dataURL -> ingestion fiable -> URL jsDelivr stockée et persistée.
+      const dataUrl = await fileToWebp(blob)
+      if (!dataUrl) { setPasting(false); notify({ kind: 'error', title: 'Image illisible' }); return }
+      const cdn = await ingestShelfImage({ dataUrl, name: item.name, cat })
+      onChange({ image: { kind: 'url', ref: cdn || dataUrl } }) // cdn prioritaire ; dataURL webp (petit) en repli
+    } catch (e) { notify({ kind: 'error', title: 'Collage impossible', body: `${(e && e.message) || e} (autorise l'accès au presse-papier si demandé)` }) }
+    setPasting(false)
+  }
+  // Ouvre Google Images DANS TON navigateur (IP résidentielle = vrais résultats), sur le titre. Tu copies une
+  // image (clic droit > Copier l'image), puis « Coller une image » ici. Contourne le blocage datacenter.
+  const openGoogle = () => { setImgMenu(false); window.open(`https://www.google.com/search?tbm=isch&q=${encodeURIComponent(item.name)}`, '_blank', 'noopener') }
+  const commitScore = () => {
+    const raw = scoreDraft.trim()
+    if (raw === '') { if (item.score != null) onChange({ score: null }); return }
+    let n = parseInt(raw, 10)
+    if (Number.isNaN(n)) { setScoreDraft(item.score === 0 || item.score ? String(item.score) : ''); return }
+    n = Math.max(0, Math.min(100, n))
+    if (n !== item.score) onChange({ score: n })
+    setScoreDraft(String(n))
+  }
+  const url = posterUrl(item.image)
+  // Liquid glass theme-aware : le panneau est portalisé vers <body> (hors du div .zr-dark) -> on ne peut pas
+  // compter sur la variante CSS .zr-dark, on pose le fond translucide + backdrop-blur EN INLINE selon le thème.
+  const dark = !!(t && t.textPrimary === PALETTE.textPrimaryDark)
+  const liquidBg = dark ? 'rgba(31,31,30,0.52)' : 'rgba(253,253,252,0.62)'
+
+  const field = { background: (t && t.bg) || '#1F1F1E', color: textP, border: `1px solid ${border}`, borderRadius: 8, padding: '8px 11px', fontSize: 'var(--zr-ui-md)', outline: 'none', fontFamily: FONTS.sans, width: '100%', boxSizing: 'border-box' }
+
+  // POPOVER ancré à la carte : on MESURE le panneau (ref, useLayoutEffect = avant le 1er paint, zéro flash) puis on
+  // le place À CÔTÉ de la carte cliquée — à droite si ça rentre, sinon à gauche, sinon centré dessus (overlap) —
+  // aligné verticalement sur elle et clampé à l'écran. La mesure RÉELLE empêche l'effondrement au centre quand le
+  // panneau est grand vs la fenêtre (le vrai bug du « 100 km »). transformOrigin pointe vers la carte.
+  const MW = Math.min(440, (typeof window !== 'undefined' ? window.innerWidth : 1280) * 0.94)
+  const panelRef = useRef(null)
+  const [pos, setPos] = useState(null)
+  useLayoutEffect(() => {
+    const el = panelRef.current; if (!el || typeof window === 'undefined') return
+    const vw = window.innerWidth, vh = window.innerHeight, M = 12
+    const w = el.offsetWidth || MW, h = el.offsetHeight || 480
+    const r = rect || { left: vw / 2, top: vh / 2, width: 0, height: 0 }
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2        // centre de la carte cliquée
+    const left = Math.max(M, Math.min(cx - w / 2, vw - w - M))        // panneau CENTRÉ sur la carte, clampé à l'écran
+    const top = Math.max(M, Math.min(cy - h / 2, vh - h - M))
+    setPos({ left, top, ox: Math.max(0, Math.min(cx - left, w)), oy: Math.max(0, Math.min(cy - top, h)) })
+  }, [rect, item.id])
+
+  // PORTAIL vers <body> : un ancêtre `.zr-stage` a `backdrop-filter`, ce qui fait que tout `position:fixed`
+  // descendant se réfère à LUI (et non au viewport) -> mes coords viewport étaient décalées de l'offset de la
+  // scène (le vrai « 100 km »). En portant le panneau dans body, `fixed` redevient relatif au viewport.
+  return createPortal(
+    <>
+      <div onClick={() => { saveNotes(); onClose() }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.28)', zIndex: 80, backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)' }} />
+      <aside ref={panelRef} className="zr-liquid-rim" style={{ position: 'fixed', left: pos ? pos.left : -9999, top: pos ? pos.top : 0, visibility: pos ? 'visible' : 'hidden', transformOrigin: pos ? `${pos.ox}px ${pos.oy}px` : 'center', width: MW, maxHeight: 'min(560px, 90vh)', borderRadius: 18, overflow: 'hidden', zIndex: 81, display: 'flex', flexDirection: 'column', fontFamily: FONTS.sans, background: liquidBg, backdropFilter: 'blur(36px) saturate(195%) brightness(1.05)', WebkitBackdropFilter: 'blur(36px) saturate(195%) brightness(1.05)', animation: pos ? 'shelfCardPop .2s cubic-bezier(0.2,1,0.4,1)' : 'none' }}>
+        {/* Bandeau poster */}
+        <div style={{ position: 'relative', flex: '0 0 auto', height: 150, background: url ? '#15151f' : fallbackGrad(item.id), overflow: 'hidden' }}>
+          {url && <img src={url} alt="" onError={(e) => { const raw = jsdelivrToRaw(e.currentTarget.src); if (raw && raw !== e.currentTarget.src) e.currentTarget.src = raw }} style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: 0.85 }} />}
+          <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(to top, rgba(0,0,0,0.72) 0%, rgba(0,0,0,0.15) 42%, transparent 72%)' }} />
+          <button onClick={() => { saveNotes(); onClose() }} title="Fermer" style={{ position: 'absolute', top: 12, right: 12, width: 32, height: 32, borderRadius: 99, border: 'none', cursor: 'pointer', background: 'rgba(0,0,0,0.5)', color: '#fff', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(6px)' }}><Icon name="xmark" size={16} color="#fff" /></button>
+          <div style={{ position: 'absolute', left: 18, right: 56, bottom: 12 }}>
+            <input key={item.id} defaultValue={item.name} title="Clique pour renommer"
+              onFocus={(e) => { e.currentTarget.style.borderBottomColor = 'rgba(255,255,255,0.55)' }}
+              onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+              onBlur={(e) => { e.currentTarget.style.borderBottomColor = 'transparent'; const v = e.target.value.trim(); if (v && v !== item.name) onChange({ name: v }); else if (!v) e.currentTarget.value = item.name }}
+              style={{ width: '100%', background: 'transparent', border: 'none', borderBottom: '1px solid transparent', outline: 'none', padding: '0 0 2px', fontFamily: FONTS.serif, fontSize: 23, fontWeight: 700, color: '#fff', lineHeight: 1.2, textShadow: '0 1px 8px rgba(0,0,0,0.6)' }} />
+          </div>
+          {/* UN SEUL bouton « Image » (bas-droite) : ouvre le menu centralisé des 4 fonctions, affiché dans le corps. */}
+          <button onClick={() => setImgMenu((m) => !m)} title="Image — changer la couverture"
+            style={{ position: 'absolute', right: 14, bottom: 12, width: 34, height: 34, borderRadius: 9, border: 'none', cursor: 'pointer', background: imgMenu ? accent : 'rgba(0,0,0,0.5)', color: '#fff', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)' }}>
+            <Icon name={(uploading || pasting) ? 'arrow.clockwise' : 'photo'} size={16} color="#fff" />
+          </button>
+          <input ref={fileRef} type="file" accept="image/*" style={{ display: 'none' }}
+            onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; importImage(f) }} />
+        </div>
+
+        {/* Corps scrollable */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 18px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {imgMenu && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Image</span>
+              {/* 4 fonctions centralisées, icônes + noms clairs. Grille 2x2. */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                {[
+                  { ic: 'square.and.arrow.down', lb: pasting ? 'Collage…' : 'Clipboard paste', fn: pasteImage, on: pasting },
+                  { ic: 'magnifyingglass', lb: 'Google Images', fn: openGoogle },
+                  { ic: 'sparkles', lb: 'Auto search', fn: () => setPicking((p) => !p), on: picking },
+                  { ic: 'photo', lb: uploading ? 'Import…' : 'Import file', fn: () => fileRef.current && fileRef.current.click(), on: uploading },
+                ].map((b) => (
+                  <button key={b.lb} onClick={b.fn}
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '9px 11px', borderRadius: 10, border: `1px solid ${b.on ? accent : border}`, background: b.on ? PALETTE.primarySoft : 'transparent', color: b.on ? accent : textP, cursor: 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', fontWeight: 600, textAlign: 'left' }}>
+                    <Icon name={b.ic} size={15} color="currentColor" />{b.lb}
+                  </button>
+                ))}
+              </div>
+              <div style={{ fontSize: 'var(--zr-ui-xs)', color: textS, lineHeight: 1.4 }}>Astuce : « Google Images » ouvre la recherche dans ton navigateur → clic droit sur une image → « Copier l'image » → reviens ici et « Clipboard paste ».</div>
+            </div>
+          )}
+          {picking && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Changer la couverture (recherche auto)</span>
+              <PosterPicker name={item.name} cat={cat} t={t} onPick={(u) => { onChange({ image: { kind: 'url', ref: u } }); setPicking(false) }} />
+            </div>
+          )}
+          {/* Métadonnées : status + score */}
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+            <label style={{ flex: '1 1 140px', display: 'flex', flexDirection: 'column', gap: 5 }}>
+              <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Status</span>
+              <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+                {/* La pastille vivait à côté du titre « Shelf » (2026-08-15) ; Matthieu l'a voulue ailleurs
+                    (2026-08-20) : au contact du réglage qu'elle décrit, pas de la page entière. Purement
+                    décorative, `pointer-events: none` pour ne jamais voler le clic au select en dessous. */}
+                <span style={{ width: 8, height: 8, borderRadius: 99, background: st(item.status).color, position: 'absolute', left: 10, pointerEvents: 'none' }} />
+                <select value={item.status} onChange={(e) => onChange({ status: e.target.value })} style={{ ...field, cursor: 'pointer', paddingLeft: 24, width: '100%' }}>
+                  {STATUS_ORDER.map((s) => <option key={s} value={s}>{st(s).label}</option>)}
+                </select>
+              </div>
+            </label>
+            <label style={{ flex: '0 0 96px', display: 'flex', flexDirection: 'column', gap: 5 }}>
+              <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Score</span>
+              <input value={scoreDraft} onChange={(e) => setScoreDraft(e.target.value)} onBlur={commitScore} onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }} placeholder="" inputMode="numeric" style={field} />
+            </label>
+          </div>
+
+          {/* TRACKER ÉPISODES — ANIMES uniquement (jeux/films ont une logique différente). Opt-in (désactivé par
+              défaut). On stocke { enabled, season, total, unseen[] } dans item.extra.tracker. unseen = épisodes À VOIR. */}
+          {cat === 'anime-manga' && (() => {
+            const tk = (item.extra && item.extra.tracker) || null
+            const enabled = !!(tk && tk.enabled)
+            const total = (tk && tk.total) || 12
+            const season = (tk && tk.season) || 1
+            const unseen = (tk && Array.isArray(tk.unseen)) ? tk.unseen : []
+            const textP = (t && t.textPrimary) || '#ECECEA'
+            const setTracker = (patch) => onChange({ extra: { ...(item.extra || {}), tracker: { enabled, season, total, unseen, ...patch } } })
+            return (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 'var(--zr-ui-md)', color: textP, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={enabled} onChange={(e) => setTracker({ enabled: e.target.checked })} />
+                  Suivi des épisodes — pastille « à voir » sur la carte (In Progress)
+                </label>
+                {enabled && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                      <label style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                        <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Saison</span>
+                        <input value={season} onChange={(e) => setTracker({ season: Math.max(1, +e.target.value || 1) })} inputMode="numeric" style={{ ...field, width: 66 }} />
+                      </label>
+                      <label style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                        <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Épisodes</span>
+                        <select value={[12, 24].includes(total) ? total : 'custom'} onChange={(e) => { const v = e.target.value; if (v === 'custom') { setTracker({ total: total === 12 || total === 24 ? total + 1 : total }) } else setTracker({ total: +v, unseen: unseen.filter((n) => n <= +v) }) }} style={{ ...field, cursor: 'pointer', width: 118 }}>
+                          <option value={12}>12</option><option value={24}>24</option><option value="custom">Custom…</option>
+                        </select>
+                      </label>
+                      {![12, 24].includes(total) && (
+                        <label style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                          <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Total</span>
+                          <input value={total} onChange={(e) => { const v = Math.max(1, +e.target.value || 1); setTracker({ total: v, unseen: unseen.filter((n) => n <= v) }) }} inputMode="numeric" style={{ ...field, width: 78 }} />
+                        </label>
+                      )}
+                    </div>
+                    <span style={{ fontSize: 'var(--zr-ui-xs)', color: textS }}>Sélectionne les épisodes <b>NON vus</b> (à voir) :</span>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {Array.from({ length: Math.min(total, 200) }, (_, i) => i + 1).map((n) => {
+                        const on = unseen.includes(n)
+                        return <button key={n} onClick={() => setTracker({ unseen: on ? unseen.filter((x) => x !== n) : [...unseen, n].sort((a, b) => a - b) })}
+                          style={{ minWidth: 32, height: 30, padding: '0 6px', borderRadius: 8, border: 'none', cursor: 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', background: on ? accent : ((t && t.cardBg) || 'rgba(127,127,127,.14)'), color: on ? '#fff' : textP }}>{n}</button>
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          })()}
+
+          {/* Notes (Markdown, édition simple) */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Notes</span>
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={saveNotes} placeholder=""
+              style={{ ...field, minHeight: 200, resize: 'vertical', lineHeight: 1.55, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)' }} />
+          </div>
+
+          <button onClick={() => { if (window.confirm(`Retirer « ${item.name} » de l'étagère ?`)) onDelete() }}
+            style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: 6, background: 'transparent', color: '#9B5A57', border: `1px solid ${border}`, borderRadius: 8, padding: '7px 13px', fontSize: 'var(--zr-ui-sm)', fontWeight: 600, cursor: 'pointer', fontFamily: FONTS.sans, marginTop: 4 }}>
+            <Icon name="trash" size={14} color="currentColor" />Retirer
+          </button>
+        </div>
+
+        <style>{`@keyframes shelfCardPop{from{opacity:0;transform:scale(0.92)}to{opacity:1;transform:scale(1)}}`}</style>
+      </aside>
+    </>,
+    document.body,
+  )
+}
+
+// ── Picker de poster (recherche d'images WEB type Google -> 3 tuiles -> pick -> ingestion jsDelivr) ──────
+// « Chercher des images » fait une recherche d'images web (keyless, DuckDuckGo) sur le titre + catégorie et
+// affiche les 3 PREMIERS résultats. « Autres » remplace par les 3 suivants (on défile le pool sans re-requête).
+// Au clic sur une tuile : l'image est TÉLÉCHARGÉE et STOCKÉE en public (ingestShelfImage) -> URL jsDelivr stable.
+function PosterPicker({ name, cat, t, onPick }) {
+  const [pool, setPool] = useState(null) // null=jamais cherché, []=aucun, [...]=résultats web
+  const [offset, setOffset] = useState(0) // index du trio courant dans le pool
+  const [loading, setLoading] = useState(false)
+  const [busyIdx, setBusyIdx] = useState(-1)
+  const textS = (t && t.textSecondary) || '#8E8E93'
+  const border = (t && t.border) || '#3A3A38'
+  const accent = (t && t.accent) || PALETTE.primary
+  const land = cat === 'games'
+  const TRIO = 3
+
+  const run = async () => {
+    const q = (name || '').trim(); if (!q) return
+    setLoading(true); setPool(null); setOffset(0)
+    const r = await searchShelfPosters(q, cat) // mode combiné : API média (RAWG/TMDB/AniList) + images web
+    setPool(r); setLoading(false)
+  }
+  // « Autres » : avance de 3 dans le pool (boucle au début quand on atteint la fin).
+  const more = () => { if (pool && pool.length > TRIO) setOffset((o) => (o + TRIO) % pool.length) }
+  const pick = async (cand, i) => {
+    setBusyIdx(i)
+    const cdn = await ingestShelfImage({ url: cand.image, name: name || cand.title, cat })
+    setBusyIdx(-1)
+    onPick(cdn || cand.image) // si l'ingestion échoue, on garde au moins l'URL d'origine (mieux que rien)
+  }
+
+  // Les 3 tuiles visibles (slice circulaire à partir de offset).
+  const trio = pool && pool.length ? Array.from({ length: Math.min(TRIO, pool.length) }, (_, k) => pool[(offset + k) % pool.length]) : []
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button type="button" onClick={run} disabled={loading || !(name || '').trim()}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: 'transparent', color: accent, border: `1px solid ${border}`, borderRadius: 99, padding: '6px 12px', fontSize: 'var(--zr-ui-sm)', fontWeight: 600, cursor: (name || '').trim() ? 'pointer' : 'default', fontFamily: FONTS.sans, opacity: (name || '').trim() ? 1 : 0.5 }}>
+          <Icon name="sparkles" size={13} color={accent} />{loading ? 'Recherche…' : 'Chercher des images'}
+        </button>
+        {pool && pool.length > TRIO && (
+          <button type="button" onClick={more} title="3 résultats suivants"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: 'transparent', color: textS, border: `1px solid ${border}`, borderRadius: 99, padding: '6px 11px', fontSize: 'var(--zr-ui-sm)', fontWeight: 600, cursor: 'pointer', fontFamily: FONTS.sans }}>
+            <Icon name="arrow.clockwise" size={12} color={textS} />Autres
+          </button>
+        )}
+      </div>
+      {pool && pool.length === 0 && <div style={{ fontSize: 'var(--zr-ui-sm)', color: textS }}>Aucune image trouvée. Saisis une URL ci-dessous, ou affine le titre.</div>}
+      {trio.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, padding: 2 }}>
+          {trio.map((c, i) => (
+            <button key={`${offset}-${i}-${c.image}`} type="button" onClick={() => pick(c, i)} title={`${c.title || ''} · ${c.source || 'web'}`}
+              style={{ position: 'relative', padding: 0, border: `1px solid ${border}`, borderRadius: 8, overflow: 'hidden', cursor: 'pointer', background: '#15151f', aspectRatio: land ? '3 / 2' : '2 / 3' }}>
+              <img src={c.image} alt="" loading="lazy" referrerPolicy="no-referrer" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', opacity: busyIdx === i ? 0.4 : 1 }} />
+              {busyIdx === i && <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 'var(--zr-ui-xs)', background: 'rgba(0,0,0,0.4)' }}>…</div>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Modale d'ajout ────────────────────────────────────────────────────────
+function AddModal({ t, cat, initialName, initialImage, onClose, onAdd }) {
+  const [name, setName] = useState(initialName || '')
+  const [status, setStatus] = useState('backlog')
+  const [score, setScore] = useState('')
+  const [image, setImage] = useState(initialImage || '') // deep link : URL externe -> ingérée à la soumission
+  const [picked, setPicked] = useState(false) // image issue du picker = déjà jsDelivr -> pas de ré-ingestion
+  const [busy, setBusy] = useState(false)
+
+  const cardBg = (t && t.cardBg) || '#2A2A29'
+  const border = (t && t.border) || '#3A3A38'
+  const textP = (t && t.textPrimary) || '#ECECEA'
+  const textS = (t && t.textSecondary) || '#8E8E93'
+  const accent = (t && t.accent) || PALETTE.primary
+  const field = { background: (t && t.bg) || '#1F1F1E', color: textP, border: `1px solid ${border}`, borderRadius: 8, padding: '9px 12px', fontSize: 'var(--zr-ui-md)', outline: 'none', fontFamily: FONTS.sans, width: '100%', boxSizing: 'border-box' }
+
+  const submit = async () => {
+    const nm = name.trim()
+    if (!nm || busy) return
+    const sc = score.trim() === '' ? null : Math.max(0, Math.min(100, parseInt(score, 10) || 0))
+    let imageObj = null
+    const raw = image.trim()
+    if (raw) {
+      // URL collée manuellement -> on l'ingère (download + stockage public jsDelivr). Image du picker = déjà cdn.
+      let ref = raw
+      if (!picked) { setBusy(true); const cdn = await ingestShelfImage({ url: raw, name: nm, cat: cat.key }); setBusy(false); ref = cdn || raw }
+      imageObj = { kind: 'url', ref }
+    }
+    onAdd({ name: nm, score: sc, status, tags: [], extra: {}, image: imageObj, notes: null })
+  }
+
+  return createPortal(
+    <>
+      <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 90, backdropFilter: 'blur(3px)' }} />
+      <div role="dialog" style={{ position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', width: 'min(420px, 92vw)', background: cardBg, border: `1px solid ${border}`, borderRadius: RADII.lg, boxShadow: '0 30px 80px rgba(0,0,0,0.5)', zIndex: 91, padding: 22, display: 'flex', flexDirection: 'column', gap: 14, fontFamily: FONTS.sans }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ fontFamily: FONTS.serif, fontSize: 20, fontWeight: 700, color: textP }}>Ajouter</div>
+          <span style={{ fontSize: 'var(--zr-ui-sm)', color: textS }}>· {cat.label}</span>
+          <button onClick={onClose} title="Fermer" style={{ marginLeft: 'auto', background: 'transparent', border: 'none', cursor: 'pointer', color: textS, padding: 2, display: 'inline-flex' }}><Icon name="xmark" size={18} color="currentColor" /></button>
+        </div>
+
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+          <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Titre</span>
+          <input autoFocus value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submit() }} placeholder="Nom de l'œuvre" style={field} />
+        </label>
+
+        <div style={{ display: 'flex', gap: 12 }}>
+          <label style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 5 }}>
+            <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Status</span>
+            <select value={status} onChange={(e) => setStatus(e.target.value)} style={{ ...field, cursor: 'pointer' }}>
+              {STATUS_ORDER.map((s) => <option key={s} value={s}>{st(s).label}</option>)}
+            </select>
+          </label>
+          <label style={{ flex: '0 0 100px', display: 'flex', flexDirection: 'column', gap: 5 }}>
+            <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Score</span>
+            <input value={score} onChange={(e) => setScore(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submit() }} placeholder="0–100" inputMode="numeric" style={field} />
+          </label>
+        </div>
+
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <span style={{ fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 0.8, color: textS }}>Image du poster</span>
+          {/* Picker : cherche par TITRE sur les API média, propose des tuiles, télécharge+stocke en public au pick. */}
+          <PosterPicker name={name} cat={cat.key} t={t} onPick={(u) => { setImage(u); setPicked(true) }} />
+          {image.trim() && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
+              <img src={image.trim()} alt="" style={{ width: 34, height: 46, objectFit: 'cover', borderRadius: 6, border: `1px solid ${border}` }} />
+              <span style={{ fontSize: 'var(--zr-ui-xs)', color: picked ? accent : textS }}>{picked ? 'Image stockée ✓' : 'URL personnalisée (sera téléchargée)'}</span>
+              <button onClick={() => { setImage(''); setPicked(false) }} title="Retirer" style={{ marginLeft: 'auto', background: 'transparent', border: 'none', color: textS, cursor: 'pointer', display: 'inline-flex' }}><Icon name="xmark" size={14} color="currentColor" /></button>
+            </div>
+          )}
+          <input value={picked ? '' : image} onChange={(e) => { setImage(e.target.value); setPicked(false) }} onKeyDown={(e) => { if (e.key === 'Enter') submit() }} placeholder="… ou colle une URL d'image" style={{ ...field, marginTop: 2 }} />
+        </label>
+
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 4 }}>
+          <button onClick={onClose} style={{ background: 'transparent', color: textS, border: `1px solid ${border}`, borderRadius: 99, padding: '8px 16px', fontSize: 'var(--zr-ui-md)', fontWeight: 600, cursor: 'pointer', fontFamily: FONTS.sans }}>Annuler</button>
+          <button onClick={submit} disabled={!name.trim() || busy} style={{ background: name.trim() ? accent : border, color: '#fff', border: 'none', borderRadius: 99, padding: '8px 18px', fontSize: 'var(--zr-ui-md)', fontWeight: 700, cursor: (name.trim() && !busy) ? 'pointer' : 'default', fontFamily: FONTS.sans, opacity: (name.trim() && !busy) ? 1 : 0.6 }}>{busy ? 'Ajout…' : 'Ajouter'}</button>
+        </div>
+      </div>
+    </>,
+    document.body,
+  )
+}

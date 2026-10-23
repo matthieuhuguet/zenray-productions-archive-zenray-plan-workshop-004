@@ -1,0 +1,162 @@
+// @vitest-environment node
+// The browser uploader driven straight into the REAL server logic, against an in-memory GitHub that can lose replies, race and refuse.
+import { beforeEach, describe, expect, it } from 'vitest'
+import { createGuestUploader } from './uploadCore.js'
+import { processGuestUpload, importMediaKey } from '../../server/guestUploadCore.js'
+import { makeFakeGitHub } from '../../server/testing/fakeGithub.js'
+import { unpackFrame } from '../lib/guestFrame.js'
+import { GUEST } from '../config/guestUpload.js'
+
+const ROOT = 'pages/Photos/Mariage'
+const TOKEN = 'zrs1.sim'
+const KEYRAW = crypto.getRandomValues(new Uint8Array(32))
+const jpeg = (n, seed = 1) => { const u = new Uint8Array(n); for (let i = 0; i < n; i++) u[i] = (i * 31 + seed) & 255; u.set([0xff, 0xd8, 0xff, 0xe0, 0, 16, 0x4a, 0x46, 0x49, 0x46, 0, 1], 0); return u }
+const gridThumb = () => { const u = new Uint8Array(150).fill(9); u.set([0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4, 0x57, 0x45, 0x42, 0x50], 0); return u }
+const thumb = () => { const u = new Uint8Array(400).fill(7); u.set([0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4, 0x57, 0x45, 0x42, 0x50], 0); return u }
+const sha = async (u8) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', u8)), (b) => b.toString(16).padStart(2, '0')).join('')
+const fileOf = (name, bytes, rel = '') => ({ name, size: bytes.length, bytes, lastModified: 1, webkitRelativePath: rel })
+const FAST = { ...GUEST, BACKOFF_MS: [1, 1, 1], PART_BYTES: 100_000, MIN_PART_BYTES: 12_000, REQUEST_BYTES: 260_000 }
+
+let gh, key
+const serve = (extra = {}) => async (frame) => {
+  const { header, payload } = unpackFrame(frame)
+  return processGuestUpload({ header, payload, gh, key, secret: 'sec', sleep: async () => {}, resolveShare: async (t) => (t === TOKEN ? { kind: 'folder', path: ROOT } : Promise.reject(new Error('x'))), ...extra })
+}
+const adapters = (send) => ({ readBlob: async (f, a, b) => f.bytes.subarray(a, b), hashBytes: sha, makeThumb: async () => ({ bytes: thumb(), mime: 'image/webp', w: 1920, h: 1080, thumbW: 1920, thumbH: 1080, grid: { bytes: gridThumb(), thumbSW: 520, thumbSH: 293 } }), send, sleep: async () => {}, isOnline: () => true })
+const guest = (name, send, cfg = FAST) => { const u = createGuestUploader({ token: TOKEN, adapters: adapters(send), config: cfg }); u.setName(name); return u }
+const manifests = () => gh.listPaths('zenray-data', ROOT).filter((p) => p.endsWith('.img.json'))
+const decrypt = async (cipher, ivB64) => new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: Uint8Array.from(atob(ivB64), (c) => c.charCodeAt(0)) }, await crypto.subtle.importKey('raw', KEYRAW, 'AES-GCM', false, ['decrypt']), cipher))
+const finish = async (u) => { for (let i = 0; i < 400; i++) { await u.idle(); const s = u.snapshot(); if (s.idle) return s; await new Promise((r) => setTimeout(r, 2)) } throw new Error('uploader never became idle') }
+
+beforeEach(async () => { gh = makeFakeGitHub(); key = await importMediaKey(btoa(String.fromCharCode(...KEYRAW))) })
+
+describe('Marie et Anne', () => {
+  it('Marie envoie trois photos, Anne une grosse : tout arrive, chiffré, rangé sous leurs prénoms', async () => {
+    const marie = guest('Marie', serve()), anne = guest('Anne', serve())
+    const originals = [jpeg(30_000, 1), jpeg(40_000, 2), jpeg(50_000, 3)]
+    marie.add(originals.map((b, i) => fileOf(`IMG_${i}.JPG`, b)))
+    const big = jpeg(260_000, 9)                                 // 3 chunks of ≤100 000 bytes
+    anne.add([fileOf('DSC_BIG.JPG', big)])
+    const [sm, sa] = await Promise.all([finish(marie), finish(anne)])
+    expect(sm.counts).toMatchObject({ total: 3, done: 3 }); expect(sa.counts).toMatchObject({ total: 1, done: 1 })
+    expect(manifests().sort()).toEqual([`${ROOT}/Anne/DSC_BIG.JPG.img.json`, `${ROOT}/Marie/IMG_0.JPG.img.json`, `${ROOT}/Marie/IMG_1.JPG.img.json`, `${ROOT}/Marie/IMG_2.JPG.img.json`])
+    // every photo carries its light grid thumbnail, which the gallery tiles ask for instead of the heavy standard one
+    const mg = JSON.parse(gh.file('zenray-data', `${ROOT}/Marie/IMG_1.JPG.img.json`).text)
+    expect(mg.thumbS).toBeTruthy(); expect(mg.thumbSW).toBe(520); expect(mg.thumbSH).toBe(293); expect(mg.thumbS).not.toBe(mg.thumb)
+    // Marie's first photo decrypts to the exact bytes she sent
+    const m0 = JSON.parse(gh.file('zenray-data', `${ROOT}/Marie/IMG_0.JPG.img.json`).text)
+    expect(Array.from(await decrypt(gh.file(m0.cdnRepo, m0.cdnChunks[0]).bytes, m0.iv))).toEqual(Array.from(originals[0]))
+    // Anne's big photo was stored in 3 independently encrypted chunks, and joins back to the original
+    const ma = JSON.parse(gh.file('zenray-data', `${ROOT}/Anne/DSC_BIG.JPG.img.json`).text)
+    expect(ma.cdnChunks).toHaveLength(3); expect(ma.ivs).toHaveLength(3)
+    const parts = []; for (let i = 0; i < 3; i++) parts.push(...(await decrypt(gh.file(ma.cdnRepo, ma.cdnChunks[i]).bytes, ma.ivs[i])))
+    expect(parts).toHaveLength(big.length); expect(Array.from(parts)).toEqual(Array.from(big))
+  })
+
+  it('un dossier local : les sous-dossiers du téléphone deviennent des sous-dossiers de Marie', async () => {
+    const marie = guest('Marie', serve())
+    marie.add([fileOf('a.jpg', jpeg(20_000, 1), 'Mariage/Soirée/a.jpg'), fileOf('b.jpg', jpeg(20_000, 2), 'Mariage/b.jpg')])
+    await finish(marie)
+    expect(manifests().sort()).toEqual([`${ROOT}/Marie/Mariage/Soirée/a.jpg.img.json`, `${ROOT}/Marie/Mariage/b.jpg.img.json`])
+  })
+
+  it('un fichier qui n’est pas une photo est ignoré poliment (compté, jamais une erreur)', async () => {
+    const marie = guest('Marie', serve())
+    marie.add([fileOf('notes.pdf', jpeg(5000)), fileOf('ok.jpg', jpeg(5000, 3))])
+    const s = await finish(marie)
+    expect(s.counts).toMatchObject({ total: 2, done: 1, skipped: 1 }); expect(s.items.find((i) => i.name === 'notes.pdf').reason).toBe('type')
+  })
+
+  it('« Marie » et « Anne » en même temps, avec des courses de commits : rien ne se perd, rien ne s’écrase', async () => {
+    gh.hooks.beforeCommit = async () => { await new Promise((r) => setTimeout(r, Math.random() * 3)) }    // interleave the two flows between read and commit
+    const marie = guest('Marie', serve()), anne = guest('Anne', serve())
+    marie.add(Array.from({ length: 8 }, (_, i) => fileOf(`m${i}.jpg`, jpeg(15_000, i + 1))))
+    anne.add(Array.from({ length: 8 }, (_, i) => fileOf(`a${i}.jpg`, jpeg(15_000, i + 50))))
+    await Promise.all([finish(marie), finish(anne)])
+    expect(manifests()).toHaveLength(16)
+  })
+})
+
+describe('les invités ne voient jamais d’échec : tout est retenté', () => {
+  it('requêtes qui échouent au hasard (réseau, 5xx, « busy ») : tout finit par passer, une seule fois', async () => {
+    let n = 0
+    const flaky = async (frame) => { n++; const r = n % 3; if (r === 1) throw new Error('network'); if (r === 2) return { ok: false, retry: true, reason: 'busy', waitMs: 1 }; return serve()(frame) }
+    const marie = guest('Marie', flaky)
+    marie.add(Array.from({ length: 6 }, (_, i) => fileOf(`p${i}.jpg`, jpeg(20_000, i + 1))))
+    const s = await finish(marie)
+    expect(s.counts.done).toBe(6); expect(manifests()).toHaveLength(6); expect(s.stats.failures).toBeGreaterThan(3)
+  })
+
+  it('réponse perdue APRÈS que le serveur a tout écrit : le renvoi ne crée aucun doublon', async () => {
+    let lost = 0
+    const lossy = async (frame) => { const reply = await serve()(frame); if (lost < 3) { lost++; throw new Error('reply lost') } return reply }
+    const marie = guest('Marie', lossy)
+    marie.add([fileOf('one.jpg', jpeg(20_000, 1)), fileOf('two.jpg', jpeg(20_000, 2))])
+    const s = await finish(marie)
+    expect(s.counts.done).toBe(2); expect(manifests().sort()).toEqual([`${ROOT}/Marie/one.jpg.img.json`, `${ROOT}/Marie/two.jpg.img.json`])
+  })
+
+  it('un lot que le serveur refuse : il est coupé en deux jusqu’à passer', async () => {
+    const picky = async (frame) => { const { header } = unpackFrame(frame); if (header.photos.length > 1) return { ok: false, retry: true, reason: 'busy', waitMs: 1 }; return serve()(frame) }
+    const marie = guest('Marie', picky)
+    marie.add(Array.from({ length: 5 }, (_, i) => fileOf(`s${i}.jpg`, jpeg(10_000, i + 1))))
+    const s = await finish(marie)
+    expect(s.counts.done).toBe(5); expect(s.stats.splits).toBeGreaterThan(0)
+  })
+
+  it('un morceau trop gros pour passer : le morceau est divisé par deux jusqu’à passer', async () => {
+    const small = async (frame) => { const { header } = unpackFrame(frame); if (header.parts.some((p) => p.role === 'chunk' && p.len > 30_000)) return { ok: false, retry: true, reason: 'busy', waitMs: 1 }; return serve()(frame) }
+    const anne = guest('Anne', small)
+    const big = jpeg(250_000, 4)
+    anne.add([fileOf('big.jpg', big)])
+    const s = await finish(anne)
+    expect(s.counts.done).toBe(1)
+    const m = JSON.parse(gh.file('zenray-data', `${ROOT}/Anne/big.jpg.img.json`).text)
+    const out = []; for (let i = 0; i < m.cdnChunks.length; i++) out.push(...(await decrypt(gh.file(m.cdnRepo, m.cdnChunks[i]).bytes, m.ivs ? m.ivs[i] : m.iv)))
+    expect(Array.from(out)).toEqual(Array.from(big))
+  })
+
+  it('hors ligne : le client attend le retour du réseau, sans rien perdre', async () => {
+    let online = false
+    const a = { ...adapters(serve()), isOnline: () => online, waitOnline: async () => { online = true } }
+    const u = createGuestUploader({ token: TOKEN, adapters: a, config: FAST }); u.setName('Marie')
+    u.add([fileOf('x.jpg', jpeg(9000, 2))])
+    const s = await finish(u)
+    expect(s.counts.done).toBe(1)
+  })
+
+  it('1024 par jour : arrêt poli (notice « daily »), les photos restent en attente, aucune erreur', async () => {
+    const day = new Date().toISOString().slice(0, 10)
+    await gh.commit('zenray-data', { expectedHeadOid: 'c0000', headline: 'l', additions: [{ path: `${GUEST.STATE_DIR}/ledger/${day}.json`, text: JSON.stringify({ n: GUEST.DAILY_MAX }) }] })
+    const marie = guest('Marie', serve())
+    marie.add([fileOf('x.jpg', jpeg(9000, 2))])
+    const s = await finish(marie)
+    expect(s.notice).toBe('daily'); expect(s.counts.done).toBe(0); expect(manifests()).toHaveLength(0)
+  })
+
+  it('un lien révoqué : arrêt poli (notice « link »)', async () => {
+    const marie = guest('Marie', serve({ resolveShare: async () => { throw new Error('revoked') } }))
+    marie.add([fileOf('x.jpg', jpeg(9000, 2))])
+    const s = await finish(marie)
+    expect(s.notice).toBe('link')
+  })
+
+  it('une photo déjà envoyée lors d’une visite précédente n’est pas renvoyée', async () => {
+    const seen = new Set()
+    const a = { ...adapters(serve()), seen: (h) => seen.has(h), remember: (h) => seen.add(h) }
+    const u1 = createGuestUploader({ token: TOKEN, adapters: a, config: FAST }); u1.setName('Marie')
+    const f = fileOf('x.jpg', jpeg(9000, 2))
+    u1.add([f]); await finish(u1)
+    const commits = gh.stats.commits
+    const u2 = createGuestUploader({ token: TOKEN, adapters: a, config: FAST }); u2.setName('Marie')
+    u2.add([f]); const s = await finish(u2)
+    expect(s.counts.done).toBe(1); expect(gh.stats.commits).toBe(commits)
+  })
+
+  it('créer un dossier dans son espace', async () => {
+    const marie = guest('Marie', serve())
+    const made = await marie.createFolder('Danse')
+    expect(made).toBe('Danse')
+    expect(gh.file('zenray-data', `${ROOT}/Marie/Danse/${GUEST.FOLDER_MARKER}`)).toBeTruthy()
+  })
+})

@@ -1,0 +1,133 @@
+// 2 October 2026, 13:05 CEST: one project identity maps scoped local sources to collision-free cloud paths.
+import { classify } from '../capture/classify.js'
+
+export const WORKSPACE_SCHEMA_VERSION = 2
+export const SOURCE_NAMESPACES = ['tmp', 'memory', 'houdini', 'unreal']
+const ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+
+export function isWorkspaceId(value) {
+  return typeof value === 'string' && ID_PATTERN.test(value)
+}
+
+export function assertWorkspaceId(value, label = 'id') {
+  if (!isWorkspaceId(value)) throw new Error(`Invalid ${label}`)
+  return value
+}
+
+export function safeRelativePath(value) {
+  if (typeof value !== 'string' || !value || value.startsWith('/') || /[\\\x00-\x1f]/.test(value)
+    || /^[a-z]:/i.test(value) || value.split('/').some((segment) => !segment || segment === '.' || segment === '..')) {
+    throw new Error('Invalid relative path')
+  }
+  return value.normalize('NFC')
+}
+
+export function normalizeWorkspaceProject(project, { cloudRoot = 'pages/ZenRayAssets' } = {}) {
+  if (!project || typeof project !== 'object') throw new Error('Project definition required')
+  const id = assertWorkspaceId(project.id, 'project id')
+  if (!project.name || !Array.isArray(project.sources)) throw new Error('Project name and sources required')
+  const sourceIds = new Set()
+  const sources = project.sources.map((source) => {
+    const sourceId = assertWorkspaceId(source.id, 'source id')
+    if (sourceIds.has(sourceId)) throw new Error(`Duplicate source id: ${sourceId}`)
+    sourceIds.add(sourceId)
+    if (!SOURCE_NAMESPACES.includes(source.namespace)) throw new Error(`Unknown source namespace: ${source.namespace}`)
+    if (typeof source.localPath !== 'string' || !source.localPath.startsWith('/') || source.localPath.includes('\0')) {
+      throw new Error(`Absolute local path required: ${sourceId}`)
+    }
+    const include = source.include?.map(safeRelativePath)
+    const exclude = source.exclude?.map(safeRelativePath) || []
+    return { ...source, id: sourceId, include, exclude, keep: !!source.keep }
+  })
+  const folder = `${safeRelativePath(cloudRoot)}/${id}`
+  if (project.folder && project.folder !== folder) throw new Error('Cloud folder must follow stable project id')
+  return { ...project, id, name: String(project.name), folder, sources, schemaVersion: WORKSPACE_SCHEMA_VERSION }
+}
+
+export function sourceCloudFolder(project, source) {
+  assertWorkspaceId(source.id, 'source id')
+  if (!SOURCE_NAMESPACES.includes(source.namespace)) throw new Error('Unknown source namespace')
+  return `${safeRelativePath(project.folder)}/sources/${source.namespace}/${source.id}`
+}
+
+export function workspaceCloudPath(project, source, relativePath) {
+  return `${sourceCloudFolder(project, source)}/${safeRelativePath(relativePath)}`
+}
+
+export function workspaceFileId(sourceId, relativePath) {
+  return `${assertWorkspaceId(sourceId, 'source id')}:${safeRelativePath(relativePath)}`
+}
+
+export function pathIsSelected(relativePath, includes) {
+  if (!includes) return true
+  return includes.some((entry) => relativePath === entry || relativePath.startsWith(`${entry}/`))
+}
+
+export function deriveWorkspaceFileStatus(local, backup, restored = null) {
+  if (!local) return backup ? 'missing' : 'unknown'
+  if (local.error) return 'error'
+  // 2 October 2026, 15:45 CEST: unchanged production baselines must not replace a newer saved working copy.
+  if (local.olderLocal && backup?.sha256) return 'older-local'
+  if (!backup?.sha256) return 'local-only'
+  if (!local.sha256) return 'pending'
+  if (local.sha256 !== backup.sha256 || local.size !== backup.size) return 'modified'
+  if (restored?.sha256 === backup.sha256 && restored?.verifiedAt) return 'verified'
+  return 'backed-up'
+}
+
+export function combineWorkspaceFiles(project, localFiles, backups = {}, restorations = {}) {
+  const sources = new Map(project.sources.map((source) => [source.id, source]))
+  const local = new Map(localFiles.map((file) => [file.id, file]))
+  const allIds = new Set([...local.keys(), ...Object.keys(backups)])
+  return [...allIds].map((id) => {
+    const file = local.get(id)
+    const backup = backups[id]
+    const source = sources.get(file?.sourceId || backup?.sourceId)
+    if (!source) return null
+    const relativePath = file?.relativePath || backup.relativePath
+    const expectedCloudPath = workspaceCloudPath(project, source, relativePath)
+    const status = deriveWorkspaceFileStatus(file, backup, restorations[id])
+    return {
+      ...backup, ...file, id, name: relativePath.split('/').pop(), relativePath,
+      sourceId: source.id, namespace: source.namespace, kind: classify({ name: relativePath }).kind,
+      status, present: !!file, expectedCloudPath,
+      cloudPath: backup?.manifestPath || null, contentPath: backup?.manifestPath || null,
+      restoredAt: restorations[id]?.verifiedAt || null,
+    }
+  }).filter(Boolean).sort((a, b) => a.namespace.localeCompare(b.namespace) || a.relativePath.localeCompare(b.relativePath))
+}
+
+export function workspaceSummary(files, { state = null, error = null, checkedAt = null } = {}) {
+  const present = files.filter((file) => file.present)
+  const backedUp = present.filter((file) => ['backed-up', 'verified', 'older-local'].includes(file.status))
+  const verified = present.filter((file) => file.status === 'verified')
+  const pending = present.filter((file) => !['backed-up', 'verified', 'older-local'].includes(file.status))
+  return {
+    count: present.length, bytes: present.reduce((sum, file) => sum + file.size, 0),
+    state: state || (error ? 'error' : pending.length ? 'pending' : present.length ? 'backed-up' : 'unknown'),
+    backedUpCount: backedUp.length, verifiedCount: verified.length, pendingCount: pending.length,
+    sourceConflictCount: present.filter((file) => file.sourceConflict).length,
+    checkedAt, lastVerifiedAt: verified.map((file) => file.restoredAt).filter(Boolean).sort().at(-1) || null,
+    error,
+  }
+}
+
+export function buildWorkspacePlan(project, files, { action = 'load', fileIds = null } = {}) {
+  if (!['load', 'unload'].includes(action)) throw new Error('Unsupported workspace plan')
+  const selected = fileIds === null ? files : files.filter((file) => fileIds.includes(file.id))
+  if (fileIds?.some((id) => !files.some((file) => file.id === id))) throw new Error('Unknown file selection')
+  const blockers = []
+  const entries = selected.map((file) => {
+    const source = project.sources.find((entry) => entry.id === file.sourceId)
+    if (!source) throw new Error('Unknown source')
+    // 10 October 2026, 12:30 CEST: saved additions qualify for the fresh recovery probe performed by UNLOAD.
+    const ready = action === 'load' ? !!file.cloudPath && !!file.sha256 :
+      !source.keep && !file.sourceConflict && (file.status === 'verified' || file.loadedCopy && file.status === 'backed-up' && !!file.cloudPath && !!file.sha256)
+    if (!ready) blockers.push({ id: file.id, reason: action === 'load' ? 'cloud-proof-missing' : source.keep ? 'source-kept' : 'restore-proof-missing' })
+    return { id: file.id, sourceId: source.id, namespace: source.namespace, relativePath: file.relativePath,
+      manifestPath: file.cloudPath, size: file.size, sha256: file.sha256, ready }
+  })
+  return { projectId: project.id, action, dryRun: action === 'unload', count: entries.length,
+    bytes: entries.reduce((sum, entry) => sum + entry.size, 0), entries, blockers, executable: action === 'load' && blockers.length === 0,
+    dependencies: project.dependencies || [] }
+}

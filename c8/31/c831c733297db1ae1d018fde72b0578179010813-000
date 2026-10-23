@@ -1,0 +1,154 @@
+// 23 October 2026: one pass of ZenRay Knowledge. Scan the sources, write every unit not yet read into the queue,
+// let a model answer each unit (Claude CLI here, or Haiku sub-agents for the first pass), then ingest only what passes the proof gate.
+// FR : une passe de Knowledge : relire les sources, mettre en file les unités nouvelles, laisser un modèle les lire, et n'ingérer
+// que ce qui passe la porte de preuve.
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { conversationPairs, conversationUnits, memoryFiles, memoryUnits } from './Sources.mjs'
+import { checkEntry } from './Validate.mjs'
+import { callModel } from './Model.mjs'
+import { appendBook, loadStore, mergeEntries, parseDate, saveStore, withStoreLock } from './Store.mjs'
+
+export const runtimeDirectory = () => path.join(process.env.HOME, 'Library/Application Support/ZenRayKnowledge')
+const dirs = () => { const root = runtimeDirectory(); return { root, queue: path.join(root, 'Queue'), out: path.join(root, 'Out'), state: path.join(root, 'State.json') } }
+
+export async function loadState() {
+  try { return JSON.parse(await readFile(dirs().state, 'utf8')) } catch { return { done: {}, files: {}, rejected: 0, runs: [] } }
+}
+export async function saveState(state) {
+  const { root, state: file } = dirs()
+  await mkdir(root, { recursive: true })
+  await writeFile(`${file}.tmp`, JSON.stringify(state)); await rename(`${file}.tmp`, file)
+}
+
+function unitText(unit) {
+  if (unit.kind === 'memory') return `UNIT ${unit.id}\nKIND memory\nSOURCE ${unit.ref}\nMODIFIED ${unit.mtime}\n---\n${unit.text}\n`
+  return `UNIT ${unit.id}\nKIND conversation\n---\n` + unit.pairs.map((p) => `\n### PAIR ${p.id} · ${p.kind} · ${p.at}\nQUESTION:\n${p.q}\nANSWER:\n${p.answer}\n`).join('')
+}
+
+/** Scan sources and write every unread unit to Queue/<id>.md (with a sidecar .json keeping its metadata). */
+export async function prepare(config, { root, conversations = true, memory = true } = {}) {
+  const state = await loadState(), { queue } = dirs()
+  await mkdir(queue, { recursive: true })
+  const units = []
+  if (memory) for (const file of await memoryFiles(config)) units.push(...memoryUnits(file, config))
+  if (conversations) {
+    // A pair already waiting in a queued unit is never queued again (the groups of 28 change as soon as one pair is done).
+    // FR : une paire déjà en file n'est jamais remise en file.
+    const waiting = new Set()
+    for (const name of (await readdir(queue)).filter((n) => n.startsWith('u_') && n.endsWith('.json'))) {
+      try { for (const p of JSON.parse(await readFile(path.join(queue, name), 'utf8')).pairs || []) waiting.add(p.id) } catch {}
+    }
+    const pairs = (await conversationPairs(config, { root })).filter((p) => !state.done[p.id] && !waiting.has(p.id))
+    units.push(...conversationUnits(pairs, config))
+  }
+  let queued = 0
+  const existing = new Set((await readdir(queue)).map((n) => n.replace(/\.(md|json)$/, '')))
+  for (const unit of units) {
+    if (state.done[unit.id] || existing.has(unit.id)) continue
+    await writeFile(path.join(queue, `${unit.id}.md`), unitText(unit))
+    await writeFile(path.join(queue, `${unit.id}.json`), JSON.stringify(unit))
+    queued++
+  }
+  return { units: units.length, queued, pending: (await readdir(queue)).filter((n) => n.endsWith('.md')).length }
+}
+
+/** Pending units, most useful first (config.backfill.priority), skipping units whose answer is already in Out/. */
+export async function orderedPending(config) {
+  const { queue, out } = dirs()
+  const answered = new Set((await readdir(out).catch(() => [])).map((n) => n.replace(/\.json$/, '')))
+  const priority = (config.backfill?.priority || []).map((p) => new RegExp(p))
+  const names = (await readdir(queue).catch(() => [])).filter((n) => n.endsWith('.md') && !answered.has(n.replace(/\.md$/, '')))
+  const ranked = await Promise.all(names.map(async (n) => {
+    if (n.startsWith('u_')) return [0, n]
+    const source = /^SOURCE (.*)$/m.exec((await readFile(path.join(queue, n), 'utf8')).slice(0, 400))?.[1] || ''
+    const i = priority.findIndex((re) => re.test(source))
+    return [i < 0 ? priority.length + 1 : i + 1, n]
+  }))
+  return ranked.sort((a, b) => a[0] - b[0] || a[1].localeCompare(b[1])).map(([, n]) => path.join(queue, n))
+}
+
+export async function pendingUnits() {
+  const { queue } = dirs()
+  try { return (await readdir(queue)).filter((n) => n.endsWith('.md')).map((n) => path.join(queue, n)).sort() } catch { return [] }
+}
+
+/** Turn one model output into candidates; every entry passes `checkEntry` against the unit's own text. */
+export function candidatesFromOutput(unit, output, config) {
+  const candidates = [], rejected = []
+  if (unit.kind === 'memory') {
+    for (const raw of output.entries || []) {
+      const verdict = checkEntry(raw, unit.text, config)
+      if (!verdict.ok) { rejected.push(verdict.reason); continue }
+      const e = verdict.entry
+      const at = parseDate(e.date) || unit.mtime
+      candidates.push({ q: e.q, a: e.a, d: e.d, kw: e.kw, asked: false, src: { kind: 'memory', ref: unit.ref, at, proof: e.proof, dated: Boolean(e.date) } })
+    }
+  } else {
+    const byId = new Map(unit.pairs.map((p) => [p.id, p]))
+    for (const raw of output.pairs || []) {
+      const pair = byId.get(raw.id)
+      if (!pair || !raw.keep) continue
+      const verdict = checkEntry(raw, `${pair.q}\n${pair.answer}`, config)
+      if (!verdict.ok) { rejected.push(verdict.reason); continue }
+      const e = verdict.entry
+      candidates.push({ q: e.q, a: e.a, d: e.d, kw: e.kw, asked: true, src: { kind: pair.kind, ref: `${pair.project}/${pair.session}`, at: pair.at, proof: e.proof, original: pair.q } })
+    }
+  }
+  return { candidates, rejected }
+}
+
+const parseJson = (text) => { const m = /\{[\s\S]*\}/.exec(String(text)); return m ? JSON.parse(m[0]) : null }
+
+/** Read Out/<id>.json for every queued unit, validate, merge, append the book, and mark the unit done. */
+export const ingest = (config) => withStoreLock(config, () => ingestUnlocked(config))
+async function ingestUnlocked(config) {
+  const state = await loadState(), { queue, out } = dirs()
+  await mkdir(out, { recursive: true })
+  const entries = await loadStore(config)
+  const allCandidates = [], processed = []
+  const report = { units: 0, candidates: 0, rejected: {}, added: 0, merged: 0, broken: [] }
+  for (const name of (await readdir(out)).filter((n) => n.endsWith('.json'))) {
+    const id = name.replace(/\.json$/, '')
+    let unit, output
+    try { unit = JSON.parse(await readFile(path.join(queue, `${id}.json`), 'utf8')) } catch { continue }
+    try { output = parseJson(await readFile(path.join(out, name), 'utf8')) } catch { output = null }
+    if (!output) { report.broken.push(id); continue }
+    const { candidates, rejected } = candidatesFromOutput(unit, output, config)
+    for (const reason of rejected) report.rejected[reason] = (report.rejected[reason] || 0) + 1
+    allCandidates.push(...candidates)
+    state.done[unit.id] = new Date().toISOString()
+    if (unit.kind === 'conversation') for (const p of unit.pairs) state.done[p.id] = state.done[unit.id]
+    processed.push(unit.id); report.units++
+  }
+  report.candidates = allCandidates.length
+  const before = entries.length
+  const added = mergeEntries(entries, allCandidates)
+  report.added = added.length; report.merged = allCandidates.length - (entries.length - before)
+  await saveStore(config, entries)
+  await appendBook(config, added)
+  await saveState(state)
+  // Units are removed only after the store is written, so a crash never loses a model answer.
+  for (const id of processed) { for (const ext of ['md', 'json']) await rm(path.join(queue, `${id}.${ext}`), { force: true }); await rm(path.join(out, `${id}.json`), { force: true }) }
+  report.total = entries.length
+  return report
+}
+
+/** The service's own reader, one unit at a time (API or CLI backend, lib/Model.mjs). Never throws: a refusal is reported. */
+export async function extractWithCli(config, { root, limit = config.extract.maxUnitsPerRun } = {}) {
+  const prompt = await readFile(path.join(root, 'scripts/Knowledge/prompts/Extract.md'), 'utf8')
+  const { out } = dirs(); await mkdir(out, { recursive: true })
+  const result = { read: 0, failed: 0, error: null }
+  for (const file of (await orderedPending(config)).slice(0, limit)) {
+    const id = path.basename(file, '.md')
+    try {
+      await writeFile(path.join(out, `${id}.json`), await callModel(config, prompt, await readFile(file, 'utf8')))
+      result.read++
+    } catch (error) {
+      result.failed++; result.error = String(error.message).slice(0, 300)
+      // The model is down (key refused, credit, limit, logged out): stop now instead of failing on every unit.
+      if (error.down) break
+    }
+  }
+  return result
+}

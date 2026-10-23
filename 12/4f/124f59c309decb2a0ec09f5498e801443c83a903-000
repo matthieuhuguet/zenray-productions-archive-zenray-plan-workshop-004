@@ -1,0 +1,95 @@
+// streaming-proof.test.mjs (14 October 2026): the streaming proof is GREEN on a complete film and RED on every kind of damage.
+// FR : la preuve du streaming est verte sur un film complet et rouge sur chaque type de degat.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { verifyStreaming, parseCdnUrl } from './streaming-proof.mjs'
+
+const OWNER = 'matthieuhuguet', REPO = 'zenray-vid-public-99', COMMIT = 'a'.repeat(40), ID = 'film-abc123'
+const base = `https://cdn.jsdelivr.net/gh/${OWNER}/${REPO}@${COMMIT}/${ID}`
+const POSTER = `https://cdn.jsdelivr.net/gh/${OWNER}/zenray-poster-public-01@${'b'.repeat(40)}/posters/x.jpg`
+const SEGS = 5
+
+function fixture(mutate = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-'))
+  const rel = 'pages/Anime/Bleach/Saison 17/.streams/film-abc123'
+  fs.mkdirSync(path.join(dir, rel), { recursive: true })
+  const media = (n) => ['#EXTM3U', `#EXT-X-MAP:URI="${base}/init_${n}.m4s"`, ...Array.from({ length: SEGS }, (_, i) => `${base}/chunk_${n}_${String(i + 1).padStart(5, '0')}.m4s`)].join('\n')
+  fs.writeFileSync(path.join(dir, rel, 'master.m3u8'), [
+    '#EXTM3U', '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="日本語",LANGUAGE="jpn",DEFAULT=YES,URI="/api/hls?path=' + encodeURIComponent(`${rel}/media_1.m3u8`) + '"',
+    '#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO="audio"', '/api/hls?path=' + encodeURIComponent(`${rel}/media_0.m3u8`), ''].join('\n'))
+  fs.writeFileSync(path.join(dir, rel, 'media_0.m3u8'), media(0)); fs.writeFileSync(path.join(dir, rel, 'media_1.m3u8'), media(1))
+  const tree = new Map()
+  for (const n of [0, 1]) { tree.set(`${ID}/init_${n}.m4s`, 800); for (let i = 1; i <= SEGS; i += 1) tree.set(`${ID}/chunk_${n}_${String(i).padStart(5, '0')}.m4s`, 1000) }
+  const total = [...tree.values()].reduce((a, b) => a + b, 0)
+  const manifest = { type: 'dash', v: 2, name: 'Bleach S17E48.mkv', streamOnly: true, duration: 100, master: `${rel}/master.m3u8`, mpd: `${rel}/manifest.mpd`, poster: POSTER,
+    publicRepo: REPO, commitPublic: COMMIT, cmafSegmentCount: tree.size, cmafBytes: total, audio: [{ lang: 'jpn', label: '日本語' }], subtitles: [{ lang: 'fre', label: 'Français' }],
+    ...mutate.manifest }
+  const mp = path.join(dir, 'm.media.json'); fs.writeFileSync(mp, JSON.stringify(manifest))
+  const src = path.join(dir, 'src.mkv'); fs.writeFileSync(src, 'x'.repeat(100))
+  if (mutate.tree) mutate.tree(tree)
+  const fetchImpl = async (url) => {
+    const u = String(url)
+    if (u.includes('api.github.com')) return { ok: true, json: async () => ({ truncated: false, tree: [...tree].map(([p, size]) => ({ path: p, type: 'blob', size })) }) }
+    const viaRaw = u.startsWith('https://raw.githubusercontent.com/')
+    const p = viaRaw ? { path: u.split('/').slice(6).join('/') } : parseCdnUrl(u)
+    if (mutate.cdnBad && p.path.endsWith(mutate.cdnBad) && (!viaRaw || mutate.rawBad)) return { ok: false, status: 403 }
+    const size = (mutate.cdnSize && mutate.cdnSize(p.path)) ?? tree.get(p.path)
+    return { ok: true, arrayBuffer: async () => new ArrayBuffer(size) }
+  }
+  return { dir, mp, src, fetchImpl, probe: { duration: 100, audio: [{}], subtitles: [{ codec_name: 'ass' }] } }
+}
+const cfg = { kind: 'streaming-v1', sampleCount: 4, durationToleranceSec: 1.5, retryAttempts: 2, retryDelayMs: 1 }
+const run = (f, extra = {}) => verifyStreaming({ manifestPath: f.mp, manifestClone: f.dir, source: f.src, probe: f.probe, token: 't', fetchImpl: f.fetchImpl, config: cfg, localSha256: 'c'.repeat(64), ...extra })
+const failed = (r) => r.checks.filter((c) => !c.ok).map((c) => c.name)
+
+test('GREEN: a complete streamed film gives a receipt', async () => {
+  const r = await run(fixture())
+  assert.equal(r.ok, true, JSON.stringify(failed(r)))
+  assert.equal(r.receipt.kind, 'streaming-v1'); assert.equal(r.receipt.files, 12); assert.equal(r.receipt.completeStreamingVerified, true)
+})
+test('RED: a segment missing from the repository tree', async () => {
+  const r = await run(fixture({ tree: (t) => t.delete(`${ID}/chunk_0_00003.m4s`) }))
+  assert.equal(r.ok, false); assert.ok(failed(r).includes('every file of every rendition exists in the repository tree'))
+})
+test('RED: summed sizes differ from the manifest bytes', async () => {
+  const r = await run(fixture({ tree: (t) => t.set(`${ID}/chunk_0_00002.m4s`, 999) }))
+  assert.ok(failed(r).includes('summed file sizes equal the manifest bytes'))
+})
+test('GREEN: the CDN refuses a sampled segment but GitHub raw serves the same bytes, and the receipt says so', async () => {
+  const r = await run(fixture({ cdnBad: 'init_0.m4s' }))
+  assert.equal(r.ok, true, JSON.stringify(failed(r)))
+  assert.ok(r.receipt.sampled.some((s) => s.via === 'raw'))
+})
+test('RED: the CDN AND GitHub raw both refuse a sampled segment', async () => {
+  const r = await run(fixture({ cdnBad: 'init_0.m4s', rawBad: true }))
+  assert.ok(failed(r).includes('sampled segments are served by the CDN with the right size'))
+})
+test('RED: the CDN serves a truncated segment', async () => {
+  const r = await run(fixture({ cdnSize: (p) => (p.endsWith('chunk_1_00005.m4s') ? 10 : undefined) }))
+  assert.ok(failed(r).includes('sampled segments are served by the CDN with the right size'))
+})
+test('RED: the manifest announces more files than the playlists carry', async () => {
+  const r = await run(fixture({ manifest: { cmafSegmentCount: 99 } }))
+  assert.ok(failed(r).includes('file count equals the manifest'))
+})
+test('RED: an audio track named audio_1 is refused (a clear name is mandatory)', async () => {
+  const r = await run(fixture({ manifest: { audio: [{ lang: 'jpn', label: 'audio_1' }] } }))
+  assert.equal(r.ok, false); assert.ok(failed(r).includes('every audio track has a clear name'))
+})
+test('RED: no public poster', async () => {
+  const r = await run(fixture({ manifest: { poster: '/api/raw-proxy?x=1' } }))
+  assert.ok(failed(r).includes('public poster'))
+})
+test('RED: the source has an audio track the manifest dropped', async () => {
+  const f = fixture(); f.probe.audio = [{}, {}]
+  const r = await run(f)
+  assert.ok(failed(r).includes('every audio track of the source is kept'))
+})
+test('RED: the manifest lost a text subtitle track of the source', async () => {
+  const f = fixture(); f.probe.subtitles = [{ codec_name: 'ass' }, { codec_name: 'subrip' }]
+  const r = await run(f)
+  assert.ok(failed(r).includes('every text subtitle track of the source is in the manifest'))
+})

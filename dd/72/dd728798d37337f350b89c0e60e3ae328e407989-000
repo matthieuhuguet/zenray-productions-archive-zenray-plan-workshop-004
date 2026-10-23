@@ -1,0 +1,388 @@
+// ═══ ZENRAYTIMER, LA VUE. LE TEMPS, LUI, VIT PLUS HAUT ═══════════════════════════════════════════
+//
+// Demande d'origine de Matthieu : « une section avec ce seul composant centré sur page, un son, et la
+// tâche effectuée va directement dans Plan. Ajoute un maximum d'animation ET REND ÇA LE PLUS JUICE IT
+// POSSIBLE. »
+//
+// CE FICHIER A PERDU LA MOITIÉ DE SON TRAVAIL LE 2026-08-27, ET C'ÉTAIT LE CORRECTIF. Il portait
+// l'état du minuteur, or il n'était monté que sous `view === 'timer'` : quitter la nav le démontait,
+// avec son heure de fin, et le bloc en cours disparaissait. L'état est parti dans
+// `src/timer/TimerContext.jsx`, monté à la racine de l'application comme `PlayerProvider` l'est pour
+// ZenRay Audio. Ce qui reste ici est tout ce qui n'a de sens que sous les yeux : les étincelles, la
+// secousse, le camembert. Le fournisseur SIGNALE les moments, cette vue décide comment les dessiner,
+// et personne ne dessine quand personne ne regarde.
+//
+// LE PRINCIPE DIRECTEUR VIENT DU SKILL `juice-it`, tiré de la conférence de Jonasson et Purho :
+// rendement maximal pour une entrée minimale. Un clic ne doit pas produire un changement, il doit en
+// produire six, le son, l'échelle, la couleur, les particules, la secousse, le chiffre qui bouge. Le
+// mécanisme, lui, ne change jamais : ce minuteur ferait exactement la même chose sans une seule de ces
+// lignes, il serait simplement mort sous la main.
+//
+// CE QUI EST DÉLIBÉRÉMENT ABSENT. Aucune bibliothèque d'animation, aucun moteur de particules, aucun
+// fichier de son. La conférence nomme le piège du programmeur qui écrit le meilleur moteur de
+// particules et ne finit jamais son jeu ; ici quarante lignes de canvas et un oscillateur suffisent.
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import Icon from '../components/Icon.jsx'
+import Segmente from '../components/Segmente.jsx'
+import { HABITUDES, prefixeHabitude } from './planHabitudes.js'
+import { TB, jouer, useTimer } from '../timer/TimerContext.jsx'
+import { analyserDuree, formaterDuree, messageRefus } from '../timer/dureeSaisie.js'
+import './ZenRayTimer.css'
+
+// ── PARTICULES ────────────────────────────────────────────────────────────────────────────────────
+// Un canvas, un tableau, une boucle. C'est tout ce qu'il faut, et c'est exactement le conseil de la
+// conférence : ne pas écrire le grand moteur qu'on n'utilisera jamais.
+function useParticules(refCanvas) {
+  const parts = useRef([])
+  const boucle = useRef(0)
+  const dessiner = useCallback(() => {
+    const cv = refCanvas.current
+    if (!cv) return
+    const ctx = cv.getContext('2d')
+    const dpr = window.devicePixelRatio || 1
+    if (cv.width !== cv.clientWidth * dpr) { cv.width = cv.clientWidth * dpr; cv.height = cv.clientHeight * dpr }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, cv.clientWidth, cv.clientHeight)
+    const maintenant = performance.now()
+    parts.current = parts.current.filter((p) => maintenant - p.ne < p.vie)
+    // COMPOSITION ADDITIVE. Deux étincelles qui se croisent doivent devenir PLUS lumineuses, jamais se
+    // recouvrir : c'est ce cumul qui donne le cœur brillant d'une gerbe. En composition normale, cent
+    // points blancs ne font qu'un aplat blanc, et la gerbe redevient une tache.
+    ctx.globalCompositeOperation = 'lighter'
+    const { gravite, friction, halo, scintille } = TB.particules
+    for (const p of parts.current) {
+      p.vx *= friction
+      p.vy = p.vy * friction + gravite
+      p.x += p.vx; p.y += p.vy
+      const age = (maintenant - p.ne) / p.vie
+      // Extinction en carré : longue braise, disparition franche. Un fondu linéaire donne l'impression
+      // que les points s'éteignent tous en même temps, ce qui se lit comme un effacement, pas une fin.
+      const vie = Math.max(0, (1 - age) * (1 - age))
+      // Le scintillement est la seule chose qui distingue une étincelle d'un pixel blanc. Chaque
+      // particule bat à sa propre cadence, sinon toute la gerbe clignote d'un bloc comme un gyrophare.
+      const bat = 1 - scintille + scintille * (0.5 + 0.5 * Math.sin(p.phase + (maintenant - p.ne) * p.freq))
+      const a = vie * bat
+      if (a <= 0.004) continue
+      ctx.globalAlpha = a * 0.16
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.t * halo, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill()
+      ctx.globalAlpha = a
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.t, 0, Math.PI * 2); ctx.fill()
+    }
+    ctx.globalCompositeOperation = 'source-over'
+    ctx.globalAlpha = 1
+    boucle.current = requestAnimationFrame(dessiner)
+  }, [refCanvas])
+  useEffect(() => { boucle.current = requestAnimationFrame(dessiner); return () => cancelAnimationFrame(boucle.current) }, [dessiner])
+  // L'ÉMISSION EN COURONNE, ET C'EST TOUTE LA DIFFÉRENCE AVEC UN NUAGE. Un tirage uniforme dans un
+  // disque concentre les points au centre et donne une bouffée informe ; en tirant la vitesse dans une
+  // bande étroite, toutes les étincelles partent ensemble et forment un FRONT qui s'ouvre. C'est ce
+  // front que l'œil reconnaît comme un feu d'artifice, et il ne coûte qu'une ligne de plus.
+  const emettre = useCallback((x, y, n, force = 6) => {
+    const [rMin, rMax] = TB.particules.rayon
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2
+      const v = force * (0.80 + Math.random() * 0.38)
+      parts.current.push({
+        x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - force * 0.16,
+        t: rMin + Math.random() * (rMax - rMin),
+        phase: Math.random() * 6.283, freq: 0.006 + Math.random() * 0.014,
+        ne: performance.now(), vie: TB.particules.vieMs * (0.55 + Math.random() * 0.9),
+      })
+    }
+  }, [])
+  return emettre
+}
+
+// Un point du cercle, angle compté depuis le HAUT dans le sens horaire (le sens d'un cadran).
+const pt = (cx, cy, r, deg) => { const a = ((deg - 90) * Math.PI) / 180; return [cx + r * Math.cos(a), cy + r * Math.sin(a)] }
+const part = (cx, cy, r, d, f) => {
+  const [x1, y1] = pt(cx, cy, r, d); const [x2, y2] = pt(cx, cy, r, f)
+  return `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${f - d > 180 ? 1 : 0} 1 ${x2} ${y2} Z`
+}
+// Au-delà de l'heure, on passe à h:mm:ss. Sans cela, une durée libre de deux heures s'afficherait
+// « 120:00 », qu'on lit d'abord comme cent vingt secondes avant de se raviser.
+const mmss = (t) => {
+  const s = Math.max(0, t)
+  const d2 = (n) => String(n).padStart(2, '0')
+  return s >= 3600
+    ? `${Math.floor(s / 3600)}:${d2(Math.floor((s % 3600) / 60))}:${d2(s % 60)}`
+    : `${d2(Math.floor(s / 60))}:${d2(s % 60)}`
+}
+
+export default function ZenRayTimer() {
+  const tm = useTimer()
+  const {
+    minutes, reste, enCours, fini, titre, habit, muet, enregistre, evenement, avance,
+    setTitre, setMuet, choisir, choisirDuree, demarrer, suspendre, annuler, nouveauBloc, choisirHabitude,
+  } = tm
+
+  const refChamp = useRef(null)
+  const refLibre = useRef(null)
+  const [saisieOuverte, setSaisieOuverte] = useState(false)
+  const [saisie, setSaisie] = useState('')
+  const [refus, setRefus] = useState(null)
+  const [secousse, setSecousse] = useState(0)     // amplitude courante, décroissante
+  const [pulse, setPulse] = useState(0)           // compteur : chaque incrément relance la pulsation
+  const [focusChamp, setFocusChamp] = useState(0) // compteur : chaque incrément redonne le focus au champ
+  const refCanvas = useRef(null)
+  const refScene = useRef(null)
+  const emettre = useParticules(refCanvas)
+
+  // Le focus passe par un effet, jamais par `requestAnimationFrame` : celui-ci est suspendu dès que
+  // l'onglet passe en arrière-plan, et le curseur restait alors au début du champ (faute payée deux fois).
+  useEffect(() => {
+    if (!focusChamp) return
+    const ch = refChamp.current
+    if (!ch) return
+    ch.focus()
+    ch.setSelectionRange(ch.value.length, ch.value.length)
+  }, [focusChamp])
+
+  // Ouvrir un champ sans y poser le curseur oblige à un clic de plus, et ce clic supplémentaire est
+  // exactement ce que le double-clic venait d'économiser.
+  //
+  // ET LE CONTENU SE SÉLECTIONNE, faute payée à la première utilisation réelle : le champ s'ouvre
+  // pré-rempli de la durée courante, donc taper « 90s » par-dessus « 15 » donnait « 1590s ». Un champ
+  // pré-rempli sans sélection oblige à effacer avant d'écrire, ce qui annule tout le bénéfice du
+  // pré-remplissage. Sélectionné, il se corrige en tapant OU s'ajuste en cliquant dedans : les deux
+  // gestes restent possibles, et le plus fréquent devient le plus court.
+  useEffect(() => { if (saisieOuverte) { refLibre.current?.focus(); refLibre.current?.select() } }, [saisieOuverte])
+
+  // `prefers-reduced-motion` : le juice n'est jamais une raison de rendre l'interface pénible à
+  // quelqu'un que le mouvement dérange. Tout ce qui bouge se coupe ici, le minuteur continue.
+  const sobre = useMemo(() => typeof window !== 'undefined' && window.matchMedia
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches, [])
+
+  const { taille, rExt, rInt, trait } = TB.anneau
+  const c = taille / 2
+  const circ = 2 * Math.PI * rExt
+
+  // L'ARC AU REPOS SE CALE SUR LA PART, PAS SUR LA DURÉE (bug signalé par Matthieu le 2026-08-27).
+  // Il valait `minutes / 90`, ce qui est une proportion de temps parfaitement juste et visuellement
+  // fausse : le camembert, lui, découpe le cercle en parts ÉGALES, une par palier. Choisir 15 poussait
+  // donc l'arc à 60 degrés alors que la part « 15 » s'arrête à 120, et l'œil lisait un décalage sans
+  // pouvoir le nommer. Deux repères pour un seul cercle, il fallait en supprimer un.
+  //
+  // L'arc s'arrête maintenant au bord de fuite de la part allumée : 15 remplit le premier tiers, 30 les
+  // deux premiers, 90 le tour entier. La valeur descend de `TB.paliers`, celui-là même qui dessine les
+  // parts, si bien qu'ajouter un palier déplace les deux du même geste et qu'ils ne peuvent plus diverger.
+  //
+  // Une fois le bloc lancé, c'est `avance` qui reprend la main : là, l'arc mesure vraiment le temps qui
+  // passe, et il n'a plus aucune part à désigner puisque le camembert s'est effacé.
+  //
+  // DURÉE LIBRE : aucune part n'est allumée, donc l'arc n'a plus de bord de fuite à viser. Il redevient
+  // alors ce qu'il était avant la correction, une proportion du plus grand palier, et ce n'est plus une
+  // faute pour autant : la faute venait du DÉSACCORD entre deux repères, pas de la proportion elle-même.
+  // Sans part allumée, il n'y a plus de désaccord possible.
+  const rangDuPalier = TB.paliers.indexOf(minutes)
+  const libre = rangDuPalier === -1
+  const marqueDuPalier = libre
+    ? Math.min(1, minutes / TB.paliers[TB.paliers.length - 1])
+    : (rangDuPalier + 1) / TB.paliers.length
+
+  // Secousse d'écran : décroissante, jamais constante. « Avec un grand pouvoir vient une grande
+  // personnalité », dit la conférence en plaisantant, mais le dosage est réel : au-delà, on ne lit plus.
+  const secouer = useCallback((force) => {
+    if (sobre) return
+    setSecousse(force)
+    const t0 = performance.now()
+    const pas = () => {
+      const k = (performance.now() - t0) / TB.secousse.duree
+      if (k >= 1) { setSecousse(0); return }
+      setSecousse(force * (1 - k) * (1 - k))   // décroissance quadratique : sec, puis plus rien
+      requestAnimationFrame(pas)
+    }
+    requestAnimationFrame(pas)
+  }, [sobre])
+
+  const centreEcran = useCallback(() => {
+    const el = refScene.current
+    if (!el) return [0, 0]
+    const r = el.getBoundingClientRect()
+    return [r.width / 2, r.height / 2]
+  }, [])
+
+  // ── LE SPECTACLE, BRANCHÉ SUR LES MOMENTS DU FOURNISSEUR ────────────────────────────────────────
+  // Une seule table dit ce que chaque moment déclenche à l'écran. Le fournisseur ne connaît ni les
+  // étincelles ni la secousse, et c'est ce qui permet à la pastille flottante de vivre le même moment
+  // en le dessinant tout autrement, sans qu'aucune des deux vues n'ait à savoir que l'autre existe.
+  //
+  // On dépend du COMPTEUR d'événements, jamais du nom seul : deux tics d'affilée portent le même nom et
+  // doivent pourtant se jouer deux fois, ce qu'un effet sur le nom ne ferait jamais.
+  useEffect(() => {
+    if (!evenement.n) return
+    const [x, y] = centreEcran()
+    const gerbe = (n, force) => { if (!sobre) emettre(x, y, n, force) }
+    switch (evenement.nom) {
+      case 'choix': setPulse((n) => n + 1); secouer(TB.secousse.legere); gerbe(TB.particules.parPalier, 5); break
+      case 'depart': setPulse((n) => n + 1); secouer(TB.secousse.moyenne); break
+      case 'pause': secouer(TB.secousse.legere); break
+      case 'annule': secouer(TB.secousse.moyenne); break
+      case 'tic': setPulse((n) => n + 1); secouer(TB.secousse.legere); break
+      case 'fin':
+        secouer(TB.secousse.forte)
+        // Trois bouffées décalées plutôt qu'une seule : « le décalage aléatoire est ce qui transforme un
+        // effet correct en effet vivant », et une explosion unique se lit comme un clignotement.
+        gerbe(TB.particules.parFin, 9)
+        setTimeout(() => gerbe(70, 6.5), 150)
+        setTimeout(() => gerbe(45, 4.2), 320)
+        break
+      default: break
+    }
+  }, [evenement.n])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  const ouvrirSaisie = () => {
+    if (enCours) return
+    // Le champ s'ouvre PRÉ-REMPLI de la durée courante : corriger « 15 » en « 17 » est plus fréquent que
+    // repartir de rien, et un champ vide obligerait à retaper ce qu'on voulait seulement ajuster.
+    setSaisie(libre ? String(Math.round(minutes * 60)) + 's' : String(Math.round(minutes)))
+    setRefus(null)
+    setSaisieOuverte(true)
+    jouer('survol', muet)
+  }
+
+  const validerSaisie = () => {
+    const resultat = analyserDuree(saisie)
+    if (!resultat.ok) {
+      // ÉCHEC BRUYANT, ET SURTOUT PRÉCIS. Un champ qui refuse sans le dire laisse croire que le réglage
+      // a pris ; un champ qui refuse en se trompant de motif est pire encore, puisqu'il envoie chercher
+      // une faute là où il n'y en a pas. « 24h » avait été compris et rejeté d'un « durée non comprise »,
+      // faute payée en vrai le 2026-08-27 : le résultat porte donc sa raison, et le message la dit.
+      setRefus(resultat)
+      jouer('annule', muet)
+      secouer(TB.secousse.legere)
+      return
+    }
+    choisirDuree(resultat.secondes)
+    setSaisieOuverte(false)
+  }
+
+  const decalage = secousse ? `translate(${(Math.random() - 0.5) * secousse}px, ${(Math.random() - 0.5) * secousse}px)` : 'none'
+
+  return (
+    <div className="zrt-scene" ref={refScene} style={{ transform: decalage }}>
+      <canvas ref={refCanvas} className="zrt-particules" aria-hidden="true" />
+
+      <div className="zrt-centre">
+        <div className="zrt-entete">
+          <span className="zrt-titre-section">ZenRayTimer</span>
+          <button type="button" className="zrt-son" onClick={() => { setMuet((m) => !m); if (muet) jouer('choix', false) }}
+            title={muet ? 'Réactiver le son' : 'Couper le son'} aria-label={muet ? 'Réactiver le son' : 'Couper le son'}>
+            {/* `speaker.wave.0` et non `speaker.slash` : ce dernier n'existe pas dans Icon.jsx, qui retombe
+              SILENCIEUSEMENT sur « doc » pour un nom inconnu, erreur déjà répertoriée dans l'index du
+              projet, et vérifiée ici contre la liste réelle avant d'écrire. */}
+          <Icon name={muet ? 'speaker.wave.0' : 'speaker.wave.2'} size={16} />
+          </button>
+        </div>
+
+        {/* L'ANNEAU. Trois parts égales pour choisir, un arc extérieur pour mesurer, le même partage des
+            rôles que dans le Plan, pour qu'on retrouve le même geste aux deux endroits.
+
+            UN SEUL NOMBRE À L'ÉCRAN À LA FOIS (Matthieu, 2026-08-27). Avant, les trois paliers, le compte
+            à rebours et la ligne d'état s'affichaient ensemble : cinq nombres pour une seule information,
+            et l'œil ne savait plus lequel lire. Le camembert et le compte occupent maintenant la même
+            place et se relaient par un fondu : le camembert s'efface EN révélant le compte, ce qui fait
+            de la disparition elle-même l'annonce du départ, au lieu d'un simple changement d'écran. */}
+        <div className={`zrt-anneau-hote${enCours ? ' zrt-court' : ''}${fini ? ' zrt-fini' : ''}${(enCours || fini) ? ' zrt-revele' : ''}`} key={pulse % 2}>
+          <svg className="zrt-anneau" viewBox={`0 0 ${taille} ${taille}`} width={taille} height={taille} role="group" aria-label="Durée du bloc">
+            <defs>
+              <linearGradient id="zrt-arc" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stopColor="#3b82f7" /><stop offset="100%" stopColor="#30d158" />
+              </linearGradient>
+            </defs>
+            <circle cx={c} cy={c} r={rExt} className="zrt-piste" strokeWidth={trait} fill="none" />
+            <circle cx={c} cy={c} r={rExt} className="zrt-arc" strokeWidth={trait} fill="none" strokeLinecap="round"
+              transform={`rotate(-90 ${c} ${c})`} strokeDasharray={`${circ * (enCours || fini ? avance : marqueDuPalier)} ${circ}`} />
+            <g className="zrt-parts">
+            {TB.paliers.map((m, i) => {
+              const d = (360 / TB.paliers.length) * i
+              const f = d + 360 / TB.paliers.length
+              const actif = minutes === m
+              const [tx, ty] = pt(c, c, rInt * 0.62, d + 180 / TB.paliers.length)
+              return (
+                <g key={m} className={`zrt-part${actif ? ' zrt-actif' : ''}${enCours ? ' zrt-verrou' : ''}`} role="button" tabIndex={enCours ? -1 : 0}
+                  aria-label={`${m} minutes`} aria-pressed={actif}
+                  onMouseEnter={() => !enCours && jouer('survol', muet)}
+                  onClick={() => choisir(m)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choisir(m) } }}>
+                  <path d={part(c, c, rInt, d, f)} />
+                  <text x={tx} y={ty} textAnchor="middle" dominantBaseline="central">{m}</text>
+                </g>
+              )
+            })}
+            {/* LA SPHÈRE DE SÉLECTION, « élégante, pas trop visible » (Matthieu, 2026-08-27). Elle vit
+                DANS le groupe des parts, et pas à côté : c'est un outil de choix, elle doit donc
+                s'effacer avec le camembert au moment du départ, sans quoi elle resterait posée au milieu
+                du compte à rebours à proposer un réglage qui n'est plus réglable.
+                Sa discrétion est ce qui la rend utilisable : elle n'annonce rien, elle attend d'être
+                remarquée, et elle ne s'allume franchement que sous le curseur. Un bouton qui crie au
+                milieu du cadran aurait détruit le calme de l'objet pour une fonction rare. */}
+            <circle className={`zrt-noyau${libre ? ' zrt-noyau-libre' : ''}`} cx={c} cy={c} r={rInt * 0.17}
+              role="button" tabIndex={enCours ? -1 : 0}
+              aria-label="Durée libre : double-cliquez ou pressez Entrée"
+              onMouseEnter={() => !enCours && jouer('survol', muet)}
+              onDoubleClick={ouvrirSaisie}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); ouvrirSaisie() } }}>
+              <title>Double-cliquez pour une durée libre</title>
+            </circle>
+            </g>
+          </svg>
+          {/* Le compte à rebours est POSÉ SUR l'anneau, pas dedans : trois parts se rejoignent au centre,
+              un texte placé là tomberait sur leur jonction. Il flotte donc au-dessus, sur son propre plan. */}
+          <div className={`zrt-compte${reste <= 10 && enCours ? ' zrt-urgence' : ''}`} aria-live="off">{mmss(reste)}</div>
+          {/* Le champ se pose au même centre que le compte à rebours, sur son propre plan : trois parts
+              se rejoignent là, et un champ posé dans le SVG tomberait sur leur jonction. */}
+          {saisieOuverte && (
+            <div className={`zrt-libre${refus ? ' zrt-libre-refus' : ''}`}>
+              <input ref={refLibre} className="zrt-libre-champ" value={saisie}
+                onChange={(e) => { setSaisie(e.target.value); setRefus(null) }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') { e.preventDefault(); validerSaisie() }
+                  if (e.key === 'Escape') { e.preventDefault(); setSaisieOuverte(false) }
+                }}
+                onBlur={() => setSaisieOuverte(false)}
+                aria-label="Durée libre" placeholder="7 min" />
+              <span className="zrt-libre-aide">{refus ? messageRefus(refus) : '7 · 90s · 2m30 · 1h30 · 24h'}</span>
+            </div>
+          )}
+        </div>
+
+        <input ref={refChamp} className="zrt-champ" value={titre} onChange={(e) => setTitre(e.target.value)}
+          placeholder="Sur quoi ?" aria-label="Intitulé du bloc" />
+
+        {/* HABITUDES, mêmes qu'au composeur du Plan, même préfixe, même mécanique. Le bouton prépare le
+            titre et rend la main au clavier : ce qui manque n'est jamais l'habitude, c'est ce qu'on y
+            fait aujourd'hui.
+
+            UNE SEULE CAPSULE SEGMENTÉE, sur le modèle du sélecteur « Today | 27 August 2026 » d'Apple
+            (capture fournie). Trois pastilles séparées disaient « trois objets » ; une capsule fendue de
+            filets dit « un choix parmi trois », ce qui est la vérité du geste. Le survol n'allume que la
+            portion de fond adossée au texte, jamais toute la capsule : c'est ce détail-là qui fait
+            qu'on sent le segment sous le doigt avant même d'avoir cliqué. */}
+        <Segmente ariaLabel="Habitudes" options={HABITUDES} valeur={habit}
+          onSurvol={() => jouer('survol', muet)}
+          onChange={(h) => {
+            // Le préfixe du Plan compte en minutes entières : « Japonais - 1.5 min - » n'aurait aucun sens.
+            choisirHabitude(h, (hh) => prefixeHabitude(hh, Math.max(1, Math.round(minutes))))
+            // Le focus est demandé APRÈS le rendu : viser le champ maintenant le trouverait encore
+            // porteur de l'ancienne valeur, et le curseur se poserait au mauvais endroit.
+            setFocusChamp((n) => n + 1)
+          }} />
+
+        <div className="zrt-commandes">
+          {!enCours && !fini && <button type="button" className="zrt-btn zrt-primaire" onClick={demarrer}>Démarrer</button>}
+          {enCours && <button type="button" className="zrt-btn" onClick={suspendre}>Pause</button>}
+          {(enCours || reste !== minutes * 60) && <button type="button" className="zrt-btn zrt-discret" onClick={annuler}>Réinitialiser</button>}
+          {fini && <button type="button" className="zrt-btn zrt-primaire" onClick={nouveauBloc}>Nouveau bloc</button>}
+        </div>
+
+        {/* La durée choisie N'EST PLUS ÉCRITE ICI : elle se lit déjà sur la part allumée du camembert, et
+            la répéter en toutes lettres était précisément le nombre de trop. Cette ligne ne parle donc
+            plus que de ce qu'aucun autre élément ne dit : l'état du bloc, et où il est parti. */}
+        {/* Une durée libre n'allume aucune part : sans cette ligne, le réglage serait invisible et l'on
+            démarrerait sans savoir pour combien de temps. C'est le seul cas où cette ligne parle au repos. */}
+        <div className="zrt-etat">{fini ? (enregistre || 'enregistrement…') : enCours ? 'en cours' : libre ? `durée libre · ${formaterDuree(Math.round(minutes * 60))}` : ''}</div>
+      </div>
+    </div>
+  )
+}

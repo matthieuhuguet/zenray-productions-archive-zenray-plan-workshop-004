@@ -1,0 +1,47 @@
+// 3 October 2026, 16:05 CEST: every agent conversation can begin with a mapped, watched workspace.
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { config, requestAssets } from './BridgeClient.mjs'
+import { conversationStart } from './ConversationIdentity.mjs'
+import { writeFile, rename } from 'node:fs/promises'
+import { projectResume } from './Resume.mjs'
+
+try {
+  const allowed = ['agent', 'session-id', 'project-id', 'name']
+  const parameters = Object.fromEntries(process.argv.slice(2).map((option) => {
+    const match = option.match(/^--([^=]+)=(.+)$/)
+    if (!match || !allowed.includes(match[1])) throw new Error('Use --agent=<agent> --session-id=<actual-id> [--project-id=<existing-id>] [--name=<subject>]')
+    return [match[1], match[2]]
+  }))
+  const sessionId = parameters['session-id'] || process.env.CODEX_SESSION_ID || process.env.CODEX_THREAD_ID || process.env.CLAUDE_SESSION_ID || process.env.ANTIGRAVITY_CONVERSATION_ID || process.env.GEMINI_SESSION_ID
+  let bindings = {}
+  try { bindings = JSON.parse(await readFile(path.join(config.storage.stateDir, 'SessionBindings.json'), 'utf8')) }
+  catch (error) { if (error.code !== 'ENOENT') throw error }
+  const payload = conversationStart({ agent: parameters.agent, sessionId, projectId: parameters['project-id'], name: parameters.name }, bindings)
+  let result
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { result = await requestAssets(payload); break }
+    catch (error) {
+      if (!error.message.includes('Transcript capture is active') || attempt === 2) throw error
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+  }
+  // 13 October 2026: every start returns the resume brief (latest conversation, last dated prompts) and refreshes RESUME.md beside FEEDBACK.md, so any LLM resumes from the last things said.
+  const resume = await resumeOf(result.project.id)
+  console.log(JSON.stringify({ projectId: result.project.id, name: result.project.name, ...result.setup, conversation: { agent: parameters.agent, sessionId, nativeCaptureSupported: ['claude', 'codex', 'antigravity'].includes(parameters.agent) }, resume, backupConfirmed: false }, null, 2))
+} catch (error) {
+  console.error(`Conversation initialization failed: ${error.message}. No verified cloud backup is claimed.`)
+  // 13 October 2026: the service can be unloaded on purpose; the project can still be resumed from its files. The session is NOT bound and the exit code stays 1.
+  const projectId = process.argv.slice(2).map(option => option.match(/^--project-id=(.+)$/)?.[1]).find(Boolean)
+  if (projectId) console.log(JSON.stringify({ projectId, sessionBound: false, serviceError: error.message, resume: await resumeOf(projectId) }, null, 2))
+  process.exitCode = 1
+}
+
+async function resumeOf(projectId) {
+  try {
+    const brief = await projectResume(projectId)
+    const temporary = `${brief.resumePath}.${process.pid}.tmp`
+    await writeFile(temporary, brief.markdown, { mode: 0o600 }); await rename(temporary, brief.resumePath)
+    return { path: brief.resumePath, latestConversation: brief.brief.conversations[0] || null, markdown: brief.markdown }
+  } catch (error) { return { error: `Resume brief unavailable: ${error.message}` } }
+}

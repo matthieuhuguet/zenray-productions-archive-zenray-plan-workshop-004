@@ -1,0 +1,776 @@
+// push-batch-policy.mjs (12 October 2026): ONE definition of how uploaded data is grouped into git pushes.
+//
+// EN: Every number lives in the single configuration object built by loadPushPolicyConfig (HDA rule: one definition, one
+//     parameter interface, environment overrides, a bad value raises an error that names the parameter). The planning functions
+//     are pure; the controller is a small state machine; the engine runPushBatch drives ONE batch to a confirmed push.
+// FR : tous les nombres vivent dans un seul objet de configuration ; les fonctions de plan sont pures, le controleur est une
+//     petite machine a etats, le moteur runPushBatch mene UN lot jusqu'a une poussee confirmee.
+//
+// DECISIONS OF MATTHIEU (12 October 2026, final):
+//   D1 Target 1 900 MiB per push = 20 parts of 95 MiB (each part is 95 MiB + 16 bytes of AES-GCM tag), 7.2 % under the ENFORCED
+//      2 GiB (2 048 MiB) per push of GitHub. Fill each batch to the maximum, never above the safety threshold. A failure is
+//      counted PER BATCH: one failure is retried unchanged (network, timeout and GitHub server errors can be accidental), the
+//      THIRD failure of the same batch falls back to the OLD RULE (2 parts = 190 MiB), then the policy recovers step by step
+//      after 3 consecutive successes. Ladder [2, 4, 8, 12, 16, 20] parts, start at 20 (14 October 2026), never above 20.
+//   D2 Archive repository cap 4 096 MiB (was 2 GiB): 43 parts per repository instead of 21, about half the repository
+//      creations (the creations are what trigger the secondary rate limit 403 waves). Applies to NEW films only: a manifest
+//      stores the repository inside every part url, the part index is never mapped back to a repository at read time.
+//      Evidence: an old note (10 June 2026, scripts/_archive/eagle-video-bulk.mjs:37) reports pushes that bring a repository to
+//      about 4 GB rejected in series; on 12 October 2026 the GitHub API `size` shows repositories of 9.7 to 10.4 GB accepting
+//      pushes (zenray-vid-public-31, zenray-vid-public-32, zenrayshards-vid-36499389363f). A rejection at the cap boundary is
+//      still classified permanent and fails cleanly (no data loss, the part files stay in the clone, the caller moves to a new
+//      repository).
+//
+// WHAT IS NOT DECIDED HERE: how the data is staged. The callers (video-raw-lib, video-git-shard) stage, commit and push; this
+// module only decides how many items go in the next push and what to do when it fails.
+
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import { MiB, GCM_TAG_BYTES, RAW_CHUNK } from '../../src/config/chunkPolicy.js'
+import { isPermanentPushRejection } from './archive-route.mjs'
+
+const GiB_IN_MiB = 1024
+
+// One row per parameter: key, environment variable(s), type, default, bounds. The defaults ARE the delivered behaviour.
+// FR : une ligne par parametre ; les valeurs par defaut SONT le comportement livre.
+export const PUSH_POLICY_PARAMETERS = Object.freeze([
+  { key: 'targetMiB', env: 'ZR_PUSH_TARGET_MIB', type: 'number', min: 0.000001, defaultValue: 1900,
+    doc: 'Payload target of one push, in MiB (20 parts of 95 MiB).' },
+  { key: 'partMiB', env: 'ZR_PUSH_PART_MIB', type: 'number', min: 0.000001, defaultValue: RAW_CHUNK / MiB,
+    doc: 'Size of one archive part in MiB (single source: src/config/chunkPolicy.js RAW_CHUNK).' },
+  { key: 'gcmTagBytes', env: 'ZR_PUSH_GCM_TAG_BYTES', type: 'int', min: 0, defaultValue: GCM_TAG_BYTES,
+    doc: 'Bytes added to every part by AES-GCM.' },
+  { key: 'maxParts', env: 'ZR_PUSH_MAX_PARTS', type: 'int', min: 1, defaultValue: 20,
+    doc: 'Ceiling of parts per push. Never exceeded.' },
+  { key: 'ladder', env: 'ZR_PUSH_LADDER', type: 'ints', min: 1, defaultValue: [2, 4, 8, 12, 16, 20],
+    doc: 'Reference levels of parts per push, ascending.' },
+  { key: 'rampStartParts', env: 'ZR_PUSH_RAMP_START_PARTS', type: 'int', min: 1, defaultValue: 20,
+    doc: 'Level a push session starts at (14 October 2026: 20 parts = 1 900 MiB, Matthieu); after a fallback it steps back up after recoverAfterSuccesses consecutive successes.' },
+  { key: 'failuresBeforeFallback', env: 'ZR_PUSH_FAILURES_BEFORE_FALLBACK', type: 'int', min: 1, defaultValue: 3,
+    doc: 'Failures of the SAME batch after which the old rule applies (the Nth failure falls back).' },
+  { key: 'fallbackParts', env: 'ZR_PUSH_FALLBACK_PARTS', type: 'int', min: 1, defaultValue: 2,
+    doc: 'Level of the old rule (2 parts = about 190 MiB).' },
+  { key: 'recoverAfterSuccesses', env: 'ZR_PUSH_RECOVER_AFTER_SUCCESSES', type: 'int', min: 1, defaultValue: 3,
+    doc: 'Consecutive successful pushes needed to step up one level.' },
+  { key: 'hardLimitMiB', env: 'ZR_PUSH_HARD_LIMIT_MIB', type: 'number', min: 0.000001, defaultValue: 2048,
+    doc: 'Size GitHub enforces per push, in MiB.' },
+  { key: 'safetyMarginPct', env: 'ZR_PUSH_SAFETY_MARGIN_PCT', type: 'number', min: 0, max: 50, defaultValue: 5,
+    doc: 'Share of the hard limit kept free: the estimated pack must stay under hardLimitMiB x (1 - margin).' },
+  { key: 'packOverheadRatio', env: 'ZR_PUSH_PACK_OVERHEAD_RATIO', type: 'number', min: 1, defaultValue: 1.001,
+    doc: 'Estimated pack size / payload size (no compression: incompressible data, pack.window 0). Raised by the observed maximum.' },
+  { key: 'packFixedOverheadKiB', env: 'ZR_PUSH_PACK_FIXED_OVERHEAD_KIB', type: 'number', min: 0, defaultValue: 64,
+    doc: 'Fixed bytes added to the pack estimate (tree objects, commit).' },
+  { key: 'ratioSampleMinMiB', env: 'ZR_PUSH_RATIO_SAMPLE_MIN_MIB', type: 'number', min: 0, defaultValue: 32,
+    doc: 'Pushes smaller than this are not used to measure the pack ratio.' },
+  { key: 'repoCapMiB', env: 'ZR_REPO_CAP_MIB', legacy: [{ env: 'ZR_SHARD_CAP_GO', scale: GiB_IN_MiB }], type: 'number', min: 1, lenient: true,
+    defaultValue: 4096, doc: 'Cap of one archive repository for NEW films, in MiB (D2).' },
+  { key: 'legacyFilmRepoCapMiB', env: 'ZR_LEGACY_FILM_REPO_CAP_MIB', type: 'number', min: 1, defaultValue: 2048,
+    doc: 'Cap that films started BEFORE D2 were laid out with (21 parts per repository). A resumed film keeps that layout (F1, 12 October 2026).' },
+  { key: 'folderRepoCapMiB', env: 'ZR_FOLDER_REPO_CAP_MIB', legacy: [{ env: 'ZR_SHARD_CAP_GO', scale: GiB_IN_MiB }], type: 'number', min: 1, lenient: true,
+    defaultValue: 2048, doc: 'Cap of one folder archive repository (scripts/archive-folder.mjs), in MiB. Unchanged by D2.' },
+  { key: 'overlapPrepare', env: 'ZR_PUSH_OVERLAP_PREPARE', type: 'bool', defaultValue: true,
+    doc: 'Prepare (read, encrypt, hash, stage) the next batch while the previous one transfers. Never two pushes to one repository.' },
+  { key: 'prefetchParallel', env: 'ZR_PUSH_PREFETCH_PARALLEL', type: 'int', min: 1, defaultValue: 4,
+    doc: 'Files hashed at the same time while a batch transfers (video-git-shard.mjs).' },
+  { key: 'maxAttempts', env: 'ZR_PUSH_MAX_ATTEMPTS', type: 'int', min: 1, defaultValue: 12,
+    doc: 'Attempts of one batch (all kinds of failures) before the push is declared exhausted.' },
+  { key: 'backoffBaseMs', env: 'ZR_PUSH_BACKOFF_BASE_MS', type: 'int', min: 0, defaultValue: 3000,
+    doc: 'Pause after the first transient failure; grows linearly with the attempt number.' },
+  { key: 'backoffMaxMs', env: 'ZR_PUSH_BACKOFF_MAX_MS', type: 'int', min: 0, defaultValue: 60000,
+    doc: 'Ceiling of the pause between two attempts.' },
+  { key: 'pushTimeoutMs', env: 'ZR_PUSH_TIMEOUT_MS', type: 'int', min: 1000, defaultValue: 30 * 60 * 1000,
+    doc: 'Timeout of one git push process.' },
+  { key: 'pushMinThroughputKiBps', env: 'ZR_PUSH_MIN_THROUGHPUT_KIBPS', type: 'number', min: 1, defaultValue: 512,
+    doc: 'Slowest line a push must still finish on: the timeout of one push is max(pushTimeoutMs, bytes / this rate) (12 October 2026, F1).' },
+  { key: 'timeoutHoldFactor', env: 'ZR_PUSH_TIMEOUT_HOLD_FACTOR', type: 'int', min: 1, defaultValue: 3,
+    doc: 'After a timeout, stepping back up to the level that timed out needs this many times recoverAfterSuccesses successes.' },
+  { key: 'stepUpMinFillPct', env: 'ZR_PUSH_STEP_UP_MIN_FILL_PCT', type: 'number', min: 0, max: 100, defaultValue: 50,
+    doc: 'A success counts toward a step up only when its payload reaches this share of the budget of the current level (tail pushes do not).' },
+  { key: 'throughputSizing', env: 'ZR_PUSH_THROUGHPUT_SIZING', type: 'bool', defaultValue: true,
+    doc: 'Size a push by the MEASURED line (14 October 2026). A slow or flaky line gets small pushes (cheap to retry), a fast stable one the full 1 900 MiB. false = size by level only.' },
+  { key: 'targetPushSeconds', env: 'ZR_PUSH_TARGET_SECONDS', type: 'number', min: 0, defaultValue: 0,
+    doc: 'Aimed duration of one push in seconds. 0 = AUTOMATIC: sqrt(2 x fixed overhead x measured mean time between line hiccups), the optimum between idle overhead and lost work.' },
+  { key: 'fixedPushOverheadSeconds', env: 'ZR_PUSH_FIXED_OVERHEAD_S', type: 'number', min: 0.1, defaultValue: 6,
+    doc: 'Fixed cost of one push in seconds (server queue, hash, spawn), measured 5.7 to 7.6 s on 14 October 2026.' },
+  { key: 'minTargetSeconds', env: 'ZR_PUSH_MIN_TARGET_S', type: 'number', min: 1, defaultValue: 60,
+    doc: 'Lower bound of the automatic push duration.' },
+  { key: 'maxTargetSeconds', env: 'ZR_PUSH_MAX_TARGET_S', type: 'number', min: 1, defaultValue: 600,
+    doc: 'Upper bound of the automatic push duration.' },
+  { key: 'hiccupPriorMtbfSeconds', env: 'ZR_PUSH_HICCUP_PRIOR_MTBF_S', type: 'number', min: 1, defaultValue: 7200,
+    doc: 'Mean time between line hiccups assumed before any is observed (weight of one hiccup); the real value is learned from the failures.' },
+  { key: 'throughputMinParts', env: 'ZR_PUSH_THROUGHPUT_MIN_PARTS', type: 'int', min: 1, defaultValue: 1,
+    doc: 'Smallest push the throughput sizing may choose, in parts (a part is the atomic unit).' },
+  { key: 'throughputAlpha', env: 'ZR_PUSH_THROUGHPUT_ALPHA', type: 'number', min: 0.01, max: 1, defaultValue: 0.3,
+    doc: 'Weight of the newest measure in the throughput average (0.3 = the line change is followed within three pushes).' },
+  { key: 'throughputSampleMinMiB', env: 'ZR_PUSH_THROUGHPUT_SAMPLE_MIN_MIB', type: 'number', min: 0, defaultValue: 32,
+    doc: 'Only pushes at least this large are used to measure the throughput (small pushes are dominated by fixed costs).' },
+  { key: 'fixedBatchMiB', env: 'ZR_SHARD_PUSH_BATCH_MB', type: 'number', min: 0, defaultValue: 0, lenient: true,
+    doc: 'Fixed batch size in MiB. Any value above 0 DISABLES the adaptive policy (backward compatible, 0 = policy on).' },
+  { key: 'metricsFile', env: 'ZR_PUSH_METRICS_FILE', type: 'string', defaultValue: '',
+    doc: 'JSON lines file receiving one record per push attempt (empty = no file).' },
+  { key: 'stateFile', env: 'ZR_PUSH_STATE_FILE', type: 'string', defaultValue: '',
+    doc: 'JSON file that carries the learned level between processes (one process per film otherwise restarts the ramp at 8 parts). Empty = off.' },
+  { key: 'stateMaxAgeMin', env: 'ZR_PUSH_STATE_MAX_AGE_MIN', type: 'number', min: 1, defaultValue: 360,
+    doc: 'A saved state older than this is ignored and the ramp restarts.' },
+  { key: 'folderPushMinMiB', env: 'ZR_FOLDER_PUSH_MIN_MIB', type: 'number', min: 1, defaultValue: 20,
+    doc: 'archive-folder.mjs: size of the first incremental push.' },
+  { key: 'folderPushMaxMiB', env: 'ZR_PUSH_CHUNK_MB', type: 'number', min: 1, defaultValue: 150, lenient: true,
+    doc: 'archive-folder.mjs: ceiling of the incremental push (legacy name ZR_PUSH_CHUNK_MB).' },
+  { key: 'folderPushRampFactor', env: 'ZR_FOLDER_PUSH_RAMP_FACTOR', type: 'number', min: 1, defaultValue: 1.8,
+    doc: 'archive-folder.mjs: growth factor of the incremental push after each push.' },
+  { key: 'folderMaxAttempts', env: 'ZR_FOLDER_PUSH_MAX_ATTEMPTS', type: 'int', min: 1, defaultValue: 40,
+    doc: 'archive-folder.mjs: attempts of one push (it survives an internet outage of about one hour).' },
+])
+
+const PARAMETER_BY_KEY = new Map(PUSH_POLICY_PARAMETERS.map((parameter) => [parameter.key, parameter]))
+
+function fail(parameter, message) {
+  return new Error(`push policy parameter ${parameter.key} (${parameter.env}) ${message}`)
+}
+
+function parseValue(parameter, raw) {
+  const text = String(raw).trim()
+  if (parameter.type === 'string') return text
+  if (parameter.type === 'bool') {
+    if (/^(1|true|on|yes)$/i.test(text)) return true
+    if (/^(0|false|off|no)$/i.test(text)) return false
+    throw fail(parameter, `must be 0 or 1, got "${text}"`)
+  }
+  if (parameter.type === 'ints') {
+    const list = text.split(',').map((item) => Number(item.trim()))
+    if (!list.length || list.some((item) => !Number.isInteger(item) || item < parameter.min)) {
+      throw fail(parameter, `must be a comma separated list of integers >= ${parameter.min}, got "${text}"`)
+    }
+    return list
+  }
+  const value = Number(text)
+  if (!Number.isFinite(value)) throw fail(parameter, `must be a number, got "${text}"`)
+  if (parameter.type === 'int' && !Number.isInteger(value)) throw fail(parameter, `must be an integer, got "${text}"`)
+  return value
+}
+
+function checkBounds(parameter, value) {
+  if (parameter.type === 'number' || parameter.type === 'int') {
+    if (parameter.min !== undefined && value < parameter.min) throw fail(parameter, `must be >= ${parameter.min}, got ${value}`)
+    if (parameter.max !== undefined && value > parameter.max) throw fail(parameter, `must be <= ${parameter.max}, got ${value}`)
+  }
+}
+
+/**
+ * Builds the frozen configuration. `env` supplies the environment overrides, `overrides` the programmatic ones (tests, callers).
+ * FR : construit la configuration figee ; une valeur invalide leve une erreur qui nomme le parametre.
+ */
+export function loadPushPolicyConfig(env = process.env, overrides = {}) {
+  for (const key of Object.keys(overrides)) {
+    if (!PARAMETER_BY_KEY.has(key)) throw new Error(`push policy: unknown parameter ${key}`)
+  }
+  const values = {}
+  const sources = {}
+  for (const parameter of PUSH_POLICY_PARAMETERS) {
+    let value = parameter.defaultValue
+    let source = 'default'
+    // `lenient` parameters keep the behaviour of the code they replace: an unreadable or non positive value of the legacy
+    // variables (Number(x) || default, parseInt(x) || default) means "not set", it is never an error.
+    // FR : un parametre `lenient` garde le comportement du code remplace : valeur illisible ou nulle = variable non definie.
+    const legacy = (parameter.legacy || []).find((entry) => env[entry.env] !== undefined && String(env[entry.env]).trim() !== '')
+    if (legacy) {
+      const parsed = Number(String(env[legacy.env]).trim())
+      if (Number.isFinite(parsed) && parsed > 0) {
+        value = parsed * legacy.scale
+        source = `env:${legacy.env}`
+      } else if (!parameter.lenient) {
+        throw new Error(`push policy parameter ${parameter.key} (${legacy.env}) must be a positive number, got "${env[legacy.env]}"`)
+      }
+    }
+    if (env[parameter.env] !== undefined && String(env[parameter.env]).trim() !== '') {
+      let parsed
+      try {
+        parsed = parseValue(parameter, env[parameter.env])
+        if (parameter.lenient && parsed <= 0) parsed = undefined
+      } catch (error) {
+        if (!parameter.lenient) throw error
+      }
+      if (parsed !== undefined) {
+        value = parsed
+        source = `env:${parameter.env}`
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(overrides, parameter.key)) {
+      value = overrides[parameter.key]
+      source = 'override'
+    }
+    if (parameter.type === 'ints') {
+      if (!Array.isArray(value)) throw fail(parameter, 'must be an array of integers')
+      if (value.some((item) => !Number.isInteger(item) || item < parameter.min)) throw fail(parameter, `must hold integers >= ${parameter.min}`)
+    } else if (parameter.type === 'bool') {
+      if (typeof value !== 'boolean') throw fail(parameter, 'must be a boolean')
+    } else if (parameter.type === 'string') {
+      if (typeof value !== 'string') throw fail(parameter, 'must be a string')
+    } else {
+      if (typeof value !== 'number' || !Number.isFinite(value)) throw fail(parameter, 'must be a finite number')
+      if (parameter.type === 'int' && !Number.isInteger(value)) throw fail(parameter, 'must be an integer')
+      checkBounds(parameter, value)
+    }
+    values[parameter.key] = value
+    sources[parameter.key] = source
+  }
+
+  const partBytes = Math.round(values.partMiB * MiB) + values.gcmTagBytes
+  const topParts = Math.min(values.maxParts, Math.floor(values.targetMiB / values.partMiB + 1e-9))
+  if (topParts < 1) throw new Error(`push policy: targetMiB (${values.targetMiB}) is smaller than one part (partMiB ${values.partMiB})`)
+  const ladder = [...new Set(values.ladder)].sort((left, right) => left - right).filter((parts) => parts <= topParts)
+  if (!ladder.length) throw new Error(`push policy parameter ladder (ZR_PUSH_LADDER) has no level <= ${topParts} parts`)
+  if (!ladder.includes(values.rampStartParts)) throw new Error(`push policy parameter rampStartParts (ZR_PUSH_RAMP_START_PARTS) = ${values.rampStartParts} is not a level of the ladder [${ladder.join(', ')}]`)
+  if (!ladder.includes(values.fallbackParts)) throw new Error(`push policy parameter fallbackParts (ZR_PUSH_FALLBACK_PARTS) = ${values.fallbackParts} is not a level of the ladder [${ladder.join(', ')}]`)
+
+  return Object.freeze({
+    ...values,
+    ladder: Object.freeze(ladder),
+    fixed: values.fixedBatchMiB > 0,
+    partBytes,
+    topParts,
+    hardLimitBytes: Math.round(values.hardLimitMiB * MiB),
+    safeLimitBytes: Math.floor(values.hardLimitMiB * MiB * (1 - values.safetyMarginPct / 100)),
+    packFixedOverheadBytes: Math.round(values.packFixedOverheadKiB * 1024),
+    sources: Object.freeze(sources),
+  })
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Pure planning functions
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/** Bytes of a push of `parts` full archive parts. / FR : octets d'une poussee de `parts` parts pleines. */
+export const levelBytes = (config, parts) => parts * config.partBytes
+
+/** Cap of one archive repository in bytes. kind 'film' (D2, 4 096 MiB), 'folder' (2 048 MiB) or 'legacy' (2 048 MiB, films laid out before D2). */
+export function repoCapBytes(config, kind = 'film') {
+  const capMiB = { film: config.repoCapMiB, folder: config.folderRepoCapMiB, legacy: config.legacyFilmRepoCapMiB }[kind]
+  if (capMiB === undefined) throw new Error(`push policy: unknown repository kind ${kind}`)
+  return Math.round(capMiB * MiB)
+}
+
+/** Parts per repository, floor(cap / (part + tag)). 4 096 MiB gives 43, 2 048 MiB gives 21. */
+export function partsPerRepo(config, kind = 'film') {
+  return Math.max(1, Math.floor(repoCapBytes(config, kind) / config.partBytes))
+}
+
+/**
+ * Timeout of one push attempt carrying `payloadBytes`: never below pushTimeoutMs, and long enough for the slowest accepted line.
+ * FR : delai d'une poussee ; jamais sous pushTimeoutMs, assez long pour la ligne la plus lente acceptee (un lot de 1 900 Mio ne
+ * tient pas en 30 min sous 1,06 Mio/s).
+ */
+export function pushTimeoutMsFor(config, payloadBytes) {
+  const byRate = Math.ceil((Math.max(0, payloadBytes) / (config.pushMinThroughputKiBps * 1024)) * 1000)
+  return Math.max(config.pushTimeoutMs, byRate)
+}
+
+/**
+ * True when the remote branch tip already is `commit` (a previous attempt landed late: killed or cut after the server accepted the pack).
+ * `readTip` is async () => sha | null, the caller owns the git command. A read failure answers false (the safe, old behaviour).
+ * FR : vrai si le sommet distant est deja `commit` (une tentative precedente est arrivee en retard).
+ */
+export async function remoteTipIs(readTip, commit) {
+  if (!commit) return false
+  try { return (await readTip()) === commit } catch { return false }
+}
+
+/** Estimated pack size of a push of `payloadBytes`, before any push. */
+export function estimatePackBytes(config, payloadBytes, ratio = config.packOverheadRatio) {
+  return Math.ceil(payloadBytes * Math.max(ratio, config.packOverheadRatio)) + config.packFixedOverheadBytes
+}
+
+/**
+ * Greedy fill: how many leading items fit in `budgetBytes`. Always at least one item when the list is not empty (an item larger
+ * than the budget travels alone). `maxCount` caps the number of items.
+ * FR : combien d'elements de tete tiennent dans le budget ; au moins un.
+ */
+export function planBatch(sizes, budgetBytes, maxCount = Infinity) {
+  let count = 0
+  let bytes = 0
+  for (const size of sizes) {
+    if (count >= maxCount) break
+    if (count > 0 && bytes + size > budgetBytes) break
+    count += 1
+    bytes += size
+  }
+  return { count, bytes }
+}
+
+/** Splits a whole list into consecutive batches of one budget. / FR : decoupe une liste entiere en lots. */
+export function planAllBatches(sizes, budgetBytes) {
+  const batches = []
+  let start = 0
+  while (start < sizes.length) {
+    const { count, bytes } = planBatch(sizes.slice(start), budgetBytes)
+    batches.push({ start, count, bytes })
+    start += count
+  }
+  return batches
+}
+
+const UNIT_BYTES = { bytes: 1, byte: 1, B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, TiB: 1024 ** 4 }
+
+/**
+ * Reads the pack size from the output of `git push --progress`: the last "Writing objects: 100% (N/N), X MiB | Y MiB/s" line.
+ * Returns { objects, bytes } or null (a push of a few objects can omit the size, or the output was cut).
+ * FR : lit la taille reelle du pack dans la sortie de git push --progress.
+ */
+export function parsePushPackBytes(text) {
+  const source = String(text || '')
+  const pattern = /Writing objects:\s*100%\s*\((\d+)\/(\d+)\),\s*([\d.]+)\s*(bytes|byte|B|KiB|MiB|GiB|TiB)/g
+  let last = null
+  for (const match of source.matchAll(pattern)) last = match
+  if (!last) return null
+  return { objects: Number(last[2]), bytes: Math.round(Number(last[3]) * UNIT_BYTES[last[4]]) }
+}
+
+const TIMEOUT_PATTERN = /push timed out|timed out after|etimedout|operation timed out/i
+const PACK_SIZE_PATTERN = /pack exceeds maximum allowed size|exceeds the maximum allowed size|http(?:\s+error)?\s+413|\b413\b.{0,40}(?:entity|payload|too large)|request entity too large|payload too large|push is too large|pack is too large/i
+
+/**
+ * 'pack-size': the push itself was too big (reduce the batch, nothing is lost); 'permanent': GitHub refuses this repository or
+ * this object for good (the caller moves to a new repository); 'timeout': our own kill after the push timeout (the line is too slow
+ * for this size); 'transient': everything else (network, server).
+ * A pack-size failure is tested FIRST because the permanent test also matches the word "exceeds".
+ * FR : un echec de taille se teste en premier car le test permanent reconnait aussi le mot "exceeds".
+ */
+export function classifyPushFailure(message) {
+  const text = String(message || '')
+  if (PACK_SIZE_PATTERN.test(text)) return 'pack-size'
+  if (isPermanentPushRejection(text)) return 'permanent'
+  if (TIMEOUT_PATTERN.test(text)) return 'timeout'
+  return 'transient'
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------------------------------------------------------
+
+export function createPushMetrics(config, { now = Date.now } = {}) {
+  const totals = {
+    batches: 0, attempts: 0, failedAttempts: 0, sizeFailures: 0, fallbacks: 0, stepUps: 0,
+    payloadBytes: 0, packBytes: 0, packSampledPayloadBytes: 0, successMs: 0, failedMs: 0, waitMs: 0, maxPackRatio: 0,
+  }
+  let firstAt = null
+  let lastAt = null
+  const write = (record) => {
+    if (!config.metricsFile) return
+    try { appendFileSync(config.metricsFile, `${JSON.stringify(record)}\n`) } catch { /* metrics never break a push */ }
+  }
+  return {
+    recordAttempt({ ok, count = 0, bytes = 0, packBytes = null, durationMs = 0, waitMs = 0, attempt = 1, level = null, mode = null, kind = null }) {
+      const at = now()
+      firstAt = firstAt ?? at - durationMs - waitMs
+      lastAt = at
+      totals.attempts += 1
+      totals.waitMs += waitMs
+      if (ok) {
+        totals.batches += 1
+        totals.payloadBytes += bytes
+        totals.successMs += durationMs
+        if (packBytes !== null) {
+          totals.packBytes += packBytes
+          if (bytes >= config.ratioSampleMinMiB * MiB) {
+            totals.packSampledPayloadBytes += bytes
+            totals.maxPackRatio = Math.max(totals.maxPackRatio, packBytes / bytes)
+          }
+        }
+      } else {
+        totals.failedAttempts += 1
+        totals.failedMs += durationMs
+        if (kind === 'pack-size') totals.sizeFailures += 1
+      }
+      write({ at: new Date(at).toISOString(), type: 'attempt', ok, count, bytes, packBytes, durationMs, waitMs, attempt, level, mode, kind,
+        throughputBps: ok && durationMs > 0 ? Math.round(bytes / (durationMs / 1000)) : null })
+    },
+    recordEvent(type, data = {}) {
+      if (type === 'fallback') totals.fallbacks += 1
+      if (type === 'step-up') totals.stepUps += 1
+      write({ at: new Date(now()).toISOString(), type, ...data })
+    },
+    summary() {
+      const wallMs = firstAt === null ? 0 : Math.max(0, lastAt - firstAt)
+      const sampled = totals.packSampledPayloadBytes
+      return {
+        ...totals,
+        packRatio: sampled > 0 ? Number((totals.maxPackRatio).toFixed(5)) : null,
+        averageThroughputBps: totals.successMs > 0 ? Math.round(totals.payloadBytes / (totals.successMs / 1000)) : 0,
+        effectiveThroughputBps: totals.successMs + totals.failedMs > 0
+          ? Math.round(totals.payloadBytes / ((totals.successMs + totals.failedMs) / 1000)) : 0,
+        wallMs,
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Controller: the adaptive state machine
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/**
+ * State: a level of the ladder (parts per push), a count of consecutive successes, a failure count PER BATCH, a size ceiling
+ * learned from a size refusal and the largest pack ratio seen.
+ *   success            : +1 consecutive success; at recoverAfterSuccesses the level steps up one rung (never above the top).
+ *   transient failure  : counted for THIS batch; failures 1 and 2 retry the batch unchanged; failure 3 falls back to
+ *                        fallbackParts and the count of that batch restarts.
+ *   pack-size failure  : deterministic, so no unchanged retry: the level drops below the attempted size and a ceiling is set.
+ * In fixed mode (ZR_SHARD_PUSH_BATCH_MB > 0) nothing adapts: the batch is the fixed size and every failure retries unchanged.
+ * FR : machine a etats ; echecs comptes PAR LOT ; 1 et 2 rejouent le meme lot, le 3e retombe a 2 parts, remontee apres 3 succes.
+ */
+export function createPushController(config, { log = () => {}, now = Date.now } = {}) {
+  const ladder = config.ladder
+  const fallbackIndex = ladder.indexOf(config.fallbackParts)
+  const startIndex = ladder.indexOf(config.rampStartParts)
+  let levelIndex = config.fixed ? ladder.length - 1 : startIndex
+  let consecutiveSuccesses = 0
+  let sizeCeilingBytes = Infinity
+  let maxObservedRatio = 0
+  let throughputBps = 0 // average of the measured throughput of successful pushes (bytes per second), 0 = not measured yet
+  let transferSeconds = 0 // seconds spent transferring (successes and failures), the denominator of the hiccup rate
+  let hiccups = 0 // transient failures and timeouts seen (the line, not GitHub's size rules)
+  let fellBack = false
+  let timeoutHoldIndex = -1      // level index that timed out: climbing back to it is slower (F1)
+  let lastSavedAt = 0
+  const failuresByBatch = new Map()
+  const metrics = createPushMetrics(config, { now })
+
+  // Optional state shared between processes (stateFile). Best effort on both sides: an unreadable or stale file means a fresh ramp.
+  // FR : etat optionnel partage entre processus ; un fichier illisible ou perime = nouvelle montee en charge.
+  const readSavedState = () => {
+    try {
+      const saved = JSON.parse(readFileSync(config.stateFile, 'utf8'))
+      const fresh = saved?.version === 1 && Number.isFinite(saved.savedAt) && now() - saved.savedAt <= config.stateMaxAgeMin * 60000
+      const index = ladder.indexOf(saved?.level)
+      return fresh && index >= 0 ? { saved, index } : null
+    } catch { return null }
+  }
+  // Two upload lanes (archive and packaging) save to the same file from two processes. The save is a CONSERVATIVE merge, never last
+  // writer wins: when the file was written by someone else since our last save, a lower level, a fallback flag, a smaller size
+  // ceiling and a larger ratio survive, and our memory adopts a lower level at once (F5, 12 October 2026).
+  // FR : deux processus ecrivent le meme fichier ; la fusion est prudente, un repli ou un plafond d'un autre processus survit.
+  const saveState = () => {
+    if (!config.stateFile || config.fixed) return
+    try {
+      const other = readSavedState()
+      if (other && other.saved.savedAt > lastSavedAt) {
+        if (other.index < levelIndex) { levelIndex = other.index; consecutiveSuccesses = 0 }
+        if (other.saved.fellBack === true) fellBack = true
+        if (Number.isFinite(other.saved.sizeCeilingBytes) && other.saved.sizeCeilingBytes > 0) sizeCeilingBytes = Math.min(sizeCeilingBytes, other.saved.sizeCeilingBytes)
+        if (Number.isFinite(other.saved.maxObservedRatio) && other.saved.maxObservedRatio >= 1) maxObservedRatio = Math.max(maxObservedRatio, other.saved.maxObservedRatio)
+        if (!throughputBps && Number.isFinite(other.saved.throughputBps) && other.saved.throughputBps > 0) throughputBps = other.saved.throughputBps
+        if (Number.isFinite(other.saved.transferSeconds)) transferSeconds = Math.max(transferSeconds, other.saved.transferSeconds)
+        if (Number.isFinite(other.saved.hiccups)) hiccups = Math.max(hiccups, other.saved.hiccups)
+      }
+      mkdirSync(path.dirname(config.stateFile), { recursive: true })
+      const temporary = `${config.stateFile}.${process.pid}.tmp`
+      lastSavedAt = Math.max(now(), lastSavedAt + 1)
+      writeFileSync(temporary, JSON.stringify({
+        version: 1, savedAt: lastSavedAt, level: ladder[levelIndex], consecutiveSuccesses, fellBack,
+        sizeCeilingBytes: Number.isFinite(sizeCeilingBytes) ? sizeCeilingBytes : null, maxObservedRatio, throughputBps, transferSeconds, hiccups,
+      }))
+      renameSync(temporary, config.stateFile)
+    } catch { /* the state is an optimisation, never a reason to fail a push */ }
+  }
+  if (config.stateFile && !config.fixed) {
+    try {
+      const loaded = readSavedState()
+      if (loaded) {
+        const { saved, index } = loaded
+        lastSavedAt = saved.savedAt
+        levelIndex = index
+        consecutiveSuccesses = Math.max(0, Math.min(config.recoverAfterSuccesses - 1, Number(saved.consecutiveSuccesses) || 0))
+        fellBack = saved.fellBack === true
+        if (Number.isFinite(saved.sizeCeilingBytes) && saved.sizeCeilingBytes > 0) sizeCeilingBytes = saved.sizeCeilingBytes
+        if (Number.isFinite(saved.maxObservedRatio) && saved.maxObservedRatio >= 1) maxObservedRatio = saved.maxObservedRatio
+        if (Number.isFinite(saved.throughputBps) && saved.throughputBps > 0) throughputBps = saved.throughputBps
+        if (Number.isFinite(saved.transferSeconds)) transferSeconds = saved.transferSeconds
+        if (Number.isFinite(saved.hiccups)) hiccups = saved.hiccups
+      }
+    } catch { /* no state yet */ }
+  }
+
+  const effectiveRatio = () => Math.max(config.packOverheadRatio, maxObservedRatio)
+  const mode = () => {
+    if (config.fixed) return 'fixed'
+    if (fellBack && levelIndex <= fallbackIndex) return 'fallback'
+    if (levelIndex === ladder.length - 1) return 'steady'
+    return 'ramp'
+  }
+
+  /** Mean time between hiccups, learned: (observed transfer time + prior) / (hiccups + 1). */
+  const meanTimeBetweenHiccups = () => (transferSeconds + config.hiccupPriorMtbfSeconds) / (hiccups + 1)
+  /** The duration a push should aim for: sqrt(2 x overhead x MTBF), or the explicit override. */
+  const targetSeconds = () => config.targetPushSeconds > 0 ? config.targetPushSeconds
+    : Math.min(config.maxTargetSeconds, Math.max(config.minTargetSeconds, Math.sqrt(2 * config.fixedPushOverheadSeconds * meanTimeBetweenHiccups())))
+
+  function budgetBytes() {
+    if (config.fixed) return Math.max(config.partBytes, Math.floor(config.fixedBatchMiB * MiB))
+    const byLevel = levelBytes(config, ladder[levelIndex])
+    const bySafety = Math.floor((config.safeLimitBytes - config.packFixedOverheadBytes) / effectiveRatio())
+    // the learned ceiling wins over the one part floor: a refused size must never be planned again
+    // FR : le plafond appris l'emporte sur le plancher d'une part
+    // 14 October 2026: size the push by the MEASURED line, not by a constant. A push should last about targetPushSeconds: at 11 MB/s
+    // that is 2.6 GB (the full 1 900 MiB applies), at 1 MB/s it is 240 MB. Never below the old rule (fallbackParts), never above the level.
+    // FR : on dimensionne le push par la ligne MESUREE : une duree visee (240 s), jamais sous l'ancienne regle, jamais au-dessus du niveau.
+    const byThroughput = config.throughputSizing && throughputBps > 0
+      ? Math.max(config.throughputMinParts * config.partBytes, Math.floor(throughputBps * targetSeconds())) : Infinity
+    return Math.min(sizeCeilingBytes, Math.max(config.partBytes, Math.min(byLevel, bySafety, byThroughput)))
+  }
+
+  /**
+   * The next batch out of the pending sizes. `maxCount` keeps a retried batch from growing when more items arrived.
+   * FR : le prochain lot ; maxCount empeche un lot rejoue de grossir.
+   */
+  function plan(sizes, headId = '', { maxCount = Infinity } = {}) {
+    const budget = budgetBytes()
+    const { count, bytes } = planBatch(sizes, budget, maxCount)
+    return {
+      headId, count, bytes, budgetBytes: budget, parts: Number((bytes / config.partBytes).toFixed(2)),
+      level: ladder[levelIndex], mode: mode(), estimatePackBytes: estimatePackBytes(config, bytes, effectiveRatio()),
+      timeoutMs: pushTimeoutMsFor(config, bytes),
+    }
+  }
+
+  function recordSuccess({ headId = '', count, bytes, packBytes = null, durationMs = 0, waitMs = 0, attempt = 1 }) {
+    failuresByBatch.delete(headId)
+    metrics.recordAttempt({ ok: true, count, bytes, packBytes, durationMs, waitMs, attempt, level: ladder[levelIndex], mode: mode() })
+    if (packBytes !== null && bytes >= config.ratioSampleMinMiB * MiB) maxObservedRatio = Math.max(maxObservedRatio, packBytes / bytes)
+    if (durationMs > 0) transferSeconds += durationMs / 1000
+    if (durationMs > 0 && bytes >= config.throughputSampleMinMiB * MiB) {
+      const measured = bytes / (durationMs / 1000)
+      throughputBps = throughputBps > 0 ? throughputBps * (1 - config.throughputAlpha) + measured * config.throughputAlpha : measured
+    }
+    if (config.fixed) return { action: 'none' }
+    if (timeoutHoldIndex >= 0 && levelIndex >= timeoutHoldIndex) timeoutHoldIndex = -1 // the line carried that level again
+    // A success counts toward a step up only when it filled the budget of the current level: the tail drain (1 or 2 parts) and the
+    // poster at the end of a film say nothing about the line's ability to carry a 1 900 MiB push (F3, 12 October 2026).
+    // FR : un succes ne compte pour la montee que s'il a rempli le budget du niveau courant ; les queues de film ne comptent pas.
+    const filled = bytes >= levelBytes(config, ladder[levelIndex]) * (config.stepUpMinFillPct / 100) - 1
+    if (filled) consecutiveSuccesses += 1
+    const needed = timeoutHoldIndex >= 0 && levelIndex + 1 >= timeoutHoldIndex
+      ? config.recoverAfterSuccesses * config.timeoutHoldFactor : config.recoverAfterSuccesses
+    if (consecutiveSuccesses >= needed && levelIndex < ladder.length - 1) {
+      levelIndex += 1
+      consecutiveSuccesses = 0
+      if (levelIndex > fallbackIndex) fellBack = false
+      metrics.recordEvent('step-up', { level: ladder[levelIndex] })
+      log(`  push policy: ${config.recoverAfterSuccesses} successes in a row, level up to ${ladder[levelIndex]} parts`)
+      saveState()
+      return { action: 'step-up', level: ladder[levelIndex] }
+    }
+    saveState()
+    return { action: 'none' }
+  }
+
+  /** A transient failure of the batch headed by `headId`. / FR : echec transitoire du lot de tete `headId`. */
+  function recordFailure(headId, details = {}, kind = 'transient') {
+    metrics.recordAttempt({ ok: false, ...details, level: ladder[levelIndex], mode: mode(), kind })
+    if (kind === 'transient' || kind === 'timeout') { hiccups += 1; if (details.durationMs > 0) transferSeconds += details.durationMs / 1000 }
+    if (config.fixed) return { action: 'retry', failures: (failuresByBatch.get(headId) || 0) + 1 }
+    consecutiveSuccesses = 0
+    const failures = (failuresByBatch.get(headId) || 0) + 1
+    if (failures >= config.failuresBeforeFallback) {
+      failuresByBatch.delete(headId)
+      const from = ladder[levelIndex]
+      levelIndex = Math.min(levelIndex, fallbackIndex)
+      fellBack = true
+      metrics.recordEvent('fallback', { from, to: ladder[levelIndex], failures })
+      log(`  push policy: ${failures} failures of the same batch, falling back to ${ladder[levelIndex]} parts`)
+      saveState()
+      return { action: 'fallback', level: ladder[levelIndex], failures }
+    }
+    failuresByBatch.set(headId, failures)
+    return { action: 'retry', failures }
+  }
+
+  /**
+   * Our own timeout killed the push: the line cannot carry this size in the allowed time. Retrying the same batch would burn the
+   * same time again, so the level drops below the attempted size at once (no permanent ceiling: the line may recover) and the climb
+   * back to the level that timed out is slower. At the lowest level it is a plain transient failure (F1, 12 October 2026).
+   * FR : notre delai a tue la poussee : le niveau descend sous la taille tentee, la remontee jusqu'a ce niveau est plus lente.
+   */
+  function recordTimeout(headId, details = {}) {
+    const bytes = details.bytes || 0
+    let next = -1
+    for (let index = 0; index < ladder.length; index += 1) if (levelBytes(config, ladder[index]) < bytes) next = index
+    if (config.fixed || next < 0 || next >= levelIndex) {
+      return recordFailure(headId, details, 'timeout')
+    }
+    metrics.recordAttempt({ ok: false, ...details, level: ladder[levelIndex], mode: mode(), kind: 'timeout' })
+    consecutiveSuccesses = 0
+    failuresByBatch.delete(headId)
+    const from = ladder[levelIndex]
+    timeoutHoldIndex = Math.max(timeoutHoldIndex, levelIndex)
+    levelIndex = Math.min(levelIndex, next)
+    metrics.recordEvent('timeout-shrink', { from, to: ladder[levelIndex], attemptedBytes: bytes })
+    log(`  push policy: a push of ${Math.round(bytes / MiB)} MiB timed out, level down to ${ladder[levelIndex]} parts`)
+    saveState()
+    return { action: 'shrink-timeout', level: ladder[levelIndex] }
+  }
+
+  /**
+   * GitHub refused the push because of its size. `count` items totalling `bytes` were attempted.
+   * Returns { action: 'shrink' } when a smaller batch can be tried, { action: 'giveup' } when one item alone was refused.
+   * FR : GitHub a refuse la poussee pour sa taille ; on reduit sans rien perdre, ou on abandonne si un seul element est refuse.
+   */
+  function recordSizeFailure({ count, bytes, durationMs = 0, waitMs = 0, attempt = 1, headId = '' }) {
+    metrics.recordAttempt({ ok: false, count, bytes, durationMs, waitMs, attempt, level: ladder[levelIndex], mode: mode(), kind: 'pack-size' })
+    if (config.fixed || count <= 1) return { action: 'giveup' }
+    consecutiveSuccesses = 0
+    failuresByBatch.delete(headId)
+    sizeCeilingBytes = Math.min(sizeCeilingBytes, bytes - 1)
+    let next = 0
+    for (let index = 0; index < ladder.length; index += 1) if (levelBytes(config, ladder[index]) < bytes) next = index
+    levelIndex = Math.min(levelIndex, next)
+    metrics.recordEvent('size-shrink', { attemptedBytes: bytes, ceilingBytes: sizeCeilingBytes, level: ladder[levelIndex] })
+    log(`  push policy: a push of ${Math.round(bytes / MiB)} MiB was refused for its size, batch reduced to at most ${Math.round(sizeCeilingBytes / MiB)} MiB`)
+    saveState()
+    return { action: 'shrink', level: ladder[levelIndex], ceilingBytes: sizeCeilingBytes }
+  }
+
+  const backoffMs = (attempt) => Math.min(config.backoffMaxMs, config.backoffBaseMs * attempt)
+
+  return {
+    config, metrics, plan, budgetBytes, recordSuccess, recordFailure, recordTimeout, recordSizeFailure, backoffMs,
+    get fixed() { return config.fixed },
+    state: () => ({
+      mode: mode(), level: ladder[levelIndex], levelIndex, consecutiveSuccesses, sizeCeilingBytes,
+      maxObservedRatio, pendingFailures: Object.fromEntries(failuresByBatch), budgetBytes: budgetBytes(), throughputBps, transferSeconds, hiccups, targetSeconds: targetSeconds(),
+    }),
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Engine: one batch, until it is confirmed
+// ---------------------------------------------------------------------------------------------------------------------------
+
+export class PushPermanentRejection extends Error {
+  constructor(message, label = '') {
+    super(`push permanently refused${label ? ` for ${label}` : ''}: ${String(message).slice(-400)}`)
+    this.name = 'PushPermanentRejection'
+    this.detail = String(message || '')
+    this.label = label
+  }
+}
+
+export class PushExhausted extends Error {
+  constructor(label, attempts, lastMessage) {
+    super(`push exhausted for ${label} after ${attempts} attempts: ${String(lastMessage || '').slice(-200)}`)
+    this.name = 'PushExhausted'
+    this.attempts = attempts
+    this.lastMessage = String(lastMessage || '')
+  }
+}
+
+const defaultSleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+
+/**
+ * Drives ONE batch to a confirmed push.
+ *   sizes   : sizes in bytes of the pending items, head first (the head decides the batch identity)
+ *   headId  : stable identity of the head item (failures are counted per batch, never per file)
+ *   attempt : async ({ count, bytes, parts, attemptNumber, estimatePackBytes, ... }) => { status, stdout, stderr, packBytes?,
+ *             durationMs?, waitMs? }; status 0 means the push is confirmed. It must be safe to call again (same commit).
+ * Returns { count, bytes, attempts, packBytes }. Throws PushPermanentRejection or PushExhausted; the data is never dropped,
+ * the caller still owns the items.
+ * FR : mene UN lot jusqu'a la confirmation ; ne perd jamais de donnees, l'appelant garde ses elements.
+ */
+export async function runPushBatch({ controller, sizes, headId, attempt, sleep = defaultSleep, log = () => {}, label = 'push' }) {
+  if (!Array.isArray(sizes) || !sizes.length) throw new Error('runPushBatch: no pending item')
+  if (typeof attempt !== 'function') throw new Error('runPushBatch: the attempt function is missing')
+  const { config } = controller
+  let attempts = 0
+  let lastMessage = ''
+  let lockedCount = Infinity
+  while (attempts < config.maxAttempts) {
+    const plan = controller.plan(sizes, headId, { maxCount: lockedCount })
+    attempts += 1
+    log(`  push ${label}: attempt ${attempts}, ${plan.count} item(s), ${(plan.bytes / MiB).toFixed(1)} MiB (${plan.parts} parts), `
+      + `estimated pack ${(plan.estimatePackBytes / MiB).toFixed(1)} MiB, mode ${plan.mode}`)
+    const started = Date.now()
+    const result = await attempt({ ...plan, attemptNumber: attempts })
+    const durationMs = Number.isFinite(result?.durationMs) ? result.durationMs : Date.now() - started
+    const waitMs = Number.isFinite(result?.waitMs) ? result.waitMs : 0
+    const output = `${result?.stderr || ''}\n${result?.stdout || ''}`
+    if (result && result.status === 0) {
+      const packBytes = Number.isFinite(result.packBytes) ? result.packBytes : (parsePushPackBytes(output)?.bytes ?? null)
+      controller.recordSuccess({ headId, count: plan.count, bytes: plan.bytes, packBytes, durationMs, waitMs, attempt: attempts })
+      return { count: plan.count, bytes: plan.bytes, attempts, packBytes }
+    }
+    lastMessage = output.trim()
+    const kind = classifyPushFailure(lastMessage)
+    if (kind === 'permanent' || (kind === 'pack-size' && controller.fixed)) {
+      controller.metrics.recordAttempt({ ok: false, count: plan.count, bytes: plan.bytes, durationMs, waitMs, attempt: attempts, kind: 'permanent' })
+      throw new PushPermanentRejection(lastMessage, label)
+    }
+    if (kind === 'pack-size') {
+      const decision = controller.recordSizeFailure({ count: plan.count, bytes: plan.bytes, durationMs, waitMs, attempt: attempts, headId })
+      if (decision.action === 'giveup') throw new PushPermanentRejection(lastMessage, label)
+      lockedCount = Infinity // the smaller budget decides the next count
+      continue
+    }
+    if (kind === 'timeout') {
+      const timeoutDecision = controller.recordTimeout(headId, { count: plan.count, bytes: plan.bytes, durationMs, waitMs, attempt: attempts })
+      if (timeoutDecision.action === 'shrink-timeout') {
+        lockedCount = Infinity // the smaller level decides the next count
+        log(`  push ${label}: attempt ${attempts} timed out, batch reduced`)
+        if (attempts < config.maxAttempts) await sleep(controller.backoffMs(attempts))
+        continue
+      }
+      lockedCount = timeoutDecision.action === 'fallback' ? Infinity : plan.count
+      log(`  push ${label}: attempt ${attempts} failed (${timeoutDecision.action}) ${lastMessage.slice(-120)}`)
+      if (attempts < config.maxAttempts) await sleep(controller.backoffMs(attempts))
+      continue
+    }
+    const decision = controller.recordFailure(headId, { count: plan.count, bytes: plan.bytes, durationMs, waitMs, attempt: attempts })
+    lockedCount = decision.action === 'fallback' ? Infinity : plan.count
+    log(`  push ${label}: attempt ${attempts} failed (${decision.action}) ${lastMessage.slice(-120)}`)
+    if (attempts < config.maxAttempts) await sleep(controller.backoffMs(attempts))
+  }
+  throw new PushExhausted(label, attempts, lastMessage)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// One controller per process, so that the archive push and the CMAF push of a film share the same ramp state.
+// ---------------------------------------------------------------------------------------------------------------------------
+let sharedController = null
+
+export function sharedPushController({ env = process.env, log } = {}) {
+  if (!sharedController) sharedController = createPushController(loadPushPolicyConfig(env), { log })
+  return sharedController
+}
+
+export function resetSharedPushController() { sharedController = null }
+
+/**
+ * For the scripts that keep their own synchronous push loop (folder archives, image shards, audio, the cold backup): they ask the
+ * shared controller how big a push may be (the measured line, never above 1 900 MiB), how long to wait for it, and they report each
+ * outcome so the controller keeps learning the line. Fixed values were written in each of them (150, 400, 900 MiB); they now follow.
+ * FR : pour les scripts qui gardent leur boucle de push synchrone : taille permise, delai, et compte rendu de chaque resultat.
+ */
+export function sharedBatchAdapter({ env = process.env, log, controller = null } = {}) {
+  const shared = controller || sharedPushController({ env, log })
+  let sequence = 0
+  return {
+    controller: shared,
+    /** Bytes a push may carry now. ZR_SHARD_PUSH_BATCH_MB above 0 still means a fixed batch. */
+    budgetBytes: () => shared.budgetBytes(),
+    /** Timeout of one push attempt carrying `bytes`: never below the configured minimum, long enough for the slowest accepted line. */
+    timeoutMs: (bytes) => pushTimeoutMsFor(shared.config, bytes),
+    /** One batch: call ok() or fail() after EACH attempt; the batch keeps one identity, so repeated failures are counted per batch. */
+    track(bytes, count = 1) {
+      sequence += 1
+      const headId = `adapter-${sequence}`
+      return {
+        ok: (durationMs) => shared.recordSuccess({ headId, count, bytes, durationMs }),
+        fail: (durationMs, message = '') => {
+          const kind = classifyPushFailure(message)
+          // a permanent refusal is not a line hiccup (the caller moves to a new repository); a size refusal reduces the batch
+          if (kind === 'permanent') return { action: 'ignored' }
+          if (kind === 'pack-size') return shared.recordSizeFailure({ count, bytes, durationMs, headId })
+          return shared.recordFailure(headId, { count, bytes, durationMs }, kind)
+        },
+      }
+    },
+  }
+}

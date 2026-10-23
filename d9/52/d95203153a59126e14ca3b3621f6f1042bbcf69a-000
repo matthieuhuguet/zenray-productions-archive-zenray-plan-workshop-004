@@ -1,0 +1,52 @@
+// 6 October 2026, 21:35 CEST: `node scripts/Assets/LinkConversations.mjs [--project <id>] [--bind <conversation id>] [--write-memory] [--json]`
+// EN: finds, from exact path evidence in the original transcripts, every Claude, Codex and Gemini conversation that worked on each project; prints the table, binds ONLY the conversations named by --bind (bind-session through the service, needs --project; evidence is not meaning, a UI session that used a project as its test case also leaves strong evidence) and writes ConversationIndex.md/json into the project memory folder, which is archived with the project and read by agents before they write an article or resume work.
+// FR : relie chaque conversation aux projets sur lesquels elle a travaille, par preuve de chemins exacts ; sans service pour l'analyse, le service ne sert qu'a --bind.
+import { readFile, stat } from 'node:fs/promises'
+import path from 'node:path'
+import { config, requestAssets } from './BridgeClient.mjs'
+import { createConversationCatalog } from './ConversationCatalog.mjs'
+import { linkConversations, suggestions } from './ConversationLinks.mjs'
+import { completeWithBound, writeProjectIndex, memoryFolder } from './ConversationIndexSync.mjs'
+
+const args = process.argv.slice(2), flag = name => args.includes(name), values = name => args.flatMap((value, at) => value === name ? [args[at + 1]] : [])
+const stateDir = config.storage.stateDir, wanted = values('--project')
+const read = async file => { try { return JSON.parse(await readFile(path.join(stateDir, file), 'utf8')) } catch (error) { if (error.code === 'ENOENT') return {}; throw error } }
+const date = new Intl.DateTimeFormat('en-GB', { dateStyle: 'long', timeZone: 'Europe/Paris' }).format(new Date())
+try {
+  const index = await read('GlobalProjectIndex.json'), bindings = await read('SessionBindings.json')
+  const catalog = createConversationCatalog({ home: process.env.HOME, stateDir }), { conversations } = await catalog.list()
+  const started = Date.now(), links = await linkConversations({ conversations, index, stateDir, bindings, readConversation: (id, before) => catalog.read(id, before) })
+  const projects = wanted.length ? wanted : Object.keys(links.byProject)
+  if (flag('--json')) console.log(JSON.stringify({ scannedAt: links.scannedAt, byProject: Object.fromEntries(projects.map(id => [id, links.byProject[id] || []])) }, null, 1))
+  else {
+    console.log(`Scanned ${conversations.filter(item => item.readable).length} readable conversations in ${((Date.now() - started) / 1000).toFixed(1)} s (${links.rows.length} touch at least one project).`)
+    for (const projectId of projects) {
+      const list = links.byProject[projectId] || []
+      console.log(`\n== ${projectId}: ${list.length} conversation(s), ${list.filter(item => item.strength === 'strong').length} strong`)
+      for (const item of list.slice(0, 25)) console.log(`  ${item.strength.padEnd(6)} ${item.provider.padEnd(6)} work ${String(item.work).padStart(5)} prompts ${String(item.prompts).padStart(4)}  ${(item.first || '').slice(0, 10)}..${(item.last || '').slice(0, 10)}  bound:${item.boundProject || 'no'}  ${item.conversationId}  ${String(item.title || '').replace(/\s+/g, ' ').slice(0, 50)}`)
+    }
+  }
+  if (flag('--write-memory')) for (const projectId of projects) {
+    const folder = memoryFolder(index, projectId)
+    if (!folder) { console.log(`no memory folder for ${projectId}, index not written`); continue }
+    try { await stat(folder) } catch (error) { if (error.code === 'ENOENT') { console.log(`memory folder missing for ${projectId}`); continue } throw error }
+    // 7 October 2026: the same code path as the service (bound sessions always listed, files verified after the write).
+    const { list, warnings, boundOnly } = completeWithBound({ projectId, links, bindings, conversations, metadata: await read('SessionConversationMetadata.json') })
+    const problems = await writeProjectIndex({ folder, projectId, links, list, date, boundOnly, bindings })
+    for (const warning of warnings) console.log(`warning: ${warning}`)
+    console.log(problems.length ? `INDEX PROBLEMS for ${projectId}: ${problems.join('; ')}` : `wrote and verified ${path.join(folder, 'ConversationIndex.md')} and .json`)
+    if (problems.length) process.exitCode = 1
+  }
+  const toBind = values('--bind')
+  if (toBind.length) {
+    if (wanted.length !== 1) throw new Error('--bind needs exactly one --project <id>')
+    for (const conversationId of toBind) {
+      const row = links.rows.find(item => item.id === conversationId), evidence = row?.evidence.find(item => item.projectId === wanted[0])
+      if (!row || !evidence) { console.log(`NOT bound ${conversationId}: no path evidence for ${wanted[0]}`); continue }
+      try { await requestAssets({ action: 'bind-session', projectId: wanted[0], sessionId: row.sessionId, agent: row.provider }); console.log(`bound ${conversationId} -> ${wanted[0]} (${evidence.strength}, work ${evidence.work}, prompts ${evidence.prompts})`) }
+      catch (error) { console.log(`NOT bound ${conversationId}: ${error.message}`) }
+    }
+  }
+  const proposed = suggestions(links.rows).filter(item => !wanted.length || wanted.includes(item.projectId))
+  if (!flag('--json') && proposed.length) { console.log('\nSuggestions (unbound, strong evidence for exactly one project; review, then --bind):'); for (const item of proposed.slice(0, 30)) console.log(`  ${item.projectId}  ${item.conversationId}  work ${item.work} prompts ${item.prompts}  ${String(item.title || '').replace(/\s+/g, ' ').slice(0, 60)}`) }
+} catch (error) { console.error(error.message); process.exitCode = 1 }

@@ -1,0 +1,95 @@
+// cdnFallbackLoader.js (14 October 2026): hls.js fragment loader that falls back from jsDelivr to GitHub raw WITHOUT waiting.
+//
+// Measured on 14 October 2026 (streaming-only films of the new public shards 80 and 81, same commit, same path):
+//   jsDelivr  404 "Failed to fetch the requested commit", 503 "No healthy backends", or no byte at all for 30 s
+//   raw       200 in 1 to 10 s for every one of the same segments
+// The old player waited the whole hls.js retry policy on jsDelivr (1.5 s growing, 15 s first byte, 10 tries) before it
+// asked raw, so every cold segment cost seconds and the film stalled. Here the first jsDelivr attempt has a short first
+// byte window and NO retry; on failure the same segment is asked to raw at once; and a commit that failed twice is
+// asked to raw first for a while (the verdict is per commit, kept in memory for the session).
+// FR : jsDelivr refuse ou bloque les segments des commits neufs, GitHub raw les sert ; on bascule tout de suite au lieu
+// d'attendre toute la politique de retente de hls.js, et on retient par commit quelle origine marche.
+//
+// Every number lives in CDN_POLICY (one place). Pure module: the hls.js loader class is given by the caller.
+import { rawFallbackUrl } from './streamFiles.js'
+
+export const CDN_POLICY = Object.freeze({
+  firstByteMs: 3000,      // a warm jsDelivr segment answers in 50 to 150 ms (measured); beyond 3 s it is cold or down
+  failuresBeforeRaw: 2,   // failures on one commit before raw becomes the first choice for it
+  rawFirstMs: 120000,     // raw stays the first choice this long, then jsDelivr is probed again (it is faster when warm)
+})
+
+const CDN_URL = /^https:\/\/(?:cdn|fastly|gcore|testingcf)\.jsdelivr\.net\/gh\/([^/@]+)\/([^/@]+)@([0-9a-f]{7,40})\//
+
+/** "owner/repo@commit" of a jsDelivr URL, or null. / Cle de commit d'une URL jsDelivr. */
+export function cdnKeyOf(url) {
+  const match = CDN_URL.exec(String(url || ''))
+  return match ? `${match[1]}/${match[2]}@${match[3]}` : null
+}
+
+/** Per commit memory of which origin works. / Memoire par commit de l'origine qui marche. */
+export function createCdnHealth(policy = CDN_POLICY, now = () => Date.now()) {
+  const state = new Map() // key -> { fails, rawUntil }
+  const entry = (key) => { let value = state.get(key); if (!value) { value = { fails: 0, rawUntil: 0 }; state.set(key, value) } return value }
+  return {
+    preferRaw: (key) => Boolean(key) && (state.get(key)?.rawUntil || 0) > now(),
+    // fails is kept after the window opens: a failed probe sends the commit straight back to raw. / une sonde ratee renvoie a raw.
+    fail(key) { const value = entry(key); value.fails += 1; if (value.fails >= policy.failuresBeforeRaw) value.rawUntil = now() + policy.rawFirstMs },
+    ok(key) { const value = state.get(key); if (value) { value.fails = 0; value.rawUntil = 0 } },
+    snapshot: () => Object.fromEntries([...state].map(([key, value]) => [key, { ...value }])),
+  }
+}
+
+/**
+ * Build the loader class to give to hls.js (`fLoader`).
+ * InnerLoader is hls.js's own default loader (Hls.DefaultConfig.loader): one instance can be used only once.
+ */
+export function createCdnFallbackLoader(InnerLoader, { health = createCdnHealth(), policy = CDN_POLICY, toRaw = rawFallbackUrl } = {}) {
+  return class CdnFallbackLoader {
+    constructor(config) {
+      this.config = config
+      this.inner = new InnerLoader(config)
+      this.stats = this.inner.stats // frag.stats is bound to this object before load() is called
+      this.context = null
+      this.finished = false
+    }
+
+    getCacheAge() { return this.inner?.getCacheAge ? this.inner.getCacheAge() : null }
+
+    getResponseHeader(name) { return this.inner?.getResponseHeader ? this.inner.getResponseHeader(name) : null }
+
+    abort() { this.finished = true; if (this.inner) this.inner.abort() }
+
+    destroy() { this.finished = true; if (this.inner) this.inner.destroy(); this.inner = null }
+
+    load(context, config, callbacks) {
+      this.context = context
+      const raw = toRaw(context.url)
+      const key = raw ? cdnKeyOf(context.url) : null
+      // Not a CDN segment (playlist through /api/hls, ...), or raw is already the first choice: one attempt, hls.js policy.
+      if (!raw || health.preferRaw(key)) {
+        this.inner.load(raw ? { ...context, url: raw } : context, config, callbacks)
+        return
+      }
+      // First attempt on jsDelivr: short first byte window, no retry (null retry config = fail at once).
+      const quick = { ...config, loadPolicy: { ...config.loadPolicy, maxTimeToFirstByteMs: policy.firstByteMs, timeoutRetry: null, errorRetry: null } }
+      const fallback = () => {
+        if (this.finished) return
+        health.fail(key)
+        const failed = this.inner
+        const second = new InnerLoader(this.config)
+        second.stats = this.stats
+        this.stats.loading.start = 0 // "Loader can only be used once" checks this field
+        this.inner = second
+        failed.destroy()
+        second.load({ ...context, url: raw }, config, callbacks)
+      }
+      this.inner.load(context, quick, {
+        ...callbacks,
+        onSuccess: (response, stats, ctx, details) => { health.ok(key); callbacks.onSuccess(response, stats, context, details) },
+        onError: () => fallback(),
+        onTimeout: () => fallback(),
+      })
+    }
+  }
+}

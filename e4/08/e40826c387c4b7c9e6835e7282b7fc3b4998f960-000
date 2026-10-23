@@ -1,0 +1,102 @@
+// 3 October 2026, 04:08 CEST: exact identity mapping includes declared dependencies and excludes unproven paths.
+import { describe, expect, it } from 'vitest'
+import { mapSceneReferences } from './sceneReferenceMapping.js'
+
+const file = (relativePath, canonicalPath, sourceId = 'production') => ({ id: `${sourceId}:${relativePath}`, sourceId, relativePath, canonicalPath, status: 'backed-up', sha256: 'abc', size: 10 })
+const snapshot = (id, files, dependencies = []) => ({ id, name: id, folder: `pages/${id}`, sources: [], files, dependencies })
+const scene = file('scene.hiplc', '/Users/zenray/scene.hiplc')
+const reference = (canonicalPath, extra = {}) => ({ canonicalPath, pathKind: 'absolute', mode: 'input', existsAtCurrentFrame: true, parameterPath: '/obj/mesh/file', ...extra })
+const run = (references, projects = [snapshot('test-project', [scene])], extra = {}) => mapSceneReferences({ projectId: 'test-project', sceneFileId: scene.id, sceneSha256: 'scene-hash', audit: { sceneSha256: 'scene-hash', checkedAt: '2026-10-03T02:08:00Z', references }, projects, ...extra })
+
+describe('scene reference mapping', () => {
+  it('maps exact paths and preserves inventory archive evidence', () => {
+    const texture = file('maps/color.png', '/Users/zenray/maps/color.png')
+    const result = run([reference(texture.canonicalPath)], [snapshot('test-project', [scene, texture])])
+    expect(result.references[0]).toEqual({ referenceId: 0, parameterPath: '/obj/mesh/file', role: 'input', type: 'mapped', targets: [{ projectId: 'test-project', fileId: texture.id, sourceId: 'production', relativePath: 'maps/color.png', status: 'backed-up', sha256: 'abc', size: 10 }] })
+    expect(result.portabilityVerified).toBe(false)
+  })
+
+  it('traverses a declared HDA dependency and excludes unrelated projects', () => {
+    const hda = file('roof.hda', '/Users/zenray/otls/roof.hda', 'library')
+    const unrelated = file('other.png', '/Users/zenray/other.png')
+    const result = run([reference(hda.canonicalPath), reference(unrelated.canonicalPath)], [snapshot('test-project', [scene], [{ projectId: 'shared-houdini' }]), snapshot('shared-houdini', [hda]), snapshot('unrelated', [unrelated])])
+    expect(result.references[0].targets[0].projectId).toBe('shared-houdini')
+    expect(result.references[1].type).toBe('outside-mapping')
+    expect(result.dependencies).toEqual(['shared-houdini'])
+  })
+
+  it('does not infer inventory admission from source roots or filenames', () => {
+    const project = snapshot('test-project', [scene, file('admitted.png', '/Users/zenray/source/admitted.png')])
+    project.sources = [{ id: 'production', namespace: 'houdini', localPath: '/Users/zenray/source', include: ['admitted.png'] }]
+    expect(run([reference('/Users/zenray/source/excluded.png')], [project]).references[0].type).toBe('outside-mapping')
+    expect(run([reference('/Users/zenray/elsewhere/admitted.png')], [project]).references[0].type).toBe('outside-mapping')
+  })
+
+  // 3 October 2026, 05:02 CEST: an exact source identity survives LOAD but remains a relocation requirement, never a consumed-path proof.
+  it('links an original reference to its active copy without pretending the scene reads that copy', () => {
+    const texture = { ...file('maps/color.png', '/Users/zenray/loads/maps/color.png'), loadedCopy: true, originCanonicalPath: '/Users/zenray/production/maps/color.png', status: 'verified' }
+    const result = run([reference(texture.originCanonicalPath, { existsAtCurrentFrame: false })], [snapshot('test-project', [scene, texture])])
+    expect(result.references[0]).toMatchObject({ type: 'relocation-required', existsAtCurrentFrame: false, targets: [{ fileId: texture.id, status: 'verified' }] })
+    expect(result.portabilityVerified).toBe(false)
+    expect(JSON.stringify(result)).not.toContain('/Users/')
+    const unproven = { ...texture, loadedCopy: false }
+    expect(run([reference(texture.originCanonicalPath)], [snapshot('test-project', [scene, unproven])]).references[0].type).toBe('outside-mapping')
+  })
+
+  // 3 October 2026, 05:02 CEST: a current consumed-path match has priority over a different identity's relocation suggestion.
+  it('preserves current path evidence and does not guess a relocated identity by filename', () => {
+    const texture = { ...file('color.png', '/Users/zenray/loads/color.png'), loadedCopy: true, originCanonicalPath: '/Users/zenray/production/color.png' }
+    const current = file('current.png', texture.originCanonicalPath)
+    const project = snapshot('test-project', [scene, texture, current])
+    expect(run([reference(texture.originCanonicalPath)], [project]).references[0]).toMatchObject({ type: 'mapped', targets: [{ fileId: current.id }] })
+    expect(run([reference('/Users/zenray/elsewhere/color.png')], [project]).references[0].type).toBe('outside-mapping')
+  })
+
+  it('keeps all ambiguous identities instead of selecting one', () => {
+    const texture = file('color.png', '/Users/zenray/color.png')
+    const result = run([reference(texture.canonicalPath)], [snapshot('test-project', [scene, texture], ['shared']), snapshot('shared', [file('color.png', texture.canonicalPath, 'library')])])
+    expect(result.references[0].type).toBe('ambiguous')
+    expect(result.references[0].targets.map((target) => target.projectId)).toEqual(['test-project', 'shared'])
+  })
+
+  it('rejects stale audits and unknown scene identities', () => {
+    expect(() => run([], undefined, { sceneSha256: 'new-hash' })).toThrow('Stale scene audit')
+    expect(() => run([], undefined, { projectId: 'missing' })).toThrow('Unknown scene project')
+    expect(() => run([], undefined, { sceneFileId: 'production:missing.hiplc' })).toThrow('Unknown scene file')
+  })
+
+  it('separates URI, relative, internal, output, sequence and unknown absent references', () => {
+    const result = run([
+      reference('/Users/zenray/invalid-uri', { pathKind: 'uri' }),
+      reference('/Users/zenray/invalid-relative', { pathKind: 'relative' }),
+      reference(null, { internal: true }),
+      reference('/Users/zenray/render.exr', { mode: 'output' }),
+      reference('/Users/zenray/sequence.0001.exr', { dynamic: true }),
+      reference('/Users/zenray/unknown.usd', { mode: 'unknown', existsAtCurrentFrame: false }),
+    ])
+    expect(result.references.map((entry) => entry.type)).toEqual(['uri', 'relative', 'internal', 'output', 'dynamic', 'unresolved'])
+    expect(result.references[4].sequenceVerified).toBe(false)
+    expect(result.references[5].role).toBe('unknown')
+  })
+
+  it('reports missing and cyclic dependencies while completing known mappings', () => {
+    const result = run([], [snapshot('test-project', [scene], ['shared', 'missing']), snapshot('shared', [], ['test-project'])])
+    expect(result.issues).toEqual([{ code: 'dependency-missing', projectId: 'test-project', dependency: 'missing' }, { code: 'dependency-cycle', projectId: 'test-project' }])
+  })
+
+  it('separates existing directories from resource files without mapping a target', () => {
+    const directory = file('usd', '/Users/zenray/usd')
+    const result = run([reference(directory.canonicalPath, { fileKind: 'directory' })], [snapshot('test-project', [scene, directory])])
+    expect(result.references[0].type).toBe('directory')
+    expect(result.references[0]).not.toHaveProperty('targets')
+    expect(result.portabilityVerified).toBe(false)
+  })
+
+  it('exports no paths or raw diagnostic text from the Mac', () => {
+    const texture = file('maps/color.png', '/Users/zenray/color.png')
+    const result = run([reference(texture.canonicalPath, { rawPath: '/Users/zenray/raw', resolvedPath: '/Users/zenray/resolved', parameterPath: '/Users/zenray/bad' })], [snapshot('test-project', [scene, texture])])
+    expect(result.references[0].parameterPath).toBeNull()
+    expect(JSON.stringify(result)).not.toContain('/Users/')
+    for (const key of ['canonicalPath', 'rawPath', 'resolvedPath', 'scenePath']) expect(JSON.stringify(result)).not.toContain(key)
+  })
+})

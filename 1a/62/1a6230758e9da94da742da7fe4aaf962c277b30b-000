@@ -1,0 +1,249 @@
+// ZenRayMedia — L8 : le document `.zmedia.json`.
+// C'est la couche qui écrit dans le drive de Matthieu : c'est donc celle où une erreur coûte
+// le plus cher (écrasement, perte, document illisible). Elle est gardée en conséquence.
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import {
+  isZMediaPath, slugify, suggestPath, toDocument, fromDocument, migrateDocument,
+  crumbsOf, parentOf, dirOf, ZMEDIA_EXT, DEFAULT_MEDIA_DIR,
+} from './document.js'
+import { emptyBrief, validate, isValid } from './contracts.js'
+import { buildCut } from './cut.js'
+import { seedProject } from './store.js'
+import { DEFAULT_THEME_ID } from './themes/registry.js'
+import theme from './themes/T-01-3-2.theme.js'
+
+function projectFixture() {
+  const { brief, notes } = seedProject()
+  return { id: 'p1', brief, notes, cut: buildCut(brief, notes, theme), seed: 3 }
+}
+
+describe('L8 — chemins et nommage', () => {
+  it('reconnaît un document et rejette les extensions voisines', () => {
+    expect(isZMediaPath('pages/Media/x.zmedia.json')).toBe(true)
+    // Piège réel : `.media.json` est DÉJÀ pris par les manifestes vidéo/audio du projet.
+    // Confondre les deux ferait ouvrir un manifeste vidéo dans l'éditeur d'article.
+    expect(isZMediaPath('pages/Media/x.media.json')).toBe(false)
+    expect(isZMediaPath('pages/Media/x.ref.json')).toBe(false)
+    expect(isZMediaPath(null)).toBe(false)
+  })
+
+  it('nettoie un titre en nom de fichier sûr, accents compris', () => {
+    expect(slugify('Un brief, mille formes')).toBe('un-brief-mille-formes')
+    expect(slugify('Été à Ōsaka — 2026 !')).toBe('ete-a-osaka-2026')
+    expect(slugify('///')).toBe('media')
+    expect(slugify('')).toBe('media')
+  })
+
+  it('propose un chemin stable et suffixé, jamais un doublon exact', () => {
+    const a = suggestPath('pages/Media', 'Mon article')
+    expect(a.startsWith('pages/Media/mon-article-')).toBe(true)
+    expect(a.endsWith(ZMEDIA_EXT)).toBe(true)
+    expect(suggestPath('pages/Media', 'Mon article')).toBe(a) // déterministe
+    expect(suggestPath('pages/Media', 'Mon article', 1)).not.toBe(a) // le sel change le suffixe
+    expect(suggestPath('pages/Media/', 'Mon article')).toBe(a) // barre finale tolérée
+  })
+
+  it('découpe un chemin en fil d’Ariane et remonte au parent', () => {
+    expect(crumbsOf('pages/Media/Japon')).toEqual([
+      { name: 'pages', path: 'pages' },
+      { name: 'Media', path: 'pages/Media' },
+      { name: 'Japon', path: 'pages/Media/Japon' },
+    ])
+    expect(parentOf('pages/Media/Japon')).toBe('pages/Media')
+    expect(parentOf('pages')).toBe('pages') // on ne remonte jamais au-dessus de la racine
+    expect(dirOf('pages/Media/x.zmedia.json')).toBe('pages/Media')
+    expect(dirOf('x.zmedia.json')).toBe(DEFAULT_MEDIA_DIR)
+  })
+})
+
+describe('L8 — sérialisation', () => {
+  it('fait un aller-retour sans rien perdre', () => {
+    const project = projectFixture()
+    project.compositions = {
+      'T-01-1-3': { v: 1, themeId: 'T-01-1-3', serial: 1, rows: [{ id: 'row-1', items: [{ id: 'cmp-1', kind: 'component', componentId: '11-headline', name: 'Titre' }] }] },
+    }
+    const doc = toDocument(project, { themeId: 'T-01-3-2', formatId: 'F-print-a4', path: 'pages/Media/x.zmedia.json' })
+    const back = fromDocument(doc, 'pages/Media/x.zmedia.json')
+    expect(back.themeId).toBe('T-01-3-2')
+    expect(back.formatId).toBe('F-print-a4')
+    expect(back.project.brief.title).toBe(project.brief.title)
+    expect(back.project.notes).toBe(project.notes)
+    expect(back.project.cut.beats.length).toBe(project.cut.beats.length)
+    expect(back.project.seed).toBe(3)
+    expect(back.project.compositions['T-01-1-3'].rows[0].items[0].componentId).toBe('11-headline')
+  })
+
+  it('ne stocke JAMAIS le rendu : le document reste la source', () => {
+    const doc = toDocument(projectFixture(), { themeId: 'T-01-3-2', formatId: 'F-web-article' })
+    const serialized = JSON.stringify(doc)
+    expect(serialized).not.toContain('<!doctype')
+    expect(serialized).not.toContain('<style')
+    // Un document reste léger : c'est ce qui permet d'en avoir des milliers dans le drive.
+    expect(serialized.length).toBeLessThan(20_000)
+  })
+
+  it('refuse un fichier qui n’est pas un document ZenRayMedia', () => {
+    expect(fromDocument({ type: 'playlist', items: [] }, 'x')).toBe(null)
+    expect(fromDocument(null, 'x')).toBe(null)
+    expect(fromDocument({ type: 'zenraymedia' }, 'pages/x.zmedia.json')).toBeTruthy()
+  })
+
+  it('tolère un document partiel sans jamais planter', () => {
+    const back = fromDocument({ type: 'zenraymedia', v: 99, title: 'Futur' }, 'pages/Media/f.zmedia.json')
+    expect(back.project.brief).toMatchObject({ register: emptyBrief().register })
+    expect(back.project.brief.id).toBeTruthy()   // un identifiant est fabriqué si absent
+    expect(back.project.notes).toBe('')
+    expect(back.project.cut).toBe(null)          // un cut vide n'est pas un cut
+    expect(back.themeId).toBe(DEFAULT_THEME_ID)  // repli sur le thème par défaut, jamais une valeur figée
+    expect(back.formatId).toBe('F-web-article')
+  })
+
+  it('un cut aux beats vides est traité comme absent, pas comme valide', () => {
+    const back = fromDocument({ type: 'zenraymedia', cut: { beats: [] } }, 'pages/x.zmedia.json')
+    expect(back.project.cut).toBe(null)
+  })
+})
+
+// AUDIT R3 · trois versions se sont réellement succédé sur ce format (V1 implicite à composition
+// unique, V2 à `compositions`, V3 identité + révision), jamais nommées ni testées comme des
+// migrations avant ce lot. Débloquée par T2 (contrats Document/ThemePackage/Artifact/Publication,
+// juste au-dessus dans ce même backlog).
+describe('R3 — migrations de document V1/V2 vers V3', () => {
+  const PATH = 'pages/Media/migration.zmedia.json'
+
+  it('migre un document V1 (composition unique, sans champ v) sans perdre le contenu', () => {
+    const v1 = {
+      type: 'zenraymedia', title: 'Ancien article',
+      brief: { ...emptyBrief(), id: 'b1', title: 'Ancien article', message: 'Un message.', audience: 'Public' },
+      notes: 'Des notes.', cut: null,
+      composition: { v: 1, themeId: 'T-01-1-3', serial: 2, rows: [{ id: 'row-1', items: [{ id: 'cmp-1', kind: 'component', componentId: '11-headline', name: 'Titre' }] }] },
+      themeId: 'T-01-1-3', formatId: 'F-web-article', seed: 1,
+    }
+    const back = migrateDocument(v1, PATH)
+    expect(back.futureVersion).toBe(false)
+    expect(back.document.v).toBe(3)
+    // Rien perdu : le brief, les notes, et la composition (migrée vers `compositions`) survivent.
+    expect(back.document.brief.title).toBe('Ancien article')
+    expect(back.document.notes).toBe('Des notes.')
+    expect(back.document.compositions['T-01-1-3'].rows[0].items[0].componentId).toBe('11-headline')
+    expect(back.document.composition).toBeUndefined()   // la forme V1 ne survit pas EN PLUS de la V3
+    // V3 : identité, révision et empreinte désormais présentes.
+    expect(back.document.documentId).toBeTruthy()
+    expect(back.document.revisionId).toBeTruthy()
+    expect(back.document.savedHash).toBeTruthy()
+  })
+
+  it('migre un document V2 (déjà `compositions`) sans perdre le contenu, ajoute seulement l’identité V3', () => {
+    const v2 = {
+      type: 'zenraymedia', v: 2, title: 'Article récent',
+      brief: { ...emptyBrief(), id: 'b2', title: 'Article récent', message: 'Un autre message.', audience: 'Public' },
+      notes: '', cut: null,
+      compositions: { 'T-01-1-3': { v: 1, themeId: 'T-01-1-3', serial: 0, rows: [] } },
+      themeId: 'T-01-1-3', formatId: 'F-web-article', seed: 5,
+    }
+    const back = migrateDocument(v2, PATH)
+    expect(back.document.v).toBe(3)
+    expect(back.document.compositions).toEqual(v2.compositions)   // structure V2 intacte
+    expect(back.document.seed).toBe(5)
+    expect(back.document.documentId).toBeTruthy()
+  })
+
+  it('un document déjà V3 traverse sans changer ses identifiants (idempotent)', () => {
+    const v3 = migrateDocument({ type: 'zenraymedia', title: 'X', brief: emptyBrief(), themeId: 'T-01-1-3', formatId: 'F-web-article' }, PATH).document
+    const rejoue = migrateDocument(v3, PATH)
+    expect(rejoue.document.documentId).toBe(v3.documentId)
+    expect(rejoue.document.revisionId).toBe(v3.revisionId)
+  })
+
+  it('migrer le même document V1 deux fois produit exactement les mêmes identifiants (déterministe)', () => {
+    const v1 = { type: 'zenraymedia', title: 'Stable', brief: emptyBrief(), themeId: 'T-01-1-3', formatId: 'F-web-article' }
+    const a = migrateDocument(v1, PATH)
+    const b = migrateDocument(v1, PATH)
+    expect(a.document.documentId).toBe(b.document.documentId)
+    expect(a.document.revisionId).toBe(b.document.revisionId)
+  })
+
+  it('une version future reste lisible et INTACTE, jamais réécrite ni devinée', () => {
+    const futur = { type: 'zenraymedia', v: 99, title: 'Futur', unChampInconnu: 'valeur précieuse' }
+    const back = migrateDocument(futur, PATH)
+    expect(back.futureVersion).toBe(true)
+    expect(back.document).toBe(futur)   // identité de référence : rien recopié, rien perdu
+    expect(back.document.unChampInconnu).toBe('valeur précieuse')
+  })
+
+  it('fromDocument sur une version future ne porte JAMAIS docPath/docSha depuis MediaApp (protection en lecture)', () => {
+    const back = fromDocument({ type: 'zenraymedia', v: 99, title: 'Futur' }, PATH)
+    expect(back.futureVersion).toBe(true)
+    // Le chemin RESTE connu (pour l'affichage), mais rien dans ce retour n'affirme un SHA de base :
+    // c'est à l'appelant (MediaApp.jsx, audit R3) de ne jamais l'associer à `docPath`/`docSha`.
+    expect(back.project.path).toBe(PATH)
+  })
+
+  it('un document produit par toDocument est un Document V3 VALIDE au sens du contrat T2', () => {
+    const doc = toDocument(projectFixture(), { themeId: 'T-01-3-2', formatId: 'F-web-article', path: PATH })
+    expect(isValid('document', {
+      documentId: doc.documentId, schemaVersion: doc.v, revisionId: doc.revisionId, savedHash: doc.savedHash,
+      createPath: doc.path, createSha: 'sha-de-test',
+    })).toBe(true)
+  })
+})
+
+describe('L8 — écriture et lecture réseau', () => {
+  let calls
+  beforeEach(() => {
+    calls = []
+    global.fetch = vi.fn(async (url, init) => {
+      calls.push({ url: String(url), init })
+      if (init?.method === 'POST') {
+        const body = JSON.parse(init.body)
+        if (body.sha === 'perime') return { json: async () => ({ error: 'conflict' }) }
+        return { json: async () => ({ ok: true, sha: 'sha-neuf' }) }
+      }
+      return { json: async () => ({ markdown: JSON.stringify({ type: 'zenraymedia', title: 'Lu', brief: { title: 'Lu' } }), sha: 'sha-lu' }) }
+    })
+  })
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('refuse d’écrire un brief invalide plutôt que de salir le drive', async () => {
+    const { saveDocument } = await import('./document.js')
+    const res = await saveDocument('pages/Media/x.zmedia.json', { brief: { ...emptyBrief(), title: '' } }, {})
+    expect(res.ok).toBe(false)
+    expect(res.error).toMatch(/incomplet/)
+    expect(calls.length).toBe(0) // aucun appel réseau : on n'écrit pas pour découvrir que c'est faux
+  })
+
+  it('signale un conflit au lieu d’écraser le travail d’un autre onglet', async () => {
+    const { saveDocument } = await import('./document.js')
+    const res = await saveDocument('pages/Media/x.zmedia.json', projectFixture(), { sha: 'perime' })
+    expect(res.ok).toBe(false)
+    expect(res.conflict).toBe(true)
+    expect(res.error).toMatch(/modifié ailleurs/)
+  })
+
+  it('enregistre et rend le nouveau sha, qui protège l’écriture suivante', async () => {
+    const { saveDocument } = await import('./document.js')
+    const res = await saveDocument('pages/Media/x.zmedia.json', projectFixture(), { themeId: 'T-01-3-2', formatId: 'F-web-article' })
+    expect(res.ok).toBe(true)
+    expect(res.sha).toBe('sha-neuf')
+    const body = JSON.parse(calls[0].init.body)
+    expect(body.action).toBe('save')
+    expect(body.path).toBe('pages/Media/x.zmedia.json')
+    expect(JSON.parse(body.markdown).type).toBe('zenraymedia')
+  })
+
+  it('lit un document existant et remonte son sha', async () => {
+    const { loadDocument } = await import('./document.js')
+    const res = await loadDocument('pages/Media/x.zmedia.json')
+    expect(res.ok).toBe(true)
+    expect(res.sha).toBe('sha-lu')
+    expect(res.project.brief.title).toBe('Lu')
+  })
+
+  it('refuse un chemin qui n’est pas un document, sans toucher au réseau', async () => {
+    const { loadDocument } = await import('./document.js')
+    const res = await loadDocument('pages/Media/x.media.json')
+    expect(res.ok).toBe(false)
+    expect(calls.length).toBe(0)
+  })
+})

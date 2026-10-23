@@ -1,0 +1,484 @@
+// push-batch-policy.test.js (12 October 2026): the push batch policy, in both directions (green on the good case, red on the broken one).
+// Run: npx vitest run scripts/lib/push-batch-policy.test.js --maxWorkers=1
+import { describe, expect, it } from 'vitest'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { MiB } from '../../src/config/chunkPolicy.js'
+import {
+  PushExhausted, PushPermanentRejection, classifyPushFailure, createPushController, estimatePackBytes, loadPushPolicyConfig,
+  parsePushPackBytes, partsPerRepo, planAllBatches, planBatch, repoCapBytes, runPushBatch,
+} from './push-batch-policy.mjs'
+import { scanPushPaths } from './push-policy-guard.mjs'
+
+// 14 October 2026: the delivered default starts at 20 parts; the ramp tests below start at 8 on purpose.
+// FR : le defaut livre part a 20 parts ; les tests de montee partent volontairement a 8.
+const config = (env = {}, overrides = {}) => loadPushPolicyConfig(env, { rampStartParts: 8, ...overrides })
+const defaultConfig = (env = {}) => loadPushPolicyConfig(env)
+const PART = 95 * MiB + 16
+const items = (count, size = PART) => Array.from({ length: count }, () => size)
+const noSleep = async () => {}
+
+// Drives the whole queue through the engine, like the callers do. `script` gives the outcome of attempt n ('ok', 'fail', 'size' or
+// a function of the plan). Returns what was confirmed and what the attempts looked like.
+async function drive(controller, total, script = () => 'ok', { size = PART, headPrefix = 'q' } = {}) {
+  const queue = Array.from({ length: total }, (_, index) => ({ id: `${headPrefix}${index}`, size }))
+  const attempts = []
+  const confirmed = []
+  let attemptNumber = 0
+  while (queue.length) {
+    const outcome = await runPushBatch({
+      controller, sizes: queue.map((item) => item.size), headId: queue[0].id, sleep: noSleep,
+      attempt: async (plan) => {
+        attemptNumber += 1
+        const verdict = typeof script === 'function' ? script(attemptNumber, plan) : script[attemptNumber - 1] || 'ok'
+        attempts.push({ n: attemptNumber, count: plan.count, parts: plan.parts, verdict, level: plan.level, mode: plan.mode })
+        if (verdict === 'ok') return { status: 0, stderr: '' }
+        if (verdict === 'size') return { status: 1, stderr: 'remote: fatal: pack exceeds maximum allowed size (2.00 GiB)' }
+        if (verdict === 'permanent') return { status: 1, stderr: 'remote: error: GH013: Repository rule violations found for refs/heads/main' }
+        return { status: 1, stderr: 'fatal: unable to access: Could not resolve host: github.com' }
+      },
+    })
+    confirmed.push(...queue.splice(0, outcome.count).map((item) => item.id))
+  }
+  return { attempts, confirmed }
+}
+
+describe('configuration', () => {
+  it('delivers the decided numbers by default', () => {
+    const c = defaultConfig()
+    expect(c.targetMiB).toBe(1900)
+    expect(c.partBytes).toBe(95 * MiB + 16)
+    expect(c.topParts).toBe(20)
+    expect([...c.ladder]).toEqual([2, 4, 8, 12, 16, 20])
+    expect(c.rampStartParts).toBe(20)
+    expect(c.failuresBeforeFallback).toBe(3)
+    expect(c.fallbackParts).toBe(2)
+    expect(c.recoverAfterSuccesses).toBe(3)
+    expect(c.overlapPrepare).toBe(true)
+    expect(c.fixed).toBe(false)
+    // 20 parts are 1 900 MiB and 7.2 % under the 2 048 MiB GitHub enforces
+    expect(20 * c.partBytes / MiB).toBeCloseTo(1900, 3)
+    expect(1 - 1900 / 2048).toBeCloseTo(0.0723, 3)
+    expect(estimatePackBytes(c, 20 * c.partBytes)).toBeLessThan(c.safeLimitBytes)
+  })
+
+  it('caps a repository at 4 096 MiB for new films (43 parts) and keeps 2 048 MiB (21 parts) for folder archives', () => {
+    const c = config()
+    expect(repoCapBytes(c, 'film')).toBe(4096 * MiB)
+    expect(partsPerRepo(c, 'film')).toBe(43)
+    expect(repoCapBytes(c, 'folder')).toBe(2048 * MiB)
+    expect(partsPerRepo(c, 'folder')).toBe(21)
+    // red: the same formula on the old 2 GiB cap gives the old 21, so the two numbers really differ
+    expect(partsPerRepo(config({}, { repoCapMiB: 2048 }), 'film')).toBe(21)
+  })
+
+  it('keeps ZR_SHARD_CAP_GO (GiB) as the legacy name of the cap and ZR_SHARD_PUSH_BATCH_MB as the fixed batch switch', () => {
+    const legacy = config({ ZR_SHARD_CAP_GO: '2' })
+    expect(partsPerRepo(legacy, 'film')).toBe(21)
+    expect(legacy.sources.repoCapMiB).toBe('env:ZR_SHARD_CAP_GO')
+    expect(config({ ZR_REPO_CAP_MIB: '8192', ZR_SHARD_CAP_GO: '2' }).repoCapMiB).toBe(8192) // the specific name wins
+    const fixed = config({ ZR_SHARD_PUSH_BATCH_MB: '190' })
+    expect(fixed.fixed).toBe(true)
+    expect(createPushController(fixed).budgetBytes()).toBe(190 * MiB)
+    expect(config({ ZR_SHARD_PUSH_BATCH_MB: '0' }).fixed).toBe(false)
+  })
+
+  it('keeps the leniency of the variables it replaces: an unreadable or zero legacy value means "not set"', () => {
+    const c = config({ ZR_SHARD_PUSH_BATCH_MB: 'abc', ZR_SHARD_CAP_GO: '0', ZR_PUSH_CHUNK_MB: '0' })
+    expect(c.fixed).toBe(false)
+    expect(c.repoCapMiB).toBe(4096)
+    expect(c.folderRepoCapMiB).toBe(2048)
+    expect(c.folderPushMaxMiB).toBe(150)
+  })
+
+  it('names the parameter in every error', () => {
+    expect(() => config({ ZR_PUSH_MAX_PARTS: 'many' })).toThrow(/maxParts \(ZR_PUSH_MAX_PARTS\)/)
+    expect(() => config({ ZR_PUSH_LADDER: '2,four' })).toThrow(/ladder \(ZR_PUSH_LADDER\)/)
+    expect(() => config({ ZR_PUSH_OVERLAP_PREPARE: 'maybe' })).toThrow(/overlapPrepare/)
+    expect(() => defaultConfig({ ZR_PUSH_RAMP_START_PARTS: '7' })).toThrow(/rampStartParts \(ZR_PUSH_RAMP_START_PARTS\) = 7 is not a level/)
+    expect(() => config({ ZR_PUSH_FALLBACK_PARTS: '3' })).toThrow(/fallbackParts/)
+    expect(() => config({ ZR_PUSH_SAFETY_MARGIN_PCT: '90' })).toThrow(/safetyMarginPct/)
+    expect(() => config({}, { nonsense: 1 })).toThrow(/unknown parameter nonsense/)
+    expect(() => config({}, { targetMiB: 10 })).toThrow(/targetMiB/)
+  })
+
+  it('never lets the ladder go above maxParts', () => {
+    const c = config({ ZR_PUSH_MAX_PARTS: '12' })
+    expect([...c.ladder]).toEqual([2, 4, 8, 12])
+    expect(c.topParts).toBe(12)
+  })
+})
+
+describe('planning', () => {
+  it('fills a batch to the budget and never splits an item', () => {
+    expect(planBatch([10, 10, 10, 10], 25)).toEqual({ count: 2, bytes: 20 })
+    expect(planBatch([10, 10, 10, 10], 40)).toEqual({ count: 4, bytes: 40 })
+    expect(planBatch([50, 10], 25)).toEqual({ count: 1, bytes: 50 }) // an oversized item travels alone, never an empty batch
+    expect(planBatch([10, 10, 10], 100, 2)).toEqual({ count: 2, bytes: 20 })
+    expect(planBatch([], 100)).toEqual({ count: 0, bytes: 0 })
+  })
+
+  it('cuts exactly 20 parts of 95 MiB into a 1 900 MiB batch, and the 21st into the next one', () => {
+    const c = config()
+    const top = 20 * c.partBytes
+    expect(planBatch(items(21), top).count).toBe(20)
+    expect(planAllBatches(items(43), top).map((batch) => batch.count)).toEqual([20, 20, 3])
+    expect(planAllBatches(items(43), top).reduce((sum, batch) => sum + batch.count, 0)).toBe(43)
+  })
+})
+
+describe('real pack size', () => {
+  it('reads the size of the pack from the progress output', () => {
+    const output = 'Enumerating objects: 62, done.\rWriting objects:  50% (11/22), 950.00 MiB | 10.5 MiB/s\r'
+      + 'Writing objects: 100% (22/22), 1.86 GiB | 10.90 MiB/s, done.\nTotal 22 (delta 0), reused 0 (delta 0)\n'
+    expect(parsePushPackBytes(output)).toEqual({ objects: 22, bytes: Math.round(1.86 * 1024 ** 3) })
+    expect(parsePushPackBytes('Writing objects: 100% (3/3), 512 bytes | 512.00 KiB/s, done.').bytes).toBe(512)
+    expect(parsePushPackBytes('Writing objects: 100% (3/3), 12.50 KiB | 12.50 MiB/s, done.').bytes).toBe(12800)
+  })
+
+  it('answers null when the size is not printed (a red case, not a guess)', () => {
+    expect(parsePushPackBytes('Writing objects:  50% (11/22), 950.00 MiB | 10.5 MiB/s')).toBeNull()
+    expect(parsePushPackBytes('')).toBeNull()
+    expect(parsePushPackBytes(undefined)).toBeNull()
+  })
+})
+
+describe('failure classification', () => {
+  it('tests the size of the pack first because the permanent test also matches the word exceeds', () => {
+    expect(classifyPushFailure('remote: fatal: pack exceeds maximum allowed size (2.00 GiB)')).toBe('pack-size')
+    expect(classifyPushFailure('error: RPC failed; HTTP 413 curl 22 The requested URL returned error: 413')).toBe('pack-size')
+    expect(classifyPushFailure('remote: error: GH013: Repository rule violations found for refs/heads/main.')).toBe('permanent')
+    expect(classifyPushFailure('remote: error: this repository is over its data quota. Account responsible')).toBe('permanent')
+  })
+
+  it('treats network, timeout and server errors as transient, retried', () => {
+    expect(classifyPushFailure('fatal: unable to access: Could not resolve host: github.com')).toBe('transient')
+    expect(classifyPushFailure('error: RPC failed; HTTP 500 curl 22 The requested URL returned error: 500')).toBe('transient')
+    expect(classifyPushFailure('send-pack: unexpected disconnect while reading sideband packet')).toBe('transient')
+    // 12 October 2026: a timeout is its own class (size aware handling, F1); FR : un delai depasse est une classe propre.
+    expect(classifyPushFailure('Video shard Git push timed out')).toBe('timeout')
+    expect(classifyPushFailure('(s)')).toBe('transient')
+    expect(classifyPushFailure('')).toBe('transient')
+  })
+})
+
+describe('controller: ramp, retry, fallback, recovery', () => {
+  it('starts at 8 parts and steps up one level after 3 consecutive successes, never above 20', async () => {
+    const controller = createPushController(config())
+    const { attempts, confirmed } = await drive(controller, 240)
+    expect(attempts[0].parts).toBe(8)
+    expect(attempts[0].mode).toBe('ramp')
+    expect(attempts.every((attempt) => attempt.parts <= 20)).toBe(true)
+    expect(Math.max(...attempts.map((attempt) => attempt.parts))).toBe(20)
+    const levels = attempts.map((attempt) => attempt.level)
+    expect(levels.slice(0, 3)).toEqual([8, 8, 8])
+    expect(levels[3]).toBe(12)
+    expect(confirmed).toHaveLength(240)
+    expect(controller.state().mode).toBe('steady')
+  })
+
+  it('retries ONE failure unchanged: same batch, same size, nothing falls back', async () => {
+    const controller = createPushController(config())
+    const { attempts } = await drive(controller, 8, ['fail', 'ok'])
+    expect(attempts).toHaveLength(2)
+    expect(attempts[0].count).toBe(8)
+    expect(attempts[1].count).toBe(8)
+    expect(attempts[1].level).toBe(8)
+    expect(controller.state().mode).toBe('ramp')
+    expect(controller.metrics.summary().fallbacks).toBe(0)
+  })
+
+  it('retries TWO failures unchanged and falls back to 2 parts at the THIRD failure of the same batch', async () => {
+    const controller = createPushController(config())
+    const { attempts, confirmed } = await drive(controller, 8, ['fail', 'fail', 'fail', 'ok', 'ok', 'ok', 'ok'])
+    expect(attempts.slice(0, 3).map((attempt) => attempt.count)).toEqual([8, 8, 8])
+    expect(attempts[3].count).toBe(2)
+    expect(attempts[3].mode).toBe('fallback')
+    expect(confirmed).toHaveLength(8) // 2 + 2 + 2 + 2, nothing lost
+    expect(controller.metrics.summary().fallbacks).toBe(1)
+  })
+
+  it('counts failures PER BATCH, not per file and not across batches', async () => {
+    const controller = createPushController(config())
+    // batch A fails twice then passes, batch B fails twice then passes: 4 failures in total but never 3 on one batch
+    const { attempts } = await drive(controller, 16, ['fail', 'fail', 'ok', 'fail', 'fail', 'ok'])
+    expect(controller.metrics.summary().fallbacks).toBe(0)
+    expect(attempts.map((attempt) => attempt.level).every((level) => level === 8)).toBe(true)
+  })
+
+  it('recovers step by step after 3 consecutive successes, and a failure restarts that count', async () => {
+    const controller = createPushController(config())
+    // fall back first: the success that ends the fallback counts as the first of the 3
+    await drive(controller, 2, ['fail', 'fail', 'fail', 'ok'])
+    expect(controller.state().level).toBe(2)
+    expect(controller.state().mode).toBe('fallback')
+    expect(controller.state().consecutiveSuccesses).toBe(1)
+    // a failure restarts the count: 3 clean successes are needed again, then the level goes 2 -> 4 and not further
+    const { attempts } = await drive(controller, 12, ['fail', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok'])
+    expect(attempts.slice(0, 4).map((attempt) => attempt.level)).toEqual([2, 2, 2, 2])
+    expect(attempts[4].level).toBe(4)
+    expect(attempts[4].count).toBe(4)
+    expect(controller.metrics.summary().stepUps).toBe(1)
+    // a clean line climbs to the top, one rung at a time
+    await drive(controller, 200)
+    expect(controller.state().level).toBe(20)
+    expect(controller.state().mode).toBe('steady')
+  })
+
+  it('never plans more than 20 parts even when 500 are waiting', () => {
+    const controller = createPushController(config())
+    for (let i = 0; i < 30; i += 1) controller.recordSuccess({ headId: `h${i}`, count: 8, bytes: 8 * PART })
+    const plan = controller.plan(items(500), 'x')
+    expect(plan.count).toBe(20)
+    expect(plan.bytes).toBe(20 * PART)
+  })
+
+  it('raises the estimate with the largest pack ratio seen and plans fewer parts, never more', () => {
+    const controller = createPushController(config())
+    for (let i = 0; i < 30; i += 1) controller.recordSuccess({ headId: `h${i}`, count: 20, bytes: 20 * PART })
+    expect(controller.plan(items(40), 'x').count).toBe(20)
+    controller.recordSuccess({ headId: 'big', count: 20, bytes: 20 * PART, packBytes: Math.round(20 * PART * 1.04) })
+    const after = controller.plan(items(40), 'x')
+    expect(after.count).toBeLessThan(20)
+    expect(after.estimatePackBytes).toBeLessThanOrEqual(controller.config.safeLimitBytes)
+  })
+})
+
+describe('controller: size refusal without data loss', () => {
+  it('shrinks the batch after a refusal for size, retries at once and confirms every item', async () => {
+    const controller = createPushController(config({}, { rampStartParts: 20 }))
+    const { attempts, confirmed } = await drive(controller, 20, ['size', 'size', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok'])
+    expect(attempts[0].count).toBe(20)
+    expect(attempts[1].count).toBeLessThan(20)
+    expect(attempts[2].count).toBeLessThan(attempts[1].count)
+    expect(attempts.filter((attempt) => attempt.verdict === 'size')).toHaveLength(2)
+    expect(confirmed).toHaveLength(20)
+    expect(new Set(confirmed).size).toBe(20)
+    expect(controller.metrics.summary().sizeFailures).toBe(2)
+    // a size refusal is deterministic: it does not count toward the 3 failures of the fallback
+    expect(controller.metrics.summary().fallbacks).toBe(0)
+  })
+
+  it('never plans again a size that was refused', async () => {
+    const controller = createPushController(config({}, { rampStartParts: 20 }))
+    await drive(controller, 20, ['size', 'ok', 'ok', 'ok'])
+    const ceiling = controller.state().sizeCeilingBytes
+    expect(ceiling).toBeLessThan(20 * PART)
+    for (let i = 0; i < 40; i += 1) controller.recordSuccess({ headId: `h${i}`, count: 4, bytes: 4 * PART })
+    expect(controller.plan(items(40), 'x').bytes).toBeLessThanOrEqual(ceiling)
+  })
+
+  it('gives up cleanly when ONE item alone is refused for its size (permanent, nothing is dropped)', async () => {
+    const controller = createPushController(config())
+    await expect(runPushBatch({
+      controller, sizes: [PART], headId: 'only', sleep: noSleep, label: 'repo-a',
+      attempt: async () => ({ status: 1, stderr: 'remote: fatal: pack exceeds maximum allowed size' }),
+    })).rejects.toBeInstanceOf(PushPermanentRejection)
+  })
+})
+
+describe('engine: permanent and exhausted failures', () => {
+  it('stops at once on a permanent refusal and does not retry it', async () => {
+    const controller = createPushController(config())
+    let calls = 0
+    await expect(runPushBatch({
+      controller, sizes: items(8), headId: 'p', sleep: noSleep, label: 'repo-b',
+      attempt: async () => { calls += 1; return { status: 1, stderr: 'remote: error: GH013: Repository rule violations found for refs/heads/main' } },
+    })).rejects.toThrow(/permanently refused for repo-b/)
+    expect(calls).toBe(1)
+  })
+
+  it('declares the push exhausted after maxAttempts and keeps the caller in charge of its items', async () => {
+    const controller = createPushController(config({}, { maxAttempts: 5 }))
+    let calls = 0
+    const slept = []
+    await expect(runPushBatch({
+      controller, sizes: items(8), headId: 'e', label: 'repo-c', sleep: async (ms) => { slept.push(ms) },
+      attempt: async () => { calls += 1; return { status: 1, stderr: 'fatal: unable to access: Could not resolve host' } },
+    })).rejects.toBeInstanceOf(PushExhausted)
+    expect(calls).toBe(5)
+    expect(slept).toEqual([3000, 6000, 9000, 12000]) // linear backoff, no pause after the last attempt
+  })
+
+  it('in fixed mode (ZR_SHARD_PUSH_BATCH_MB) nothing adapts: no ramp, no fallback, a size refusal is permanent', async () => {
+    const controller = createPushController(config({ ZR_SHARD_PUSH_BATCH_MB: '190' }, { maxAttempts: 6 }))
+    const { attempts } = await drive(controller, 8, ['fail', 'fail', 'fail', 'fail', 'ok', 'ok', 'ok', 'ok', 'ok'])
+    expect(attempts.every((attempt) => attempt.count === 1 || attempt.count === 2)).toBe(true) // 190 MiB = 2 parts of 95 MiB + 16
+    expect(controller.metrics.summary().fallbacks).toBe(0)
+    expect(controller.state().mode).toBe('fixed')
+    const sized = createPushController(config({ ZR_SHARD_PUSH_BATCH_MB: '190' }))
+    await expect(runPushBatch({
+      controller: sized, sizes: items(2), headId: 's', sleep: noSleep,
+      attempt: async () => ({ status: 1, stderr: 'remote: fatal: pack exceeds maximum allowed size' }),
+    })).rejects.toBeInstanceOf(PushPermanentRejection)
+  })
+})
+
+describe('state carried between processes (one process per film)', () => {
+  it('keeps the learned level in a file, so the ramp does not restart at 8 parts for every film', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'push-state-'))
+    const stateFile = path.join(dir, 'PushState.json')
+    try {
+      const first = createPushController(config({ ZR_PUSH_STATE_FILE: stateFile }))
+      await drive(first, 40) // 8, 8, 8, 12, 12, 12 ... several successes
+      expect(first.state().level).toBeGreaterThan(8)
+      const second = createPushController(config({ ZR_PUSH_STATE_FILE: stateFile }))
+      expect(second.state().level).toBe(first.state().level)
+      expect(second.plan(items(40), 'x').level).toBe(first.state().level)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  it('carries a fallback too, so a flaky line is not hammered by the next film', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'push-state-'))
+    const stateFile = path.join(dir, 'PushState.json')
+    try {
+      const first = createPushController(config({ ZR_PUSH_STATE_FILE: stateFile }))
+      await drive(first, 2, ['fail', 'fail', 'fail', 'ok'])
+      const second = createPushController(config({ ZR_PUSH_STATE_FILE: stateFile }))
+      expect(second.state().level).toBe(2)
+      expect(second.state().mode).toBe('fallback')
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  it('ignores a stale, unreadable or foreign state: a fresh ramp at 8 parts (red cases)', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'push-state-'))
+    const stateFile = path.join(dir, 'PushState.json')
+    try {
+      const old = createPushController(config({ ZR_PUSH_STATE_FILE: stateFile }), { now: () => Date.now() - 24 * 3600 * 1000 })
+      await drive(old, 60)
+      expect(old.state().level).toBeGreaterThan(8)
+      expect(createPushController(config({ ZR_PUSH_STATE_FILE: stateFile })).state().level).toBe(8) // older than 6 hours
+      writeFileSync(stateFile, '{ not json')
+      expect(createPushController(config({ ZR_PUSH_STATE_FILE: stateFile })).state().level).toBe(8)
+      writeFileSync(stateFile, JSON.stringify({ version: 1, savedAt: Date.now(), level: 7 }))
+      expect(createPushController(config({ ZR_PUSH_STATE_FILE: stateFile })).state().level).toBe(8) // 7 is not a rung
+      writeFileSync(stateFile, JSON.stringify({ version: 1, savedAt: Date.now(), level: 20 }))
+      expect(createPushController(config({ ZR_PUSH_STATE_FILE: stateFile, ZR_SHARD_PUSH_BATCH_MB: '190' })).state().mode).toBe('fixed')
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+})
+
+describe('metrics', () => {
+  it('measures throughput, wait, duration, attempts and pack ratio', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'push-metrics-'))
+    const file = path.join(dir, 'metrics.jsonl')
+    try {
+      const controller = createPushController(config({ ZR_PUSH_METRICS_FILE: file }))
+      await runPushBatch({
+        controller, sizes: items(8), headId: 'm', sleep: noSleep,
+        attempt: async () => ({ status: 0, stderr: 'Writing objects: 100% (8/8), 760.00 MiB | 10.00 MiB/s, done.', durationMs: 20000, waitMs: 1500 }),
+      })
+      const summary = controller.metrics.summary()
+      expect(summary.batches).toBe(1)
+      expect(summary.attempts).toBe(1)
+      expect(summary.payloadBytes).toBe(8 * PART)
+      expect(summary.waitMs).toBe(1500)
+      expect(summary.averageThroughputBps).toBe(Math.round(8 * PART / 20))
+      expect(summary.packBytes).toBe(760 * MiB)
+      expect(summary.packRatio).toBeGreaterThan(0.99)
+      const line = JSON.parse(readFileSync(file, 'utf8').trim().split('\n').pop())
+      expect(line).toMatchObject({ type: 'attempt', ok: true, count: 8, packBytes: 760 * MiB, waitMs: 1500 })
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  it('counts failed time in the effective throughput, so a flaky line looks slower than a clean one', async () => {
+    const controller = createPushController(config())
+    let n = 0
+    await runPushBatch({
+      controller, sizes: items(8), headId: 'm', sleep: noSleep,
+      attempt: async () => { n += 1; return n === 1 ? { status: 1, stderr: 'Could not resolve host', durationMs: 30000 } : { status: 0, stderr: '', durationMs: 30000 } },
+    })
+    const summary = controller.metrics.summary()
+    expect(summary.failedAttempts).toBe(1)
+    expect(summary.effectiveThroughputBps).toBeLessThan(summary.averageThroughputBps)
+  })
+})
+
+describe('the guard of the repository', () => {
+  it('finds no script that pushes outside the policy without a written reason', () => {
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
+    const report = scanPushPaths({ root })
+    expect(report.unlisted).toEqual([])
+    expect(report.stale).toEqual([])
+    expect(report.weak).toEqual([])
+    expect(report.pinned).toEqual([])
+    expect(report.routed).toEqual(expect.arrayContaining(['scripts/video-raw-lib.mjs', 'scripts/lib/video-git-shard.mjs']))
+  })
+})
+
+// 14 October 2026: the push is sized by the MEASURED line. Matthieu's connection can change, and a batch can be 15 or 1 500 files.
+describe('throughput sizing (14 October 2026)', () => {
+  const MiBs = 1048576
+  const PART = 95 * MiBs + 16
+  const success = (controller, bytes, seconds) => controller.recordSuccess({ headId: `b${Math.random()}`, count: Math.round(bytes / PART), bytes, durationMs: seconds * 1000 })
+  const budgetParts = (controller) => controller.budgetBytes() / PART
+
+  it('keeps the full 20 parts on a fast line and shrinks on a slow one', () => {
+    const fast = createPushController(config({}, { rampStartParts: 20 }))
+    success(fast, 1900 * MiBs, 170) // 11.2 MB/s
+    expect(budgetParts(fast)).toBeCloseTo(20, 0)
+    const slow = createPushController(config({}, { rampStartParts: 20 }))
+    success(slow, 380 * MiBs, 380) // 1 MB/s
+    expect(budgetParts(slow)).toBeLessThan(4)
+    expect(budgetParts(slow)).toBeGreaterThanOrEqual(1) // a part is the atomic unit
+  })
+  it('follows a line that gets faster and slower again (average with weight 0.3)', () => {
+    const controller = createPushController(config({}, { rampStartParts: 20 }))
+    const seen = []
+    for (const mbps of [11, 11, 2, 2, 2, 2, 11, 11, 11, 11]) {
+      success(controller, 600 * MiBs, (600 * 1.048576) / mbps)
+      seen.push(Math.round(budgetParts(controller)))
+    }
+    expect(seen[0]).toBe(20)
+    expect(Math.min(...seen.slice(2, 6))).toBeLessThan(16) // the slow stretch shrinks the batch
+    expect(seen[9]).toBeGreaterThan(seen[5]) // and the fast line gets it back
+  })
+  it('ignores small pushes, and the switch off value 0 keeps the old behaviour (red controls)', () => {
+    const controller = createPushController(config({}, { rampStartParts: 20 }))
+    success(controller, 10 * MiBs, 100) // 0.1 MB/s but only 10 MiB: not a sample
+    expect(budgetParts(controller)).toBeCloseTo(20, 0)
+    const off = createPushController(config({ ZR_PUSH_THROUGHPUT_SIZING: '0' }, { rampStartParts: 20 }))
+    success(off, 380 * MiBs, 380)
+    expect(budgetParts(off)).toBeCloseTo(20, 0)
+  })
+  it('is carried between processes by the state file (one process per film)', () => {
+    const stateFile = path.join(mkdtempSync(path.join(tmpdir(), 'zr-throughput-')), 'state.json')
+    const first = createPushController(config({ ZR_PUSH_STATE_FILE: stateFile }, { rampStartParts: 20 }))
+    success(first, 380 * MiBs, 380)
+    const second = createPushController(config({ ZR_PUSH_STATE_FILE: stateFile }, { rampStartParts: 20 }))
+    expect(second.state().throughputBps).toBeGreaterThan(900000)
+    expect(budgetParts(second)).toBeLessThan(4)
+  })
+})
+
+describe('hiccups are learned (14 October 2026)', () => {
+  it('a flaky line lowers the aimed push duration, a clean hour raises it', () => {
+    const controller = createPushController(config({}, { rampStartParts: 20 }))
+    const clean = controller.state().targetSeconds
+    for (let i = 0; i < 4; i += 1) controller.recordFailure(`b${i}`, { count: 8, bytes: 760 * 1048576, durationMs: 60000 }, 'transient')
+    expect(controller.state().hiccups).toBe(4)
+    expect(controller.state().targetSeconds).toBeLessThan(clean)
+    expect(controller.state().targetSeconds).toBeGreaterThanOrEqual(60)
+  })
+})
+
+describe('adapter for the scripts with their own push loop (14 October 2026)', () => {
+  it('follows the measured line, reports hiccups, ignores permanent refusals and honours a fixed batch (red controls)', async () => {
+    const { sharedBatchAdapter } = await import('./push-batch-policy.mjs')
+    const MiBs = 1048576
+    const slow = sharedBatchAdapter({ controller: createPushController(config({}, { rampStartParts: 20 })) })
+    expect(slow.budgetBytes() / MiBs).toBeGreaterThan(1800) // before any measure: the full level
+    slow.track(380 * MiBs, 4).ok(380000) // 1 MB/s
+    expect(slow.budgetBytes() / MiBs).toBeLessThan(400)
+    const batch = slow.track(300 * MiBs, 3)
+    batch.fail(5000, 'fatal: unable to access: Could not resolve host') // a hiccup, counted
+    expect(slow.controller.state().hiccups).toBe(1)
+    batch.fail(5000, 'remote: error: GH013: Repository rule violations found') // permanent: not a hiccup
+    expect(slow.controller.state().hiccups).toBe(1)
+    expect(slow.timeoutMs(1900 * MiBs)).toBeGreaterThanOrEqual(30 * 60 * 1000)
+    const fixed = sharedBatchAdapter({ controller: createPushController(config({ ZR_SHARD_PUSH_BATCH_MB: '400' })) })
+    expect(fixed.budgetBytes()).toBe(400 * MiBs)
+  })
+})

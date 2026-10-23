@@ -1,0 +1,62 @@
+import importlib.util, os, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('worker', '/Users/zenray/.claude/tmp/tmp-movies-series-upload/Scripts/ProcessFilmsSequentially.py')
+w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
+tmp = Path(tempfile.mkdtemp())
+w.LOG_FILE = tmp / 'log.txt'
+w.REPO = Path(sys.argv[1])
+w.INDEX_SPOOL = tmp / 'IndexAddSpool.txt'
+out = tmp / 'received.txt'
+env = dict(os.environ, STUB_OUT=str(out), STUB_EXIT='0')
+def pending():
+    names = ['IndexAddSpool.txt', 'IndexAddSpool.flushing.txt', 'IndexAddSpool.taken.txt']
+    return sorted(l for n in names if (tmp / n).exists() for l in (tmp / n).read_text().split('\n') if l.strip())
+
+# 1) below the minimum: nothing is sent, nothing is lost
+w.INDEX_SPOOL.write_text('a\nb\nb\n')
+w.flush_index_spool(env, minimum=8)
+assert not out.exists() and pending() == ['a', 'b', 'b'], pending()
+
+# 2) minimum reached: de-duplicated sorted batch, everything cleared
+w.flush_index_spool(env, minimum=1)
+assert out.read_text() == 'a\nb\n', repr(out.read_text())
+assert pending() == [], pending()
+
+# 3) failure keeps the paths for a retry
+w.INDEX_SPOOL.write_text('x\ny\n')
+env['STUB_EXIT'] = '1'
+w.flush_index_spool(env, minimum=1)
+assert pending() == ['x', 'y'], pending()
+assert 'non mis a jour' in w.LOG_FILE.read_text()
+
+# 4) the retry succeeds and includes what was spooled in between
+w.INDEX_SPOOL.write_text('z\n')
+env['STUB_EXIT'] = '0'
+w.flush_index_spool(env, minimum=1)
+assert out.read_text() == 'x\ny\nz\n', repr(out.read_text())
+assert pending() == [], pending()
+
+# 5) nothing spooled at all is a no-op
+w.flush_index_spool(env, minimum=1)
+
+# 6) paths appended while the flush runs are kept
+w.INDEX_SPOOL.write_text('p\nq\n')
+real_run = w.subprocess.run
+def run_and_append(*a, **k):
+    res = real_run(*a, **k)
+    with w.INDEX_SPOOL.open('a') as f: f.write('late\n')
+    return res
+w.subprocess.run = run_and_append
+w.flush_index_spool(env, minimum=1)
+w.subprocess.run = real_run
+assert out.read_text() == 'p\nq\n', repr(out.read_text())
+assert pending() == ['late'], pending()
+
+# 7) a crash between the rename and the read leaves a taken file: it is picked up
+(tmp / 'IndexAddSpool.taken.txt').write_text('orphan\n')
+w.flush_index_spool(env, minimum=1)
+assert out.read_text() == 'orphan\n', repr(out.read_text())
+assert pending() == ['late'], pending()
+w.flush_index_spool(env, minimum=1)
+assert out.read_text() == 'late\n' and pending() == [], (out.read_text(), pending())
+print('flush tests OK')

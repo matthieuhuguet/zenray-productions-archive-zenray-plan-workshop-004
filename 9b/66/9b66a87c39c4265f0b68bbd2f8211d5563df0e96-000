@@ -1,0 +1,71 @@
+// index-add-paths.mjs — rend cherchable IMMÉDIATEMENT une liste de chemins déjà committés sur zenray-data,
+// sans réécrire ni rebuild du gros index. RÉUTILISE la logique exacte du serveur (appendPublicDelta,
+// thumbsForPaths — server/page.js, ré-exportées) : même mécanisme que le drop/Ctrl-V in-app (action=index-add
+// sur /api/page), appliqué depuis la CLI.
+//
+// POURQUOI CE SCRIPT EXISTE (bug trouvé le 2026-07-14, signalé par Matthieu) : tout upload en masse via les
+// scripts CLI (upload-img-list.mjs, upload-img-list-git.mjs, upload-vidraw-list.mjs) écrit les manifestes
+// directement en Git sur zenray-data, mais n'a JAMAIS appelé index-add — les fichiers restaient donc invisibles
+// à la recherche jusqu'au prochain rebuild MANUEL (`build-search-index.mjs --apply`, jamais automatique).
+// Ce n'est PAS un problème de champ `tags` (absent de toute la logique de scoring, vérifié par grep) : la
+// recherche matche sur le CHEMIN normalisé (segments + sous-chaîne) et le nom, jamais sur `tags`.
+//
+// Usage direct (liste de chemins, un par ligne, stdin ou fichier) :
+//   GITHUB_TOKEN=$(gh auth token) node scripts/index-add-paths.mjs < paths.txt
+//   GITHUB_TOKEN=$(gh auth token) node scripts/index-add-paths.mjs paths.txt
+// Usage dossier (tous les .img.json d'un dossier du clone sparse zenray-data, récursif) :
+//   GITHUB_TOKEN=$(gh auth token) node scripts/index-add-paths.mjs --dir "pages/References/Series/House of the Dragon"
+//
+// Idempotent (appendPublicDelta ne fait qu'ajouter à un Set, un chemin déjà présent ne change rien).
+//
+// PIÈGE CORRIGÉ (2026-07-14) : appendPublicDelta lit son état courant via raw.githubusercontent.com, qui a
+// un cache ~5 min (documenté dans server/page.js). Plusieurs appels SÉQUENTIELS RAPPROCHÉS (ex. un par lot
+// de 200) lisent tous le MÊME instantané périmé -> chaque lot ÉCRASE le précédent au lieu de s'accumuler
+// (constaté : un sweep de 4949 chemins annoncé "4949/4949 OK" n'en a laissé que 518 dans le delta réel).
+// Fix : thumbsForPaths est appelé PAR LOTS de 200 (son propre plafond interne), mais TOUS les résultats sont
+// fusionnés puis appendPublicDelta n'est appelé QU'UNE SEULE FOIS avec la liste complète -> une seule
+// lecture-modification-écriture, aucun risque d'écrasement intra-run.
+
+import { appendPublicDelta, publicDeltaLastError, thumbsForPaths } from './../server/page.js'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+
+const token = process.env.GITHUB_TOKEN
+if (!token) { console.error('usage: GITHUB_TOKEN=.. node index-add-paths.mjs <paths.txt | --dir "<dossier>">'); process.exit(1) }
+
+const CLONE = process.env.ZR_ZDATA_CLONE || path.join(process.env.HOME, '.zr-thumb-bulk', 'zdata-clone')
+const BATCH = 200 // thumbsForPaths résout au plus 200 .img.json par appel (server/page.js)
+
+let paths = []
+if (process.argv[2] === '--dir') {
+  const dir = process.argv[3]
+  if (!dir) { console.error('usage: --dir "<dossier pages/...>"'); process.exit(1) }
+  const { execFileSync } = await import('node:child_process')
+  const abs = path.join(CLONE, dir)
+  const out = execFileSync('find', [abs, '-type', 'f'], { encoding: 'utf8' })
+  paths = out.split('\n').filter(Boolean).map((p) => dir.replace(/\/+$/, '') + '/' + path.relative(abs, p))
+} else {
+  const file = process.argv[2]
+  const raw = file ? readFileSync(file, 'utf8') : readFileSync(0, 'utf8')
+  paths = raw.split('\n').map((s) => s.trim()).filter(Boolean)
+}
+
+if (!paths.length) { console.log('aucun chemin à indexer.'); process.exit(0) }
+console.log(`=== INDEX-ADD ${paths.length} chemin(s) ===`)
+
+// 1) résoudre les vignettes PAR LOTS de 200 (plafond interne de thumbsForPaths), fusionner tout en mémoire.
+const allThumbs = {}
+// 13 October 2026, 09:29 CEST: exact non-media archives can index paths without fetching nonexistent thumbnails.
+const skipThumbnails = process.env.ZR_INDEX_SKIP_THUMBNAILS === '1'
+for (let i = 0; !skipThumbnails && i < paths.length; i += BATCH) {
+  const slice = paths.slice(i, i + BATCH)
+  Object.assign(allThumbs, await thumbsForPaths(token, slice))
+  console.log(`  vignettes résolues ${Math.min(i + BATCH, paths.length)}/${paths.length}`)
+}
+// 2) UN SEUL appendPublicDelta avec la liste COMPLÈTE -> une seule lecture-modification-écriture du delta.
+const ok = await appendPublicDelta(token, paths, allThumbs)
+console.log(ok ? `\n✓✓ INDEX-ADD COMPLET — ${paths.length}/${paths.length} chemins ajoutés au delta public (cherchables immédiatement, sans rebuild).`
+               : `\n⚠ INDEX-ADD ÉCHOUÉ — aucun chemin ajouté, relancer.`)
+// 21 October 2026: the reason goes to stderr, where the Assets service reads the last line of a failed child.
+if (!ok) console.error(`index delta refused: ${publicDeltaLastError() || 'no reason reported'}`)
+process.exit(ok ? 0 : 1)

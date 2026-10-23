@@ -1,0 +1,131 @@
+// LibFilePreview — aperçu des formats qui exigent un décodeur JS (chargé en IMPORT DYNAMIQUE = code-split, donc
+// AUCUN poids ajouté au bundle initial : la lib n'est téléchargée que quand on ouvre un fichier de ce type).
+// Reçoit l'URL blob DÉJÀ reconstituée (ZenRayShards bit-exact) ; décode selon la catégorie fileKinds.
+//   doc-lib (docx)   -> mammoth -> HTML
+//   sheet-lib (xlsx) -> SheetJS -> table HTML (onglets)
+//   slides-lib(pptx) -> pas de lib fiable -> message + download (déjà bit-exact)
+//   epub-lib (epub)  -> epubjs -> rendition paginée
+//   image-lib(heic/tiff) -> heic2any / UTIF -> <img>/<canvas>
+//   3d-lib (glb/obj/stl/fbx) -> three.js -> viewer WebGL orbitable
+import React, { useEffect, useRef, useState } from 'react'
+import { extOf } from '../lib/fileKinds.js'
+
+const Box = ({ children }) => <div style={{ width: 'min(900px,92vw)', maxHeight: '82vh', overflow: 'auto', background: '#fff', color: '#1d1d1f', borderRadius: 14, padding: '26px 30px', boxShadow: '0 20px 60px rgba(0,0,0,0.4)' }}>{children}</div>
+const Msg = ({ children }) => <div style={{ color: '#fff', opacity: 0.75, textAlign: 'center', lineHeight: 1.6, fontSize: 'var(--zr-ui-lg)' }}>{children}</div>
+
+export default function LibFilePreview({ url, name, kind }) {
+  const [state, setState] = useState({ loading: true })
+  const mountRef = useRef(null)
+
+  useEffect(() => {
+    let live = true, cleanup = null
+    ;(async () => {
+      try {
+        const ext = extOf(name)
+        // ---- DOCX -> HTML (mammoth) ----
+        if (kind === 'doc-lib' && (ext === 'docx')) {
+          const mammoth = (await import('mammoth')).default || (await import('mammoth'))
+          const buf = await (await fetch(url)).arrayBuffer()
+          const { value } = await mammoth.convertToHtml({ arrayBuffer: buf })
+          if (live) setState({ html: value })
+          return
+        }
+        // ---- XLSX/XLS -> tables HTML (SheetJS) ----
+        if (kind === 'sheet-lib') {
+          const XLSX = await import('xlsx')
+          const buf = await (await fetch(url)).arrayBuffer()
+          const wb = XLSX.read(buf, { type: 'array' })
+          const sheets = wb.SheetNames.map((n) => ({ n, html: XLSX.utils.sheet_to_html(wb.Sheets[n]) }))
+          if (live) setState({ sheets })
+          return
+        }
+        // ---- HEIC/HEIF -> JPEG (heic2any) ; TIFF -> canvas (UTIF) ----
+        if (kind === 'image-lib') {
+          if (ext === 'heic' || ext === 'heif') {
+            const heic2any = (await import('heic2any')).default
+            const blob = await (await fetch(url)).blob()
+            const out = await heic2any({ blob, toType: 'image/jpeg', quality: 0.9 })
+            const u = URL.createObjectURL(Array.isArray(out) ? out[0] : out)
+            cleanup = () => URL.revokeObjectURL(u)
+            if (live) setState({ img: u }); return
+          }
+          // TIFF / DNG
+          const UTIF = (await import('utif')).default
+          const buf = await (await fetch(url)).arrayBuffer()
+          const ifds = UTIF.decode(buf); UTIF.decodeImage(buf, ifds[0])
+          const rgba = UTIF.toRGBA8(ifds[0])
+          const cv = document.createElement('canvas'); cv.width = ifds[0].width; cv.height = ifds[0].height
+          const ctx = cv.getContext('2d'); const id = ctx.createImageData(cv.width, cv.height); id.data.set(rgba); ctx.putImageData(id, 0, 0)
+          if (live) setState({ img: cv.toDataURL('image/png') }); return
+        }
+        // ---- EPUB (epubjs) ----
+        if (kind === 'epub-lib') {
+          const ePub = (await import('epubjs')).default
+          const buf = await (await fetch(url)).arrayBuffer()
+          if (live) setState({ epub: buf, epubLib: ePub }); return
+        }
+        // ---- 3D glb/gltf/obj/stl (three.js) ----
+        if (kind === '3d-lib') {
+          if (live) setState({ three: true }); return
+        }
+        // pptx & co -> pas d'aperçu fiable
+        if (live) setState({ unsupported: true })
+      } catch (e) { if (live) setState({ err: (e && e.message) || 'décodage impossible' }) }
+    })()
+    return () => { live = false; if (cleanup) cleanup() }
+  }, [url, name, kind])
+
+  // EPUB : rendu dans un conteneur (après que le buffer soit prêt)
+  useEffect(() => {
+    if (!state.epub || !mountRef.current) return
+    let rendition = null
+    try {
+      const book = state.epubLib(state.epub)
+      rendition = book.renderTo(mountRef.current, { width: '100%', height: '74vh', spread: 'auto' })
+      rendition.display()
+    } catch {}
+    return () => { try { rendition && rendition.destroy() } catch {} }
+  }, [state.epub])
+
+  // 3D : scène three.js orbitable
+  useEffect(() => {
+    if (!state.three || !mountRef.current) return
+    let raf = 0, renderer = null, controls = null, disposed = false
+    ;(async () => {
+      const THREE = await import('three')
+      const ext = extOf(name)
+      const { OrbitControls } = await import('three/examples/jsm/controls/OrbitControls.js')
+      const el = mountRef.current; if (!el || disposed) return
+      const W = Math.min(900, window.innerWidth * 0.9), H = window.innerHeight * 0.74
+      const scene = new THREE.Scene(); scene.background = new THREE.Color(0x101013)
+      const cam = new THREE.PerspectiveCamera(50, W / H, 0.01, 5000); cam.position.set(2, 1.5, 3)
+      renderer = new THREE.WebGLRenderer({ antialias: true }); renderer.setSize(W, H); renderer.setPixelRatio(window.devicePixelRatio)
+      el.appendChild(renderer.domElement)
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.1)); const d = new THREE.DirectionalLight(0xffffff, 1.4); d.position.set(3, 5, 2); scene.add(d)
+      controls = new OrbitControls(cam, renderer.domElement); controls.enableDamping = true
+      const fit = (obj) => { const box = new THREE.Box3().setFromObject(obj); const s = box.getSize(new THREE.Vector3()).length() || 1; const c = box.getCenter(new THREE.Vector3()); obj.position.sub(c); cam.position.set(0, s * 0.3, s * 1.4); cam.near = s / 100; cam.far = s * 100; cam.updateProjectionMatrix(); controls.target.set(0, 0, 0) }
+      try {
+        if (ext === 'glb' || ext === 'gltf') { const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js'); const g = await new GLTFLoader().loadAsync(url); scene.add(g.scene); fit(g.scene) }
+        else if (ext === 'obj') { const { OBJLoader } = await import('three/examples/jsm/loaders/OBJLoader.js'); const o = await new OBJLoader().loadAsync(url); scene.add(o); fit(o) }
+        else if (ext === 'stl') { const { STLLoader } = await import('three/examples/jsm/loaders/STLLoader.js'); const geo = await new STLLoader().loadAsync(url); const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x9aa0a6, metalness: 0.1, roughness: 0.7 })); scene.add(mesh); fit(mesh) }
+        else if (ext === 'fbx') { const { FBXLoader } = await import('three/examples/jsm/loaders/FBXLoader.js'); const fbx = await new FBXLoader().loadAsync(url); scene.add(fbx); fit(fbx) }
+      } catch {}
+      const loop = () => { if (disposed) return; raf = requestAnimationFrame(loop); controls.update(); renderer.render(scene, cam) }
+      loop()
+    })()
+    return () => { disposed = true; cancelAnimationFrame(raf); try { controls && controls.dispose(); renderer && renderer.dispose(); renderer && renderer.domElement.remove() } catch {} }
+  }, [state.three, name, url])
+
+  if (state.loading && !state.html && !state.sheets && !state.img && !state.epub && !state.three) {
+    if (state.err) return <Msg>Aperçu impossible : {state.err}. Entrée pour télécharger.</Msg>
+    if (state.unsupported) return <Msg>Aperçu indisponible pour ce type — Entrée pour télécharger (fichier intact).</Msg>
+    return <Msg>Décodage…</Msg>
+  }
+  if (state.err) return <Msg>Aperçu impossible : {state.err}. Entrée pour télécharger.</Msg>
+  if (state.html != null) return <Box><div dangerouslySetInnerHTML={{ __html: state.html }} /></Box>
+  if (state.sheets) return <Box><div className="zr-xlsx">{state.sheets.map((s, i) => (<div key={i} style={{ marginBottom: 22 }}><div style={{ fontWeight: 700, marginBottom: 8 }}>{s.n}</div><div style={{ overflow: 'auto' }} dangerouslySetInnerHTML={{ __html: s.html }} /></div>))}<style>{'.zr-xlsx table{border-collapse:collapse}.zr-xlsx td,.zr-xlsx th{border:1px solid #ddd;padding:3px 7px;font-size:13px}'}</style></div></Box>
+  if (state.img) return <img src={state.img} alt={name} style={{ maxWidth: '92vw', maxHeight: '82vh', objectFit: 'contain', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }} />
+  if (state.epub) return <div ref={mountRef} style={{ width: 'min(900px,92vw)', height: '74vh', background: '#fff', borderRadius: 12, overflow: 'hidden' }} />
+  if (state.three) return <div ref={mountRef} style={{ borderRadius: 12, overflow: 'hidden', lineHeight: 0 }} />
+  return <Msg>Aperçu indisponible — Entrée pour télécharger.</Msg>
+}

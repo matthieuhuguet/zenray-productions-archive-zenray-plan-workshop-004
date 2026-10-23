@@ -1,0 +1,695 @@
+// ZENRAY FREELANCE v3 (4 October 2026).
+//
+// The engine on the Mac searches the boards every six hours and writes what it finds next to the studios (`studio.engine`, one letter
+// archive per vacancy, `freelance/engine.json`). This page shows it: one button to search now, the vacancies sorted by how well they fit
+// the published CV, a letter already written for each, the studio's own application page, and the trail of everything sent.
+// Storage is the drive file `freelance/applications.json`, written through the read-modify-write helper so two tabs never lose a message.
+//
+// FR : le moteur du Mac cherche toutes les six heures et ecrit ce qu'il trouve a cote des studios. Cette page le montre : un bouton pour
+// chercher maintenant, les annonces triees par adequation au CV publie, une lettre deja ecrite pour chacune, la page de candidature
+// du studio, et la trace de tout ce qui a ete envoye.
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import { readJson, saveJsonWithRetry } from '../lib/saveJson.js'
+import { urlLectureAffichage } from '../lib/urlLecture.js'
+import { createFreelanceBridge } from '../lib/freelanceBridge.js'
+import { UI } from '../config/colors.js'
+import { notify } from './Notifications.jsx'
+import FreelanceOfferDetails from './FreelanceOfferDetails.jsx'
+import FreelanceAttachments from './freelance/FreelanceAttachments.jsx'
+import FreelanceEngineBar from './freelance/FreelanceEngineBar.jsx'
+import FreelanceLetter from './freelance/FreelanceLetter.jsx'
+import FreelanceFeedbackRequest, { FeedbackRequestShortcut } from './freelance/FreelanceFeedbackRequest.jsx'
+import FreelanceSources from './freelance/FreelanceSources.jsx'
+import FreelanceTemplate from './freelance/FreelanceTemplate.jsx'
+import FreelanceBatch from './freelance/FreelanceBatch.jsx'
+import FreelanceMySearches from './freelance/FreelanceMySearches.jsx'
+import { SEARCHES_PATH, addSearch, normalizeSearches, removeSearch } from '../lib/freelanceSearches.js'
+import { Button, Field, GlassPill, P, Panel, SectionTitle, glassStyle, textareaStyle } from './freelance/ui.jsx'
+
+const CARD_PAGE = 72
+import {
+  STATUSES, normalizeStore, normalizeStudio, setStatus, addMessage, lastMessage, applyStudioChange,
+  groupByStatus, counts, timeline, searchStudios, readableDate, isoDay, chronologyOf,
+  isOutdatedStudio, deprecateOutdatedStudios,
+} from '../lib/freelanceStudios.js'
+import { FEEDBACK_SENT_FIELD, refusalDate } from '../lib/freelanceFeedbackRequest.js'
+import {
+  DEFAULT_FILTERS, KINDS, LANES, laneOf, TIERS, isClosedStudio, isNewStudio, kindLabel, matchesFilters, scoreOf, sortStudios, sourceLabelOf, sourceOptions, sourceProblems, tierOf, countryOf, countryOptions,
+} from '../lib/freelanceEngineModel.js'
+
+const PATHS = { store: 'freelance/applications.json', engine: 'freelance/engine.json', template: 'freelance/letter-template.json' }
+const FILTERS_KEY = 'zr:freelance:filters'
+const LANE_KEY = 'zr:freelance:lane'
+const readLane = () => { try { return localStorage.getItem(LANE_KEY) === 'other' ? 'other' : 'games' } catch { return 'games' } }
+const TIER_COLOR = { high: UI.green, medium: UI.orange, low: UI.gray }
+
+const readStoredFilters = () => { try { return { ...DEFAULT_FILTERS, ...JSON.parse(localStorage.getItem(FILTERS_KEY) || '{}') } } catch { return DEFAULT_FILTERS } }
+const storeFilters = (filters) => { try { localStorage.setItem(FILTERS_KEY, JSON.stringify(filters)) } catch {} }
+
+/** A small state read, outside the GitHub quota; a missing or unreadable file is just "not published yet". */
+async function readDisplay(path) {
+  try {
+    const response = await fetch(urlLectureAffichage(path, { fresh: true }), { cache: 'no-cache' })
+    if (!response.ok) return null
+    const result = await response.json()
+    return result.missing || typeof result.markdown !== 'string' ? null : JSON.parse(result.markdown)
+  } catch { return null }
+}
+
+function Badge({ t, color, children, title }) {
+  return <span title={title} style={{ ...glassStyle(t, color), padding: '2px 9px', fontSize: 11.5 }}>{children}</span>
+}
+
+/** One studio card: name, role, how well it fits, what it is, and the beginning of the last message sent. */
+function StudioCard({ t, studio, onOpen, today }) {
+  const msg = lastMessage(studio)
+  const engine = studio.engine
+  const closed = isClosedStudio(studio, today)
+  const score = scoreOf(studio)
+  const chrono = chronologyOf(studio, today)
+  const country = countryOf(studio)
+
+  return (
+    <button type="button" onClick={onOpen} title={studio.name}
+      style={{ display: 'flex', flexDirection: 'column', gap: 8, textAlign: 'left', padding: P.cardPadding, border: `1px solid ${t.border}`, borderRadius: P.radius, background: t.surface, color: 'inherit', cursor: 'pointer', minWidth: 0, opacity: closed ? 0.6 : 1 }}>
+      <span style={{ display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }}>
+        <span style={{ fontFamily: P.serif, fontWeight: P.serifWeight, fontSize: 18, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{studio.name}</span>
+        {score !== null && (
+          <span title={`Adéquation avec ton CV : ${score} sur 100`} style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 6, fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 13, color: t.textPrimary }}>
+            <span aria-hidden="true" style={{ width: 9, height: 9, borderRadius: 999, background: TIER_COLOR[tierOf(studio)] || UI.gray }} />{score}
+          </span>
+        )}
+      </span>
+      <span style={{ fontFamily: P.sans, fontSize: 13, color: t.textPrimary, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{studio.role || 'poste à préciser'}</span>
+      <span style={{ fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {[country.code !== 'OTHER' ? `${country.flag} ${studio.city || country.label}` : studio.city, kindLabel(studio), sourceLabelOf(studio)].filter(Boolean).join(' · ')}
+      </span>
+
+      {/* 07 October 2026: Badges enrichis avec dates precises */}
+      <span style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+        {country.code !== 'OTHER' && (
+          <Badge t={t} color={country.code === 'FR' ? UI.blue : country.code === 'JP' ? UI.orange : UI.gray} title={`Localisation : ${country.label}`}>
+            <span>{country.flag} {country.label}</span>
+          </Badge>
+        )}
+        {isNewStudio(studio, today) && (
+          <Badge t={t} color={UI.blue} title={`Détectée le ${chrono.foundLabel}`}>
+            <span>Nouveau</span>{chrono.foundLabel ? ` · ${chrono.foundLabel}` : ''}
+          </Badge>
+        )}
+        {closed && <Badge t={t} color={UI.gray} title="L’annonce n’est plus dans la liste du site source"><span>Fermée</span>{chrono.closedLabel ? ` · ${chrono.closedLabel}` : ''}</Badge>}
+        {studio.status === 'deprecated' && (
+          <Badge t={t} color={UI.gray} title="Offre périmée / fermée sur le site source">
+            <span>Périmé</span>{chrono.closedLabel ? ` · ${chrono.closedLabel}` : ''}
+          </Badge>
+        )}
+        {studio.status === 'contacted' && <Badge t={t} color={UI.orange} title={`Contacté le ${chrono.contactedLabel}`}><span>Contacté</span> · {chrono.contactedLabel}</Badge>}
+        {studio.status === 'declined' && <Badge t={t} color={UI.red} title="Refus reçu du studio"><span>Refusé</span>{refusalDate(studio) ? ` · ${readableDate(refusalDate(studio))}` : ''}</Badge>}
+        {studio.status === 'replied' && <Badge t={t} color={UI.blue} title={`Activité le ${chrono.lastActivityLabel}`}><span>Réponse</span> · {chrono.lastActivityLabel}</Badge>}
+        {studio.status === 'to_contact' && !isNewStudio(studio, today) && chrono.foundLabel && <Badge t={t} color={UI.gray} title={`Trouvée le ${chrono.foundLabel}`}><span>Trouvée</span> · {chrono.foundLabel}</Badge>}
+        {engine && engine.letterPath && studio.status === 'to_contact' && <Badge t={t} color={UI.green} title="Une lettre est déjà écrite">Lettre prête</Badge>}
+        {engine && engine.freelance && <Badge t={t} color={UI.purple}>Freelance</Badge>}
+        {studio.attachments?.length > 0 && (
+          <Badge t={t} color={UI.blue} title={`${studio.attachments.length} pièce(s) jointe(s)`}>
+            <span>📎 {studio.attachments.length} {studio.attachments.length > 1 ? 'pièces' : 'pièce'}</span>
+          </Badge>
+        )}
+      </span>
+
+      {/* 07 October 2026: Bloc chronologique mis en avant avec dates en grand format */}
+      <div style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 5,
+        padding: '8px 10px',
+        borderRadius: 8,
+        background: 'rgba(255, 255, 255, 0.03)',
+        border: `1px solid ${t.border}`,
+        marginTop: 2,
+        marginBottom: 2,
+      }}>
+        {studio.contactedAt ? (
+          <>
+            <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 6, flexWrap: 'wrap' }}>
+              <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 15, color: UI.orange }}>
+                Contacté le {chrono.contactedLabel}
+              </span>
+              {chrono.daysSinceContact !== null && (
+                <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 12, color: t.textSecondary }}>
+                  {chrono.daysSinceContact === 0 ? "aujourd'hui" : `il y a ${chrono.daysSinceContact} j`}
+                </span>
+              )}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>
+              <span>Offre trouvée le <strong style={{ fontFamily: P.serif, fontWeight: P.numberWeight, color: t.textPrimary }}>{chrono.foundLabel}</strong></span>
+              {chrono.daysToContact !== null && (
+                <span>(contacté {chrono.daysToContact === 0 ? "le jour même" : `${chrono.daysToContact} jour${chrono.daysToContact > 1 ? 's' : ''} après`})</span>
+              )}
+            </div>
+          </>
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 6, flexWrap: 'wrap' }}>
+            <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 14, color: t.textPrimary }}>
+              Trouvée le {chrono.foundLabel || 'date inconnue'}
+            </span>
+            {chrono.daysSinceFound !== null && (
+              <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 12, color: t.textSecondary }}>
+                {chrono.daysSinceFound === 0 ? "aujourd'hui" : `il y a ${chrono.daysSinceFound} j`}
+              </span>
+            )}
+          </div>
+        )}
+        {studio.messages.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: P.sans, fontSize: 11.5, color: t.textSecondary }}>
+            <span>{studio.messages.length} message{studio.messages.length > 1 ? 's' : ''} envoyé{studio.messages.length > 1 ? 's' : ''}</span>
+            {chrono.lastActivityLabel && chrono.lastActivityLabel !== chrono.contactedLabel && (
+              <span>· dernier le <strong style={{ fontFamily: P.serif, fontWeight: P.numberWeight, color: t.textPrimary }}>{chrono.lastActivityLabel}</strong></span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {msg && (
+        <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary, display: '-webkit-box', WebkitLineClamp: P.messageLines, WebkitBoxOrient: 'vertical', overflow: 'hidden', lineHeight: 1.45 }}>{msg.text}</span>
+      )}
+    </button>
+  )
+}
+
+/** One studio, opened in place: its application, its messages, its dated history, its notes. */
+function StudioDetail({ t, studio, onBack, onChange, onDelete, engineFile, template, bridge, onTemplateSaved, today }) {
+  const [draft, setDraft] = useState('')
+  const [channel, setChannel] = useState('mail')
+  const [notes, setNotes] = useState(studio.notes)
+  useEffect(() => { setNotes(studio.notes) }, [studio.id])
+
+  const send = async () => {
+    if (!draft.trim()) return
+    if (!await onChange(addMessage(studio, { text: draft, channel }))) return
+    setDraft('')
+    notify({ title: 'Message enregistré', body: 'Le texte exact est gardé avec sa date.' })
+  }
+  const logSent = async ({ text, channel: used }) => {
+    if (!await onChange(addMessage(studio, { text, channel: used }))) return
+    notify({ title: 'Candidature enregistrée', body: 'La lettre exacte est gardée avec sa date dans les messages envoyés.' })
+  }
+  // 12 October 2026: the feedback request is logged like any sent message, and the day is kept so it is never offered twice.
+  const logFeedbackSent = async ({ text, channel: used }) => {
+    if (!await onChange({ ...addMessage(studio, { text, channel: used }), [FEEDBACK_SENT_FIELD]: isoDay() })) return
+    notify({ title: 'Demande de retour enregistrée', body: 'Le mail exact est gardé avec sa date dans les messages envoyés.' })
+  }
+  const copy = (text) => { try { navigator.clipboard.writeText(text) } catch {} notify({ title: 'Message copié', body: 'Collé tel quel, prêt à envoyer.' }) }
+
+  const engine = studio.engine
+  const closed = isClosedStudio(studio, today)
+  const chrono = chronologyOf(studio, today)
+  const country = countryOf(studio)
+  const events = timeline([studio], 40)
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 18, flexWrap: 'wrap' }}>
+        <button type="button" onClick={onBack} style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: t.textSecondary, fontFamily: P.sans, fontSize: 13 }}>← Tous les studios</button>
+        <span style={{ flex: 1 }} />
+        {studio.link && <a href={studio.link} target="_blank" rel="noreferrer" style={{ fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary }}>site ou offre ↗</a>}
+        <button type="button" onClick={onDelete} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.textSecondary, fontFamily: P.sans, fontSize: 12.5 }}>supprimer</button>
+      </div>
+
+      <h2 style={{ fontFamily: P.serif, fontWeight: P.serifWeight, fontSize: 32, letterSpacing: '-0.02em', margin: '0 0 6px' }}>{studio.name}</h2>
+      <div style={{ fontFamily: P.sans, fontSize: 13.5, color: t.textSecondary, marginBottom: 8 }}>
+        {[studio.role, country.code !== 'OTHER' ? `${country.flag} ${studio.city || country.label}` : studio.city, kindLabel(studio), sourceLabelOf(studio)].filter(Boolean).join(' · ')}
+      </div>
+
+      {/* 07 October 2026: Panneau chronologique en grand format */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+        gap: 12,
+        margin: '14px 0 20px',
+        padding: 14,
+        borderRadius: P.radius,
+        border: `1px solid ${t.border}`,
+        background: t.surface,
+      }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ fontFamily: P.sans, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em', color: t.textSecondary }}>Offre trouvée</span>
+          <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 18, color: t.textPrimary }}>
+            {chrono.foundLabel || 'Date inconnue'}
+          </span>
+          {chrono.daysSinceFound !== null && (
+            <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>
+              {chrono.daysSinceFound === 0 ? "Découverte aujourd'hui" : `Il y a ${chrono.daysSinceFound} jour${chrono.daysSinceFound > 1 ? 's' : ''}`}
+            </span>
+          )}
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ fontFamily: P.sans, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em', color: t.textSecondary }}>Premier contact</span>
+          <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 18, color: chrono.contactedAt ? UI.orange : t.textSecondary }}>
+            {chrono.contactedLabel ? `Contacté le ${chrono.contactedLabel}` : 'Non contacté'}
+          </span>
+          {chrono.daysSinceContact !== null && (
+            <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>
+              {chrono.daysSinceContact === 0 ? "Aujourd'hui" : `Il y a ${chrono.daysSinceContact} jour${chrono.daysSinceContact > 1 ? 's' : ''}`}
+            </span>
+          )}
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ fontFamily: P.sans, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em', color: t.textSecondary }}>Chronologie & Délai</span>
+          <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 18, color: t.textPrimary }}>
+            {chrono.daysToContact !== null
+              ? (chrono.daysToContact === 0 ? 'Le jour même' : `${chrono.daysToContact} jour${chrono.daysToContact > 1 ? 's' : ''}`)
+              : (chrono.daysSinceFound !== null ? `${chrono.daysSinceFound} j d'attente` : 'En attente')}
+          </span>
+          <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>
+            {chrono.daysToContact !== null
+              ? 'Délai entre découverte et premier contact'
+              : 'Depuis la découverte de l’opportunité'}
+          </span>
+        </div>
+
+        {chrono.publishedAt && chrono.publishedAt !== chrono.foundAt && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <span style={{ fontFamily: P.sans, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em', color: t.textSecondary }}>Publication originale</span>
+            <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 18, color: t.textPrimary }}>
+              {chrono.publishedLabel}
+            </span>
+            <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>
+              Date de parution sur le site source
+            </span>
+          </div>
+        )}
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ fontFamily: P.sans, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em', color: t.textSecondary }}>Zone géographique</span>
+          <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 18, color: country.code === 'FR' ? UI.blue : country.code === 'JP' ? UI.orange : t.textPrimary }}>
+            {country.flag} {country.label}
+          </span>
+          <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>
+            {country.code === 'FR' ? 'Priorité 1 : France (+20 pts)' : country.code === 'JP' ? 'Priorité 2 : Japon (+15 pts)' : country.code === 'GB' ? 'Priorité 3 : Royaume-Uni (+10 pts)' : country.code === 'US' ? 'Priorité 4 : USA (+8 pts)' : (country.bonus > 0 ? `Zone partenaire (+${country.bonus} pts)` : 'Zone distante (0 pt)')}
+          </span>
+        </div>
+      </div>
+
+      {closed && <p role="status" style={{ fontFamily: P.sans, fontSize: 13, color: '#d68c00', margin: '0 0 8px' }}>Cette annonce n’apparaît plus sur le site source{engine && engine.closedAt ? ` depuis le ${readableDate(engine.closedAt)}` : ''} : vérifie avant d’écrire.</p>}
+      {engine && engine.score !== undefined && engine.scoreWhy && engine.scoreWhy.length > 0 && (
+        <details style={{ margin: '0 0 14px' }}>
+          <summary style={{ cursor: 'pointer', fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary }}>Adéquation avec ton CV : <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight }}>{engine.score}</span> sur 100, pourquoi ?</summary>
+          <ul style={{ margin: '8px 0 0', paddingLeft: 18, fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary, lineHeight: 1.6 }}>{engine.scoreWhy.map((line) => <li key={line}>{line}</li>)}</ul>
+        </details>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 22 }}>
+        {STATUSES.map((s) => <GlassPill key={s.key} t={t} statusKey={s.key} active={studio.status === s.key} onClick={() => onChange(setStatus(studio, s.key))} />)}
+      </div>
+
+      <FreelanceFeedbackRequest t={t} studio={studio} onSent={logFeedbackSent} />
+
+      <FreelanceLetter t={t} studio={studio} engine={engineFile} template={template} bridge={bridge} onSent={logSent} onTemplateSaved={onTemplateSaved} templatePath={PATHS.template} />
+
+      <FreelanceOfferDetails key={studio.id} path={studio.offerDetailsPath} t={t} />
+
+      <FreelanceAttachments studio={studio} onChange={onChange} t={t} />
+
+      <SectionTitle t={t} title="Messages envoyés" count={studio.messages.length} />
+      <div style={{ display: 'grid', gap: 10, marginBottom: 18 }}>
+        {studio.messages.slice().reverse().map((m, i) => (
+          <div key={`${m.at}-${i}`} style={{ border: `1px solid ${t.border}`, borderRadius: P.radius, background: t.surface, padding: P.cardPadding }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 6 }}>
+              <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 14.5, color: t.textPrimary }}>{readableDate(m.at)}</span>
+              <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>{m.channel}</span>
+              <button type="button" onClick={() => copy(m.text)} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: t.textSecondary, fontFamily: P.sans, fontSize: 12 }}>copier</button>
+            </div>
+            <div style={{ fontFamily: P.sans, fontSize: 13, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{m.text}</div>
+          </div>
+        ))}
+        {!studio.messages.length && <div style={{ fontFamily: P.sans, fontSize: 13, color: t.textSecondary }}>Aucun message pour l'instant. « Marquer comme envoyée » ci-dessus garde la lettre exacte ; tu peux aussi coller ici un autre message envoyé.</div>}
+      </div>
+
+      <textarea value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Un autre message envoyé, collé tel quel…" aria-label="Message envoyé"
+        style={{ ...textareaStyle(t), minHeight: 120 }} />
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', margin: '10px 0 24px', flexWrap: 'wrap' }}>
+        {['mail', 'linkedin', 'instagram', 'discord', 'en personne'].map((c) => <GlassPill key={c} t={t} onClick={() => setChannel(c)} active={channel === c}>{c}</GlassPill>)}
+        <span style={{ flex: 1 }} />
+        <Button t={t} primary onClick={send}>Enregistrer le message</Button>
+      </div>
+
+      <SectionTitle t={t} title="Historique" count={events.length} />
+      <div style={{ display: 'grid', gap: 6, marginBottom: 24 }}>
+        {events.map((e, i) => (
+          <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'baseline', fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary }}>
+            <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 14, color: t.textPrimary, minWidth: 130 }}>{readableDate(e.at)}</span>
+            <span>{e.label}</span>
+          </div>
+        ))}
+        {!events.length && <div style={{ fontFamily: P.sans, fontSize: 13, color: t.textSecondary }}>Rien encore.</div>}
+      </div>
+
+      <SectionTitle t={t} title="Notes" count="" />
+      <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={() => { if (notes !== studio.notes) onChange({ ...studio, notes }) }} aria-label="Notes"
+        placeholder="Contact, salaire, retour reçu…" style={{ ...textareaStyle(t), minHeight: 90 }} />
+    </>
+  )
+}
+
+export default function FreelanceView({ t }) {
+  const [store, setStore] = useState(null)
+  const [sha, setSha] = useState(null)
+  const [engineFile, setEngineFile] = useState(null)
+  const [template, setTemplate] = useState(null)
+  const [openId, setOpenId] = useState(null)
+  const [query, setQuery] = useState('')
+  // 15 October 2026: cards drawn per group before « Afficher plus » (the filters narrow the group, the counter keeps what was revealed).
+  const [limits, setLimits] = useState({})
+  const limitOf = (key) => limits[key] || CARD_PAGE
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [filters, setFilters] = useState(readStoredFilters)
+  const [lane, setLane] = useState(readLane)
+  const [form, setForm] = useState({ name: '', role: '', link: '' })
+  const [saving, setSaving] = useState('')
+  const [loadError, setLoadError] = useState('')
+  const [panels, setPanels] = useState({ sources: false, template: false, batch: true, mine: false, filters: false, add: false })
+  const [mine, setMine] = useState({ sha: null, data: null })
+  const bridge = useMemo(() => createFreelanceBridge(), [])
+  const today = isoDay()
+
+  // A file that exists but cannot be read (an empty body above 1 MiB, a network error) is NOT an empty list: nothing may be saved over it.
+  // FR : un fichier qui existe mais ne se lit pas n'est PAS une liste vide : rien ne doit etre enregistre par-dessus.
+  const loadStore = useCallback(async () => {
+    try {
+      const r = await readJson(PATHS.store)
+      if (r.data === null && !r.missing) { setLoadError('Le fichier des studios ne se lit pas pour le moment : rien n’est modifié, réessaie dans un instant.'); return }
+      setLoadError(''); setSha(r.sha); setStore(normalizeStore(r.data))
+    } catch { setLoadError('Le fichier des studios ne se lit pas pour le moment : rien n’est modifié, réessaie dans un instant.') }
+  }, [])
+  const loadAux = useCallback(async () => {
+    setEngineFile(await readDisplay(PATHS.engine)); setTemplate(await readDisplay(PATHS.template))
+    try { const r = await readJson(SEARCHES_PATH); if (r.data !== null || r.missing) setMine({ sha: r.sha, data: r.data }) } catch {}
+  }, [])
+  useEffect(() => { loadStore(); loadAux() }, [loadStore, loadAux])
+  const afterRun = useCallback(() => { loadStore(); loadAux() }, [loadStore, loadAux])
+
+  const changeFilters = (patch) => setFilters((current) => { const next = { ...current, ...patch }; storeFilters(next); return next })
+
+  // 30 September 2026, 19:45 Europe/Paris: Retry the intended change against the latest catalogue.
+  async function persist(mutate) {
+    if (loadError || store === null) { notify({ title: 'Enregistrement refusé', body: 'La liste ne s’est pas chargée : rien n’est écrit pour ne rien écraser.' }); return false }
+    setSaving('…')
+    try {
+      const r = await saveJsonWithRetry(PATHS.store, (current) => mutate(normalizeStore(current)), { sha, data: store })
+      if (!r.ok) throw new Error(String(r.error || 'Enregistrement impossible'))
+      setSha(r.sha); setStore(normalizeStore(r.data)); setSaving('enregistré')
+      return true
+    } catch (error) {
+      setSaving('erreur'); notify({ title: 'Enregistrement impossible', body: error.message })
+      return false
+    }
+  }
+
+  const allStudios = store ? store.studios : []
+  // Two lanes that never mix: video games, and every other industry (tenders, film and series VFX, visualisation, XR, simulation).
+  // FR : deux voies qui ne se melangent jamais : le jeu video, et toutes les autres industries.
+  const studios = useMemo(() => allStudios.filter((s) => laneOf(s) === lane), [allStudios, lane])
+  const laneCounts = useMemo(() => Object.fromEntries(LANES.map((l) => [l.key, allStudios.filter((s) => laneOf(s) === l.key && s.status === 'to_contact' && !isClosedStudio(s, isoDay())).length])), [allStudios])
+  const chooseLane = (key) => { setLane(key); setOpenId(null); try { localStorage.setItem(LANE_KEY, key) } catch {} }
+  const open = allStudios.find((s) => s.id === openId) || null
+  const shown = useMemo(() => {
+    const list = searchStudios(studios, query).filter((s) => matchesFilters(s, filters, today))
+    return statusFilter === 'all' ? list : list.filter((s) => s.status === statusFilter)
+  }, [studios, query, filters, statusFilter, today])
+  const c = { ...counts(studios), toContact: studios.filter((s) => s.status === 'to_contact' && !isClosedStudio(s, today)).length }
+  const events = useMemo(() => timeline(studios, 24), [studios])
+  const newCount = studios.filter((s) => isNewStudio(s, today)).length
+  const sources = useMemo(() => sourceOptions(studios), [studios])
+  const countryData = useMemo(() => countryOptions(studios), [studios])
+  const problems = sourceProblems(engineFile).length
+  const filtersActive = JSON.stringify({ ...filters, sort: 'x' }) !== JSON.stringify({ ...DEFAULT_FILTERS, sort: 'x' })
+
+  const addStudio = () => {
+    const s = normalizeStudio({ ...form, createdAt: isoDay(), status: 'to_contact' })
+    if (!s) return
+    setForm({ name: '', role: '', link: '' })
+    persist((current) => ({ ...current, studios: [s, ...current.studios] }))
+  }
+  const updateStudio = (next) => persist((current) => applyStudioChange(current, allStudios.find((studio) => studio.id === next.id), next))
+  const removeStudio = (id) => { if (!window.confirm('Supprimer ce studio et son historique ?')) return; setOpenId(null); persist((current) => ({ ...current, studios: current.studios.filter((studio) => studio.id !== id) })) }
+  // His own searches: dated, append-only, written through the same read-modify-write helper as the studios.
+  // FR : ses recherches : datees, jamais effacees, ecrites par le meme assistant lecture-modification-ecriture que les studios.
+  async function saveMine(mutate) {
+    const r = await saveJsonWithRetry(SEARCHES_PATH, (current) => mutate(normalizeSearches(current)), { sha: mine.sha, data: mine.data })
+    if (!r.ok) { notify({ title: 'Enregistrement impossible', body: String(r.error || 'Les recherches ne sont pas enregistrées.') }); return { error: 'Enregistrement impossible, réessaie dans un instant.' } }
+    setMine({ sha: r.sha, data: r.data }); return {}
+  }
+  const addMine = async ({ input, label }) => {
+    const id = `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+    const probe = addSearch(mine.data, { input, label, at: isoDay(), id })
+    if (probe.error) return { error: probe.error }
+    let refused = ''
+    const saved = await saveMine((current) => { const next = addSearch(current, { input, label, at: isoDay(), id }); if (next.error) { refused = next.error; return current } return next.file })
+    return refused ? { error: refused } : saved
+  }
+  const removeMine = (id) => saveMine((current) => removeSearch(current, id, isoDay()))
+  const toggle = (name) => setPanels((current) => ({ ...current, [name]: !current[name] }))
+
+  const outdatedUncontactedCount = useMemo(() => {
+    return studios.filter((s) => s.status === 'to_contact' && isOutdatedStudio(s, today)).length
+  }, [studios, today])
+  const deprecateOutdated = () => {
+    if (!outdatedUncontactedCount) return
+    persist((current) => ({
+      ...current,
+      studios: deprecateOutdatedStudios(current.studios, today),
+    }))
+  }
+
+  return (
+    <div style={{ maxWidth: P.column, margin: '0 auto', padding: '6px 2px 60px', color: t.textPrimary }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap', marginBottom: 6 }}>
+        <h1 style={{ fontFamily: P.serif, fontWeight: P.serifWeight, fontSize: 30, letterSpacing: '-0.02em', margin: 0 }}>ZenRay <span style={{ fontStyle: 'italic' }}>Freelance</span></h1>
+        <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 13, color: t.textSecondary }}>
+          {c.toContact} à contacter{newCount ? ` (${newCount} nouvelle${newCount > 1 ? 's' : ''})` : ''} · {c.contacted} contactés · {c.answered} réponses · {c.messages} messages{c.deprecated ? ` · ${c.deprecated} périmé${c.deprecated > 1 ? 's' : ''}` : ''}
+        </span>
+        {outdatedUncontactedCount > 0 && (
+          <button
+            type="button"
+            onClick={deprecateOutdated}
+            title="Passer automatiquement les offres fermées en Périmé"
+            style={{
+              padding: '2px 8px',
+              borderRadius: 6,
+              border: `1px solid ${t.border}`,
+              background: 'rgba(255, 69, 58, 0.12)',
+              color: '#ff453a',
+              fontFamily: P.sans,
+              fontSize: 12,
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+            }}
+          >
+            <span>Passer {outdatedUncontactedCount} offre{outdatedUncontactedCount > 1 ? 's' : ''} fermée{outdatedUncontactedCount > 1 ? 's' : ''} en Périmé</span>
+          </button>
+        )}
+        <span style={{ marginLeft: 'auto', fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>{saving}</span>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, margin: '4px 0 12px' }} role="tablist" aria-label="Voie de recherche">
+        {LANES.map((l) => <GlassPill key={l.key} t={t} onClick={() => chooseLane(l.key)} active={lane === l.key} title={l.key === 'other' ? 'Appels d’offres publics, VFX cinéma et séries, visualisation, XR, simulation, missions freelance 3D' : 'Studios et offres du jeu vidéo'}>{l.label} · {laneCounts[l.key]}</GlassPill>)}
+      </div>
+      <FreelanceEngineBar t={t} engine={engineFile} bridge={bridge} onFinished={afterRun} sourcesOpen={panels.sources} onToggleSources={() => toggle('sources')} problems={problems} />
+      {panels.sources && !open && <div style={{ border: `1px solid ${t.border}`, borderRadius: P.radius, background: t.surface, padding: '18px 18px 8px', marginBottom: 22 }}><FreelanceSources t={t} engine={engineFile} lane={lane} /></div>}
+
+      {!open && store !== null && (
+        <>
+          <FreelanceBatch t={t} studios={studios} today={today} open={panels.batch} onToggle={() => toggle('batch')} onOpen={setOpenId} onChange={updateStudio} bridge={bridge} />
+          <Panel t={t} title="Mes recherches" open={panels.mine} onToggle={() => toggle('mine')} aside={`${normalizeSearches(mine.data).searches.filter((entry) => !entry.removedAt).length} enregistrée(s)`}>
+            <FreelanceMySearches t={t} file={mine.data} engine={engineFile} onAdd={addMine} onRemove={removeMine} />
+          </Panel>
+        </>
+      )}
+
+      {store === null && !loadError && <div style={{ fontFamily: P.sans, fontSize: 13, color: t.textSecondary }}>chargement…</div>}
+      {loadError && <div role="alert" style={{ fontFamily: P.sans, fontSize: 13, color: '#eb584f', margin: '8px 0 16px' }}>{loadError} <Button t={t} small onClick={loadStore}>Réessayer</Button></div>}
+
+      {store !== null && open && (
+        <StudioDetail t={t} studio={open} onBack={() => setOpenId(null)} onChange={updateStudio} onDelete={() => removeStudio(open.id)}
+          engineFile={engineFile} template={template} bridge={bridge} onTemplateSaved={setTemplate} today={today} />
+      )}
+
+      {store !== null && !open && (
+        <>
+          {panels.add && (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '4px 0 12px' }}>
+            <Field t={t} value={form.name} onChange={(v) => setForm({ ...form, name: v })} placeholder="Studio" onKeyDown={(e) => { if (e.key === 'Enter') addStudio() }} />
+            <Field t={t} value={form.role} onChange={(v) => setForm({ ...form, role: v })} placeholder="Poste visé" width={150} />
+            <Field t={t} value={form.link} onChange={(v) => setForm({ ...form, link: v })} placeholder="Site ou offre" width={200} />
+            <Button t={t} primary onClick={addStudio}>Ajouter</Button>
+          </div>
+          )}
+
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
+            <GlassPill t={t} onClick={() => setStatusFilter('all')} active={statusFilter === 'all'}>Tous {studios.length}</GlassPill>
+            {groupByStatus(studios).map((g) => (
+              <GlassPill key={g.key} t={t} statusKey={g.key} active={statusFilter === g.key} onClick={() => setStatusFilter(statusFilter === g.key ? 'all' : g.key)}>{g.label} {g.items.length}</GlassPill>
+            ))}
+            <span style={{ flex: 1, minWidth: 140 }}>
+              <Field t={t} value={query} onChange={setQuery} placeholder="Chercher un studio, un message…" width={200} />
+            </span>
+            <GlassPill t={t} onClick={() => toggle('filters')} active={panels.filters || filtersActive} title="Pertinence, type, nouveauté, fermées, source, tri">Filtres{filtersActive ? ' •' : ''}</GlassPill>
+            <GlassPill t={t} onClick={() => toggle('add')} active={panels.add} title="Ajouter un studio à la main">+ studio</GlassPill>
+          </div>
+
+          {(panels.filters || filtersActive) && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 22 }} aria-label="Filtres des annonces">
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                <GlassPill t={t} onClick={() => changeFilters({ tier: 'all' })} active={filters.tier === 'all'}>Toutes les annonces</GlassPill>
+                <GlassPill t={t} color={UI.green} onClick={() => changeFilters({ tier: filters.tier === 'high' ? 'all' : 'high' })} active={filters.tier === 'high'}>{TIERS[0].label}</GlassPill>
+                <GlassPill t={t} color={UI.orange} onClick={() => changeFilters({ tier: filters.tier === 'medium' ? 'all' : 'medium' })} active={filters.tier === 'medium'}>Pertinent et plus</GlassPill>
+                <span style={{ width: 8 }} />
+                {KINDS.map((kind) => <GlassPill key={kind.key} t={t} onClick={() => changeFilters({ kind: filters.kind === kind.key ? 'all' : kind.key })} active={filters.kind === kind.key}>{kind.label}</GlassPill>)}
+                <span style={{ width: 8 }} />
+                <GlassPill t={t} color={UI.blue} onClick={() => changeFilters({ onlyNew: !filters.onlyNew })} active={filters.onlyNew}>Nouveau</GlassPill>
+                <GlassPill t={t} color={UI.gray} onClick={() => changeFilters({ showClosed: !filters.showClosed })} active={filters.showClosed}>Fermées</GlassPill>
+                {sources.length > 1 && (
+                  <select value={filters.source} onChange={(e) => changeFilters({ source: e.target.value })} aria-label="Source"
+                    style={{ background: t.surface, color: t.textPrimary, border: `1px solid ${t.border}`, borderRadius: 999, padding: '4px 10px', fontFamily: P.sans, fontSize: 12.5 }}>
+                    <option value="all">Toutes les sources</option>
+                    {sources.map((name) => <option key={name} value={name}>{name}</option>)}
+                  </select>
+                )}
+                <GlassPill t={t} onClick={() => changeFilters({ sort: filters.sort === 'score' ? 'recent' : 'score' })}>{filters.sort === 'score' ? 'Tri : adéquation' : 'Tri : plus récent'}</GlassPill>
+              </div>
+
+              {/* 08 October 2026: Filtre par pays avec priorités (France, Japon, Royaume-Uni, USA, autres pays présents uniquement) */}
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', padding: '6px 10px', borderRadius: 8, background: 'rgba(255, 255, 255, 0.03)', border: `1px solid ${t.border}` }} aria-label="Filtre géographique par pays">
+                <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary, marginRight: 4 }}>Pays :</span>
+                <GlassPill t={t} onClick={() => changeFilters({ country: 'all' })} active={filters.country === 'all'}>
+                  Tous ({studios.length})
+                </GlassPill>
+                {countryData.priorityCountries.map((c) => (
+                  <GlassPill key={c.code} t={t} onClick={() => changeFilters({ country: filters.country === c.code ? 'all' : c.code })} active={filters.country === c.code}>
+                    {c.flag} {c.label} ({c.count})
+                  </GlassPill>
+                ))}
+                {countryData.otherCountries.length > 0 && (
+                  <select
+                    value={countryData.priorityCountries.some((c) => c.code === filters.country) || filters.country === 'all' ? 'none' : filters.country}
+                    onChange={(e) => changeFilters({ country: e.target.value === 'none' ? 'all' : e.target.value })}
+                    aria-label="Autres pays présents"
+                    style={{
+                      background: !countryData.priorityCountries.some((c) => c.code === filters.country) && filters.country !== 'all' ? 'rgba(255, 255, 255, 0.15)' : t.surface,
+                      color: t.textPrimary,
+                      border: `1px solid ${t.border}`,
+                      borderRadius: 999,
+                      padding: '4px 10px',
+                      fontFamily: P.sans,
+                      fontSize: 12.5,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <option value="none">
+                      {countryData.otherCountries.some((c) => c.code === filters.country)
+                        ? `Autre : ${countryData.otherCountries.find((c) => c.code === filters.country)?.label}`
+                        : `Autres pays (${countryData.otherCountries.length}) ▾`}
+                    </option>
+                    {countryData.otherCountries.map((c) => (
+                      <option key={c.code} value={c.code}>
+                        {c.flag} {c.label} ({c.count})
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {filters.country !== 'all' && (
+                  <button
+                    type="button"
+                    onClick={() => changeFilters({ country: 'all' })}
+                    title="Réinitialiser le filtre pays"
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      color: t.textSecondary,
+                      cursor: 'pointer',
+                      fontFamily: P.sans,
+                      fontSize: 12,
+                      marginLeft: 4,
+                      padding: '2px 6px',
+                    }}
+                  >
+                    Effacer filtre pays ✕
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {groupByStatus(shown).map((g) => (
+            <div key={g.key} style={{ marginBottom: 26 }}>
+              <SectionTitle t={t} title={g.label} count={g.items.length} />
+              {g.key === 'contacted' && (
+                <div style={{ fontFamily: P.sans, fontSize: 13, color: t.textSecondary, marginTop: -6, marginBottom: 14 }}>
+                  Candidatures envoyées : chronologie complète entre découverte de l’offre, premier contact et suivi.
+                </div>
+              )}
+              {g.key === 'declined' && (
+                <div style={{ fontFamily: P.sans, fontSize: 13, color: t.textSecondary, marginTop: -6, marginBottom: 14 }}>
+                  Refus reçus : « Copier le mail » prépare une demande de retour au studio (ce qui n’a pas marché), prête à coller.
+                </div>
+              )}
+              {/* 15 October 2026: a group draws its first cards and reveals the rest on request. 617 vacancies were 10 000 DOM nodes at once. */}
+              <div style={{ display: 'grid', gridTemplateColumns: P.studioGrid, gap: P.gap }}>
+                {(g.key === 'to_contact' ? sortStudios(g.items, filters.sort) : g.items).slice(0, limitOf(g.key)).map((s) => (g.key === 'declined'
+                  ? (
+                    <div key={s.id} style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }}>
+                      <StudioCard t={t} studio={s} today={today} onOpen={() => setOpenId(s.id)} />
+                      <FeedbackRequestShortcut t={t} studio={s} onOpen={() => setOpenId(s.id)} />
+                    </div>
+                  )
+                  : <StudioCard key={s.id} t={t} studio={s} today={today} onOpen={() => setOpenId(s.id)} />))}
+              </div>
+              {g.items.length > limitOf(g.key) && (
+                <div style={{ display: 'flex', justifyContent: 'center', marginTop: 14 }}>
+                  <GlassPill t={t} onClick={() => setLimits((current) => ({ ...current, [g.key]: limitOf(g.key) + CARD_PAGE }))}>
+                    Afficher {Math.min(CARD_PAGE, g.items.length - limitOf(g.key))} de plus · {g.items.length - limitOf(g.key)} restantes
+                  </GlassPill>
+                </div>
+              )}
+            </div>
+          ))}
+
+          {!shown.length && studios.length > 0 && (
+            <div style={{ fontFamily: P.sans, fontSize: 13.5, color: t.textSecondary, lineHeight: 1.6 }}>
+              Aucune fiche avec ces filtres. <button type="button" onClick={() => { setFilters(DEFAULT_FILTERS); storeFilters(DEFAULT_FILTERS); setStatusFilter('all'); setQuery('') }} style={{ background: 'none', border: 'none', color: 'inherit', textDecoration: 'underline', cursor: 'pointer', font: 'inherit' }}>Tout afficher</button>
+            </div>
+          )}
+          {!studios.length && (
+            <div style={{ fontFamily: P.sans, fontSize: 13.5, color: t.textSecondary, lineHeight: 1.6 }}>
+              {lane === 'other' ? 'Rien dans cette voie pour l’instant. Lance « Rechercher maintenant » : le moteur lit les appels d’offres BOAMP et TED et les flux de missions.' : 'Aucun studio pour l’instant. Lance « Rechercher maintenant » : le moteur remplit la liste, ou ajoute le premier avec « + studio ».'}
+            </div>
+          )}
+
+          <div style={{ marginTop: 34 }}>
+            <Panel t={t} title="Modèle de lettre" open={panels.template} onToggle={() => toggle('template')} aside={template ? (template.status === 'seed' ? 'ta lettre Asobo, à adapter' : 'personnalisé') : 'pas encore publié'}>
+              <FreelanceTemplate t={t} template={template} templatePath={PATHS.template} bridge={bridge} onSaved={setTemplate} />
+            </Panel>
+          </div>
+
+          {events.length > 0 && (
+            <div style={{ marginTop: 20 }}>
+              <SectionTitle t={t} title="Progression" count={events.length} />
+              <div style={{ display: 'grid', gap: 6 }}>
+                {events.map((e, i) => (
+                  <div key={i} onClick={() => setOpenId(e.id)} style={{ display: 'flex', gap: 10, alignItems: 'baseline', cursor: 'pointer', fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary }}>
+                    <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, minWidth: 128 }}>{readableDate(e.at)}</span>
+                    <span style={{ color: t.textPrimary }}>{e.studio}</span>
+                    <span>{e.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}

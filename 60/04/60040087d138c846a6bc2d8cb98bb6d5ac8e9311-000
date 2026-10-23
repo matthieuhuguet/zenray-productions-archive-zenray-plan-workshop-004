@@ -1,0 +1,790 @@
+import React, { useEffect, useRef, useState, useCallback } from 'react'
+import '@blocknote/mantine/style.css'
+import { getDefaultReactSlashMenuItems, SuggestionMenuController, useCreateBlockNote } from '@blocknote/react'
+import { BlockNoteView } from '@blocknote/mantine'
+import { safeMarkedParse } from '../safeMarked.js' // rendu Markdown SÛR (HTML brut échappé, anti-XSS) — voir src/safeMarked.js
+import Icon from './Icon.jsx'
+import { PALETTE } from '../theme.js'
+import { notify } from './Notifications.jsx'
+import NotionPasteMenu from './NotionPasteMenu.jsx'
+import { putLocalContent } from '../search/contentIndex.js'
+import { bnSchema, setBlockTheme, blocksForMarkdown } from './blocks/bnSchema.jsx'
+import { classifyUrl, sanitizeUrl } from './linkPaste/classifyUrl.js'
+import { EDITOR_IMAGE_MAX_BYTES, persistEditorImage, prepareEditorImage } from './editorImageUpload.js'
+import { IMAGE_ROW_TYPE, estImage, fusionner, fusionnerAvecVoisine, planifierLacher, propsRangee, sourceDeGlisse } from './blocks/imageRowDrop.js'
+// Pont de focus titre→corps : registre + fonction extraits dans un module léger (zéro dépendance
+// BlockNote) pour que l'import statique du pont depuis App.jsx n'embarque plus tout PageEditorBN dans
+// le chunk d'entrée (le React.lazy redevient réellement paresseux). Re-export pour ne casser aucun
+// importeur historique de focusPageBody depuis ce fichier.
+import { _focusBody, focusPageBody } from './focusPageBody.js'
+export { focusPageBody }
+
+// Édite une page dans BlockNote avec persistance JUMELLE :
+//   pages/x.md            (markdown lisible, dérivé)
+//   pages/x.blocknote.json(JSON BlockNote, source de vérité lossless, relu en priorité)
+// Sprint 4 : lien vers une autre page (mention) + navigation au clic (#page:nom).
+const SERIF = "var(--zr-police-serif)"
+const SANS = "var(--zr-police-sans)"
+const jsonPathOf = (mdPath) => mdPath.replace(/\.md$/, '.blocknote.json')
+
+// B-paste-table : détecte un tableau markdown GFM = au moins une ligne d'en-tête (contenant |) suivie d'une
+// ligne séparatrice |---|. Regex séparateur calquée sur le tokeniseur interne de BlockNote -> un simple
+// "chien | chat" (sans ligne ---) n'est PAS un tableau, donc zéro régression sur le texte normal.
+const MD_TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/
+function looksLikeMdTable(text) {
+  if (!text || !text.includes('|')) return false
+  const lines = text.split('\n')
+  for (let i = 0; i + 1 < lines.length; i++) {
+    if (lines[i].includes('|') && MD_TABLE_SEP.test(lines[i + 1])) return true
+  }
+  return false
+}
+// Repli : extrait la 1re <table> d'un fragment HTML et la reconstruit en markdown GFM. Le tokeniseur interne
+// de BlockNote sait transformer ce markdown en VRAI bloc table (chaîne vérifiée), même quand le parse HTML
+// direct échoue (table stylée, wrappers Claude.ai/Notion...). Spans non gérés (tables simples = cas réel).
+function htmlTableToMarkdown(html) {
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html')
+    const table = doc.querySelector('table')
+    if (!table) return null
+    const rows = Array.from(table.querySelectorAll('tr'))
+      .map((tr) => Array.from(tr.querySelectorAll('th,td')).map((td) => (td.textContent || '').replace(/\s+/g, ' ').trim().replace(/\|/g, '\\|')))
+      .filter((r) => r.length)
+    if (!rows.length) return null
+    const nCol = Math.max(...rows.map((r) => r.length))
+    const pad = (r) => { const c = r.slice(); while (c.length < nCol) c.push(''); return c }
+    const line = (cells) => '| ' + pad(cells).join(' | ') + ' |'
+    const sep = '| ' + Array.from({ length: nCol }, () => '---').join(' | ') + ' |'
+    return [line(rows[0]), sep, ...rows.slice(1).map(line)].join('\n')
+  } catch { return null }
+}
+
+// T13 — pont de focus titre→corps : PageEditorBN enregistre ci-dessous (useEffect) une fonction
+// "focus 1er bloc" pour son `path` dans le registre `_focusBody` (importé de ./focusPageBody.js) ;
+// l'input titre (PropertiesBlock, App.jsx) appelle focusPageBody(path) quand on presse Entrée.
+const pretty = (n) => n.replace(/\.md$/, '').replace(/-[a-z0-9]{1,4}$/, '')
+
+async function readFile(path) {
+  return fetch(`/api/page?action=read&path=${encodeURIComponent(path)}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+}
+async function saveFile(path, content, sha) {
+  return fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'save', path, markdown: content, sha }) }).then((r) => r.json()).catch(() => null)
+}
+
+export default function PageEditorBN({ path, theme = 'light', onOpenPage, hideTitle = false, maxW = 608 }) {
+  const [status, setStatus] = useState('chargement…')
+  const [pages, setPages] = useState([])
+  const [picker, setPicker] = useState(false)
+  const [pasteChoice, setPasteChoice] = useState(null) // C47 menu Notion au collage d'URL : { url, anchor, createdAt }
+  const shas = useRef({ md: null, json: null })
+  const [comments, setComments] = useState([])
+  const [draft, setDraft] = useState('')
+  const [mdRaw, setMdRaw] = useState('')
+  const [embeds, setEmbeds] = useState([]) // C5 transclusion légère : aperçu read-only des pages liées (#page:)
+  const cSha = useRef(null)
+  const cChain = useRef(Promise.resolve()) // sérialise les écritures de commentaires (anti-race sur cSha)
+  const dirty = useRef(false)        // edits non encore sauvegardés
+  const saveTimer = useRef(null)     // debounce autosave
+  const ready = useRef(false)        // ignore les onChange émis pendant le chargement initial
+  const saveRef = useRef(null)       // toujours le save() du rendu courant (anti-staleness)
+  const commentsPath = path.replace(/\.md$/, '.comments.json')
+
+  useEffect(() => {
+    cSha.current = null; setComments([]); setDraft(''); cChain.current = Promise.resolve()
+    readFile(commentsPath).then((j) => { if (j && j.markdown && !j.missing) { cSha.current = j.sha; try { setComments(JSON.parse(j.markdown).comments || []) } catch {} } })
+  }, [path])
+  // Écriture SÉRIALISÉE des commentaires (editor-3). Deux ajouts rapides, ou un ajout pendant qu'une
+  // suppression est en vol, partaient avant avec le MÊME cSha de base -> GitHub refuse le second PUT
+  // (409 conflict), le commentaire était perdu silencieusement. On enchaîne les écritures sur une seule
+  // promesse (une à la fois) et, sur conflit, on relit le sha frais et on retente une fois. La liste
+  // `list` passée est l'état React faisant foi : le retry réémet simplement le PUT avec le bon sha.
+  const writeComments = (list) => {
+    const run = async () => {
+      let j = await saveFile(commentsPath, JSON.stringify({ comments: list }), cSha.current)
+      if (j && j.error === 'conflict') {
+        const fresh = await readFile(commentsPath)
+        if (fresh && fresh.sha) { cSha.current = fresh.sha; j = await saveFile(commentsPath, JSON.stringify({ comments: list }), cSha.current) }
+      }
+      if (j && j.ok) cSha.current = j.sha
+      // Résiduel : un échec réseau réel qui survit même au retry post-conflit (pas juste un 409). Le
+      // commentaire reste affiché localement (state React déjà à jour) mais N'EST PAS persisté — sans ce
+      // notify(), l'utilisateur croit son commentaire sauvé alors qu'il disparaît au prochain reload.
+      else notify({ kind: 'error', title: 'Commentaire non sauvegardé', body: 'La sauvegarde a échoué — le commentaire reste affiché mais sera perdu au rechargement. Réessaie.', ttl: 9000 })
+    }
+    cChain.current = cChain.current.then(run, run)
+    return cChain.current
+  }
+  const addComment = () => {
+    if (!draft.trim()) return
+    const list = [...comments, { id: 'c' + Date.now(), text: draft.trim(), ts: Date.now() }]
+    setComments(list); setDraft('')
+    writeComments(list)
+  }
+  const delComment = (id) => {
+    const list = comments.filter((c) => c.id !== id); setComments(list)
+    writeComments(list)
+  }
+
+  // TELEVERSER UNE IMAGE, ECRIT UNE FOIS. `uploadFile` de BlockNote et le lacher qui fabrique une
+  // rangee de deux images appellent le MEME chemin : preparation, envoi, notification. En ecrire un
+  // second aurait fait diverger les messages d'erreur et la politique de taille au premier reglage.
+  const televerserImage = useCallback(async (file) => {
+    const prepared = await prepareEditorImage(file)
+    if (!prepared) {
+      notify({ title: 'Image trop lourde', body: `Impossible de rester sous ${Math.round(EDITOR_IMAGE_MAX_BYTES / 1024 / 1024)} Mo sans trop dégrader l’image. Utilise l’import média Create.`, label: 'Insertion annulée', icon: 'exclamationmark.triangle', tint: '#FF3B30', ttl: 14000 })
+      throw new Error('editor-image-too-large')
+    }
+    try {
+      const j = await persistEditorImage(prepared.dataUrl)
+      notify({ kind: 'image', label: 'GitHub · zenray-content', title: (file && file.name) || 'image', body: `Image commitée et poussée sur GitHub (${j.path}) · intégrée à cette page` })
+      return j.url
+    } catch (error) {
+      notify({ title: 'Image non ajoutée', body: error?.status === 413 ? 'Le serveur a refusé une image encore trop lourde.' : 'L’upload GitHub a échoué après plusieurs tentatives. Le document reste intact : aucun data-URI n’a été inséré.', label: 'Échec d’upload', icon: 'exclamationmark.triangle', tint: '#FF3B30', ttl: 14000 })
+      throw error
+    }
+  }, [])
+
+  const editor = useCreateBlockNote({
+    schema: bnSchema,
+    uploadFile: async (file) => {
+      // Le document ne reçoit JAMAIS le data-URI comme repli : un échec réseau
+      // ne peut donc plus gonfler définitivement le JSON/Markdown Git.
+      return televerserImage(file)
+    },
+  })
+
+  // ── Sélection multi-blocs au curseur (marquee façon Notion) ───────────────────────────────────
+  // Glisser un rectangle dans la marge / zone vide de l'éditeur sélectionne les BLOCS traversés (pas du
+  // texte). On utilise l'API native editor.setSelection (qui pose une TextSelection multi-blocs) ; le
+  // surlignage "bloc plein" est peint à la main (classe .zr-bn-blockselected) car setSelection ne pose pas
+  // de NodeSelection. Suppr appelle editor.removeBlocks (sinon ProseMirror fusionne et laisse un bloc vide).
+  // ── LACHER UNE IMAGE SUR LE BORD D'UNE AUTRE = LES METTRE COTE A COTE ────────────────────────
+  // Le VERDICT (quel bord, quelle action) vit dans `blocks/imageRowDrop.js`, qui se teste sans
+  // navigateur ; ici on ne fait que mesurer la position et appliquer ce qu'il decide. Un
+  // glisser-deposer ne se teste qu'a la main, donc on en sort tout ce qui peut s'en passer.
+  //
+  // On n'intercepte QUE le cas des bords. Lache au centre, ou ailleurs dans la page, le fichier
+  // continue son chemin habituel vers BlockNote, qui insere une image normale : ce mecanisme ajoute
+  // une possibilite, il n'en retire aucune.
+  const [cibleRangee, setCibleRangee] = useState(null) // { id, cote } pendant le survol
+  const lireCible = useCallback((e) => {
+    // DEUX SOURCES DE GLISSE, ET LA SECONDE MANQUAIT (correctif du 2026-08-29). Un fichier venu du
+    // disque annonce `Files` dans `dataTransfer.types` ; un bloc glisse DEPUIS le document, lui,
+    // annonce `blocknote/html` et jamais `Files`. Ne tester que `Files` rejetait donc tout glisser
+    // interne, c'est-a-dire exactement le cas de Matthieu : deux images deja dans la page. Le
+    // symptome etait visible et je ne l'ai pas lu : la barre affichee restait HORIZONTALE, celle de
+    // BlockNote qui insere avant ou apres, alors que la mienne est verticale et colle a un bord.
+    if (!sourceDeGlisse(e.dataTransfer?.types, blocGlisse.current)) return null
+    const el = e.target instanceof Element ? e.target.closest('[data-id]') : null
+    if (!el || !editor) return null
+    const id = el.getAttribute('data-id')
+    let bloc = null
+    try { bloc = editor.getBlock(id) } catch {}
+    if (!bloc) return null
+    const boite = el.getBoundingClientRect()
+    const plan = planifierLacher({ typeBloc: bloc.type, propsBloc: bloc.props, x: e.clientX - boite.left, largeur: boite.width })
+    return plan ? { id, bloc, plan } : null
+  }, [editor])
+
+  const survolRangee = useCallback((e) => {
+    const c = lireCible(e)
+    if (!c) { setCibleRangee((v) => (v ? null : v)); return }
+    e.preventDefault()
+    // ON COUPE L'EVENEMENT ICI, en phase de capture, sinon ProseMirror le recoit et pose SA barre
+    // horizontale d'insertion. Les deux repères s'afficheraient alors ensemble, et celui qui parle
+    // le plus fort dirait le contraire du geste qu'on est en train de faire. On ne coupe que sur un
+    // bord : au centre, l'evenement continue son chemin et l'insertion normale garde son sens.
+    e.stopPropagation()
+    e.dataTransfer.dropEffect = blocGlisse.current ? 'move' : 'copy'
+    // LE REPERE SE MESURE SUR L'ELEMENT SURVOLE, il ne se devine pas : la page defile, l'image peut
+    // etre a n'importe quelle hauteur, et une barre posee a une coordonnee fixe se retrouverait
+    // ailleurs des le premier defilement. On garde donc la boite reelle, relative au conteneur.
+    const el = e.target instanceof Element ? e.target.closest('[data-id]') : null
+    const wrap = editorWrapRef.current
+    let repere = null
+    if (el && wrap) {
+      const b = el.getBoundingClientRect(), w = wrap.getBoundingClientRect()
+      repere = { top: b.top - w.top, hauteur: b.height, x: (c.plan.cote === 'gauche' ? b.left : b.right) - w.left }
+    }
+    setCibleRangee({ id: c.id, cote: c.plan.cote, repere })
+  }, [lireCible])
+
+  // QUEL BLOC EST EN TRAIN D'ETRE GLISSE. BlockNote saisit un bloc par sa poignee, qui vit A COTE du
+  // bloc et non dedans : au `dragstart`, `e.target` est donc la poignee, et l'on ne peut pas en
+  // deduire le bloc. Le dernier bloc SURVOLE fait foi, puisque c'est son survol qui a fait
+  // apparaitre la poignee qu'on vient de saisir.
+  const dernierSurvole = useRef(null)
+  const blocGlisse = useRef(null)
+  const noterSurvol = useCallback((e) => {
+    const el = e.target instanceof Element ? e.target.closest('[data-id]') : null
+    if (el) dernierSurvole.current = el.getAttribute('data-id')
+  }, [])
+  const debutGlisse = useCallback(() => {
+    let b = null
+    try { b = dernierSurvole.current && editor ? editor.getBlock(dernierSurvole.current) : null } catch {}
+    blocGlisse.current = estImage(b) ? b : null
+  }, [editor])
+
+  // L'ECOUTE SE FAIT SUR LE DOCUMENT, pas sur le conteneur. La poignee de glisse de BlockNote est
+  // rendue par son menu lateral, qui peut vivre dans un portail hors de notre arbre : un ecouteur
+  // pose sur le conteneur ne verrait alors jamais partir le glisser, et le mecanisme resterait mort
+  // sans rien signaler. Le `dragend` remet le drapeau a zero, sans quoi un glisser abandonne
+  // laisserait croire au suivant qu'une image est en main.
+  useEffect(() => {
+    const debut = () => debutGlisse()
+    const fin = () => { blocGlisse.current = null; setCibleRangee(null) }
+    document.addEventListener('dragstart', debut, true)
+    document.addEventListener('dragend', fin, true)
+    document.addEventListener('drop', fin)
+    return () => {
+      document.removeEventListener('dragstart', debut, true)
+      document.removeEventListener('dragend', fin, true)
+      document.removeEventListener('drop', fin)
+    }
+  }, [debutGlisse])
+
+  // TROIS CHEMINS VERS LE MEME RESULTAT, et c'est voulu : un geste peut echouer ou ne pas etre
+  // devine, une commande ne rate jamais. Matthieu, le 2026-08-29 : « je peux pas mettre 2 images
+  // cote a cote ? je parle de gauche droite ». Le premier jet ne couvrait que le lacher d'un
+  // FICHIER venu du disque, alors que son cas etait deux images DEJA dans la page.
+  const lacherRangee = useCallback(async (e) => {
+    const c = lireCible(e)
+    setCibleRangee(null)
+    if (!c) { blocGlisse.current = null; return }
+
+    // (a) Une image du document glissee sur le bord d'une autre : on accole, sans rien televerser.
+    const source = blocGlisse.current
+    blocGlisse.current = null
+    if (source && c.bloc && source.id !== c.bloc.id && c.plan.action === 'creerRangee') {
+      e.preventDefault(); e.stopPropagation()
+      const gauche = c.plan.cote === 'gauche' ? source : c.bloc
+      const droite = c.plan.cote === 'gauche' ? c.bloc : source
+      const f = fusionner(gauche, droite)
+      if (f) { try { editor.replaceBlocks([c.bloc], [f.rangee]); editor.removeBlocks([source]) } catch {} }
+      return
+    }
+
+    // (b) Un fichier lache sur un bord : il faut d'abord le televerser.
+    const fichier = [...(e.dataTransfer.files || [])].find((f) => f && f.type.startsWith('image/'))
+    if (!fichier) return
+    e.preventDefault()
+    e.stopPropagation()
+    let url = null
+    try { url = await televerserImage(fichier) } catch { return }
+    if (!url) return
+    try {
+      if (c.plan.action === 'creerRangee') {
+        editor.replaceBlocks([c.bloc], [{
+          type: IMAGE_ROW_TYPE,
+          props: propsRangee({ urlExistante: c.plan.urlExistante, legendeExistante: c.plan.legendeExistante, urlDeposee: url, cote: c.plan.cote }),
+        }])
+      } else {
+        const cle = c.plan.cote === 'gauche' ? 'gauche' : 'droite'
+        editor.updateBlock(c.bloc, { props: { ...c.bloc.props, [cle]: url } })
+      }
+    } catch {}
+  }, [editor, lireCible, televerserImage])
+
+  // (c) LA COMMANDE, qui ne depend d'aucun geste. Elle prend l'image ou se trouve le curseur et
+  // l'accole a sa voisine, celle d'apres en priorite puisque « mettre a cote » se lit de gauche a
+  // droite. Exposee dans le menu « / » plus bas.
+  const accolerImages = useCallback(() => {
+    if (!editor) return false
+    let courant = null
+    try { courant = editor.getTextCursorPosition().block } catch {}
+    const id = (courant && courant.id) || dernierSurvole.current
+    const f = fusionnerAvecVoisine(editor.document, id)
+    if (!f) {
+      notify({ title: 'Aucune voisine à accoler', body: 'Place le curseur sur une image qui touche une autre image, au-dessus ou en dessous.', label: 'Deux images côte à côte', icon: 'photo.on.rectangle', ttl: 9000 })
+      return false
+    }
+    try {
+      editor.replaceBlocks([f.aSupprimer[0]], [f.rangee])
+      editor.removeBlocks([f.aSupprimer[1]])
+      return true
+    } catch { return false }
+  }, [editor])
+
+  // LACHER PLUSIEURS IMAGES A LA FOIS (2026-08-29). BlockNote n'en prend qu'une par lacher ; sur un
+  // lot de trois exercices, deux disparaissaient sans un mot. On televerse en PARALLELE, ce qui
+  // divise l'attente par le nombre de fichiers, mais on insere dans l'ORDRE du lot : `Promise.all`
+  // preserve l'ordre des resultats, alors que `Promise.race` ou une boucle de `then` rendrait un
+  // ordre dicte par le poids des fichiers.
+  const lacherPlusieurs = useCallback(async (e) => {
+    const images = [...(e.dataTransfer?.files || [])].filter((f) => f && f.type.startsWith('image/'))
+    if (images.length < 2) return
+    e.preventDefault()
+    e.stopPropagation()
+    const urls = await Promise.all(images.map((f) => televerserImage(f).catch(() => null)))
+    const blocs = urls.filter(Boolean).map((url) => ({ type: 'image', props: { url } }))
+    if (!blocs.length) return
+    try {
+      const doc = editor.document
+      const ancre = doc[doc.length - 1]
+      editor.insertBlocks(blocs, ancre, 'after')
+    } catch {}
+    const perdus = urls.length - blocs.length
+    if (perdus > 0) notify({ title: `${perdus} image${perdus > 1 ? 's' : ''} non ajoutée${perdus > 1 ? 's' : ''}`, body: 'Les autres sont en place. Réessaie celles-ci, ou passe par l’import média Create.', label: 'Import partiel', icon: 'exclamationmark.triangle', tint: '#FF9F0A', ttl: 12000 })
+  }, [editor, televerserImage])
+
+  const editorWrapRef = useRef(null)
+  const [marquee, setMarquee] = useState(null)
+  // PLACEHOLDER « lettre par lettre » : on REMPLACE le placeholder natif de BlockNote (insécable, sur ::after)
+  // par un overlay où CHAQUE lettre est un <span> animé. Un animation-delay NÉGATIF décalé par lettre crée une
+  // vague d'opacité continue (fade in/out) qui traverse le texte — fluide à 60 fps (animation d'opacité = compositée).
+  // L'overlay est positionné dynamiquement sur le 1er bloc vide (mêmes coordonnées + police que le texte saisi).
+  const PH_TEXT = "Enter text or type '/' for commands"
+  const [phPos, setPhPos] = useState(null) // { top, left, fs, lh } ou null (pas vide)
+  const updatePh = useCallback(() => {
+    const wrap = editorWrapRef.current
+    const hide = () => setPhPos((p) => (p ? null : p))
+    if (!wrap || !editor) return hide()
+    let empty = false
+    try { const d = editor.document; empty = d.length === 1 && d[0].type === 'paragraph' && (!d[0].content || d[0].content.length === 0) } catch {}
+    if (!empty) return hide()
+    const block = wrap.querySelector('.bn-block-content')
+    if (!block) return hide()
+    const inline = block.querySelector('.bn-inline-content') || block
+    const r = inline.getBoundingClientRect(), wr = wrap.getBoundingClientRect()
+    const cs = getComputedStyle(inline)
+    setPhPos({ top: r.top - wr.top, left: r.left - wr.left, fs: cs.fontSize, lh: cs.lineHeight })
+  }, [editor])
+  useEffect(() => {
+    updatePh()
+    const raf = requestAnimationFrame(updatePh); const t = setTimeout(updatePh, 300)
+    let ro; try { ro = new ResizeObserver(updatePh); if (editorWrapRef.current) ro.observe(editorWrapRef.current) } catch {}
+    window.addEventListener('resize', updatePh)
+    return () => { cancelAnimationFrame(raf); clearTimeout(t); if (ro) ro.disconnect(); window.removeEventListener('resize', updatePh) }
+  }, [updatePh])
+  const selIdsRef = useRef([])
+  const clearBlockSel = () => { selIdsRef.current = []; const w = editorWrapRef.current; if (w) w.querySelectorAll('.zr-bn-blockselected').forEach((el) => el.classList.remove('zr-bn-blockselected')) }
+  const paintBlockSel = (ids) => {
+    const w = editorWrapRef.current; if (!w) return
+    w.querySelectorAll('.zr-bn-blockselected').forEach((el) => el.classList.remove('zr-bn-blockselected'))
+    const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s)
+    ids.forEach((id) => { const el = w.querySelector(`.bn-block-outer[data-id="${esc(id)}"]`); if (el) el.classList.add('zr-bn-blockselected') })
+  }
+  const startBlockMarquee = (ev) => {
+    if (ev.button !== 0) return
+    const wrap = editorWrapRef.current; if (!wrap) return
+    const tgt = ev.target
+    // Démarrer SEULEMENT hors zone éditable / side menu / contrôles -> sinon on laisse la sélection texte normale.
+    if (tgt.closest && tgt.closest('.bn-block-content, .bn-inline-content, [contenteditable="true"], .bn-side-menu, button, a, input, textarea, [role="toolbar"]')) { clearBlockSel(); return }
+    if (!tgt.closest || !tgt.closest('.bn-editor, .ProseMirror, .bn-block-outer, .bn-container')) return
+    clearBlockSel()
+    const sx = ev.clientX, sy = ev.clientY
+    let moved = false
+    const recompute = (e) => {
+      const vl = Math.min(sx, e.clientX), vt = Math.min(sy, e.clientY)
+      const ww = Math.abs(e.clientX - sx), hh = Math.abs(e.clientY - sy)
+      if (ww > 3 || hh > 3) moved = true
+      const cr = wrap.getBoundingClientRect()
+      setMarquee({ l: vl - cr.left, t: vt - cr.top, w: ww, h: hh })
+      const hit = []
+      wrap.querySelectorAll('.bn-block-outer[data-id]').forEach((el) => {
+        const r = el.getBoundingClientRect()
+        if (!(r.left < vl + ww && r.right > vl && r.top < vt + hh && r.bottom > vt)) return
+        // garde anti-imbrication : ignorer un bloc dont un ancêtre .bn-block-outer est aussi intersecté.
+        const parentOuter = el.parentElement && el.parentElement.closest('.bn-block-outer')
+        if (parentOuter) { const pr = parentOuter.getBoundingClientRect(); if (pr.left < vl + ww && pr.right > vl && pr.top < vt + hh && pr.bottom > vt) return }
+        hit.push({ id: el.getAttribute('data-id'), top: r.top })
+      })
+      hit.sort((a, b) => a.top - b.top)
+      const ids = hit.map((x) => x.id)
+      selIdsRef.current = ids
+      paintBlockSel(ids)
+      if (ids.length >= 2) { try { editor.setSelection(ids[0], ids[ids.length - 1]) } catch {} } // throw si 1 seul id / bloc sans contenu -> avalé
+    }
+    // Throttle rAF : un drag lent sur un long document envoie des dizaines de mousemove/s, chacun relançant
+    // querySelectorAll + getBoundingClientRect sur TOUS les blocs — coalescé à 1 recompute par frame peinte
+    // (même motif que le scroll de VirtualIconGrid), sans jamais perdre la dernière position.
+    let raf = 0, pending = null
+    const move = (e) => {
+      pending = e
+      if (raf) return
+      raf = requestAnimationFrame(() => { raf = 0; if (pending) recompute(pending) })
+    }
+    const up = () => {
+      if (raf) { cancelAnimationFrame(raf); raf = 0 }
+      window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up)
+      setMarquee(null)
+      if (moved && selIdsRef.current.length) { try { editor.focus() } catch {} } else clearBlockSel()
+    }
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up)
+  }
+
+  useEffect(() => {
+    fetch('/api/page?action=list', { cache: 'no-store' }).then((r) => r.json()).then((j) => setPages(j.pages || [])).catch(() => {})
+  }, [])
+
+  // T13 — enregistre la fonction "placer le curseur au début du 1er bloc du corps" pour ce path.
+  // Si le corps est vide on insère un paragraphe vide pour avoir une cible de curseur.
+  useEffect(() => {
+    _focusBody[path] = () => {
+      try {
+        let first = editor.document[0]
+        if (!first) { editor.insertBlocks([{ type: 'paragraph' }], editor.document[0] || undefined); first = editor.document[0] }
+        editor.focus()
+        editor.setTextCursorPosition(first, 'start')
+      } catch {}
+    }
+    return () => { delete _focusBody[path] }
+  }, [path, editor])
+
+  // Le custom block lit le thème courant via ce store (useCreateBlockNote fige le schéma à la création).
+  useEffect(() => { setBlockTheme(theme) }, [theme])
+  // Ferme le menu de collage au changement de page.
+  useEffect(() => { setPasteChoice(null); clearBlockSel() }, [path])
+
+  useEffect(() => {
+    let alive = true
+    ready.current = false
+    setStatus('chargement…')
+    shas.current = { md: null, json: null }
+    ;(async () => {
+      const jp = jsonPathOf(path)
+      const jr = await readFile(jp)
+      if (!alive) return
+      let loadedFromJson = false
+      if (jr && jr.markdown && !jr.missing) {
+        shas.current.json = jr.sha
+        try { const blocks = JSON.parse(jr.markdown); if (Array.isArray(blocks) && blocks.length) { editor.replaceBlocks(editor.document, blocks); loadedFromJson = true } } catch {}
+      }
+      const mr = await readFile(path)
+      if (!alive) return
+      if (mr) {
+        shas.current.md = mr.sha
+        setMdRaw(mr.markdown || '')
+        if (!loadedFromJson && mr.markdown) {
+          try { const blocks = await editor.tryParseMarkdownToBlocks(mr.markdown); editor.replaceBlocks(editor.document, blocks) } catch {}
+        }
+      }
+      // Anti-doublon Notion : le titre est déjà affiché en tête, on retire le H1 du corps s'il répète le titre.
+      try {
+        const titleText = pretty(path.split('/').pop()).trim().toLowerCase()
+        const first = editor.document[0]
+        if (first && first.type === 'heading' && first.props && first.props.level === 1) {
+          const txt = (first.content || []).map((c) => (c && c.text) || '').join('').trim().toLowerCase()
+          if (txt && txt === titleText) editor.removeBlocks([first])
+        }
+      } catch {}
+      if (alive) { setStatus('enregistré'); setTimeout(() => { ready.current = true }, 300) }
+    })()
+    // flush au changement de page / démontage : sauvegarde les edits en attente AVANT de charger une autre page.
+    return () => { alive = false; if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null } if (dirty.current) { dirty.current = false; save() } }
+  }, [path])
+
+  const save = async () => {
+    setStatus('enregistrement…')
+    const blocks = editor.document
+    const json = JSON.stringify(blocks)
+    let md = ''
+    // Markdown dérivé lisible : les custom blocks (zenrayEmbed/zenrayBookmark) deviennent un paragraphe-lien
+    // dans un CLONE (jamais de mutation de editor.document). Le .blocknote.json garde la structure complète.
+    try { md = await editor.blocksToMarkdownLossy(blocksForMarkdown(blocks)) } catch { md = '' }
+    // editor-6 — le H1 répétant le titre est retiré du corps in-app (porté par .props.json), donc le .md
+    // dérivé n'avait plus AUCUN titre de niveau 1 : un .md exporté ou lu brut sur GitHub s'ouvrait sans
+    // titre visible. On reconstruit un « # <titre> » en tête du .md SI le corps ne commence pas déjà par
+    // un H1. Le titre source = nom de fichier joli (pretty), toujours disponible et stable. Le
+    // .blocknote.json (source de vérité in-app) reste inchangé, sans H1 redondant.
+    {
+      const titleMd = pretty(path.split('/').pop()).trim()
+      if (titleMd && !/^\s*#\s/.test(md)) md = `# ${titleMd}\n\n${md}`
+    }
+    // ANTI-PERTE (audit Y1) : sur CONFLIT (sha périmé, ex. 2e onglet / auto-sync), on ne reste PAS bloqué avec
+    // un sha mort (sinon l'autosave rebouclait en échec et les edits n'étaient JAMAIS sauvés). On reprend le sha
+    // FRAIS renvoyé par le serveur et on re-save (l'éditeur courant fait foi pour ce doc à éditeur unique).
+    const okJson = await saveTwin(jsonPathOf(path), json, 'json')
+    const okMd = await saveTwin(path, md, 'md')
+    // AUTO-INDEX : le contenu de cette page devient cherchable immédiatement (recherche plein-texte locale),
+    // sans relancer l'index serveur. Best-effort, n'impacte pas le statut de sauvegarde.
+    if (okMd) { try { putLocalContent(path, md) } catch {} }
+    setStatus(okJson && okMd ? 'enregistré (md + json)' : 'erreur de sauvegarde')
+  }
+  const saveTwin = async (p, content, slot) => {
+    let j = await saveFile(p, content, shas.current[slot])
+    if (j && j.conflict) { shas.current[slot] = j.sha || null; j = await saveFile(p, content, shas.current[slot]) }
+    if (j && j.ok) { shas.current[slot] = j.sha; return true }
+    return false
+  }
+  saveRef.current = save
+  const onKeyDown = (e) => {
+    const bsel = selIdsRef.current
+    if (bsel && bsel.length) {
+      // Sélection multi-blocs active (après un marquee) : Suppr/Backspace efface PROPREMENT les blocs.
+      if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); try { editor.removeBlocks(bsel) } catch {} clearBlockSel(); return }
+      // Toute autre touche non-modificatrice sort du mode sélection-blocs (la frappe reprend normalement).
+      // Cmd/Ctrl (ex Cmd+C copie native) et Shift sont préservés -> la sélection persiste pour la copie.
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key !== 'Shift') clearBlockSel()
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null } dirty.current = false; save() }
+  }
+
+  // Sauvegarde AUTOMATIQUE robuste : à chaque edit (debounce 2 s) + filet de sécurité toutes les 30 s + flush au changement de page.
+  const onBodyChange = () => {
+    updatePh() // recalcule l'overlay placeholder (apparition/disparition selon vide)
+    if (!ready.current) return
+    dirty.current = true
+    setStatus('modifié…')
+    if (saveTimer.current) clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(() => { saveTimer.current = null; if (dirty.current) { dirty.current = false; save() } }, 2000)
+  }
+  useEffect(() => {
+    const iv = setInterval(() => { if (dirty.current && saveRef.current) { dirty.current = false; saveRef.current() } }, 30000)
+    return () => clearInterval(iv)
+  }, [])
+  // editor-7 — filet supplémentaire : onglet caché (cmd-tab, bascule d'app) ou fermeture imminente du
+  // navigateur DANS la fenêtre de débounce (2 s) -> on force un flush immédiat des edits non sauvegardés.
+  // Le flush au changement de page (L143) couvre la navigation interne ; ceci couvre la sortie brutale.
+  useEffect(() => {
+    const flush = () => { if (dirty.current && saveRef.current) { dirty.current = false; if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null } saveRef.current() } }
+    const onVis = () => { if (document.visibilityState === 'hidden') flush() }
+    document.addEventListener('visibilitychange', onVis)
+    window.addEventListener('beforeunload', flush)
+    return () => { document.removeEventListener('visibilitychange', onVis); window.removeEventListener('beforeunload', flush) }
+  }, [])
+
+  // C5 — transclusion légère : repère les liens #page: dans le markdown, charge le contenu des pages liées, rend un aperçu read-only.
+  useEffect(() => {
+    let alive = true
+    const names = [...new Set([...(mdRaw || '').matchAll(/#page:([^)\s"'\]]+)/g)].map((m) => { try { return decodeURIComponent(m[1]) } catch { return m[1] } }))]
+    if (!names.length || !pages.length) { setEmbeds([]); return }
+    ;(async () => {
+      const out = []
+      for (const name of names.slice(0, 6)) {
+        const p = pages.find((x) => x.name === name || x.name.toLowerCase() === String(name).toLowerCase())
+        if (!p || p.path === path) continue
+        const r = await readFile(p.path)
+        if (r && r.markdown && !r.missing) out.push({ name: p.name, path: p.path, md: r.markdown })
+      }
+      if (alive) setEmbeds(out)
+    })()
+    return () => { alive = false }
+  }, [mdRaw, pages, path])
+
+  const linkToPage = (p) => {
+    setPicker(false)
+    try {
+      editor.insertInlineContent([{ type: 'link', href: `#page:${encodeURIComponent(p.name)}`, content: pretty(p.name) }, ' '])
+    } catch {}
+  }
+  const onClickCapture = (e) => {
+    const a = e.target.closest && e.target.closest('a[href^="#page:"]')
+    if (a) { e.preventDefault(); e.stopPropagation(); if (onOpenPage) onOpenPage(decodeURIComponent(a.getAttribute('href').slice(6))) }
+  }
+  // C47 — collage d'une URL HTTP(S) UNIQUE (sans espace ni saut de ligne) -> popover Notion "Paste as".
+  // On N'intercepte PAS : texte multi-ligne, collage image/fichier, ou collage dans un input/textarea (commentaire).
+  const onPaste = (e) => {
+    if (e.target && e.target.closest && e.target.closest('input,textarea')) return
+    // Bloc de code : une URL collée doit rester du texte brut, pas déclencher le menu.
+    if (e.target && e.target.closest && e.target.closest('[data-content-type="codeBlock"], pre, code')) return
+    if (e.clipboardData && e.clipboardData.files && e.clipboardData.files.length) return
+
+    // B-paste-table : un VRAI tableau collé (HTML <table> depuis le web/Sheets/Notion, ou markdown GFM depuis
+    // Claude.ai) devient un bloc table BlockNote, au lieu d'être aplati en paragraphe par le collage natif.
+    // tryParseHTMLToBlocks / tryParseMarkdownToBlocks sont SYNCHRONES en @blocknote/core 0.51.3.
+    try {
+      const html = (e.clipboardData && e.clipboardData.getData('text/html')) || ''
+      const plain = (e.clipboardData && e.clipboardData.getData('text/plain')) || ''
+      let blocks = null
+      if (/<table[\s>]/i.test(html)) {
+        blocks = editor.tryParseHTMLToBlocks(html)
+        // Repli FIABLE si le parse HTML direct n'a pas produit de tableau : HTML <table> -> markdown GFM -> blocs.
+        if (!(Array.isArray(blocks) && blocks.some((b) => b && b.type === 'table'))) {
+          const md = htmlTableToMarkdown(html)
+          if (md) blocks = editor.tryParseMarkdownToBlocks(md)
+        }
+      } else if (looksLikeMdTable(plain)) {
+        blocks = editor.tryParseMarkdownToBlocks(plain)
+      }
+      // Double garde : on n'intercepte QUE si le parse a réellement produit un bloc table ; sinon on laisse
+      // le collage natif faire son travail (aucune perte). insertBlocks est synchrone -> pas de double-collage.
+      if (Array.isArray(blocks) && blocks.some((b) => b && b.type === 'table')) {
+        e.preventDefault(); e.stopPropagation()
+        editor.insertBlocks(blocks, editor.getTextCursorPosition().block, 'after')
+        return
+      }
+    } catch {}
+
+    const txt = (e.clipboardData && e.clipboardData.getData('text/plain') || '').trim()
+    if (!/^https?:\/\/[^\s]+$/.test(txt) || txt.includes('\n')) return
+    e.preventDefault(); e.stopPropagation()
+    // Ancre près du caret : sélection DOM si dispo, sinon centre de l'éditeur.
+    let anchor = null
+    try {
+      const sel = window.getSelection()
+      if (sel && sel.rangeCount) {
+        const rc = sel.getRangeAt(0).getBoundingClientRect()
+        if (rc && (rc.x || rc.y)) anchor = { x: rc.left, y: rc.bottom }
+      }
+    } catch {}
+    setPasteChoice({ url: txt, anchor, createdAt: Date.now() })
+  }
+
+  const insertMention = async (url) => {
+    setPasteChoice(null)
+    let label = (() => { try { return new URL(url).hostname.replace(/^www\./, '') } catch { return url } })()
+    // Mémorise le bloc fraîchement inséré : l'enrichissement ne réécrira QUE celui-ci, jamais
+    // un autre lien identique ailleurs dans la page (sinon corruption des liens existants).
+    let targetId = null
+    try { editor.insertInlineContent([{ type: 'link', href: url, content: label }, ' ']); try { targetId = editor.getTextCursorPosition().block.id } catch {} } catch {}
+    // Enrichit le label avec le titre unfurl en arrière-plan (best-effort, ne bloque pas).
+    fetch('/api/unfurl?url=' + encodeURIComponent(url)).then((r) => r.json()).then((j) => {
+      if (j && j.title && j.title !== label && targetId) {
+        try {
+          const b = editor.getBlock(targetId)
+          const c = b && b.content
+          if (Array.isArray(c)) {
+            const next = c.map((n) => (n && n.type === 'link' && n.href === url ? { ...n, content: [{ type: 'text', text: j.title, styles: {} }] } : n))
+            if (next.some((n, i) => n !== c[i])) editor.updateBlock(b, { content: next })
+          }
+        } catch {}
+      }
+    }).catch(() => {})
+  }
+
+  const insertEmbed = (url) => {
+    setPasteChoice(null)
+    const c = classifyUrl(url)
+    try {
+      const ref = editor.getTextCursorPosition().block
+      if (c.kind === 'image') { editor.insertBlocks([{ type: 'image', props: { url } }], ref, 'after'); return }
+      if (c.kind === 'youtube') {
+        editor.insertBlocks([{ type: 'zenrayEmbed', props: { url, provider: 'youtube', providerId: c.providerId, embedUrl: c.embedUrl, title: 'Vidéo YouTube', thumbnail: `https://i.ytimg.com/vi/${c.providerId}/hqdefault.jpg` } }], ref, 'after')
+        return
+      }
+    } catch {}
+    insertBookmark(url) // provider inconnu -> fallback carte Bookmark
+  }
+
+  const insertBookmark = async (url) => {
+    setPasteChoice(null)
+    let inserted = null
+    try {
+      const res = editor.insertBlocks([{ type: 'zenrayBookmark', props: { url, loading: true } }], editor.getTextCursorPosition().block, 'after')
+      inserted = res && res[0]
+    } catch {}
+    const j = await fetch('/api/unfurl?url=' + encodeURIComponent(url)).then((r) => r.json()).catch(() => null)
+    if (!j || j.error) {
+      // unfurl KO : on garde une carte minimale (au moins le lien cliquable), pas de blocage.
+      if (inserted) { try { editor.updateBlock(inserted, { props: { url, title: url, loading: false } }) } catch {} }
+      return
+    }
+    if (inserted) {
+      try { editor.updateBlock(inserted, { props: { url, title: j.title || url, description: j.description || '', image: j.image || '', favicon: j.favicon || '', siteName: j.siteName || j.hostname || '', loading: false } }) } catch {}
+    }
+  }
+  const onPickPaste = (mode) => {
+    const url = sanitizeUrl(pasteChoice && pasteChoice.url)
+    if (!url) { setPasteChoice(null); return }
+    if (mode === 'mention') insertMention(url)
+    else if (mode === 'embed') insertEmbed(url)
+    else insertBookmark(url)
+  }
+
+  // LIGHTBOX plein écran d'une image du corps (comme le QuickLook des tuiles Create) :
+  // double-clic OU clic droit sur une image -> grand écran. Échap / clic = ferme. (Espace tape un espace
+  // dans l'éditeur, donc on ne l'utilise pas ici ; double-clic + clic droit couvrent le besoin.)
+  const [lightbox, setLightbox] = useState(null)
+  const openImg = (e) => { const el = e.target; const src = el && el.tagName === 'IMG' ? (el.currentSrc || el.src) : null; if (src) { e.preventDefault(); e.stopPropagation(); setLightbox(src) } }
+  useEffect(() => {
+    if (!lightbox) return
+    const h = (e) => { if (e.key === 'Escape') setLightbox(null) }
+    window.addEventListener('keydown', h, true)
+    return () => window.removeEventListener('keydown', h, true)
+  }, [lightbox])
+
+  return (
+    <div onKeyDown={onKeyDown} style={{ maxWidth: maxW, margin: '0 auto', transition: 'max-width .22s ease' }}>
+      {!hideTitle && <div style={{ fontFamily: "var(--zr-police-sans)", fontSize: 38, fontWeight: 700, lineHeight: 1.1, margin: '0 0 6px', letterSpacing: '-0.02em' }}>{pretty(path.split('/').pop())}</div>}
+      <div style={{ fontFamily: SANS, fontSize: 'var(--zr-ui-2xs)', opacity: 0.45, marginBottom: 12, height: 14, paddingLeft: hideTitle ? 54 : 0 }}>{status}</div>
+      {/* Commentaires : sous les propriétés, AVANT le corps (ordre Notion). Épuré. Aligné sur les 54px de BlockNote. */}
+      <div style={{ marginBottom: 16, paddingLeft: hideTitle ? 54 : 0, paddingRight: hideTitle ? 54 : 0 }}>
+        {comments.map((c) => (
+          <div key={c.id} className="zr-treeitem" style={{ display: 'flex', alignItems: 'baseline', gap: 8, padding: '4px 0', borderRadius: 6 }}>
+            <span style={{ fontFamily: SANS, fontSize: 'var(--zr-ui-lg)', lineHeight: 1.45, flex: 1, color: 'inherit' }}>{c.text}</span>
+            <span style={{ fontFamily: SANS, fontSize: 'var(--zr-ui-3xs)', opacity: 0.4 }}>{new Date(c.ts).toLocaleDateString('fr-FR')}</span>
+            <button onClick={() => delComment(c.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', opacity: 0.35, lineHeight: 1, display: 'inline-flex', padding: 0 }}><Icon name="xmark" size={12} weight={2} /></button>
+          </div>
+        ))}
+        <div style={{ display: 'flex', gap: 6, marginTop: comments.length ? 6 : 0 }}>
+          <input value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addComment() }} placeholder="Commenter…"
+            style={{ flex: 1, border: 'none', borderBottom: '1px solid rgba(128,128,128,0.2)', borderRadius: 0, padding: '5px 2px', fontFamily: SANS, fontSize: 'var(--zr-ui-md)', outline: 'none', background: 'transparent', color: 'inherit' }} />
+          {draft.trim() && <button onClick={addComment} style={{ background: 'transparent', color: PALETTE.primary, border: 'none', cursor: 'pointer', fontFamily: SANS, fontSize: 'var(--zr-ui-md)', fontWeight: 600 }}>Envoyer</button>}
+        </div>
+      </div>
+      <div ref={editorWrapRef} className="zr-ph-custom" onMouseDown={startBlockMarquee} onClickCapture={onClickCapture} onPasteCapture={onPaste}
+        onDoubleClickCapture={openImg} onContextMenuCapture={openImg}
+        onMouseOverCapture={noterSurvol}
+        onDragStartCapture={debutGlisse}
+        onDragOverCapture={(e) => { if (e.dataTransfer.types.includes('application/zenray-page')) { e.preventDefault(); return } if ((e.dataTransfer.items || []).length > 1) e.preventDefault(); survolRangee(e) }}
+        onDragLeave={() => setCibleRangee(null)}
+        onDropCapture={(e) => { lacherPlusieurs(e); if (!e.defaultPrevented) lacherRangee(e) }}
+        onDrop={(e) => { const d = e.dataTransfer.getData('application/zenray-page'); if (!d) return; e.preventDefault(); try { const p = JSON.parse(d); editor.insertInlineContent([{ type: 'link', href: `#page:${encodeURIComponent(p.name)}`, content: pretty(p.name) }, ' ']) } catch {} }}
+        style={{ '--bn-font-family': SERIF, '--bn-font-family-mono': SANS, '--bn-colors-editor-background': 'transparent', '--bn-colors-editor-text': theme === 'dark' ? '#ECECEA' : '#1F1F1E', position: 'relative' }}>
+        <BlockNoteView editor={editor} theme={theme === 'dark' ? 'dark' : 'light'} onChange={onBodyChange} slashMenu={false}>
+          {/* LE MENU « / » GARDE TOUTES SES ENTREES, on en AJOUTE une. `slashMenu={false}` desactive
+              le menu par defaut pour le remplacer par celui-ci, qui part de la liste par defaut :
+              retirer une entree que Matthieu utilise chaque jour serait un tres mauvais echange
+              contre une entree neuve. */}
+          <SuggestionMenuController
+            triggerCharacter="/"
+            getItems={async (query) => {
+              const items = [...getDefaultReactSlashMenuItems(editor), {
+                title: 'Deux images côte à côte',
+                subtext: 'Accole cette image à sa voisine, gauche puis droite',
+                aliases: ['cote', 'côte', 'colonnes', 'side', 'row', 'gauche', 'droite'],
+                group: 'Media',
+                onItemClick: () => accolerImages(),
+              }]
+              const q = (query || '').toLowerCase()
+              if (!q) return items
+              return items.filter((it) => [it.title, it.subtext, ...(it.aliases || [])].filter(Boolean).join(' ').toLowerCase().includes(q))
+            }}
+          />
+        </BlockNoteView>
+        {/* Placeholder « lettre par lettre » : overlay, 1 span animé/lettre, vague d'opacité continue (60 fps). */}
+        {phPos && (
+          <div aria-hidden style={{ position: 'absolute', top: phPos.top, left: phPos.left, pointerEvents: 'none', fontFamily: SERIF, fontStyle: 'italic', fontSize: phPos.fs, lineHeight: phPos.lh, whiteSpace: 'pre', color: theme === 'dark' ? '#ECECEA' : '#1F1F1E', zIndex: 1, userSelect: 'none' }}>
+            {PH_TEXT.split('').map((ch, i) => (
+              <span key={i} className="zr-ph-letter" style={{ animationDelay: (i * -0.06) + 's' }}>{ch === ' ' ? ' ' : ch}</span>
+            ))}
+          </div>
+        )}
+        {/* Le bord vise s'annonce AVANT le lacher : sans lui, on depose a l'aveugle et l'image
+            atterrit d'un cote qu'on n'a pas choisi. Une barre, pas un cadre, parce que ce qui se
+            joue est une FRONTIERE et non une zone. */}
+        {cibleRangee?.repere && (
+          <div aria-hidden style={{
+            position: 'absolute', left: cibleRangee.repere.x - 2, top: cibleRangee.repere.top,
+            width: 4, height: cibleRangee.repere.hauteur, borderRadius: 99,
+            background: 'rgba(10,132,255,0.95)', boxShadow: '0 0 0 3px rgba(10,132,255,0.18)',
+            zIndex: 80, pointerEvents: 'none',
+          }} />
+        )}
+        {marquee && (marquee.w > 2 || marquee.h > 2) && (
+          <div style={{ position: 'absolute', left: marquee.l, top: marquee.t, width: marquee.w, height: marquee.h, background: 'rgba(10,132,255,0.14)', border: '1px solid rgba(10,132,255,0.7)', borderRadius: 2, zIndex: 70, pointerEvents: 'none' }} />
+        )}
+        {pasteChoice && (
+          <NotionPasteMenu url={pasteChoice.url} anchor={pasteChoice.anchor} theme={theme} onPick={onPickPaste} onClose={() => setPasteChoice(null)} />
+        )}
+      </div>
+      {embeds.length > 0 && (
+        <div style={{ marginTop: 22, borderTop: '1px solid rgba(128,128,128,0.25)', paddingTop: 14 }}>
+          <div style={{ fontFamily: SANS, fontSize: 'var(--zr-ui-xs)', textTransform: 'uppercase', letterSpacing: 1, opacity: 0.55, marginBottom: 12 }}>Pages liées · aperçu · {embeds.length}</div>
+          {embeds.map((e) => (
+            <div key={e.path} style={{ border: '1px solid rgba(128,128,128,0.25)', borderRadius: 10, padding: '12px 16px', marginBottom: 12 }}>
+              <button onClick={() => onOpenPage && onOpenPage(e.name)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: PALETTE.primary, fontFamily: SERIF, fontSize: 'var(--zr-ui-xl)', fontWeight: 600, padding: 0, marginBottom: 6, display: 'inline-flex', alignItems: 'center', gap: 6 }}><Icon name="doc.text" size={15} weight={1.6} color={PALETTE.primary} />{pretty(e.name)}<Icon name="arrow.up.right" size={13} weight={1.7} color={PALETTE.primary} /></button>
+              <div className="md-body" style={{ fontSize: 'var(--zr-ui-lg)', opacity: 0.92, '--fg': 'inherit', '--muted': 'rgba(128,128,128,0.9)', '--acc': PALETTE.primary, '--border': 'rgba(128,128,128,0.25)', '--code': 'rgba(128,128,128,0.1)' }} dangerouslySetInnerHTML={{ __html: safeMarkedParse(e.md.length > 1200 ? e.md.slice(0, 1200) + '\n\n…' : e.md) }} />
+            </div>
+          ))}
+        </div>
+      )}
+      {lightbox && (
+        <div onClick={() => setLightbox(null)} style={{ position: 'fixed', inset: 0, zIndex: 200, background: 'rgba(0,0,0,0.82)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'zoom-out', backdropFilter: 'blur(6px)' }}>
+          <img src={lightbox} alt="" style={{ maxWidth: '94vw', maxHeight: '90vh', objectFit: 'contain', borderRadius: 8, boxShadow: '0 24px 70px rgba(0,0,0,0.5)' }} />
+        </div>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,684 @@
+// @vitest-environment node
+// 12 October 2026: the identity proof authorises deleting a local original, so a false "verified" is DATA LOSS. Every test is
+// written in both directions: green on the good film, RED on each corruption listed in the decision D3.
+// FR : la preuve par identite autorise l'effacement ; chaque test est ecrit dans les deux sens (vert sur le bon, rouge sur chaque corruption).
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { createHash, randomBytes } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  IDENTITY_PROOF_DEFAULTS, IdentityProofRefused, buildIdentityReceipt, createGitRemote, deriveCipherPart, gitBlobId,
+  locateManifestInClone, proveVideoIdentity, readRemoteManifestBytes, recordVerificationOutcome, reserveVerificationSlot,
+  resolveIdentityProofConfig, reusableReceipt, summarizeVerificationReceipts, verifyVideoCloudByPolicy,
+} from './video-identity-proof.mjs'
+import { VERIFICATION_MODES, assertVerificationEvidence, recoveryFingerprint, unloadVerifiedVideo } from './video-cloud-recovery.mjs'
+
+const OWNER = 'matthieuhuguet'
+const REPO = 'zenrayshards-vid-0123456789ab'
+const cleanups = []
+afterEach(async () => { while (cleanups.length) await cleanups.pop()() })
+const temp = (label) => {
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `${label}-`)))
+  cleanups.push(async () => fs.rmSync(directory, { recursive: true, force: true }))
+  return directory
+}
+const sha = (bytes) => createHash('sha256').update(bytes).digest('hex')
+const config = (overrides = {}) => resolveIdentityProofConfig({ realPartRereadCount: 1, ...overrides }, {})
+
+/** A film with `partSizes`, its manifest and a fake GitHub that holds exactly what the upload would have pushed. */
+function makeFilm({ partSizes = [3000, 2000, 700], name = 'film.mkv', commit = 'a'.repeat(40), key = randomBytes(32), streaming = true, poster = 'https://cdn.jsdelivr.net/gh/matthieuhuguet/zenray-poster-public-01@' + 'b'.repeat(40) + '/p/x.jpg' } = {}) {
+  const directory = temp('identity-film')
+  const source = path.join(directory, name)
+  const content = randomBytes(partSizes.reduce((sum, size) => sum + size, 0))
+  fs.writeFileSync(source, content)
+  const parts = []
+  const blobs = new Map()
+  const tree = new Map()
+  let offset = 0
+  for (const size of partSizes) {
+    const iv = randomBytes(12).toString('base64')
+    const cipher = deriveCipherPart({ key, iv, plain: content.subarray(offset, offset + size) })
+    const hash = sha(cipher)
+    const blobPath = `${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.bin`
+    blobs.set(blobPath, cipher)
+    tree.set(blobPath, gitBlobId(cipher))
+    parts.push({ url: `https://raw.githubusercontent.com/${OWNER}/${REPO}/${commit}/${blobPath}`, start: offset, end: offset + size - 1, size, iv })
+    offset += size
+  }
+  // 14 October 2026: a finished film carries its CMAF streaming (master + mpd); `streaming: false` builds the incomplete one.
+  const manifest = { type: 'video-raw', name, enc: true, alg: 'aes-256-gcm', size: content.length, parts, ...(poster ? { poster } : {}), ...(streaming ? { master: 'pages/X/.streams/film/master.m3u8', mpd: 'pages/X/.streams/film/manifest.mpd' } : {}) }
+  const manifestPath = path.join(directory, `${name}.media.json`)
+  const manifestBytes = Buffer.from(JSON.stringify(manifest))
+  fs.writeFileSync(manifestPath, manifestBytes)
+  const calls = { treeIds: [], readBlob: [] }
+  const remote = {
+    async treeIds(repo, pinned) { calls.treeIds.push(`${repo}@${pinned}`); const found = trees.get(`${repo}@${pinned}`); if (!found) throw new Error('repository not found'); return found },
+    async readBlob(repo, pinned, blobPath) { calls.readBlob.push(blobPath); const found = blobs.get(blobPath); if (!found) throw new Error('blob not found'); return Buffer.from(found) },
+  }
+  const trees = new Map([[`${REPO}@${commit}`, tree]])
+  return { directory, source, content, manifest, manifestPath, manifestBytes, key, blobs, tree, trees, calls, remote, commit,
+    remoteManifest: manifestBytes }
+}
+const prove = async (f, overrides = {}) => {
+  return proveVideoIdentity({ manifest: f.manifest, manifestBytes: f.manifestBytes, source: f.source, key: f.key, remote: f.remote,
+    readRemoteManifestBytes: async () => { if (f.remoteManifest instanceof Error) throw f.remoteManifest; return f.remoteManifest },
+    config: config(), ...overrides })
+}
+const flip = (buffer, index = 7) => { const copy = Buffer.from(buffer); copy[index] ^= 0x01; return copy }
+const replaceBlob = (f, index, mutate) => {
+  const [blobPath, bytes] = [...f.blobs.entries()][index]
+  const corrupted = mutate(bytes)
+  f.blobs.set(blobPath, corrupted)
+  f.tree.set(blobPath, gitBlobId(corrupted))
+  return blobPath
+}
+
+describe('identity proof, good film', () => {
+  it('proves every part, the manifest online and ONE real part, without downloading the others', async () => {
+    const f = makeFilm()
+    const result = await prove(f)
+    expect(result.ok).toBe(true)
+    expect(result.sha256).toBe(sha(f.content))
+    expect(result.bytes).toBe(f.content.length)
+    expect(result.counters).toMatchObject({ parts: 3, nameHashOk: 3, remoteIdOk: 3, gcmRoundTripOk: 3, realPartsRequired: 1, realPartsRead: 1,
+      realPartIndexes: [2], coversSource: true, manifestOnline: true, manifestRecoveryMatches: true, manifestIdentical: true, shardTrees: 1 })
+    expect(result.counters.partBlobIds).toHaveLength(3)
+    expect(result.pinnedShards).toEqual([`${REPO}@${f.commit}`])
+    // the cost claim: ONE blob download (the tail part), one tree per pinned commit
+    expect(f.calls.readBlob).toEqual([[...f.blobs.keys()].at(-1)])
+    expect(f.calls.treeIds).toHaveLength(1)
+  })
+
+  it('re-reads as many real parts as the parameter says, from the tail', async () => {
+    const f = makeFilm()
+    const result = await prove(f, { config: config({ realPartRereadCount: 2 }) })
+    expect(result.ok).toBe(true)
+    expect(result.counters.realPartIndexes).toEqual([1, 2])
+    expect(f.calls.readBlob).toHaveLength(2)
+  })
+
+  it('never reads more real parts than the film has', async () => {
+    const f = makeFilm({ partSizes: [900] })
+    const result = await prove(f, { config: config({ realPartRereadCount: 5 }) })
+    expect(result.ok).toBe(true)
+    expect(result.counters).toMatchObject({ parts: 1, realPartsRequired: 1, realPartsRead: 1 })
+  })
+
+  it('accepts a manifest online that differs only by fields the restore does not read (poster, name)', async () => {
+    const f = makeFilm()
+    f.remoteManifest = Buffer.from(JSON.stringify({ ...f.manifest, poster: 'later.jpg', name: 'renamed.mkv' }))
+    const result = await prove(f)
+    expect(result.ok).toBe(true)
+    expect(result.counters.manifestIdentical).toBe(false)
+    expect(result.counters.manifestRecoveryMatches).toBe(true)
+  })
+
+  it('writes a receipt the unload authority accepts', async () => {
+    const f = makeFilm()
+    const proof = await prove(f)
+    const receipt = buildIdentityReceipt({ manifestPath: f.manifestPath, manifestBytes: f.manifestBytes, manifest: f.manifest, source: f.source, proof, config: config() })
+    expect(receipt.verificationMode).toBe(VERIFICATION_MODES.identity)
+    expect(receipt.localSha256).toBe(receipt.restoredSha256)
+    expect(assertVerificationEvidence(receipt, f.manifest)).toBe(VERIFICATION_MODES.identity)
+  })
+})
+
+describe('identity proof, RED on every corrupted case', () => {
+  const expectRefusal = (result, failureClass, code) => {
+    expect(result.ok).toBe(false)
+    expect(result.failure).toMatchObject({ class: failureClass, code })
+  }
+
+  it('flipped byte in the LOCAL source: the derived part is no longer the pushed one', async () => {
+    const f = makeFilm()
+    fs.writeFileSync(f.source, flip(f.content, 3500))
+    expectRefusal(await prove(f), 'local', 'cipher-name-mismatch')
+  })
+
+  it('flipped byte in a part ON GITHUB: its object id differs from the derived one', async () => {
+    const f = makeFilm()
+    replaceBlob(f, 1, (bytes) => flip(bytes, 100))
+    const result = await prove(f)
+    expectRefusal(result, 'remote', 'remote-id-mismatch')
+    expect(result.failure.partIndex).toBe(1)
+  })
+
+  it('a part missing from the remote tree', async () => {
+    const f = makeFilm()
+    f.tree.delete([...f.tree.keys()][0])
+    expectRefusal(await prove(f), 'remote', 'remote-part-missing')
+  })
+
+  it('a wrong blob id: GitHub holds an object under the name, but not the derived one', async () => {
+    const f = makeFilm()
+    f.tree.set([...f.tree.keys()][2], '0'.repeat(40))
+    expectRefusal(await prove(f), 'remote', 'remote-id-mismatch')
+  })
+
+  it('the tree of the pinned commit cannot be fetched', async () => {
+    const f = makeFilm()
+    f.trees.clear()
+    expectRefusal(await prove(f), 'remote', 'remote-tree-unavailable')
+  })
+
+  it('the real part downloaded differs although the tree id matches (a lying server)', async () => {
+    const f = makeFilm()
+    const lastPath = [...f.blobs.keys()].at(-1)
+    f.blobs.set(lastPath, flip(f.blobs.get(lastPath), 5))   // tree keeps the correct id
+    expectRefusal(await prove(f), 'remote', 'remote-bytes-differ')
+  })
+
+  it('the real part cannot be downloaded', async () => {
+    const f = makeFilm()
+    f.blobs.delete([...f.blobs.keys()].at(-1))
+    expectRefusal(await prove(f), 'remote', 'remote-bytes-unavailable')
+  })
+
+  it('a stale manifest online (another IV for one part)', async () => {
+    const f = makeFilm()
+    const stale = JSON.parse(f.manifestBytes.toString())
+    stale.parts[0].iv = randomBytes(12).toString('base64')
+    f.remoteManifest = Buffer.from(JSON.stringify(stale))
+    expectRefusal(await prove(f), 'manifest', 'manifest-differs')
+  })
+
+  it('a manifest online with fewer parts (a push never completed)', async () => {
+    const f = makeFilm()
+    const stale = JSON.parse(f.manifestBytes.toString())
+    stale.parts.pop()
+    f.remoteManifest = Buffer.from(JSON.stringify(stale))
+    expectRefusal(await prove(f), 'manifest', 'manifest-differs')
+  })
+
+  it('a manifest that is not online at all', async () => {
+    const f = makeFilm()
+    f.remoteManifest = new Error('HTTP 404')
+    expectRefusal(await prove(f), 'manifest', 'manifest-offline')
+  })
+
+  it('a source whose size differs from the manifest (grown or truncated)', async () => {
+    const grown = makeFilm()
+    fs.appendFileSync(grown.source, Buffer.from([1]))
+    expectRefusal(await prove(grown), 'local', 'source-size-mismatch')
+    const cut = makeFilm()
+    fs.truncateSync(cut.source, cut.content.length - 1)
+    expectRefusal(await prove(cut), 'local', 'source-size-mismatch')
+  })
+
+  it('the wrong key', async () => {
+    const f = makeFilm()
+    expectRefusal(await prove(f, { key: randomBytes(32) }), 'local', 'cipher-name-mismatch')
+  })
+
+  it('a wrong IV in the manifest (the manifest online matching it does not rescue the parts)', async () => {
+    const f = makeFilm()
+    f.manifest.parts[1].iv = randomBytes(12).toString('base64')
+    f.remoteManifest = Buffer.from(JSON.stringify(f.manifest))
+    expectRefusal(await prove(f), 'local', 'cipher-name-mismatch')
+  })
+
+  it('a boundary shifted by one byte', async () => {
+    const f = makeFilm()
+    f.manifest.parts[0].size += 1; f.manifest.parts[0].end += 1
+    f.manifest.parts[1].start += 1; f.manifest.parts[1].size -= 1
+    f.remoteManifest = Buffer.from(JSON.stringify(f.manifest))
+    expectRefusal(await prove(f), 'local', 'cipher-name-mismatch')
+  })
+
+  it('offsets with a gap', async () => {
+    const f = makeFilm()
+    f.manifest.parts[1].start += 5
+    f.remoteManifest = Buffer.from(JSON.stringify(f.manifest))   // the manifest online agrees; the geometry alone must refuse
+    expectRefusal(await prove(f), 'local', 'part-offsets')
+  })
+
+  it('parts that do not cover the source (the last part is missing from the manifest)', async () => {
+    const f = makeFilm()
+    f.manifest.parts.pop()                              // manifest.size and the source still hold the whole film
+    f.remoteManifest = Buffer.from(JSON.stringify(f.manifest))
+    expectRefusal(await prove(f), 'local', 'coverage')
+  })
+
+  it('a shorter but consistent film is a valid film: the proof follows the manifest, not an expectation', async () => {
+    const f = makeFilm()
+    f.manifest.parts.pop()
+    f.manifest.size = f.content.length - 700
+    fs.writeFileSync(f.source, f.content.subarray(0, f.manifest.size))
+    f.remoteManifest = Buffer.from(JSON.stringify(f.manifest))
+    expect((await prove(f)).ok).toBe(true)
+  })
+
+  it('a source that changes while it is proven', async () => {
+    const f = makeFilm()
+    const original = f.remote.readBlob
+    f.remote.readBlob = async (...args) => {
+      const later = new Date(Date.now() + 60000)
+      fs.utimesSync(f.source, later, later)
+      return original(...args)
+    }
+    expectRefusal(await prove(f), 'local', 'source-changed')
+  })
+
+  it('an unsupported manifest type', async () => {
+    const f = makeFilm()
+    f.manifest.type = 'chunked-media'
+    expectRefusal(await prove(f), 'local', 'manifest-unsupported')
+  })
+})
+
+describe('the receipt is the unload authority: incomplete evidence is refused', () => {
+  const goodReceipt = async () => {
+    const f = makeFilm()
+    const proof = await prove(f)
+    return { f, receipt: buildIdentityReceipt({ manifestPath: f.manifestPath, manifestBytes: f.manifestBytes, manifest: f.manifest, source: f.source, proof, config: config() }) }
+  }
+  const tampered = async (mutate) => {
+    const { f, receipt } = await goodReceipt()
+    const copy = JSON.parse(JSON.stringify(receipt))
+    mutate(copy)
+    return () => assertVerificationEvidence(copy, f.manifest)
+  }
+
+  it('accepts the legacy receipt without a mode as a full read-back', () => {
+    expect(assertVerificationEvidence({}, { parts: [] })).toBe(VERIFICATION_MODES.fullReadBack)
+  })
+  it('refuses an unknown mode', async () => { expect(await tampered((r) => { r.verificationMode = 'identity-v9' })).toThrow('unknown verification mode') })
+  it('refuses one part without a remote id', async () => { expect(await tampered((r) => { r.identityProof.remoteIdOk -= 1 })).toThrow('lacks complete evidence') })
+  it('refuses a name hash count below the parts', async () => { expect(await tampered((r) => { r.identityProof.nameHashOk = 1 })).toThrow('lacks complete evidence') })
+  it('refuses a proof with no real part read', async () => { expect(await tampered((r) => { r.identityProof.realPartsRead = 0 })).toThrow('lacks complete evidence') })
+  it('refuses fewer real parts than required', async () => { expect(await tampered((r) => { r.identityProof.realPartsRequired = 2 })).toThrow('lacks complete evidence') })
+  it('refuses a manifest that was not online', async () => { expect(await tampered((r) => { r.identityProof.manifestOnline = false })).toThrow('lacks complete evidence') })
+  it('refuses a remote manifest fingerprint that is not the receipt fingerprint', async () => { expect(await tampered((r) => { r.identityProof.remoteManifestRecoverySha256 = 'f'.repeat(64) })).toThrow('lacks complete evidence') })
+  it('refuses missing part ids', async () => { expect(await tampered((r) => { r.identityProof.partBlobIds.pop() })).toThrow('lacks complete evidence') })
+  it('refuses an identity receipt without its evidence block', async () => { expect(await tampered((r) => { delete r.identityProof })).toThrow('lacks complete evidence') })
+  it('refuses coverage that was not proven', async () => { expect(await tampered((r) => { r.identityProof.coversSource = false })).toThrow('lacks complete evidence') })
+
+  it('unloads the original after an identity receipt, records the mode, and refuses a source changed since the proof', async () => {
+    const { f, receipt } = await goodReceipt()
+    const receiptPath = path.join(f.directory, 'film.recovery.json')
+    fs.writeFileSync(receiptPath, JSON.stringify(receipt))
+    const auditDir = temp('identity-audit')
+    const root = temp('identity-root')
+    const inside = path.join(root, 'film.mkv')
+    fs.copyFileSync(f.source, inside)
+    // the receipt names the source it proved: re-point it at the copy under the approved root, with its real stat
+    const st = fs.statSync(inside)
+    const onRoot = { ...receipt, source: inside, sourceStat: { bytes: st.size, mtimeMs: st.mtimeMs, inode: st.ino, device: st.dev, mode: st.mode & 0o777 } }
+    fs.writeFileSync(receiptPath, JSON.stringify(onRoot))
+    const refused = temp('identity-root-changed')
+    const changed = path.join(refused, 'film.mkv')
+    fs.copyFileSync(f.source, changed)
+    fs.appendFileSync(changed, 'x')
+    const cst = fs.statSync(changed)
+    const changedReceiptPath = path.join(f.directory, 'changed.recovery.json')
+    fs.writeFileSync(changedReceiptPath, JSON.stringify({ ...onRoot, source: changed, sourceStat: { ...onRoot.sourceStat, bytes: cst.size } }))
+    await expect(unloadVerifiedVideo({ receiptPath: changedReceiptPath, manifestPath: f.manifestPath, sourceRoot: refused, auditDir,
+      isOpen: async () => false, isQueueRequired: async () => false })).rejects.toThrow()
+    expect(fs.existsSync(changed)).toBe(true)
+
+    const done = await unloadVerifiedVideo({ receiptPath, manifestPath: f.manifestPath, sourceRoot: root, auditDir,
+      isOpen: async () => false, isQueueRequired: async () => false })
+    expect(done.status).toBe('unloaded')
+    expect(done.verificationMode).toBe(VERIFICATION_MODES.identity)
+    expect(fs.existsSync(inside)).toBe(false)
+  })
+
+  it('refuses to unload on an identity receipt whose evidence was stripped, and keeps the file', async () => {
+    const { f, receipt } = await goodReceipt()
+    const root = temp('identity-root-stripped')
+    const inside = path.join(root, 'film.mkv')
+    fs.copyFileSync(f.source, inside)
+    const st = fs.statSync(inside)
+    const stripped = { ...receipt, source: inside, sourceStat: { bytes: st.size, mtimeMs: st.mtimeMs, inode: st.ino, device: st.dev, mode: st.mode & 0o777 } }
+    delete stripped.identityProof
+    const receiptPath = path.join(f.directory, 'stripped.recovery.json')
+    fs.writeFileSync(receiptPath, JSON.stringify(stripped))
+    await expect(unloadVerifiedVideo({ receiptPath, manifestPath: f.manifestPath, sourceRoot: root, auditDir: temp('identity-audit'),
+      isOpen: async () => false, isQueueRequired: async () => false })).rejects.toThrow('lacks complete evidence')
+    expect(fs.existsSync(inside)).toBe(true)
+  })
+})
+
+describe('unload refuses a film without CMAF streaming (14 October 2026)', () => {
+  const unloadWith = async (streaming, extra = {}, filmOptions = {}) => {
+    const f = makeFilm({ streaming, ...filmOptions })
+    const receipt = buildIdentityReceipt({ manifestPath: f.manifestPath, manifestBytes: f.manifestBytes, manifest: f.manifest, source: f.source, proof: await prove(f), config: config() })
+    const root = temp('identity-root-streaming')
+    const inside = path.join(root, 'film.mkv')
+    fs.copyFileSync(f.source, inside)
+    const st = fs.statSync(inside)
+    const receiptPath = path.join(f.directory, 'streaming.recovery.json')
+    fs.writeFileSync(receiptPath, JSON.stringify({ ...receipt, source: inside, sourceStat: { bytes: st.size, mtimeMs: st.mtimeMs, inode: st.ino, device: st.dev, mode: st.mode & 0o777 } }))
+    return { inside, run: () => unloadVerifiedVideo({ receiptPath, manifestPath: f.manifestPath, sourceRoot: root, auditDir: temp('identity-audit'), isOpen: async () => false, isQueueRequired: async () => false, ...extra }) }
+  }
+  it('unloads when the manifest has master and mpd (green)', async () => {
+    const { inside, run } = await unloadWith(true)
+    expect((await run()).status).toBe('unloaded')
+    expect(fs.existsSync(inside)).toBe(false)
+  })
+  it('refuses and keeps the file when the poster is a private proxy or missing (red), 14 October 2026', async () => {
+    for (const poster of ['/api/raw-proxy?u=https%3A%2F%2Fraw.githubusercontent.com%2Fx%2Fy%2Fz%2Fp.jpg', '']) {
+      const { inside, run } = await unloadWith(true, {}, { poster })
+      await expect(run()).rejects.toThrow('no public poster')
+      expect(fs.existsSync(inside)).toBe(true)
+    }
+  })
+  it('refuses and keeps the file when master and mpd are missing (red)', async () => {
+    const { inside, run } = await unloadWith(false)
+    await expect(run()).rejects.toThrow('no CMAF streaming')
+    expect(fs.existsSync(inside)).toBe(true)
+  })
+})
+
+describe('policy: identity, 1 film in N in full, escalation on a remote failure', () => {
+  const run = async (f, { settings = {}, deps = {}, receiptName = 'film.recovery.json', ...options } = {}) => verifyVideoCloudByPolicy({
+    manifestPath: f.manifestPath, source: f.source, receiptPath: path.join(f.directory, receiptName), token: 'test',
+    config: config(settings), reuseReceipt: false, log: () => {},
+    deps: { key: f.key, remote: f.remote, readRemoteManifestBytes: async () => f.remoteManifest, ...deps }, ...options })
+  const fullReceiptFor = (f) => async ({ manifestPath, source, extraFields }) => {
+    const { createHash: hash } = await import('node:crypto')
+    const sha256 = hash('sha256').update(fs.readFileSync(source)).digest('hex')
+    const bytes = fs.readFileSync(manifestPath)
+    return { verifiedAt: new Date().toISOString(), source: path.resolve(source), manifestPath: path.resolve(manifestPath), manifestSha256: sha(bytes),
+      manifestRecoverySha256: recoveryFingerprint(f.manifest), sourceStat: { bytes: f.content.length }, bytes: f.content.length, sha256,
+      localSha256: sha256, restoredSha256: sha256, pinnedShards: [`${REPO}@${f.commit}`], sourceRetained: true, completeCloudRecoveryVerified: true,
+      verificationMode: VERIFICATION_MODES.fullReadBack, ...extraFields }
+  }
+  const readStats = (f) => JSON.parse(fs.readFileSync(path.join(f.directory, 'VerificationStats.json'), 'utf8'))
+
+  it('writes an identity receipt and counts it, without calling the full read-back', async () => {
+    const f = makeFilm()
+    const fullReadBack = vi.fn()
+    const result = await run(f, { deps: { fullReadBack } })
+    expect(result.verificationMode).toBe(VERIFICATION_MODES.identity)
+    expect(fullReadBack).not.toHaveBeenCalled()
+    const written = JSON.parse(fs.readFileSync(path.join(f.directory, 'film.recovery.json'), 'utf8'))
+    expect(written.verificationMode).toBe('identity-v1')
+    expect(readStats(f)).toMatchObject({ identityVerified: 1, fullReadBackVerified: 0, filmsSinceFullReadBack: 1 })
+  })
+
+  it('reads back in full exactly one film in N (N = 3), then starts over', async () => {
+    const f = makeFilm()
+    const fullReadBack = vi.fn(fullReceiptFor(f))
+    const modes = []
+    for (let i = 0; i < 6; i++) modes.push((await run(f, { settings: { fullReadBackEvery: 3 }, deps: { fullReadBack } })).verificationMode)
+    expect(modes).toEqual(['identity-v1', 'identity-v1', 'full-readback', 'identity-v1', 'identity-v1', 'full-readback'])
+    expect(readStats(f)).toMatchObject({ identityVerified: 4, fullReadBackVerified: 2, sampledFullReadBacks: 2, filmsSinceFullReadBack: 0 })
+  })
+
+  it('fullReadBackEvery = 0 disables the sampling: ten films, ten identity proofs', async () => {
+    const f = makeFilm()
+    const fullReadBack = vi.fn(fullReceiptFor(f))
+    for (let i = 0; i < 10; i++) expect((await run(f, { settings: { fullReadBackEvery: 0 }, deps: { fullReadBack } })).verificationMode).toBe('identity-v1')
+    expect(fullReadBack).not.toHaveBeenCalled()
+  })
+
+  it('concurrent lanes reserve slots under a lock: 8 reservations with N = 4 give 3 identity slots, the rest full', async () => {
+    const f = makeFilm()
+    const statsPath = path.join(f.directory, 'VerificationStats.json')
+    const plans = await Promise.all(Array.from({ length: 8 }, () => reserveVerificationSlot({ statsPath, config: config({ fullReadBackEvery: 4 }) })))
+    expect(plans.filter((plan) => plan.mode === 'identity')).toHaveLength(3)   // 3 identity slots, then the 4th and beyond are full
+    expect(plans.filter((plan) => plan.reason === 'sampled').length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('escalates a REMOTE failure to the full read-back and says so in the receipt', async () => {
+    const f = makeFilm()
+    replaceBlob(f, 0, (bytes) => flip(bytes, 9))        // GitHub holds another object than the derived one
+    const fullReadBack = vi.fn(fullReceiptFor(f))
+    const result = await run(f, { deps: { fullReadBack } })
+    expect(fullReadBack).toHaveBeenCalledTimes(1)
+    expect(result.verificationMode).toBe(VERIFICATION_MODES.fullReadBack)
+    const written = JSON.parse(fs.readFileSync(path.join(f.directory, 'film.recovery.json'), 'utf8'))
+    expect(written).toMatchObject({ fullReadBackReason: 'escalated', escalatedFrom: { class: 'remote', code: 'remote-id-mismatch' } })
+    expect(readStats(f)).toMatchObject({ escalatedFullReadBacks: 1 })
+  })
+
+  it('stays RED when the escalated full read-back also fails: no receipt is written', async () => {
+    const f = makeFilm()
+    replaceBlob(f, 0, (bytes) => flip(bytes, 9))
+    const fullReadBack = vi.fn(async () => { throw new Error('Cloud ciphertext verification failed for part 1') })
+    await expect(run(f, { deps: { fullReadBack } })).rejects.toThrow('Cloud ciphertext verification failed')
+    expect(fs.existsSync(path.join(f.directory, 'film.recovery.json'))).toBe(false)
+  })
+
+  it('REFUSES a local failure without escalating and without a receipt (the original stays)', async () => {
+    const f = makeFilm()
+    fs.writeFileSync(f.source, flip(f.content, 10))
+    const fullReadBack = vi.fn(fullReceiptFor(f))
+    await expect(run(f, { deps: { fullReadBack } })).rejects.toBeInstanceOf(IdentityProofRefused)
+    expect(fullReadBack).not.toHaveBeenCalled()
+    expect(fs.existsSync(path.join(f.directory, 'film.recovery.json'))).toBe(false)
+    expect(readStats(f)).toMatchObject({ identityRefusals: 1 })
+  })
+
+  it('REFUSES a stale manifest online without a full read-back (the parts would be unreadable)', async () => {
+    const f = makeFilm()
+    const stale = JSON.parse(f.manifestBytes.toString()); stale.parts[1].iv = randomBytes(12).toString('base64')
+    f.remoteManifest = Buffer.from(JSON.stringify(stale))
+    const fullReadBack = vi.fn(fullReceiptFor(f))
+    await expect(run(f, { deps: { fullReadBack } })).rejects.toMatchObject({ failure: { class: 'manifest', code: 'manifest-differs' } })
+    expect(fullReadBack).not.toHaveBeenCalled()
+  })
+
+  it('--force-full reads back in full and ignores a valid receipt', async () => {
+    const f = makeFilm()
+    const fullReadBack = vi.fn(fullReceiptFor(f))
+    await run(f)
+    const forced = await run(f, { forceFull: true, reuseReceipt: true, deps: { fullReadBack } })
+    expect(forced.verificationMode).toBe(VERIFICATION_MODES.fullReadBack)
+    expect(fullReadBack).toHaveBeenCalledTimes(1)
+  })
+
+  it('mode full never runs the identity proof', async () => {
+    const f = makeFilm()
+    const treeIds = vi.spyOn(f.remote, 'treeIds')
+    const fullReadBack = vi.fn(fullReceiptFor(f))
+    const result = await run(f, { settings: { mode: 'full' }, deps: { fullReadBack } })
+    expect(result.verificationMode).toBe(VERIFICATION_MODES.fullReadBack)
+    expect(treeIds).not.toHaveBeenCalled()
+  })
+
+  it('mode shadow runs both, only the full read-back authorises, and the comparison is counted', async () => {
+    const f = makeFilm()
+    const fullReadBack = vi.fn(fullReceiptFor(f))
+    const result = await run(f, { settings: { mode: 'shadow' }, deps: { fullReadBack } })
+    expect(result.verificationMode).toBe(VERIFICATION_MODES.fullReadBack)
+    const written = JSON.parse(fs.readFileSync(path.join(f.directory, 'film.recovery.json'), 'utf8'))
+    expect(written.shadowIdentityVerdict.ok).toBe(true)
+    expect(readStats(f)).toMatchObject({ shadowComparisons: 1, shadowDisagreements: 0 })
+    replaceBlob(f, 0, (bytes) => flip(bytes, 9))
+    await run(f, { settings: { mode: 'shadow' }, deps: { fullReadBack }, receiptName: 'second.recovery.json' })
+    expect(readStats(f)).toMatchObject({ shadowComparisons: 2, shadowDisagreements: 1 })
+  })
+
+  it('reuses a receipt that proves this manifest and this unchanged source, and not a receipt for another source', async () => {
+    const f = makeFilm()
+    await run(f)
+    const calls = f.calls.treeIds.length
+    const reused = await run(f, { reuseReceipt: true })
+    expect(reused.reused).toBe(true)
+    expect(f.calls.treeIds).toHaveLength(calls)
+    fs.appendFileSync(f.source, 'x')
+    expect(await reusableReceipt({ receiptPath: path.join(f.directory, 'film.recovery.json'), manifestPath: f.manifestPath, source: f.source })).toBeNull()
+  })
+
+  it('13 October 2026: an identity receipt is not reused when the mode demands the full read-back (full, shadow)', async () => {
+    const f = makeFilm()
+    await run(f)                                                   // identity receipt on disk
+    for (const mode of ['full', 'shadow']) {
+      const fullReadBack = vi.fn(fullReceiptFor(f))
+      const result = await run(f, { reuseReceipt: true, settings: { mode }, deps: { fullReadBack } })
+      expect(result.reused).toBe(false)
+      expect(fullReadBack).toHaveBeenCalledTimes(1)
+      await run(f)                                                 // back to an identity receipt for the next mode
+    }
+    expect((await run(f, { reuseReceipt: true })).reused).toBe(true)   // identity mode still reuses it
+  })
+
+  it('13 October 2026: reserveVerificationSlot in shadow mode never plans identity', async () => {
+    const f = makeFilm()
+    const statsPath = path.join(f.directory, 'VerificationStats.json')
+    const plan = await reserveVerificationSlot({ statsPath, config: config({ mode: 'shadow' }) })
+    expect(plan).toMatchObject({ mode: 'full', reason: 'shadow' })
+  })
+
+  it('13 October 2026: an unsupported-format full read-back gives its slot back and does not restart the 1 in N cycle', async () => {
+    const f = makeFilm()
+    const statsPath = path.join(f.directory, 'VerificationStats.json')
+    await reserveVerificationSlot({ statsPath, config: config({ fullReadBackEvery: 8 }) })
+    await reserveVerificationSlot({ statsPath, config: config({ fullReadBackEvery: 8 }) })
+    await recordVerificationOutcome({ statsPath, kind: 'full', reason: 'unsupported' })
+    expect(readStats(f)).toMatchObject({ filmsSinceFullReadBack: 1, fullReadBackVerified: 1 })
+    await recordVerificationOutcome({ statsPath, kind: 'full', reason: 'sampled' })
+    expect(readStats(f).filmsSinceFullReadBack).toBe(0)
+  })
+
+  it('does not reuse an identity receipt whose evidence was stripped', async () => {
+    const f = makeFilm()
+    await run(f)
+    const receiptPath = path.join(f.directory, 'film.recovery.json')
+    const saved = JSON.parse(fs.readFileSync(receiptPath, 'utf8')); delete saved.identityProof
+    fs.writeFileSync(receiptPath, JSON.stringify(saved))
+    expect(await reusableReceipt({ receiptPath, manifestPath: f.manifestPath, source: f.source })).toBeNull()
+  })
+})
+
+describe('separate counters for the panel', () => {
+  it('counts receipts by verificationMode and exposes the sampling state', async () => {
+    const directory = temp('identity-receipts')
+    const write = (name, fields) => fs.writeFileSync(path.join(directory, name), JSON.stringify({ completeCloudRecoveryVerified: true, ...fields }))
+    write('a.recovery.json', { verificationMode: 'identity-v1' })
+    write('b.recovery.json', { verificationMode: 'identity-v1' })
+    write('c.recovery.json', { verificationMode: 'full-readback' })
+    write('d.recovery.json', {})
+    write('e.recovery.json', { verificationMode: 'surprise' })
+    write('f.recovery.json', { completeCloudRecoveryVerified: false, verificationMode: 'identity-v1' })
+    await recordVerificationOutcome({ statsPath: path.join(directory, 'VerificationStats.json'), kind: 'identity' })
+    const summary = await summarizeVerificationReceipts(directory)
+    expect(summary).toMatchObject({ identityProofVerified: 2, fullReadBackVerified: 1, legacyFullReadBack: 1, unknownMode: 1, receipts: 5 })
+    expect(summary.stats.identityVerified).toBe(1)
+  })
+})
+
+describe('parameters', () => {
+  it('holds every number in one object and the defaults are the decided values', () => {
+    expect(IDENTITY_PROOF_DEFAULTS).toMatchObject({ fullReadBackEvery: 0, realPartRereadCount: 1, mode: 'identity' })
+    expect(Object.isFrozen(IDENTITY_PROOF_DEFAULTS)).toBe(true)
+  })
+  it('lets the environment override, with the names the worker already uses', () => {
+    const resolved = resolveIdentityProofConfig({}, { ZR_VERIFY_MODE: 'shadow', ZR_VERIFY_FULL_EVERY: '0', ZR_VERIFY_REAL_PARTS: '2' })
+    expect(resolved).toMatchObject({ mode: 'shadow', fullReadBackEvery: 0, realPartRereadCount: 2 })
+  })
+  it('names the parameter in every error', () => {
+    expect(() => resolveIdentityProofConfig({ fullReadBackEvery: -1 }, {})).toThrow('fullReadBackEvery')
+    expect(() => resolveIdentityProofConfig({ realPartRereadCount: 0 }, {})).toThrow('realPartRereadCount')
+    expect(() => resolveIdentityProofConfig({ nope: 1 }, {})).toThrow('nope')
+    expect(() => resolveIdentityProofConfig({}, { ZR_VERIFY_FULL_EVERY: 'abc' })).toThrow('fullReadBackEvery')
+    expect(() => resolveIdentityProofConfig({ mode: 'fast' }, {})).toThrow('mode')
+    expect(() => resolveIdentityProofConfig({ owner: '' }, {})).toThrow('owner')
+  })
+})
+
+describe('the real remote: a local bare repository, blobless fetch, trees without blobs', () => {
+  const git = (directory, args) => execFileSync('git', ['-C', directory, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+  function pushFilm(f) {
+    const bare = path.join(temp('identity-bare'), 'remote.git')
+    execFileSync('git', ['init', '-q', '--bare', '--initial-branch=main', bare])
+    git(bare, ['config', 'uploadpack.allowFilter', 'true'])
+    git(bare, ['config', 'uploadpack.allowAnySHA1InWant', 'true'])
+    const work = temp('identity-work')
+    git(work, ['init', '-q', '--initial-branch=main'])
+    git(work, ['config', 'user.email', 'test@example.invalid']); git(work, ['config', 'user.name', 'test'])
+    for (const [blobPath, bytes] of f.blobs) {
+      fs.mkdirSync(path.dirname(path.join(work, blobPath)), { recursive: true })
+      fs.writeFileSync(path.join(work, blobPath), bytes)
+    }
+    git(work, ['add', '-A']); git(work, ['commit', '-q', '-m', 'parts'])
+    git(work, ['remote', 'add', 'origin', `file://${bare}`]); git(work, ['push', '-q', 'origin', 'main'])
+    return { bare, commit: git(work, ['rev-parse', 'HEAD']) }
+  }
+  const repin = (f, commit) => {
+    for (const part of f.manifest.parts) part.url = part.url.replace(f.commit, commit)
+    f.commit = commit
+    f.manifestBytes = Buffer.from(JSON.stringify(f.manifest))
+    f.remoteManifest = f.manifestBytes
+  }
+
+  it('proves a film through real Git objects, downloading exactly one blob', async () => {
+    const f = makeFilm({ commit: 'b'.repeat(40) })
+    const { bare, commit } = pushFilm(f)
+    repin(f, commit)
+    const scratch = temp('identity-scratch')
+    const remote = createGitRemote({ token: 'unused', config: config(), scratchParent: scratch, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      remoteUrlFor: () => `file://${bare}` })
+    try {
+      const readBlob = vi.spyOn(remote, 'readBlob')
+      const result = await prove(f, { remote })
+      expect(result.ok).toBe(true)
+      expect(result.counters.remoteIdOk).toBe(3)
+      expect(result.counters.partBlobIds).toEqual([...f.tree.values()])
+      expect(readBlob).toHaveBeenCalledTimes(1)          // ONE real part
+      // the cost claim: listing the tree downloaded NO blob except that one (the scratch repository holds exactly one)
+      const [directory] = fs.readdirSync(scratch)
+      const objects = git(path.join(scratch, directory), ['cat-file', '--batch-all-objects', '--batch-check=%(objecttype)']).split('\n')
+      expect(objects.filter((type) => type === 'blob')).toHaveLength(1)
+    } finally { await remote.close() }
+    expect(fs.readdirSync(scratch)).toEqual([])        // scratch repositories are removed
+  })
+
+  it('is RED when the pushed bytes differ from what the source derives', async () => {
+    const f = makeFilm({ commit: 'c'.repeat(40) })
+    const blobPath = [...f.blobs.keys()][0]
+    f.blobs.set(blobPath, flip(f.blobs.get(blobPath), 2))     // what reached GitHub is not the derived ciphertext
+    const { bare, commit } = pushFilm(f)
+    repin(f, commit)
+    const remote = createGitRemote({ token: 'unused', config: config(), scratchParent: temp('identity-scratch'), env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      remoteUrlFor: () => `file://${bare}` })
+    try {
+      const result = await prove(f, { remote })
+      expect(result.ok).toBe(false)
+      expect(result.failure).toMatchObject({ class: 'remote', code: 'remote-id-mismatch', partIndex: 0 })
+    } finally { await remote.close() }
+  })
+
+  it('is RED (remote class) when the pinned commit does not exist', async () => {
+    const f = makeFilm({ commit: 'd'.repeat(40) })
+    const { bare } = pushFilm(f)
+    const remote = createGitRemote({ token: 'unused', config: config({ gitAttempts: 1 }), scratchParent: temp('identity-scratch'),
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, remoteUrlFor: () => `file://${bare}` })
+    try {
+      const result = await prove(f, { remote })
+      expect(result.ok).toBe(false)
+      expect(result.failure).toMatchObject({ class: 'remote', code: 'remote-tree-unavailable' })
+    } finally { await remote.close() }
+  })
+
+  it('finds the manifest path from Git and refuses a clone of another repository', () => {
+    const clone = temp('identity-clone')
+    git(clone, ['init', '-q'])
+    git(clone, ['remote', 'add', 'origin', 'https://github.com/matthieuhuguet/zenray-data.git'])
+    fs.mkdirSync(path.join(clone, 'pages', 'Movies'), { recursive: true })
+    const manifest = path.join(clone, 'pages', 'Movies', 'Film.media.json')
+    fs.writeFileSync(manifest, '{}')
+    expect(locateManifestInClone(manifest, { config: config() })).toBe('pages/Movies/Film.media.json')
+    git(clone, ['remote', 'set-url', 'origin', 'https://github.com/matthieuhuguet/another-repository.git'])
+    expect(() => locateManifestInClone(manifest, { config: config() })).toThrow('zenray-data')
+    expect(() => locateManifestInClone(path.join(temp('not-a-clone'), 'x.json'), { config: config() })).toThrow()
+  })
+
+  it('reads the manifest through the contents API (raw media type), retries a 503 and does not retry a 404', async () => {
+    const answers = [{ ok: false, status: 503 }, { ok: true, status: 200, arrayBuffer: async () => Buffer.from('{"a":1}') }]
+    const seen = []
+    const fetchImpl = vi.fn(async (url, init) => { seen.push({ url, accept: init.headers.Accept }); return answers.shift() })
+    const bytes = await readRemoteManifestBytes({ token: 'T', config: config(), repoPath: 'pages/Mo vies/é.media.json', fetchImpl, sleep: async () => {} })
+    expect(bytes.toString()).toBe('{"a":1}')
+    expect(seen).toHaveLength(2)
+    expect(seen[0].url).toBe('https://api.github.com/repos/matthieuhuguet/zenray-data/contents/pages/Mo%20vies/%C3%A9.media.json?ref=main')
+    expect(seen[0].accept).toBe('application/vnd.github.raw')
+    const notFound = vi.fn(async () => ({ ok: false, status: 404 }))
+    await expect(readRemoteManifestBytes({ token: 'T', config: config(), repoPath: 'x', fetchImpl: notFound, sleep: async () => {} })).rejects.toThrow('HTTP 404')
+    expect(notFound).toHaveBeenCalledTimes(1)
+  })
+})

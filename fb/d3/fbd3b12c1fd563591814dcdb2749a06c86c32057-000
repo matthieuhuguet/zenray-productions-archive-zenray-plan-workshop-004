@@ -1,0 +1,151 @@
+// 2 October 2026, 13:36 CEST: publish private project snapshots by identity with fresh conflict-safe writes.
+import { assertWorkspaceId } from '../src/lib/projectWorkspace.js'
+import { buildGlobalProjectIndex, renderProjectContext } from '../src/lib/projectContextIndex.js'
+import { createWorkspaceCatalogue, isWorkspaceCatalogue, summarizeWorkspaceProject, LEGACY_WORKSPACE_REGISTRY_PATH, WORKSPACE_CATALOGUE_PATH } from '../src/lib/assetsWorkspaceCatalogue.js'
+
+// 3 October 2026, 10:25 CEST: the shared catalogue omits transfer internals; exact proofs remain in each project snapshot.
+export function compactRegistryProject(project) {
+  const fields = ['id', 'name', 'relativePath', 'sourceId', 'namespace', 'kind', 'size', 'sha256', 'status',
+    'cloudPath', 'contentPath', 'mtimeMs', 'preservedOriginalVersion', 'sourceConflict']
+  return { ...project, files: (project.files || []).map((file) => Object.fromEntries(fields.filter((field) => file[field] !== undefined).map((field) => [field, file[field]]))) }
+}
+
+export function createAssetsCloudPublisher({ baseUrl, fetchImpl = fetch, secret = process.env.ZENRAY_API_SECRET,
+  token = process.env.GITHUB_TOKEN, repository = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data', gitWriter = null } = {}) {
+  let tail = Promise.resolve()
+  const headers = { 'content-type': 'application/json', ...(secret ? { 'x-zr-auth': secret } : {}) }
+  const registryPath = LEGACY_WORKSPACE_REGISTRY_PATH
+  const cataloguePath = WORKSPACE_CATALOGUE_PATH
+  const branch = process.env.CONTENT_BRANCH || 'main'
+  const isProjectMetadataPath = (filePath) => {
+    const match = /^pages\/ZenRayAssets\/([^/]+)\/(?:\.workspace\.json|\.context\.md)$/.exec(filePath)
+    if (!match) return false
+    try { assertWorkspaceId(match[1]); return true } catch { return false }
+  }
+  // 8 October 2026, 12:58 CEST: read project metadata from the shared local sparse Git clone, not Pages credentials.
+  const readCurrent = async (filePath) => {
+    if (gitWriter && (filePath === registryPath || filePath === cataloguePath || isProjectMetadataPath(filePath))) {
+      const local = await gitWriter.read({ path: filePath })
+      if (local.ok) return { sha: local.sha, markdown: local.markdown, gitBacked: true }
+      if (!local.conflict) throw new Error(`Cloud metadata local read failed at ${filePath}: ${local.error || 'unexpected response'}`)
+      throw new Error(`Cloud metadata changed repeatedly while its local Git copy was read at ${filePath}`)
+    }
+    if (filePath !== registryPath) {
+      const read = await fetchImpl(`${baseUrl}/api/page?action=read&path=${encodeURIComponent(filePath)}`, { headers, cache: 'no-store' })
+      if (!read.ok && read.status !== 404) throw new Error(`Cloud registry read failed (${read.status}) at ${filePath}`)
+      const current = await read.json()
+      if (current.error && !current.missing && read.status !== 404) throw new Error('Cloud registry read failed')
+      return current
+    }
+    if (!token) throw new Error(`GitHub credential unavailable for registry metadata read at ${filePath}`)
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const read = await fetchImpl(`https://api.github.com/repos/${repository}/contents/${encodeURI(filePath)}?ref=${encodeURIComponent(branch)}`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-assets' }, cache: 'no-store' })
+      if (read.status === 404) return { missing: true }
+      if (!read.ok) throw new Error(`Cloud registry metadata read failed (${read.status}) at ${filePath}`)
+      const entry = await read.json()
+      if (!entry.sha) throw new Error(`Cloud registry metadata has no SHA at ${filePath}`)
+      const markdown = entry.encoding === 'base64' && typeof entry.content === 'string'
+        ? Buffer.from(entry.content, 'base64').toString('utf8') : null
+      if (markdown !== null) return { sha: entry.sha, markdown, size: entry.size }
+      if (!gitWriter?.read) throw new Error('Cloud registry body unavailable; refusing to overwrite existing data without a local Git reader')
+      const local = await gitWriter.read({ path: filePath, expectedSha: entry.sha })
+      if (local.ok && local.sha === entry.sha) return { sha: entry.sha, markdown: local.markdown, size: entry.size, gitBacked: true }
+      if (!local.conflict) throw new Error(`Cloud registry local read failed at ${filePath}: ${local.error || 'unexpected response'}`)
+    }
+    throw new Error('Cloud registry changed repeatedly while its local Git copy was read')
+  }
+  const save = async (filePath, mutate, { text = false } = {}) => {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const current = await readCurrent(filePath)
+      const data = text ? current.markdown || '' : current.markdown ? JSON.parse(current.markdown) : {}
+      const next = mutate(data)
+      const useGitWriter = Boolean(gitWriter) && (filePath === registryPath || filePath === cataloguePath || isProjectMetadataPath(filePath))
+      if (useGitWriter) {
+        // 9 October 2026, 09:57 CEST: Publish summaries through Git without rewriting the legacy full registry.
+        const saved = await gitWriter.save({ path: filePath, markdown: text ? next : JSON.stringify(next), expectedSha: current.sha,
+          message: filePath === cataloguePath ? 'Assets workspace index save' : filePath === registryPath ? 'Assets workspace registry save' : 'Assets project metadata save' })
+        if (saved.ok) {
+          const verified = await readCurrent(filePath)
+          if (verified.sha === saved.sha) return next
+          continue
+        }
+        if (saved.conflict) continue
+        throw new Error(`Cloud registry save failed at ${filePath}: ${saved.error || 'unexpected response'}`)
+      }
+      const write = await fetchImpl(`${baseUrl}/api/page`, { method: 'POST', headers,
+        body: JSON.stringify({ action: 'save', path: filePath, sha: current.sha || null, markdown: text ? next : JSON.stringify(next) }) })
+      const result = await write.json()
+      if (write.ok && result.ok) return next
+      if (result.conflict || write.status === 409) continue
+      // 3 October 2026, 21:57 CEST: a partial publication identifies its failed document instead of claiming a complete checkpoint.
+      throw new Error(`Cloud registry save failed (${write.status}) at ${filePath}: ${result.error || "unexpected response"} ${result.detail || ""}`)
+    }
+    throw new Error('Cloud registry changed repeatedly; publication can be retried')
+  }
+  return (snapshot, contextIndex = null) => {
+    assertWorkspaceId(snapshot.id)
+    if (snapshot.folder !== `pages/ZenRayAssets/${snapshot.id}`) throw new Error('Workspace snapshot folder does not match its project id')
+    // 14 October 2026: with the local Git writer, one publication is ONE transaction (one fetch, one commit, one push for the project
+    // snapshot, the shared index and the context note). Three separate saves cost about 27 s per pass and most passes changed nothing.
+    const transact = async () => {
+      const workspacePath = `${snapshot.folder}/.workspace.json`, contextPath = `${snapshot.folder}/.context.md`
+      // A catalogue that does not exist yet may need the old registry; that rare migration keeps the step-by-step path.
+      for (let attempt = 0; attempt < 5; attempt++) {
+        let outcome = null
+        const result = await gitWriter.transaction({ paths: [workspacePath, cataloguePath, contextPath], message: 'Assets project publication', build: (read) => {
+          const catalogueText = read(cataloguePath)
+          if (catalogueText === null || catalogueText === '') { outcome = { migrate: true }; return {} }
+          const current = JSON.parse(catalogueText)
+          if (!isWorkspaceCatalogue(current)) throw new Error('Workspace index is malformed; refusing to replace it')
+          // The index timestamp only moves when a project summary really changed; a pass that changed nothing writes nothing.
+          const others = current.projects.filter((project) => project.id !== snapshot.id)
+          const unchanged = createWorkspaceCatalogue([...others, snapshot], current.updatedAt)
+          const catalogue = JSON.stringify(unchanged) === JSON.stringify(current) ? unchanged : createWorkspaceCatalogue([...others, snapshot])
+          const index = contextIndex || buildGlobalProjectIndex([snapshot].map(compactRegistryProject), { cloud: true })
+          if (!index?.projects?.[snapshot.id]) throw new Error(`Cloud project context is missing ${snapshot.id}`)
+          outcome = { catalogue }
+          return { [workspacePath]: JSON.stringify(snapshot), [cataloguePath]: JSON.stringify(catalogue), [contextPath]: renderProjectContext(index, snapshot.id) }
+        } })
+        if (outcome?.migrate) return null
+        if (result.ok) return { catalogue: outcome.catalogue, migrated: false }
+        if (result.conflict) continue
+        throw new Error(`Cloud registry save failed at ${snapshot.folder}: ${result.error || 'unexpected response'}`)
+      }
+      throw new Error('Cloud registry changed repeatedly; publication can be retried')
+    }
+    const run = async () => {
+      if (gitWriter?.transaction && [`${snapshot.folder}/.workspace.json`, cataloguePath, `${snapshot.folder}/.context.md`].every((filePath) => filePath === cataloguePath || isProjectMetadataPath(filePath))) {
+        const done = await transact()
+        if (done) return done
+      }
+      await save(`${snapshot.folder}/.workspace.json`, () => snapshot)
+      let legacy = null
+      const existingCatalogue = await readCurrent(cataloguePath)
+      if (!existingCatalogue.markdown && !existingCatalogue.sha) {
+        const previousRegistry = await readCurrent(registryPath)
+        if (previousRegistry.markdown) {
+          legacy = JSON.parse(previousRegistry.markdown)
+          if (!Array.isArray(legacy.projects)) throw new Error('Legacy workspace registry has no project list; refusing to replace it')
+        }
+      } else {
+        const current = JSON.parse(existingCatalogue.markdown)
+        if (!isWorkspaceCatalogue(current)) throw new Error('Workspace index is malformed; refusing to replace it')
+      }
+      const legacySummaries = (legacy?.projects || []).filter((project) => project.id !== snapshot.id).map(summarizeWorkspaceProject)
+      const catalogue = await save(cataloguePath, (current) => {
+        if (Object.keys(current).length && !isWorkspaceCatalogue(current)) throw new Error('Workspace index is malformed; refusing to replace it')
+        const prior = isWorkspaceCatalogue(current) ? current.projects : legacySummaries
+        return createWorkspaceCatalogue([...prior.filter((project) => project.id !== snapshot.id), snapshot])
+      })
+      const contextProjects = [...(legacy?.projects || []).filter((project) => project.id !== snapshot.id), snapshot].map(compactRegistryProject)
+      const resolvedContextIndex = contextIndex || legacy?.index || buildGlobalProjectIndex(contextProjects, { cloud: true })
+      if (!resolvedContextIndex?.projects?.[snapshot.id]) throw new Error(`Cloud project context is missing ${snapshot.id}`)
+      await save(`${snapshot.folder}/.context.md`, () => renderProjectContext(resolvedContextIndex, snapshot.id), { text: true })
+      return { catalogue, migrated: Boolean(legacy) }
+    }
+    const task = tail.then(run, run)
+    tail = task.catch(() => {})
+    return task
+  }
+}

@@ -1,0 +1,85 @@
+// LOT IMAGES — hooks React pour vignettes instantanées + visibilité.
+//
+// EN CLAIR POUR TOUS : ces petits outils disent à une vignette « charge-toi seulement quand tu
+// approches de l'écran » (IntersectionObserver), puis « si je t'ai déjà vue, réapparais tout de
+// suite » (cache mémoire). Résultat : grille fluide même à 10000 images, vignettes instantanées.
+//
+// TECHNIQUE : un SEUL IntersectionObserver partagé (un par app, pas un par image — sinon des
+// milliers d'observers tueraient la perf). Marge de 400px autour du viewport = on précharge juste
+// avant que l'image entre à l'écran. useThumb gère l'état de chargement via le cache LRU + la file.
+
+import { useEffect, useRef, useState, useCallback } from 'react'
+import { imageCache } from './imageCache.js'
+import { imageQueue } from './imageQueue.js'
+
+// ── IntersectionObserver partagé ────────────────────────────────────────────
+const _cbMap = new WeakMap() // element -> callback(isVisible)
+let _io = null
+function getIO() {
+  if (_io || typeof IntersectionObserver === 'undefined') return _io
+  _io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const cb = _cbMap.get(e.target)
+      if (cb) cb(e.isIntersecting)
+    }
+  }, { rootMargin: '400px 0px', threshold: 0 })
+  return _io
+}
+
+// Observe un élément ; appelle onChange(visible). Se nettoie tout seul.
+export function useInView(onVisible) {
+  const ref = useRef(null)
+  const [inView, setInView] = useState(false)
+  const cb = useCallback((v) => {
+    setInView(v)
+    if (v && typeof onVisible === 'function') onVisible()
+  }, [onVisible])
+  useEffect(() => {
+    const el = ref.current
+    const io = getIO()
+    if (!el) return
+    if (!io) { setInView(true); if (onVisible) onVisible(); return } // pas d'IO -> on charge direct
+    _cbMap.set(el, cb)
+    io.observe(el)
+    return () => { io.unobserve(el); _cbMap.delete(el) }
+  }, [cb, onVisible])
+  return { ref, inView }
+}
+
+// Vignette pilotée par le cache + la file. Retourne { ref, src, ready }.
+// - ref : à poser sur le conteneur (pour la détection de visibilité)
+// - src : l'URL à mettre dans <img> (posée seulement quand visible -> lazy réel)
+// - ready : true dès que l'image est décodée (déjà en cache OU chargée)
+//
+// `priority` = true pour la 1re image de l'arbre (chargée avant tout le reste).
+export function useThumb(url, { priority = false } = {}) {
+  const [ready, setReady] = useState(() => !!url && imageCache.has(url))
+  const [show, setShow] = useState(() => !!(url && imageCache.has(url)) || priority)
+
+  const onVisible = useCallback(() => {
+    if (!url) return
+    setShow(true)
+    if (imageCache.has(url)) { setReady(true); return }
+    imageQueue.enqueue(url, { priority })
+  }, [url, priority])
+
+  const { ref, inView } = useInView(onVisible)
+
+  useEffect(() => {
+    if (!url) { setReady(false); setShow(priority); return }
+    if (imageCache.has(url)) { setReady(true); setShow(true); return }
+    setReady(false)
+    if (priority) { setShow(true); imageQueue.enqueue(url, { priority: true }) }
+    else setShow(false)
+  }, [url, priority])
+
+  // quand visible et pas prêt, on tente un chargement via la file puis on marque prêt
+  useEffect(() => {
+    if (!url || !show || ready) return
+    let live = true
+    imageCache.load(url).then((bmp) => { if (live && bmp) setReady(true) }).catch(() => {})
+    return () => { live = false }
+  }, [url, show, ready])
+
+  return { ref, src: show ? url : null, ready, inView }
+}

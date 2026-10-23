@@ -1,0 +1,89 @@
+import { createCipheriv, randomBytes } from 'node:crypto'
+import { expect, test, vi } from 'vitest'
+import { attachmentDownload, downloadParts } from './attachment-download.js'
+import { createSignedShareToken, resolveShareToken } from './share-token.js'
+import { createHash } from 'node:crypto'
+
+// Exact bytes, denied access and corrupt data are separate verdicts. (19 October 2026, 00:32 Paris)
+const request = (method = 'GET') => new Request('https://site.test/api/attachment-download?share=signed-token', { method })
+function fixture() {
+  const key = randomBytes(32)
+  const originals = [Buffer.from('first audio bytes'), Buffer.from('second chunk 日本語')]
+  const ivs = originals.map(() => randomBytes(12))
+  const encrypted = originals.map((bytes, index) => {
+    const cipher = createCipheriv('aes-256-gcm', key, ivs[index])
+    return Buffer.concat([cipher.update(bytes), cipher.final(), cipher.getAuthTag()])
+  })
+  const manifest = { type: 'chunked-media', vis: 'public', alg: 'AES-GCM', name: 'audio 日本語.m4a',
+    size: Buffer.concat(originals).length, cdnRepo: 'zenrayshards-doc-test', cdnCommit: 'a'.repeat(40),
+    dir: 'media/test', parts: ['000', '001'], ivs: ivs.map((iv) => iv.toString('base64')) }
+  const fetchImpl = vi.fn(async (url, options) => {
+    const data = encrypted[url.includes('000.bin') ? 0 : 1]
+    if (options?.headers?.Range === 'bytes=-16') return new Response(data.subarray(-16), { status: 206 })
+    return new Response(new ReadableStream({ start(controller) {
+      for (let index = 0; index < data.length; index += 7) controller.enqueue(new Uint8Array(data.subarray(index, index + 7)))
+      controller.close()
+    } }))
+  })
+  return { originals, encrypted, manifest, deps: { resolveShare: async () => ({ path: 'pages/PlanAttachments/audio.media.json' }),
+    readManifest: async () => JSON.stringify(manifest), mediaKey: () => key.toString('base64'), fetchImpl } }
+}
+test('downloads all original bytes across chunks and split authentication tags', async () => {
+  const f = fixture(), response = await attachmentDownload(request(), f.deps)
+  expect(response.status).toBe(200)
+  expect(response.headers.get('Content-Disposition')).toContain('attachment;')
+  expect(response.headers.get('Cache-Control')).toContain('no-store')
+  expect(Buffer.from(await response.arrayBuffer())).toEqual(Buffer.concat(f.originals))
+})
+test('refuses a missing or revoked token before reading any file', async () => {
+  const f = fixture(); f.deps.readManifest = vi.fn()
+  f.deps.resolveShare = async () => { throw Object.assign(new Error('invalid-share'), { status: 403 }) }
+  expect((await attachmentDownload(request(), f.deps)).status).toBe(403)
+  expect(f.deps.readManifest).not.toHaveBeenCalled()
+})
+test('HEAD returns metadata without fetching binary chunks', async () => {
+  const f = fixture(), response = await attachmentDownload(request('HEAD'), f.deps)
+  expect(response.headers.get('Content-Length')).toBe(String(f.manifest.size))
+  expect(await response.text()).toBe('')
+  expect(f.deps.fetchImpl).not.toHaveBeenCalled()
+})
+test('falls back to the exact pinned origin when CDN fails', async () => {
+  const f = fixture(), original = f.deps.fetchImpl
+  f.deps.fetchImpl = (url, options) => url.includes('cdn.jsdelivr') ? new Response('', { status: 404 }) : original(url, options)
+  const response = await attachmentDownload(request(), f.deps)
+  expect(Buffer.from(await response.arrayBuffer())).toEqual(Buffer.concat(f.originals))
+})
+test('corrupt encrypted bytes fail the download rather than claiming success', async () => {
+  const f = fixture(); f.encrypted[1][0] ^= 1
+  const response = await attachmentDownload(request(), f.deps)
+  await expect(response.arrayBuffer()).rejects.toThrow()
+})
+test('object parts work and third-party URLs are refused', () => {
+  const f = fixture(), parts = downloadParts(f.manifest)
+  expect(downloadParts({ ...f.manifest, parts: parts.map((part) => ({ url: part.url, iv: part.iv })) })).toEqual(parts)
+  expect(() => downloadParts({ ...f.manifest, parts: [{ url: 'https://evil.test/file', iv: f.manifest.ivs[0] }] })).toThrow()
+})
+test('permanent file tokens still validate signature, kind and revocation', async () => {
+  const secret = 'test-secret', token = createSignedShareToken(secret)
+  const record = { v: 1, tokenHash: createHash('sha256').update(token).digest('hex'), kind: 'file', path: 'pages/PlanAttachments/audio.media.json', expiresAt: null }
+  const options = { secret, expectedKind: 'file', loadRecord: async () => record }
+  expect((await resolveShareToken(token, options)).path).toBe(record.path)
+  await expect(resolveShareToken(token + 'x', options)).rejects.toThrow()
+  await expect(resolveShareToken(token, { ...options, expectedKind: 'video' })).rejects.toThrow()
+  record.revokedAt = new Date().toISOString()
+  await expect(resolveShareToken(token, options)).rejects.toThrow()
+})
+
+// Workerd must read the authentication tag before the first update. (19 October 2026, 00:39 Paris)
+test('fetches the origin authentication tag before opening the ciphertext stream', async () => {
+  const f = fixture(), original = f.deps.fetchImpl
+  let tagReady = false
+  f.deps.fetchImpl = async (url, options) => {
+    if (options?.headers?.Range === 'bytes=-16') tagReady = true
+    else if (!tagReady) throw new Error('workerd requires the auth tag first')
+    return original(url, options)
+  }
+  const response = await attachmentDownload(request(), f.deps)
+  expect(Buffer.from(await response.arrayBuffer())).toEqual(Buffer.concat(f.originals))
+  expect(tagReady).toBe(true)
+})

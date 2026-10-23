@@ -1,0 +1,523 @@
+import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, mkdir, rm, writeFile, readFile, stat, chmod } from 'node:fs/promises'
+import { readFileSync, readdirSync, existsSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createDecipheriv, createHash, randomBytes } from 'node:crypto'
+import { commitForRepo, ingestVideoRaw, isPrivateShardName, resumableVideoShardName, videoPartsPerShard, videoRepoCapBytes, releaseUploadedShardScratch, videoRawPushBatchBytes, videoGitAuthEnvironment, makeVidRawShardCtx } from './video-raw-lib.mjs'
+import { createPushController, loadPushPolicyConfig } from './lib/push-batch-policy.mjs'
+
+describe('video transport configuration', () => {
+  it('defaults to the top of the push policy (20 parts, 1 900 MiB) and a fixed batch when the legacy variable is set', () => {
+    const partBytes = 95 * 1024 ** 2
+    expect(videoRawPushBatchBytes({})).toBe(20 * (partBytes + 16))
+    expect(videoRawPushBatchBytes({ ZR_SHARD_PUSH_BATCH_MB: '190' })).toBe(190 * 1024 ** 2)
+    expect(videoRawPushBatchBytes({ ZR_SHARD_PUSH_BATCH_MB: '1' }, partBytes)).toBe(partBytes + 16)
+  })
+
+  it('caps a repository at 4 096 MiB for new films: 43 parts per repository instead of 21', () => {
+    expect(videoRepoCapBytes()).toBe(4096 * 1024 ** 2)
+    expect(videoPartsPerShard()).toBe(43)
+    expect(Math.floor(videoRepoCapBytes() / (95 * 1024 ** 2 + 16))).toBe(43)
+  })
+
+  it('authenticates Git through environment config instead of token-bearing remote URLs', () => {
+    const token = 'test-token'
+    const env = videoGitAuthEnvironment({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'test.key' }, token)
+    expect(env.GIT_CONFIG_COUNT).toBe('2')
+    expect(env.GIT_CONFIG_KEY_1).toBe('http.https://github.com/.extraheader')
+    expect(env.GIT_CONFIG_VALUE_1).toBe(`AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`)
+  })
+})
+
+describe('bounded uploaded transport scratch', () => {
+  it('retains pending bytes and rejects paths outside the transport directory', async () => {
+    const work = await mkdtemp(path.join(tmpdir(), 'video-scratch-'))
+    const dir = path.join(work, 'zenrayshards-vid-test')
+    await mkdir(dir)
+    const proof = { work, dir, pendingBytes: 1, pendingPaths: [], commit: 'a'.repeat(40) }
+    await expect(releaseUploadedShardScratch(proof)).rejects.toThrow('not confirmed')
+    await expect(releaseUploadedShardScratch({ ...proof, pendingBytes: 0, dir: path.dirname(work) })).rejects.toThrow('unsafe')
+    expect((await stat(dir)).isDirectory()).toBe(true)
+    await rm(work, { recursive: true })
+  })
+  it('releases only the completed transport copy and preserves neighboring source files', async () => {
+    const work = await mkdtemp(path.join(tmpdir(), 'video-scratch-'))
+    const dir = path.join(work, 'zenrayshards-vid-test')
+    await mkdir(dir)
+    await writeFile(path.join(work, 'source.mkv'), 'original')
+    await releaseUploadedShardScratch({ work, dir, pendingBytes: 0, pendingPaths: [], commit: 'a'.repeat(40) })
+    await expect(stat(dir)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await stat(path.join(work, 'source.mkv'))).size).toBe(8)
+    await rm(work, { recursive: true })
+  })
+})
+
+describe('références du rail vidéo exact', () => {
+  it('exige le commit propre à chaque dépôt traversé', () => {
+    const sha = 'a'.repeat(40)
+    expect(commitForRepo({ 'zenrayshards-vid-01': sha }, 'zenrayshards-vid-01')).toBe(sha)
+    expect(() => commitForRepo({}, 'zenrayshards-vid-01')).toThrow('commit vidéo manquant')
+    expect(() => commitForRepo({ 'zenrayshards-vid-01': 'court' }, 'zenrayshards-vid-01')).toThrow('commit vidéo manquant')
+  })
+
+  it('garde privée toute famille sauf les images', () => {
+    expect(isPrivateShardName('zenrayshards-vid-abcdef')).toBe(true)
+    expect(isPrivateShardName('zenrayshards-img-abcdef')).toBe(false)
+  })
+
+  it('adresse chaque dépôt de reprise par la source et la tranche', () => {
+    const sourceSha256 = 'ab'.repeat(32)
+    expect(resumableVideoShardName(sourceSha256, 0)).toBe('zenrayshards-vid-file-abababababababab-01')
+    expect(resumableVideoShardName(sourceSha256, 1)).toBe('zenrayshards-vid-file-abababababababab-02')
+    expect(videoPartsPerShard()).toBeGreaterThan(1)
+  })
+
+  it('rend exactement les octets confiés et reproduit les mêmes parts après interruption', async () => {
+    const racine = await mkdtemp(path.join(tmpdir(), 'zrc-video-exact-'))
+    const source = path.join(racine, 'source.mkv')
+    const original = Buffer.from('piste-video\npiste-audio-2\nsous-titre\n')
+    const key = Buffer.alloc(32, 7)
+    process.env.ZENRAY_MEDIA_KEY = key.toString('base64')
+    await writeFile(source, original)
+    const repo = 'zenrayshards-vid-test'
+    const sha = 'c'.repeat(40)
+    const sourceSha256 = 'd'.repeat(64)
+    const executer = async () => {
+      const chiffres = [], chemins = [], indices = []
+      const vctx = {
+        vis: 'private', commitOf: {},
+        async beginFile(source) { expect(source).toBe(sourceSha256) },
+        async writePart(partPath, buf, index) {
+          chemins.push(partPath); chiffres.push(Buffer.from(buf)); indices.push(index); return repo
+        },
+        async flush() { this.commitOf[repo] = sha },
+      }
+      const resultat = await ingestVideoRaw(source, {
+        dest: 'pages/Cloud/Test', base: 'source', vctx, workDir: path.join(racine, 'work'),
+        sourceSha256, log: () => {},
+      })
+      return { ...resultat, chiffres, chemins, indices }
+    }
+    try {
+      const premier = await executer()
+      const reprise = await executer()
+      expect(reprise.chemins).toEqual(premier.chemins)
+      expect(reprise.chiffres).toEqual(premier.chiffres)
+      expect(reprise.indices).toEqual([0])
+      expect(reprise.manifest.parts.map((p) => p.iv)).toEqual(premier.manifest.parts.map((p) => p.iv))
+      const clairs = premier.chiffres.slice(0, premier.manifest.parts.length).map((cipher, i) => {
+        const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(premier.manifest.parts[i].iv, 'base64'))
+        decipher.setAuthTag(cipher.subarray(cipher.length - 16))
+        return Buffer.concat([decipher.update(cipher.subarray(0, -16)), decipher.final()])
+      })
+      expect(Buffer.concat(clairs)).toEqual(original)
+      expect(premier.manifest.name).toBe('source.mkv')
+      expect(premier.manifest.size).toBe(original.length)
+    } finally {
+      await rm(racine, { recursive: true, force: true })
+    }
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// 12 October 2026: the archive push path against REAL local bare repositories (no network, no GitHub write). The bare repository
+// carries a pre-receive hook that can refuse a push for its size, fail it N times, hold it for a while and flag any overlap of two
+// pushes. Parts are 256 KiB so that "20 parts" is 5 MiB and a test takes seconds.
+// FR : le chemin de poussee de l'archive contre de VRAIS depots nus locaux ; le hook peut refuser, echouer N fois, retenir la poussee.
+// ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+const PART_MIB = 0.25
+const TOKEN_OFF = () => { process.env.ZR_PUSH_TOKEN = '0' }
+
+async function makeKit({ delaySeconds = 0 } = {}) {
+  const root = await mkdtemp(path.join(tmpdir(), 'zr-vidraw-push-'))
+  const kit = {
+    root, remotes: path.join(root, 'remotes'), work: path.join(root, 'work'), control: path.join(root, 'control'),
+    log: path.join(root, 'hook.log'), metrics: path.join(root, 'metrics.jsonl'),
+  }
+  await mkdir(kit.remotes, { recursive: true })
+  await mkdir(kit.control, { recursive: true })
+  await writeFile(kit.log, '')
+  const hook = `#!/bin/sh
+LOG='${kit.log}'
+LOCK='${kit.control}/push.lock'
+now() { python3 -c 'import time;print(int(time.time()*1000))'; }
+read_control() { if [ -f "${kit.control}/$1" ]; then cat "${kit.control}/$1"; else echo "$2"; fi; }
+if ! mkdir "$LOCK" 2>/dev/null; then echo "CONCURRENT" >> "$LOG"; echo "remote: concurrent push refused" >&2; exit 1; fi
+trap 'rmdir "$LOCK"' EXIT
+echo "start $(now)" >> "$LOG"
+limit=$(read_control size-limit-kib 0)
+if [ "$limit" -gt 0 ]; then
+  size=$(du -sk "$GIT_QUARANTINE_PATH" | cut -f1)
+  if [ "$size" -gt "$limit" ]; then echo "end $(now) size-refused" >> "$LOG"; echo "remote: fatal: pack exceeds maximum allowed size (2.00 GiB)" >&2; exit 1; fi
+fi
+if [ -f "${kit.control}/permanent" ]; then echo "end $(now) permanent" >> "$LOG"; echo "remote: error: GH013: Repository rule violations found for refs/heads/main." >&2; exit 1; fi
+n=$(read_control fail-count 0)
+if [ "$n" -gt 0 ]; then echo $((n-1)) > "${kit.control}/fail-count"; echo "end $(now) failed" >> "$LOG"; echo "fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com" >&2; exit 1; fi
+sleep ${delaySeconds}
+echo "end $(now) ok" >> "$LOG"
+exit 0
+`
+  kit.createRepo = async (repo) => {
+    const dir = path.join(kit.remotes, `${repo}.git`)
+    const init = spawnSync('git', ['init', '--bare', '-q', '--initial-branch=main', dir], { encoding: 'utf8' })
+    if (init.status !== 0) throw new Error(init.stderr)
+    const file = path.join(dir, 'hooks', 'pre-receive')
+    await writeFile(file, hook)
+    await chmod(file, 0o755)
+  }
+  kit.setControl = (name, value) => writeFile(path.join(kit.control, name), String(value))
+  kit.clearControl = (name) => rm(path.join(kit.control, name), { force: true })
+  kit.git = (repo, args) => spawnSync('git', ['-C', path.join(kit.remotes, `${repo}.git`), ...args], { encoding: 'utf8' })
+  kit.hookEvents = () => readFileSync(kit.log, 'utf8').split('\n').filter(Boolean).map((line) => {
+    const [type, at, note] = line.split(' ')
+    return { type, at: Number(at), note }
+  })
+  kit.pushes = () => {
+    const events = kit.hookEvents()
+    const result = []
+    let open = null
+    for (const event of events) {
+      if (event.type === 'start') open = { start: event.at }
+      else if (event.type === 'end' && open) { result.push({ ...open, end: event.at, note: event.note }); open = null }
+    }
+    return result
+  }
+  kit.cleanup = () => rm(root, { recursive: true, force: true })
+  return kit
+}
+
+function makeCtx(kit, overrides = {}, extra = {}) {
+  const config = loadPushPolicyConfig({}, { rampStartParts: 8, partMiB: PART_MIB, targetMiB: 5, hardLimitMiB: 6, metricsFile: kit.metrics, backoffBaseMs: 1, backoffMaxMs: 2, ...overrides })
+  const controller = createPushController(config)
+  const ctx = makeVidRawShardCtx({
+    token: 'test-token', work: kit.work, log: () => {}, type: 'vid', vis: 'private', pushController: controller,
+    hooks: {
+      remoteUrl: (repo) => path.join(kit.remotes, `${repo}.git`), repoExists: async () => false,
+      createRepo: kit.createRepo, sleep: async () => {},
+    },
+    ...extra,
+  })
+  return { ctx, controller, config }
+}
+
+const partBuffer = (config) => randomBytes(Math.round(config.partMiB * 1024 * 1024) + 16)
+const sha = (buffer) => createHash('sha256').update(buffer).digest('hex')
+const partPath = (hash) => `${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.bin`
+const metricsLines = (kit) => (existsSync(kit.metrics) ? readFileSync(kit.metrics, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : [])
+
+async function writeParts(ctx, config, count, { returnTimes = null } = {}) {
+  const written = []
+  for (let index = 0; index < count; index += 1) {
+    const buffer = partBuffer(config)
+    const hashed = partPath(sha(buffer))
+    const repo = await ctx.writePart(hashed, buffer, index)
+    if (returnTimes) returnTimes.push(Date.now())
+    written.push({ hashed, buffer, repo })
+  }
+  return written
+}
+
+async function remoteHasAll(kit, repo, written) {
+  for (const item of written) {
+    const shown = spawnSync('git', ['-C', path.join(kit.remotes, `${repo}.git`), 'show', `main:${item.hashed}`], { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 })
+    if (shown.status !== 0) return false
+    if (Buffer.compare(shown.stdout, item.buffer) !== 0) return false
+  }
+  return true
+}
+
+// Each test creates one bare repository and runs git a few hundred times: allow a minute.
+describe('archive push path through the push batch policy (local bare repositories)', { timeout: 90000 }, () => {
+  const sourceSha = 'ab'.repeat(32)
+
+  it('sends every part, byte for byte, in batches of 8 then more parts, and records the commit that holds them', async () => {
+    TOKEN_OFF()
+    const kit = await makeKit()
+    try {
+      const { ctx, config } = makeCtx(kit)
+      await ctx.beginFile(sourceSha)
+      const written = await writeParts(ctx, config, 20)
+      await ctx.flush()
+      const repo = resumableVideoShardName(sourceSha, 0)
+      expect(written.every((item) => item.repo === repo)).toBe(true)
+      expect(await remoteHasAll(kit, repo, written)).toBe(true)
+      expect(ctx.pendingPaths).toEqual([])
+      expect(ctx.pendingBytes).toBe(0)
+      const remoteHead = kit.git(repo, ['rev-parse', 'main']).stdout.trim()
+      expect(ctx.commitOf[repo]).toBe(remoteHead)
+      const attempts = metricsLines(kit).filter((line) => line.type === 'attempt' && line.ok)
+      expect(attempts.reduce((sum, line) => sum + line.count, 0)).toBe(20)
+      expect(attempts[0].count).toBe(8)
+      expect(attempts.every((line) => line.count <= 20)).toBe(true)
+      expect(ctx.pushSummary().batches).toBe(attempts.length)
+    } finally { await kit.cleanup() }
+  })
+
+  it('prepares the next parts while a push transfers, and never runs two pushes to the same repository at once', async () => {
+    TOKEN_OFF()
+    const kit = await makeKit({ delaySeconds: 0.5 })
+    try {
+      const { ctx, config } = makeCtx(kit)
+      await ctx.beginFile(sourceSha)
+      const returns = []
+      const written = await writeParts(ctx, config, 20, { returnTimes: returns })
+      await ctx.flush()
+      const events = kit.hookEvents()
+      expect(events.some((event) => event.type === 'CONCURRENT')).toBe(false)
+      // pushes[0] is the push of the README of the new repository, the batches follow
+      const pushes = kit.pushes().filter((push) => push.note === 'ok')
+      expect(pushes.length).toBeGreaterThanOrEqual(4)
+      // pushes are strictly sequential
+      for (let index = 1; index < pushes.length; index += 1) expect(pushes[index].start).toBeGreaterThanOrEqual(pushes[index - 1].end)
+      // overlap: the 8th part (the one that fills the first batch) returns BEFORE the first push is confirmed, so the next parts were
+      // read, encrypted and hashed while that push transferred
+      expect(returns[7]).toBeLessThan(pushes[1].end)
+      expect(await remoteHasAll(kit, resumableVideoShardName(sourceSha, 0), written)).toBe(true)
+    } finally { await kit.cleanup() }
+  })
+
+  it('RED control: with the overlap switched off the producer never works during a push', async () => {
+    TOKEN_OFF()
+    const kit = await makeKit({ delaySeconds: 0.4 })
+    try {
+      const { ctx, config } = makeCtx(kit, { overlapPrepare: false })
+      await ctx.beginFile(sourceSha)
+      const returns = []
+      await writeParts(ctx, config, 16, { returnTimes: returns })
+      await ctx.flush()
+      const pushes = kit.pushes().filter((push) => push.note === 'ok') // pushes[0] is the README of the new repository
+      // the part that fills the first batch waits for the send: it returns only AFTER the first batch push ended
+      expect(returns[7]).toBeGreaterThanOrEqual(pushes[1].end)
+      expect(kit.hookEvents().some((event) => event.type === 'CONCURRENT')).toBe(false)
+    } finally { await kit.cleanup() }
+  })
+
+  it('retries ONE transient failure with the same batch and loses nothing', async () => {
+    TOKEN_OFF()
+    const kit = await makeKit()
+    try {
+      const { ctx, config } = makeCtx(kit)
+      await ctx.beginFile(sourceSha)
+      const written = await writeParts(ctx, config, 4) // below 8 parts: nothing sent yet
+      await kit.setControl('fail-count', 1)
+      await ctx.flush()
+      const attempts = metricsLines(kit).filter((line) => line.type === 'attempt')
+      expect(attempts.map((line) => [line.ok, line.count])).toEqual([[false, 4], [true, 4]])
+      expect(metricsLines(kit).some((line) => line.type === 'fallback')).toBe(false)
+      expect(await remoteHasAll(kit, resumableVideoShardName(sourceSha, 0), written)).toBe(true)
+    } finally { await kit.cleanup() }
+  })
+
+  it('falls back to 2 parts at the THIRD failure of the same batch, then goes on, without losing a part', async () => {
+    TOKEN_OFF()
+    const kit = await makeKit()
+    try {
+      const { ctx, config } = makeCtx(kit)
+      await ctx.beginFile(sourceSha)
+      const written = await writeParts(ctx, config, 6)
+      await kit.setControl('fail-count', 3)
+      await ctx.flush()
+      const attempts = metricsLines(kit).filter((line) => line.type === 'attempt')
+      expect(attempts.slice(0, 3).map((line) => [line.ok, line.count])).toEqual([[false, 6], [false, 6], [false, 6]])
+      expect(attempts.slice(3).every((line) => line.ok && line.count <= 2)).toBe(true)
+      expect(metricsLines(kit).filter((line) => line.type === 'fallback')).toHaveLength(1)
+      // 3 clean pushes of 2 parts after the fallback: the level steps back up one rung (2 -> 4), step by step
+      expect(ctx.pushPolicy.state().level).toBe(4)
+      expect(metricsLines(kit).filter((line) => line.type === 'step-up')).toHaveLength(1)
+      expect(await remoteHasAll(kit, resumableVideoShardName(sourceSha, 0), written)).toBe(true)
+      // the remote history carries only 2 part commits after the failed batch: nothing of the failed 6 part commit was pushed
+      const log = kit.git(resumableVideoShardName(sourceSha, 0), ['log', '--format=%H', 'main']).stdout.trim().split('\n')
+      expect(log.length).toBe(1 + 3) // README commit + three batches of 2 parts
+    } finally { await kit.cleanup() }
+  })
+
+  it('shrinks after a refusal for size and still delivers every part (no data loss)', async () => {
+    TOKEN_OFF()
+    const kit = await makeKit()
+    try {
+      const { ctx, config } = makeCtx(kit, { rampStartParts: 20 })
+      await ctx.beginFile(sourceSha)
+      const written = await writeParts(ctx, config, 12) // 12 parts = 3 MiB, level 20 would take them all
+      await kit.setControl('size-limit-kib', 1100)    // about 4 parts of 256 KiB
+      await ctx.flush()
+      const attempts = metricsLines(kit).filter((line) => line.type === 'attempt')
+      expect(attempts.some((line) => !line.ok && line.kind === 'pack-size')).toBe(true)
+      expect(attempts.filter((line) => line.ok).reduce((sum, line) => sum + line.count, 0)).toBe(12)
+      expect(Math.max(...attempts.filter((line) => line.ok).map((line) => line.count))).toBeLessThan(12)
+      expect(await remoteHasAll(kit, resumableVideoShardName(sourceSha, 0), written)).toBe(true)
+      expect(ctx.pendingPaths).toEqual([])
+    } finally { await kit.cleanup() }
+  })
+
+  it('fails cleanly on a permanent refusal: push-refus-definitif names the repository and the parts stay in the clone', async () => {
+    TOKEN_OFF()
+    const kit = await makeKit()
+    try {
+      const { ctx, config } = makeCtx(kit)
+      await ctx.beginFile(sourceSha)
+      const written = await writeParts(ctx, config, 3)
+      await kit.setControl('permanent', '1')
+      const repo = resumableVideoShardName(sourceSha, 0)
+      const quiet = console.error
+      console.error = () => {}
+      try {
+        await expect(ctx.flush()).rejects.toThrow(`push-refus-definitif ${repo}`)
+      } finally { console.error = quiet }
+      expect(ctx.pendingPaths.length).toBe(3)
+      // the parts are still in the clone, as git objects (the working tree copy is deleted once the blob is written)
+      for (const item of written) {
+        const blobId = createHash('sha1').update(`blob ${item.buffer.length}\0`).update(item.buffer).digest('hex')
+        expect(spawnSync('git', ['-C', ctx.dir, 'cat-file', '-e', blobId]).status).toBe(0)
+      }
+      expect(kit.git(repo, ['rev-list', '--count', 'main']).stdout.trim()).toBe('1') // only the README commit is online
+      // the same context recovers once the refusal is gone: the parts were never dropped
+      await kit.clearControl('permanent')
+      await ctx.flush()
+      expect(await remoteHasAll(kit, repo, written)).toBe(true)
+    } finally { await kit.cleanup() }
+  })
+
+  it('moves the parts of a new film to the next repository when a repository is full (cap from the environment)', async () => {
+    TOKEN_OFF()
+    // 191 MiB of cap = 2 parts of 95 MiB + 16 per repository: 5 small parts land in 3 repositories. The default (4 096 MiB, 43 parts)
+    // is proven by the configuration test above; here the same code path runs with a cap small enough to cross a repository.
+    process.env.ZR_REPO_CAP_MIB = '191'
+    vi.resetModules()
+    const kit = await makeKit()
+    try {
+      const lib = await import('./video-raw-lib.mjs')
+      const policy = await import('./lib/push-batch-policy.mjs')
+      expect(lib.videoPartsPerShard()).toBe(2)
+      const config = policy.loadPushPolicyConfig({}, { rampStartParts: 8, partMiB: PART_MIB, targetMiB: 5, hardLimitMiB: 6, metricsFile: kit.metrics, backoffBaseMs: 1, backoffMaxMs: 2 })
+      const ctx = lib.makeVidRawShardCtx({
+        token: 'test-token', work: kit.work, log: () => {}, type: 'vid', vis: 'private', pushController: policy.createPushController(config),
+        hooks: { remoteUrl: (repo) => path.join(kit.remotes, `${repo}.git`), repoExists: async () => false, createRepo: kit.createRepo, sleep: async () => {} },
+      })
+      await ctx.beginFile(sourceSha)
+      const written = await writeParts(ctx, config, 5)
+      await ctx.flush()
+      const names = [0, 1, 2].map((index) => lib.resumableVideoShardName(sourceSha, index))
+      expect(written.map((item) => item.repo)).toEqual([names[0], names[0], names[1], names[1], names[2]])
+      expect(await remoteHasAll(kit, names[0], written.slice(0, 2))).toBe(true)
+      expect(await remoteHasAll(kit, names[1], written.slice(2, 4))).toBe(true)
+      expect(await remoteHasAll(kit, names[2], written.slice(4))).toBe(true)
+      for (const name of names) expect(ctx.commitOf[name]).toMatch(/^[0-9a-f]{40}$/)
+    } finally {
+      delete process.env.ZR_REPO_CAP_MIB
+      vi.resetModules()
+      await kit.cleanup()
+    }
+  })
+})
+
+describe('films already online keep resolving after the repository cap moved from 2 GiB to 4 GiB', () => {
+  // The part to repository mapping is STORED in the manifest: parts[i].url is https://raw.githubusercontent.com/<owner>/<repo>/<commit>/<path>
+  // and every reader (viewer, download, verification, restore) fetches that url. The part index is only turned into a repository
+  // name while a part is being WRITTEN (resumableVideoShardName(sha, floor(index / partsPerRepository))). These two tests prove both
+  // halves: the manifest carries the repository, and nothing else reads the index to find it.
+  // FR : le depot de chaque part est STOCKE dans l'url de la part ; seul le code d'ecriture derive un depot depuis l'index.
+  it('writes the repository of the part into the part url of the manifest', async () => {
+    const racine = await mkdtemp(path.join(tmpdir(), 'zrc-old-manifest-'))
+    try {
+      process.env.ZENRAY_MEDIA_KEY = Buffer.alloc(32, 9).toString('base64')
+      const source = path.join(racine, 'source.mkv')
+      await writeFile(source, Buffer.from('a film of one part'))
+      const repository = 'zenrayshards-vid-file-aaaaaaaaaaaaaaaa-02'
+      const commit = 'f'.repeat(40)
+      const vctx = {
+        vis: 'private', commitOf: { [repository]: commit },
+        async beginFile() {}, async flush() {},
+        async writePart() { return repository },
+      }
+      const result = await ingestVideoRaw(source, { dest: 'pages/Test', base: 'source', vctx, workDir: path.join(racine, 'work'), sourceSha256: 'a'.repeat(64), log: () => {} })
+      const url = new URL(result.manifest.parts[0].url)
+      expect(url.pathname.split('/')[2]).toBe(repository)
+      expect(url.pathname.split('/')[3]).toBe(commit)
+    } finally { await rm(racine, { recursive: true, force: true }) }
+  })
+
+  it('derives a repository from a part index in ONE place only (the writer), so no reader depends on the cap', () => {
+    const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
+    const found = []
+    const walk = (directory) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (entry.name === 'node_modules' || entry.name.startsWith('.') || ['_staging', '_archive', '_deprecated', 'dist'].includes(entry.name)) continue
+        const full = path.join(directory, entry.name)
+        if (entry.isDirectory()) { walk(full); continue }
+        if (!/\.(m?js|jsx|ts|tsx)$/.test(entry.name) || /\.test\./.test(entry.name)) continue
+        if (/videoPartsPerShard|resumableVideoShardName|PARTS_PAR_DEPOT|partsPerRepo\(/.test(readFileSync(full, 'utf8'))) found.push(path.relative(root, full))
+      }
+    }
+    for (const top of ['src', 'server', 'scripts', 'functions', 'api']) { if (existsSync(path.join(root, top))) walk(path.join(root, top)) }
+    // the writer, and the policy module that owns the arithmetic (partsPerRepo)
+    expect(found.sort()).toEqual(['scripts/lib/push-batch-policy.mjs', 'scripts/video-raw-lib.mjs'])
+  })
+
+  it('names the repository of a NEW part from the index and the cap only, the old placement is untouched', () => {
+    const hash = 'a'.repeat(64)
+    // 21 parts per repository (old cap): part 21 was in repository 02. 43 per repository (new cap): part 21 is in repository 01.
+    expect(resumableVideoShardName(hash, Math.floor(21 / 21))).toBe('zenrayshards-vid-file-aaaaaaaaaaaaaaaa-02')
+    expect(resumableVideoShardName(hash, Math.floor(21 / 43))).toBe('zenrayshards-vid-file-aaaaaaaaaaaaaaaa-01')
+    expect(resumableVideoShardName(hash, Math.floor(43 / 43))).toBe('zenrayshards-vid-file-aaaaaaaaaaaaaaaa-02')
+  })
+})
+
+// 14 October 2026: the repository pool. Fifteen small files must not open fifteen repositories (GitHub blocks bursts of creations).
+describe('repository reuse and creation gate (14 October 2026)', () => {
+  const poolHooks = (kit, policy, created) => ({
+    remoteUrl: (repo) => path.join(kit.remotes, `${repo}.git`),
+    repoExists: async (repo) => existsSync(path.join(kit.remotes, `${repo}.git`)),
+    createRepo: async (repo) => { created.push(repo); await kit.createRepo(repo) },
+    sleep: async () => {},
+    repoPool: { policy },
+  })
+  const policyIn = async () => (await import('./lib/repo-create-policy.mjs')).loadRepoCreatePolicy({}, { directory: await mkdtemp(path.join(tmpdir(), 'zr-pool-')), slots: 1 })
+
+  it('the second file reuses the repository of the first: ONE creation for two files', async () => {
+    TOKEN_OFF()
+    const kit = await makeKit()
+    try {
+      const policy = await policyIn()
+      const created = []
+      const first = makeCtx(kit, {}, { hooks: poolHooks(kit, policy, created) })
+      await first.ctx.beginFile()
+      const a = await writeParts(first.ctx, first.config, 3)
+      await first.ctx.flush()
+      first.ctx.releasePool() // the first process is over (in production each file is its own process)
+      const second = makeCtx(kit, {}, { hooks: poolHooks(kit, policy, created) })
+      await second.ctx.beginFile()
+      const b = await writeParts(second.ctx, second.config, 3)
+      await second.ctx.flush()
+      expect(created.length).toBe(1)
+      expect(new Set([...a, ...b].map((item) => item.repo)).size).toBe(1)
+      expect(await remoteHasAll(kit, a[0].repo, [...a, ...b])).toBe(true)
+    } finally { await kit.cleanup() }
+  })
+
+  it('a repository marked full is NOT reused: the next file opens a new one (red control)', async () => {
+    TOKEN_OFF()
+    const kit = await makeKit()
+    try {
+      const policy = await policyIn()
+      const created = []
+      const first = makeCtx(kit, {}, { hooks: poolHooks(kit, policy, created) })
+      await first.ctx.beginFile()
+      await writeParts(first.ctx, first.config, 2)
+      await first.ctx.flush()
+      const { claimRepoPoolSlot } = await import('./lib/repo-create-policy.mjs')
+      // the lane is still held by `first` in this process: read its state file directly and mark it full
+      const stateFile = path.join(policy.directory, 'vid-private-lane0.json')
+      const state = JSON.parse(readFileSync(stateFile, 'utf8'))
+      await writeFile(stateFile, JSON.stringify({ ...state, full: true }))
+      first.ctx.releasePool()
+      expect(claimRepoPoolSlot).toBeTypeOf('function')
+      const second = makeCtx(kit, {}, { hooks: poolHooks(kit, policy, created) })
+      await second.ctx.beginFile()
+      await writeParts(second.ctx, second.config, 2)
+      await second.ctx.flush()
+      expect(created.length).toBe(2)
+    } finally { await kit.cleanup() }
+  })
+})

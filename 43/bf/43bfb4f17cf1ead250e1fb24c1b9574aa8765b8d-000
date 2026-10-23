@@ -1,0 +1,87 @@
+// @vitest-environment node
+// 14 October 2026: one publication is one Git transaction; an unchanged project writes nothing; a moved remote is a conflict, never a force.
+import { afterEach, expect, it } from 'vitest'
+import { execFileSync } from 'node:child_process'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { createAssetsCloudGitWriter } from './AssetsCloudGitWriter.mjs'
+import { createAssetsCloudPublisher } from './AssetsCloudPublisher.mjs'
+import { createWorkspaceCatalogue, WORKSPACE_CATALOGUE_PATH } from '../src/lib/assetsWorkspaceCatalogue.js'
+import { buildGlobalProjectIndex } from '../src/lib/projectContextIndex.js'
+
+const roots = []
+const sh = (args, options = {}) => execFileSync('git', ['-c', 'maintenance.auto=false', ...args], { encoding: 'utf8', ...options }).trim()
+const gitIn = (directory, ...args) => sh(['-C', directory, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args])
+afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))) })
+
+async function remoteWithCatalogue() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'assets-transaction-'))
+  roots.push(root)
+  const remote = path.join(root, 'remote.git'), seed = path.join(root, 'seed')
+  sh(['init', '--bare', '--quiet', '--initial-branch=main', remote])
+  sh(['clone', '--quiet', remote, seed])
+  await mkdir(path.dirname(path.join(seed, WORKSPACE_CATALOGUE_PATH)), { recursive: true })
+  await writeFile(path.join(seed, WORKSPACE_CATALOGUE_PATH), JSON.stringify(createWorkspaceCatalogue([{ id: 'core', name: 'Core', folder: 'pages/ZenRayAssets/core', sources: [], files: [] }], '2026-10-01T00:00:00.000Z')))
+  gitIn(seed, 'add', '--', WORKSPACE_CATALOGUE_PATH)
+  gitIn(seed, 'commit', '--quiet', '-m', 'seed')
+  gitIn(seed, 'push', '--quiet', 'origin', 'HEAD:main')
+  const writer = createAssetsCloudGitWriter({ repositoryPath: path.join(root, 'writer'), remoteUrl: remote, branch: 'main', authorName: 'Test', authorEmail: 'test@example.com' })
+  return { root, remote, seed, writer }
+}
+const commitCount = (remote) => Number(sh(['-C', remote, 'rev-list', '--count', 'refs/heads/main']))
+const snapshot = (extra = {}) => ({ id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', sources: [], files: [], checkedAt: '2026-10-14T10:00:00.000Z', ...extra })
+const indexOf = () => buildGlobalProjectIndex([snapshot()], { cloud: true })
+
+it('writes the project snapshot, the shared index and the context note in ONE commit', async () => {
+  const { remote, writer } = await remoteWithCatalogue()
+  const before = commitCount(remote)
+  const publish = createAssetsCloudPublisher({ baseUrl: 'http://unused', fetchImpl: async () => { throw new Error('No REST call expected') }, gitWriter: writer })
+  const index = indexOf()
+  await publish(snapshot(), index)
+  expect(commitCount(remote)).toBe(before + 1)
+  const workspace = JSON.parse(sh(['-C', remote, 'show', 'refs/heads/main:pages/ZenRayAssets/tiles/.workspace.json']))
+  expect(workspace.id).toBe('tiles')
+  const catalogue = JSON.parse(sh(['-C', remote, 'show', `refs/heads/main:${WORKSPACE_CATALOGUE_PATH}`]))
+  expect(catalogue.projects.map((project) => project.id).sort()).toEqual(['core', 'tiles'])
+  expect(sh(['-C', remote, 'cat-file', '-e', 'refs/heads/main:pages/ZenRayAssets/tiles/.context.md'])).toBe('')
+})
+
+it('writes nothing at all when the publication is identical to the last one', async () => {
+  const { remote, writer } = await remoteWithCatalogue()
+  const publish = createAssetsCloudPublisher({ baseUrl: 'http://unused', fetchImpl: async () => { throw new Error('No REST call expected') }, gitWriter: writer })
+  const index = indexOf()
+  await publish(snapshot(), index)
+  const after = commitCount(remote)
+  await publish(snapshot(), index)
+  expect(commitCount(remote)).toBe(after)
+})
+
+it('reports a conflict when the remote moved during the transaction and never forces the push', async () => {
+  const { root, remote, seed, writer } = await remoteWithCatalogue()
+  const rival = path.join(root, 'rival')
+  sh(['clone', '--quiet', remote, rival])
+  let raced = false
+  const result = await writer.transaction({ paths: [WORKSPACE_CATALOGUE_PATH, 'pages/ZenRayAssets/tiles/.workspace.json', 'pages/ZenRayAssets/tiles/.context.md'], message: 'mine',
+    build: async () => {
+      if (!raced) {
+        raced = true
+        await writeFile(path.join(rival, 'rival.txt'), 'someone else pushed first')
+        gitIn(rival, 'add', '--', 'rival.txt'); gitIn(rival, 'commit', '--quiet', '-m', 'rival'); gitIn(rival, 'push', '--quiet', 'origin', 'HEAD:main')
+      }
+      return { 'pages/ZenRayAssets/tiles/.workspace.json': '{"id":"tiles"}' }
+    } })
+  expect(result).toMatchObject({ ok: false, conflict: true })
+  expect(sh(['-C', remote, 'log', '--format=%s', 'refs/heads/main'])).toContain('rival')
+  expect(sh(['-C', remote, 'log', '--format=%s', 'refs/heads/main'])).not.toContain('mine')
+  void seed
+  const retry = await writer.transaction({ paths: ['pages/ZenRayAssets/tiles/.workspace.json'], message: 'mine', build: async () => ({ 'pages/ZenRayAssets/tiles/.workspace.json': '{"id":"tiles"}' }) })
+  expect(retry.ok).toBe(true)
+  expect(sh(['-C', remote, 'log', '--format=%s', 'refs/heads/main'])).toContain('mine')
+})
+
+it('refuses a path outside the project metadata set', async () => {
+  const { writer } = await remoteWithCatalogue()
+  await expect(writer.transaction({ paths: ['pages/other/file.json'], build: async () => ({}) })).rejects.toThrow(/cannot update path/)
+  await expect(writer.transaction({ paths: [WORKSPACE_CATALOGUE_PATH], build: async () => ({ 'pages/ZenRayAssets/tiles/.workspace.json': 'x' }) })).rejects.toThrow(/cannot write|cannot update path/)
+})

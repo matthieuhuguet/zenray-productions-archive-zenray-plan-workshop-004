@@ -1,0 +1,405 @@
+#!/usr/bin/env node
+// ZenRayMedia — compilateur de thème à composants.
+//
+// CE QU'EST ZENRAYMEDIA (doctrine, à rappeler dans tout fichier du moteur)
+// ----------------------------------------------------------------------
+// ZenRayMedia est un ÉDITEUR, au sens où Unreal en est un : une scène, un catalogue de pièces
+// qu'on pose dessus, des paramètres, un rendu déterministe. Ce n'est pas un générateur de pages
+// ni un moteur de gabarits — c'est un plan de travail.
+//
+// La visée tenue, et elle contraint chaque décision technique : un Photoshop ou un DaVinci
+// HYPER RAPIDE. On ouvre, on pose un média, on choisit un thème et un format, on exporte. Tout
+// ce qui ajoute une attente entre ces gestes est à refuser, même si cela ajoute une capacité.
+// C'est pourquoi le rendu est déterministe (aucun aléa à re-jouer), pourquoi les polices sont
+// embarquées (aucun aller-retour réseau), et pourquoi chaque composant est un fichier autonome
+// (ouvrable seul, vérifiable seul, remplaçable seul).
+//
+// Corollaire opérationnel : les 1024 thèmes ne servent à rien tant que l'ÉDITEUR ne sait pas les
+// consommer. Produire mille gabarits sans faire évoluer l'interface d'édition en parallèle, c'est
+// préparer une découverte désagréable au millième. Voir docs/zenraymedia/08-EDITEUR-A-FAIRE.md.
+//
+//   node scripts/zrm-build-theme.mjs T-01-1-2--une-de-rupture
+//   node scripts/zrm-build-theme.mjs --all
+//
+// LE PROBLÈME QU'IL RÉSOUT (retour Matthieu, 2026-07-25) :
+// deux exigences qui paraissaient s'exclure, et qui ne s'excluent pas.
+//   1. Matthieu veut des FICHIERS PAR COMPOSANT, ouvrables seuls dans un navigateur, comme le
+//      livrable de référence `ZenRayMedia_LeMonde_Final_V2_Offline/components/` (43 documents
+//      autonomes + un component-registry.json).
+//   2. L'application, elle, a besoin d'UN gabarit unique conforme au contrat du moteur.
+// J'avais tranché en faveur de (2) en refusant (1). C'était une erreur : il fallait écrire le
+// code qui lit les composants, pas renoncer aux composants. Ce script fait les deux depuis UNE
+// source, donc sans jamais les laisser diverger.
+//
+// SOURCE (écrite à la main) :
+//   themes/<theme>/theme.json        métadonnées (id, nom, formats, polices, calibrage privé)
+//   themes/<theme>/tokens.css        les variables mesurées sur les captures
+//   themes/<theme>/parts/<id>.html   un composant : en-tête JSON + <style> + markup
+//
+// GÉNÉRÉ (ne jamais éditer à la main) :
+//   themes/<theme>/components/<id>.html   document AUTONOME, ouvrable seul
+//   themes/<theme>/component-registry.json
+//   themes/<theme>.html                   le gabarit que l'application consomme
+//
+// Chaque composant autonome embarque les tokens : c'est la duplication qui le rend ouvrable
+// seul, et c'est voulu. Le gabarit, lui, ne les écrit qu'UNE fois.
+
+import { readFile, writeFile, mkdir, readdir, rm } from 'node:fs/promises'
+import { FONTS_BY_FAMILY } from '../src/zenraymedia/fonts.js'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+
+const ROOT = path.resolve(import.meta.dirname, '..')
+const THEMES = path.join(ROOT, 'src', 'zenraymedia', 'themes')
+
+/** Découpe un fichier de partie : en-tête JSON facultatif, <style>, markup. */
+function parsePart(raw, id) {
+  const meta = (() => {
+    const m = /<!--\s*zrm\s*([\s\S]*?)-->/i.exec(raw)
+    if (!m) return {}
+    try { return JSON.parse(m[1].trim()) } catch {
+      throw new Error(`${id} : en-tête <!--zrm …--> illisible (JSON invalide)`)
+    }
+  })()
+  const style = [...raw.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map((m) => m[1].trim()).join('\n')
+  const markup = raw
+    .replace(/<!--\s*zrm[\s\S]*?-->/i, '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .trim()
+  if (!markup) throw new Error(`${id} : aucun markup`)
+  return { id, meta, style, markup }
+}
+
+/** Nom lisible tiré de l'identifiant : « T-01-1-3--quotidien-de-reference-sobre » donne
+ *  « Quotidien de reference sobre ». Une constante codée en dur affichait le nom du PREMIER
+ *  thème sur tous les suivants — un bandeau-titre du Figaro portant « Une de rupture ». */
+function readableName(id) {
+  const slug = id.split('--')[1] || id
+  const words = slug.replace(/-/g, ' ').trim()
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
+
+/** Remplace les champs de gabarit par un exemple, pour qu'un composant seul montre quelque chose. */
+function withSample(markup, sample) {
+  return markup
+    .replace(/\{\{#beats\}\}([\s\S]*?)\{\{\/beats\}\}/g, (_, body) =>
+      sample.beats.map((b) => body.replace(/\{\{(\w+)\}\}/g, (__, k) => b[k] ?? '')).join(''))
+    .replace(/\{\{\^beats\}\}[\s\S]*?\{\{\/beats\}\}/g, '')
+    .replace(/\{\{\{?(\w+)\}?\}\}/g, (_, k) => sample[k] ?? '')
+}
+
+const sampleFor = (id) => ({
+  title: 'Deux « ogres » de feu dévorent tout sur leur passage',
+  message: 'Les incendies ravagent toujours cette partie du Sud-Ouest et ont forcé l’évacuation de 110 000 personnes.',
+  audience: 'Lecteurs du soir', readingMinutes: '4', words: '820',
+  themeName: readableName(id), formatLabel: 'Article web',
+  beats: [
+    { role: 'hook', roleLabel: 'Accroche', number: '1', text: 'On croit que le goulot d’étranglement de la création, c’est l’idée. C’est faux.' },
+    { role: 'context', roleLabel: 'Contexte', number: '2', text: 'Ce qui prend des jours, c’est le trajet entre la note et l’objet publiable.' },
+    { role: 'proof', roleLabel: 'Preuve', number: '3', text: 'Une identité visuelle est un ensemble fini de décisions. Un ensemble fini de décisions, c’est un fichier de données.' },
+    { role: 'cta', roleLabel: 'Appel', number: '4', text: 'Un brief, mille formes.' },
+  ],
+})
+
+/**
+ * Les @font-face du thème, polices EMBARQUÉES EN BASE64.
+ *
+ * BUG RÉEL, payé le 2026-07-25 : les composants autonomes et la planche déclaraient
+ * `font-family:'Anton'` sans jamais charger la fonte. Le navigateur retombait silencieusement
+ * sur Arial Narrow — Matthieu voyait donc l'ancien rendu et concluait, à raison, que rien
+ * n'avait changé. Seul le gabarit de l'application recevait ses @font-face, injectés à
+ * l'exécution par `compile.js`. Un fichier qu'on ouvre seul doit porter ses propres polices :
+ * c'est la définition même d'autonome. Le base64 n'est pas une commodité, c'est la condition.
+ */
+async function fontFacesBase64(families, root) {
+  const out = []
+  for (const family of families || []) {
+    const entry = FONTS_BY_FAMILY[family]
+    if (!entry) { console.warn(`  ! police non installée : ${family} — le rendu utilisera un repli`); continue }
+    for (const face of entry.faces) {
+      const buf = await readFile(path.join(root, 'public', face.file))
+      out.push(`@font-face{font-family:'${family}';font-style:${face.style};font-weight:${face.weight};font-display:block;src:url(data:font/woff2;base64,${buf.toString('base64')}) format('woff2');${face.unicodeRange ? `unicode-range:${face.unicodeRange};` : ''}}`)
+    }
+  }
+  return out.join('\n')
+}
+
+async function buildTheme(dir) {
+  const name = path.basename(dir)
+  const themeJson = JSON.parse(await readFile(path.join(dir, 'theme.json'), 'utf8'))
+  // Un seul exemple par thème, calculé ici. Le nommer `sample` plutôt que d'appeler sampleFor()
+  // au fil du code évite la collision avec le paramètre `id` de `pick(id)` plus bas — collision
+  // qui a fait échouer la première tentative avec « id is not defined ».
+  const sample = sampleFor(name)
+  const tokens = await readFile(path.join(dir, 'tokens.css'), 'utf8')
+  const fontFaces = await fontFacesBase64(themeJson.fonts, ROOT)
+
+  const partsDir = path.join(dir, 'parts')
+  const files = (await readdir(partsDir)).filter((f) => f.endsWith('.html')).sort()
+  const parts = []
+  for (const f of files) {
+    parts.push(parsePart(await readFile(path.join(partsDir, f), 'utf8'), f.replace(/\.html$/, '')))
+  }
+  if (!parts.length) throw new Error(`${name} : aucun composant dans parts/`)
+
+  // LA PLANCHE DE SYMBOLES DOIT VOYAGER AVEC CHAQUE COMPOSANT.
+  // Un <use href="#g-dpad"> ne résout QUE si le <symbol> est dans le même document. Sans cette
+  // injection, chaque composant autonome perdait silencieusement tous ses signes : la roue de
+  // dialogue s'ouvrait sans sa croix directionnelle, et rien ne le signalait — un href SVG qui
+  // ne résout pas ne produit ni erreur ni trace, juste du vide.
+  // On repère la planche à son contenu (elle déclare des <symbol>), pas à son nom de fichier :
+  // un thème est libre d'appeler la sienne autrement.
+  const spriteParts = parts.filter((p) => /<symbol\b/i.test(p.markup))
+  const sprite = spriteParts.map((p) => {
+    // On ne garde que les <svg> qui portent les définitions, pas la planche de démonstration —
+    // sinon chaque composant afficherait la grille d'icônes en plus de lui-même.
+    const m = p.markup.match(/<svg[^>]*>[\s\S]*?<defs>[\s\S]*?<\/defs>[\s\S]*?<\/svg>/i)
+    return m ? m[0] : ''
+  }).join('\n')
+  const spriteStyle = spriteParts.map((p) => p.style).join('\n')
+
+  // 1. Les documents AUTONOMES, un par composant.
+  const outComponents = path.join(dir, 'components')
+  await rm(outComponents, { recursive: true, force: true })
+  await mkdir(outComponents, { recursive: true })
+  for (const part of parts) {
+    const title = part.meta.name || part.id
+    // La planche elle-même n'a pas besoin d'être injectée dans son propre document.
+    const needsSprite = sprite && !spriteParts.includes(part)
+    const doc = `<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<!-- Composant ${part.id} du thème ${themeJson.id}. GÉNÉRÉ depuis parts/${part.id}.html.
+     Autonome : il embarque les tokens du thème pour s'ouvrir seul dans un navigateur.
+     Ne pas éditer ici — éditer la partie source, puis relancer zrm-build-theme.mjs. -->
+<style>
+${fontFaces}
+${tokens.trim()}
+body{margin:0;background:var(--zrm-scene, var(--zrm-wash, #f5f4f2));color:var(--zrm-ink,inherit);}
+${needsSprite ? spriteStyle + '\n' : ''}${part.style}
+</style>
+</head>
+<body>
+${needsSprite ? sprite + '\n' : ''}${withSample(part.markup, sample)}
+</body>
+</html>
+`
+    await writeFile(path.join(outComponents, `${part.id}.html`), doc, 'utf8')
+  }
+
+  // 2. Le registre des composants.
+  const registry = parts.map((p) => ({
+    id: p.id,
+    name: p.meta.name || p.id,
+    group: p.meta.group || 'Divers',
+    role: p.meta.role || null,
+    reference: p.meta.reference || null,
+    file: `components/${p.id}.html`,
+    standalone: true,
+  }))
+  await writeFile(path.join(dir, 'component-registry.json'), JSON.stringify(registry, null, 2) + '\n', 'utf8')
+
+  // 3. Le gabarit consommé par l'application : tokens UNE fois, puis chaque composant.
+  const header = `<!--zr-theme ${JSON.stringify(themeJson, null, 2)} -->`
+  const styles = parts.map((p) => `/* ── ${p.meta.name || p.id} ── */\n${p.style}`).join('\n\n')
+  const body = parts
+    .filter((p) => p.meta.inPage !== false)
+    .sort((a, b) => (a.meta.order ?? 99) - (b.meta.order ?? 99))
+    .map((p) => p.markup)
+    .join('\n\n')
+
+  const gabarit = `${header}
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>{{title}}</title>
+<!-- GÉNÉRÉ par scripts/zrm-build-theme.mjs depuis ${name}/parts/.
+     Ne pas éditer : toute modification serait écrasée au prochain build. -->
+<style>
+${fontFaces}
+${tokens.trim()}
+
+${styles}
+</style>
+</head>
+<body>
+${body}
+</body>
+</html>
+`
+  await writeFile(path.join(THEMES, `${name}.html`), gabarit, 'utf8')
+
+  // 4. La PLANCHE DE COMPOSANTS : un seul fichier qui montre les 25 composants les uns sous les
+  //    autres, avec leur nom, leur groupe et leur capture de référence. C'est le livrable qu'on
+  //    REGARDE — décrire des fichiers dans un dépôt ne montre rien.
+  const labCards = parts.map((p) => `  <section class="lab-card">
+    <header class="lab-head">
+      <span class="lab-id">${p.id}</span>
+      <span class="lab-name">${p.meta.name || p.id}</span>
+      <span class="lab-group">${p.meta.group || 'Divers'}</span>
+      ${p.meta.reference ? `<span class="lab-ref">${p.meta.reference}</span>` : ''}
+    </header>
+    <div class="lab-stage">${withSample(p.markup, sample)}</div>
+  </section>`).join('\n')
+
+  const lab = `<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${themeJson.description ? name : name} — planche de composants</title>
+<style>
+${fontFaces}
+${tokens.trim()}
+
+${styles}
+
+/* — Chrome de la planche. Prefixe lab- : il ne touche jamais aux composants. — */
+.lab-body{ background:#141416; color:#f4f4f5; font-family:ui-sans-serif,system-ui,sans-serif;
+  margin:0; padding:28px 22px 60px; }
+.lab-title{ font-size:22px; font-weight:500; margin:0 0 4px; letter-spacing:-.01em; }
+.lab-sub{ font-size:13px; color:#9a9aa2; margin:0 0 26px; }
+.lab-card{ margin:0 0 26px; border-radius:12px; overflow:hidden; background:#1d1d20;
+  box-shadow:0 1px 0 rgba(255,255,255,.06); }
+.lab-head{ display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:9px 13px; font-size:11.5px; border-bottom:1px solid rgba(255,255,255,.08); }
+.lab-id{ font-family:ui-monospace,monospace; color:#6f6f78; }
+.lab-name{ color:#f4f4f5; font-weight:500; }
+.lab-group{ background:rgba(255,255,255,.09); border-radius:99px; padding:2px 9px; color:#c9c9d1; }
+.lab-ref{ margin-left:auto; font-family:ui-monospace,monospace; color:#6f6f78; font-size:10.5px; }
+/* La scene du laboratoire herite du fond du THEME, pas d'un gris de bureau.
+   --zrm-scene d'abord (themes de jeu : l'interface se pose sur du sombre), --zrm-wash ensuite
+   (themes de presse : un lavis clair). Sans ce repli en cascade, les composants d'une interface
+   de jeu (texte blanc, halos cyan) s'affichaient en blanc sur blanc, donc invisibles, dans
+   l'outil meme qui sert a les verifier.
+   NOTE : aucun accent grave dans ce commentaire. Il est a l'interieur d'un gabarit, et un
+   accent grave y termine la chaine. Panne deja payee le 2026-07-25 dans zrm-fonts, repetee ici
+   le meme jour : d'ou le garde-fou de compilation ajoute plus bas. */
+.lab-stage{ background:var(--zrm-scene, var(--zrm-wash, #f5f4f2)); color:var(--zrm-ink, inherit); padding:0; }
+.lab-stage > *{ max-width:100%; }
+</style>
+</head>
+<body class="lab-body">
+<h1 class="lab-title">${name}</h1>
+<p class="lab-sub">${parts.length} composants · chacun aussi disponible en document autonome dans <code>components/</code></p>
+${labCards}
+</body>
+</html>
+`
+  await writeFile(path.join(dir, 'component-lab.html'), lab, 'utf8')
+
+  // 5. La COMPOSITION HOME : les composants RECOMPOSÉS en une page qui ressemble au média.
+  //    Décomposer sans recomposer ne prouve rien — c'est en remontant la home qu'on voit si les
+  //    proportions, la hiérarchie et la fonte tiennent ensemble. Demandé par Matthieu, absent
+  //    des premières versions.
+  const byId = Object.fromEntries(parts.map((p) => [p.id, withSample(p.markup, sample)]))
+  const pick = (id) => byId[id] || ''
+  const home = `<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${name} — composition home</title>
+<style>
+${fontFaces}
+${tokens.trim()}
+
+${styles}
+
+/* — Grille de la home, relevée sur la capture : colonne principale large, rail étroit,
+     gouttière franche, aucun encadrement. Le média ne met pas ses cartes dans des boîtes. — */
+.home-wrap{ background:var(--zrm-paper); }
+.home-grid{ max-width:1180px; margin:0 auto; padding:calc(var(--u)*1.4) calc(var(--u)*1.2);
+  display:grid; grid-template-columns:minmax(0,1fr) minmax(0,.36fr); gap:calc(var(--u)*2.2); align-items:start; }
+.home-lead{ display:flex; flex-direction:column; gap:calc(var(--u)*.4); }
+.home-lead .zrm-title{ font-size:2.1em; margin-bottom:calc(var(--u)*.5); }
+.home-photo{ background:var(--zrm-band); aspect-ratio:16/9; margin:calc(var(--u)*.4) 0; }
+.home-caption{ font-family:var(--f-body); font-size:.95em; line-height:1.45; margin:0; }
+.home-rule{ border:0; border-top:1px solid var(--zrm-rule); margin:calc(var(--u)*1.4) 0; }
+.home-cards{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:calc(var(--u)*1.6); }
+.home-rail{ display:flex; flex-direction:column; }
+@media (max-width:900px){ .home-grid{ grid-template-columns:minmax(0,1fr); } .home-cards{ grid-template-columns:minmax(0,1fr); } }
+</style>
+</head>
+<body>
+${pick('01-masthead')}
+${pick('03-nav-primary')}
+<div class="home-wrap">
+  <div class="home-grid">
+    <main>
+      <article class="home-lead">
+        <p class="zrm-kicker">Reportage</p>
+        <h1 class="zrm-title">${sample.title}</h1>
+        <div class="home-photo"></div>
+        <p class="home-caption">${sample.message}</p>
+        <p class="zrm-meta">24 juil. 2026 <em>abonnés</em></p>
+      </article>
+      <hr class="home-rule">
+      <div class="home-cards">
+        ${pick('13-card-v')}
+        ${pick('13-card-v')}
+      </div>
+      <hr class="home-rule">
+      ${pick('14-card-h')}
+      <hr class="home-rule">
+      ${pick('17-promo-module')}
+    </main>
+    <div class="home-rail">
+      ${pick('15-card-compact')}
+      ${pick('16-rail')}
+      ${pick('24-newsletter')}
+    </div>
+  </div>
+</div>
+${pick('18-ticker')}
+</body>
+</html>
+`
+  await writeFile(path.join(dir, 'home.html'), home, 'utf8')
+
+  // 5. Garde-fous : ce qui casserait en production, refusé ici.
+  const offenders = [...gabarit.matchAll(/https?:\/\/|@import|fetch\(|<iframe|<script/gi)].map((m) => m[0])
+  if (offenders.length) throw new Error(`${name} : ressource distante ou script interdit (${[...new Set(offenders)].join(', ')})`)
+  if (!/\{\{#beats\}\}/.test(gabarit)) throw new Error(`${name} : le gabarit n'utilise pas {{#beats}} — il serait muet`)
+  if (!/\{\{title\}\}/.test(gabarit)) throw new Error(`${name} : le gabarit n'utilise pas {{title}}`)
+  // Un thème qui NOMME une police sans l'embarquer rend avec un repli, en silence.
+  if ((themeJson.fonts || []).length && !fontFaces.includes('@font-face')) {
+    throw new Error(`${name} : ${themeJson.fonts.join(', ')} déclarée(s) mais aucune @font-face produite`)
+  }
+
+  return { name, parts: parts.length, bytes: Buffer.byteLength(gabarit) }
+}
+
+// GARDE-FOU DE GÉNÉRATION.
+// zrm-fonts compile son registre avant de l'écrire depuis qu'un accent grave égaré a produit un
+// fichier illisible. Ce compilateur-ci ne le faisait pas — et la même panne s'est reproduite le
+// même jour, dans un commentaire de gabarit. Une leçon apprise dans un fichier ne protège pas
+// les autres : elle doit être appliquée partout où le motif existe.
+function assertNoStrayBacktick(code, what) {
+  // On ne compile pas du HTML ; on vérifie l'invariant qui casse : un accent grave dans une
+  // portion destinée à rester littérale.
+  const inComment = /\/\*[^*]*`[^*]*\*\//.test(code)
+  if (inComment) throw new Error(`${what} : accent grave dans un commentaire CSS — il terminerait le gabarit`)
+}
+
+async function main() {
+  const args = process.argv.slice(2)
+  const dirs = args.includes('--all')
+    ? (await readdir(THEMES, { withFileTypes: true }))
+        .filter((d) => d.isDirectory() && existsSync(path.join(THEMES, d.name, 'theme.json')))
+        .map((d) => path.join(THEMES, d.name))
+    : args.filter((a) => !a.startsWith('--')).map((a) => path.join(THEMES, a))
+
+  if (!dirs.length) { console.error('usage : zrm-build-theme.mjs <dossier-du-theme> | --all'); process.exit(2) }
+
+  for (const dir of dirs) {
+    const res = await buildTheme(dir)
+    console.log(`  ok  ${res.name}  ${String(res.parts).padStart(2)} composants  gabarit ${(res.bytes / 1024).toFixed(1)} ko`)
+  }
+}
+
+main().catch((err) => { console.error(`ÉCHEC : ${err.message}`); process.exit(1) })

@@ -1,0 +1,50 @@
+// 23 October 2026: publish the knowledge base to the private data repository, in shards under 700 KB (the contents API reads
+// a file over 1 MiB as empty, incident of 4 October 2026), with the index mapping built by the same tokenizer as the page.
+// FR : publier la base dans le dépôt privé, en morceaux de moins de 700 Ko, avec l'index mapping du même découpage que la page.
+import { buildIndexMap } from '../../../src/lib/knowledgeIndex.js'
+import { createCloudStore } from '../../Freelance/CloudStore.mjs'
+
+/** The light form the page needs: no internal fields. */
+export const forPage = (e) => ({ id: e.id, q: e.q, a: e.a, d: e.d, kw: e.kw, asked: e.asked, firstAt: e.firstAt, lastAt: e.lastAt, src: e.src.map(({ kind, ref, at, proof }) => ({ kind, ref, at, proof })) })
+
+export function buildFiles(config, entries, engine) {
+  const list = entries.map(forPage)
+  const shards = [], files = {}
+  let current = [], size = 2
+  for (const entry of list) {
+    const bytes = JSON.stringify(entry).length + 1
+    if (current.length && size + bytes > config.index.shardBytes) { shards.push(current); current = []; size = 2 }
+    current.push(entry); size += bytes
+  }
+  if (current.length) shards.push(current)
+  shards.forEach((shard, i) => { files[`${config.cloud.shardPrefix}${String(i).padStart(2, '0')}.json`] = JSON.stringify(shard) })
+  const index = { version: 1, builtAt: new Date().toISOString(), count: list.length, shards: shards.map((s, i) => ({ path: `${config.cloud.shardPrefix}${String(i).padStart(2, '0')}.json`, count: s.length })), domains: config.domains, map: buildIndexMap(list, { minLength: config.index.minTokenLength }) }
+  const indexText = JSON.stringify(index)
+  // The page reads it by raw (no 1 MiB limit there); the cap only stops a runaway file. FR : la page le lit en raw ; le plafond arrête un fichier emballé.
+  if (indexText.length > config.index.maxIndexBytes) throw new Error(`Index mapping too large (${indexText.length} bytes)`)
+  files[config.cloud.indexPath] = indexText
+  files[config.cloud.statusPath] = JSON.stringify(engine)
+  return files
+}
+
+/** `inboxUpdates` (id -> fields) are applied to the FRESHEST inbox at commit time, so a question asked meanwhile is never lost. */
+export async function publish(config, entries, engine, { directory, dryRun = false, inboxUpdates = {} } = {}) {
+  const store = createCloudStore({ config, directory })
+  const files = buildFiles(config, entries, engine)
+  return store.commit(`knowledge: ${entries.length} questions (${new Date().toISOString().slice(0, 16)})`, async (tree) => {
+    const out = { ...files }
+    if (Object.keys(inboxUpdates).length) {
+      const inbox = (await tree.json(config.cloud.inboxPath)) || { questions: [] }
+      inbox.questions = (inbox.questions || []).map((q) => (inboxUpdates[q.id] ? { ...q, ...inboxUpdates[q.id] } : q))
+      out[config.cloud.inboxPath] = JSON.stringify(inbox)
+    }
+    return { files: out, report: { questions: entries.length, files: Object.keys(out).length } }
+  }, { dryRun })
+}
+
+/** The inbox as it is on the drive now. */
+export async function readInbox(config, directory) {
+  const store = createCloudStore({ config, directory })
+  await store.sync()
+  return (await store.tree.json(config.cloud.inboxPath)) || { questions: [] }
+}

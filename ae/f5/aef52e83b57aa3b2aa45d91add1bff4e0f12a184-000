@@ -1,0 +1,258 @@
+import React, { useRef, useState } from 'react'
+import { usePlayer } from './PlayerContext.jsx'
+import { THEMES } from '../theme.js'
+import Icon from '../components/Icon.jsx'
+import { PlayPauseGlyph } from '../media/playerControls.jsx'
+import QueuePopover from './QueuePopover.jsx'
+import SeekBar from './SeekBar.jsx'
+import './MiniPlayerCard.css'
+
+// Carte mini-player PARTAGÉE (retour Matthieu 2026-07-18) : UNE seule implémentation pour le footer de
+// ZenRay Audio (ZenRayAudioWorkspace) ET le mini-player flottant global (PlayerBar) -- mêmes boutons,
+// même comportement de file d'attente/volume/bascule verticale, même PlayerContext.
+//
+// UI 2026-07-19 : compositions "Horizontal player · V2" et "Vertical player · V2" du design V9
+// (Memory/Design/ui-design/ui-components-zenray-v9.html). Matière + géométrie dans MiniPlayerCard.css
+// (variables --g9-*, deux thèmes) ; play/pause en crossfade 0.35s (PlayPauseGlyph) ; égaliseur 4 barres
+// animé en lecture. Le transport vertical a une hauteur FIXE : plus aucun "pop" de hauteur au clic.
+const cover = (tr) => {
+  const c = tr && tr.cover
+  if (!c) return null
+  return /^(https?:|data:|blob:|\/)/.test(c) ? c : `/api/img?path=${encodeURIComponent(c)}`
+}
+const fmt = (seconds) => {
+  const value = Number(seconds) || 0
+  return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}`
+}
+
+// PAYLOAD DE DRAG PARTAGÉ (2026-07-22) : forme canonique d'un morceau, identique à celle que les lignes du
+// panneau central posent (dragTrackStart) -> les cibles de drop (playlist du panneau gauche, "This Folder")
+// n'ont qu'UN seul format à lire, quelle que soit la source du drag (pochette/titre du lecteur, ligne de liste).
+// Factorisé ici car le mode vertical le posait inline et le mode HORIZONTAL (lecteur complet) ne le posait pas
+// du tout -- c'était le trou signalé par Matthieu (« glisser depuis la pochette ou le titre du full player »).
+export const startTrackDrag = (ev, track) => {
+  if (!track) return
+  ev.dataTransfer.setData('application/zenray-track', JSON.stringify({
+    source: track.source, uri: track.uri, streamPath: track.streamPath, videoId: track.videoId,
+    title: track.title, artist: track.artist, album: track.album, cover: track.cover, dur: track.dur,
+    manifestPath: track.manifestPath, artists: track.artists,
+  }))
+  ev.dataTransfer.effectAllowed = 'copy'
+}
+
+// Nom d'artiste cliquable (2026-07-19, demande Matthieu : "cliquer sur l'artiste depuis le lecteur mini /
+// normal / panneau de droite" -> page artiste Spotify). Seuls les titres Spotify avec un ID d'artiste
+// connu ouvrent quelque chose -- un titre local/YouTube n'a pas de page équivalente, reste du texte.
+//
+// MULTI-ARTISTES (2026-07-20) : quand un titre porte PLUSIEURS artistes, chacun devient un lien SÉPARÉ
+// (le survol ne souligne que l'artiste visé), et la ligne DÉFILE de droite à gauche en boucle façon
+// Pac-Man (le texte ressort de l'autre côté) -- transform lent, en pause au survol pour laisser le temps
+// de cliquer. Le défilement ne s'active que s'il y a plusieurs artistes ; un artiste seul garde la ligne
+// statique tronquée d'avant.
+function ArtistLink({ track, onOpenArtist, onOpenArtistByName, className }) {
+  const artists = (track?.artists || []).filter((artist) => artist && artist.name)
+  const label = track?.artist || 'ZenRay Audio'
+  const clickable = !!onOpenArtist
+  if (artists.length <= 1) {
+    const artistId = artists[0]?.id
+    // ID Spotify direct -> page artiste. SINON (titre local/YouTube, 2026-07-22) : si un nom d'artiste réel
+    // existe, cliquer lance une RECHERCHE Spotify par nom (onOpenArtistByName). Sinon texte simple.
+    if (artistId && clickable) {
+      return (
+        <button type="button" className={`${className} zr-mp-artist-link`}
+          onClick={(ev) => { ev.stopPropagation(); onOpenArtist(artistId, label) }}
+          title={`Voir la page de ${label}`}>{label}</button>
+      )
+    }
+    const realName = track?.artist && track.artist !== 'ZenRay Audio' ? track.artist : ''
+    if (realName && onOpenArtistByName) {
+      return (
+        <button type="button" className={`${className} zr-mp-artist-link`}
+          onClick={(ev) => { ev.stopPropagation(); onOpenArtistByName(realName) }}
+          title={`Chercher ${realName} sur Spotify`}>{label}</button>
+      )
+    }
+    return <span className={className}>{label}</span>
+  }
+  // Piste dupliquée 2x : l'animation translateX(-50%) boucle sans couture (quand la 1re copie est
+  // sortie à gauche, la 2e est exactement à sa place de départ).
+  const run = (copy) => (
+    <span className="zr-mp-artists-run" aria-hidden={copy ? 'true' : undefined}>
+      {artists.map((artist, index) => (
+        <React.Fragment key={`${artist.id || artist.name}-${index}`}>
+          {index > 0 && <span className="zr-mp-artists-sep">, </span>}
+          {artist.id && clickable
+            ? <button type="button" className="zr-mp-artist-link zr-mp-artist-link--inline" tabIndex={copy ? -1 : 0}
+                onClick={(ev) => { ev.stopPropagation(); onOpenArtist(artist.id, artist.name) }}
+                title={`Voir la page de ${artist.name}`}>{artist.name}</button>
+            : <span>{artist.name}</span>}
+        </React.Fragment>
+      ))}
+      <span className="zr-mp-artists-gap" />
+    </span>
+  )
+  return (
+    <span className={`${className} zr-mp-artists-marquee`} title={label}>
+      <span className="zr-mp-artists-track">{run(false)}{run(true)}</span>
+    </span>
+  )
+}
+
+// Égaliseur du design (mini-eq, 4 barres) : hauteurs "vivantes" en lecture (animation zr-eq),
+// figées en pause (zr-eq-static, hauteurs moyennes du mockup).
+function Eq({ playing, width = 19, height = 15, className, style }) {
+  return (
+    <svg className={`zr-eq${playing ? '' : ' zr-eq-static'}${className ? ' ' + className : ''}`}
+      fill="currentColor" width={width} height={height} viewBox="0 0 19 15" style={style} aria-hidden="true">
+      <rect height="4" rx="1.35" width="2.7" x="0.5" y="5.5" />
+      <rect height={playing ? 12 : 7} rx="1.35" width="2.7" x="5.4" y={playing ? 1.5 : 4} />
+      <rect height={playing ? 8 : 5} rx="1.35" width="2.7" x="10.3" y={playing ? 3.5 : 5} />
+      <rect height="3" rx="1.35" width="2.7" x="15.2" y="6" />
+    </svg>
+  )
+}
+
+export default function MiniPlayerCard({ dark = false, t, mode = 'horizontal', onOpenAudio, onOpenArtist, onOpenArtistByName, onClose, maxWidth = 880, width = 230, nowBadge, rateNode }) {
+  const p = usePlayer()
+  const [queueOpen, setQueueOpen] = useState(false)
+  const [seekDraft, setSeekDraft] = useState(null)
+  const queueBtnRef = useRef(null)
+  const lastVol = useRef(1)
+  if (!p || !p.current) return null
+  const now = p.current
+
+  const toggleMute = () => { if (p.vol > 0) { lastVol.current = p.vol; p.setVol(0) } else { p.setVol(lastVol.current || 1) } }
+  const seekValue = seekDraft == null ? (p.dur ? p.time / p.dur : 0) : seekDraft
+  const seekTime = seekDraft == null ? p.time : seekDraft * p.dur
+  const seekRemaining = Math.max(0, (Number(p.dur) || 0) - (Number(seekTime) || 0))
+  const title = now.title || (now.path || '').split('/').pop()
+  const coverUrl = cover(now)
+
+  const queuePopover = queueOpen && (() => {
+    const rect = queueBtnRef.current?.getBoundingClientRect()
+    if (!rect) return null
+    // 2 colonnes de 250 depuis le 2026-07-20 (File d'attente + Playlists) : l'ancre recule d'autant
+    // pour que la coque tienne à gauche du bouton, ColumnMenuShell borne de toute façon au viewport.
+    const anchor = { left: rect.right - 500, top: rect.top, bottom: rect.bottom, triggerTop: rect.top }
+    return <QueuePopover t={t || (dark ? THEMES.dark : THEMES.light)} anchor={anchor} queue={p.queue} idx={p.idx}
+      onJump={(index) => p.playMixedQueue(p.queue, index)}
+      onPlayPlaylist={(items) => p.playMixedQueue(items, 0)}
+      onClose={() => setQueueOpen(false)} />
+  })()
+
+  if (mode === 'vertical') {
+    return (
+      <div style={{ width, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+        {/* backgroundSize:contain (pas cover) -- une pochette non carrée (poster, portrait) ne doit
+            JAMAIS perdre de contenu par rognage.
+            Draggable (2026-07-19, feature miniplayer) : glisser la pochette du morceau en cours vers
+            Create crée/complète un média, quelle que soit sa source (Spotify/YouTube/local) -- le payload
+            porte la forme canonique du morceau telle que PlayerContext la connaît déjà. */}
+        <div onClick={onOpenAudio} className="zr-mpv2-cover" draggable
+          onDragStart={(ev) => startTrackDrag(ev, now)}
+          style={{ cursor: onOpenAudio ? 'pointer' : 'default', backgroundImage: coverUrl ? `url(${coverUrl})` : undefined }}>
+          {!coverUrl && <Icon name="music.note" size={40} color="var(--g9-muted)" />}
+        </div>
+        <div className="zr-mp-card zr-mp-card--v">
+          {/* Bouton queue.playlist à la place de l'égaliseur "waveform" (retour Matthieu 2026-07-20 :
+              le bouton avait été ajouté DANS la rangée de transport, décalant prev/play/next au lieu
+              de remplacer l'Eq -- corrigé, le transport reste 3 boutons centrés comme avant). */}
+          <button ref={queueBtnRef} onClick={() => setQueueOpen((v) => !v)} title="File d’attente et playlists" className="zr-mp-btn zr-mpv2-queue"><Icon name="queue.playlist" size={16} /></button>
+          <div className="zr-mpv2-title">{title}</div>
+          <ArtistLink track={now} onOpenArtist={onOpenArtist} onOpenArtistByName={onOpenArtistByName} className="zr-mpv2-sub" />
+          <div className="zr-mpv2-progress">
+            <span>{fmt(seekTime)}</span>
+            <SeekBar value={seekValue} disabled={!p.seekable || !p.dur} onPreview={setSeekDraft} onCancel={() => setSeekDraft(null)}
+              onSeek={(v) => { p.seek(v); setSeekDraft(null) }}
+              className="zr-mp-seek zr-mp-seek--v" style={{ flex: 1, height: 14, '--zr-mp-level': `${Math.round(seekValue * 1000) / 10}%` }} />
+            <span>−{fmt(seekRemaining)}</span>
+          </div>
+          <div className="zr-mpv2-transport">
+            <div className="zr-mpv2-group">
+              <button onClick={p.prev} title="Précédent" className="zr-mp-btn"><Icon name="backward.fill" size={27} /></button>
+              <button onClick={p.toggle} title={p.playing ? 'Pause' : 'Lecture'} className="zr-mp-btn"><PlayPauseGlyph playing={p.playing} size={20} pauseSize={21} playOffset={3} /></button>
+              <button onClick={() => p.next()} title="Suivant" className="zr-mp-btn"><Icon name="forward.fill" size={27} /></button>
+            </div>
+          </div>
+        </div>
+        {queuePopover}
+      </div>
+    )
+  }
+
+  return (
+    <div className="zr-mp-card zr-mp-card--h" style={{ maxWidth }}>
+      <div className="zr-mp2-now">
+        {/* Bug réel corrigé le 2026-07-19 ("pochette + texte à 50% d'opacité") : `disabled` sur ce bouton
+            servait juste à couper le clic quand onOpenAudio est absent (cas normal ici, DÉJÀ dans ZenRay
+            Audio) -- mais la règle globale `.zra-shell button:disabled{opacity:.42}` (pensée pour de VRAIS
+            contrôles désactivés, ex. play sans piste) s'appliquait aussi à cet affichage purement
+            informationnel, l'assombrissant à moitié sans raison. onClick sur undefined ne fait déjà rien
+            en React : `disabled` n'apportait donc rien ici, seulement ce dégât visuel. Retiré. */}
+        {/* button -> div (2026-07-19) : le nom d'artiste devient un VRAI bouton cliquable en dessous
+            (ArtistLink) -- un bouton ne peut pas en contenir un autre (HTML invalide, comportement de
+            clic imprévisible). role="button" + clavier préservent l'accessibilité de la zone "ouvrir
+            ZenRay Audio" sans imbriquer d'élément interactif. */}
+        {/* DRAGGABLE (2026-07-22, demande Matthieu) : ce bloc porte la POCHETTE **et** le TITRE du morceau en
+            cours -- le rendre draggable d'un seul tenant couvre les deux prises demandées (« soit la pochette,
+            soit le titre »), avec le MÊME payload que les lignes du panneau central (startTrackDrag). */}
+        <div onClick={onOpenAudio} title={onOpenAudio ? 'Ouvrir ZenRay Audio dans Create' : undefined}
+          draggable onDragStart={(ev) => startTrackDrag(ev, now)}
+          role={onOpenAudio ? 'button' : undefined} tabIndex={onOpenAudio ? 0 : undefined}
+          onKeyDown={onOpenAudio ? (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onOpenAudio() } } : undefined}
+          style={{ display: 'flex', alignItems: 'center', gap: 12, background: 'transparent', border: 'none', cursor: onOpenAudio ? 'pointer' : 'default', color: 'inherit', minWidth: 0, textAlign: 'left', padding: 0 }}>
+          <div className="zr-mp2-cover" style={{ backgroundImage: coverUrl ? `url(${coverUrl})` : undefined }}>
+            {!coverUrl && <Icon name="music.note" size={19} color="var(--g9-muted)" />}
+          </div>
+          <div style={{ minWidth: 0 }}>
+            <div className="zr-mp2-title"><span>{title}</span><Eq playing={p.playing} width={16} height={13} /></div>
+            <ArtistLink track={now} onOpenArtist={onOpenArtist} onOpenArtistByName={onOpenArtistByName} className="zr-mp2-sub" />
+          </div>
+        </div>
+        {nowBadge}
+      </div>
+
+      {/* Centre ABSOLU sur la carte entière : reste pile centré quel que soit le poids des blocs gauche/droite. */}
+      <div className="zr-mp2-center">
+        <div className="zr-mp2-transport">
+          {/* Shuffle / Repeat : ÉTAT ACTIF signalé par un FOND CERCLE contrasté (zr-mp-btn--on : fond=--g9-fg,
+              icône=--g9-bg -> cercle sombre+icône claire en light, cercle blanc+icône sombre en dark), PAS par
+              un simple hover (retour Matthieu 2026-07-22 : « juste un toggle actif/inactif, pas de hover »).
+              Repeat = 3 états : off (plain) / all (icône repeat, cercle) / one (icône repeat.1 avec le « 1 », cercle). */}
+          <button onClick={() => p.setShuffle(!p.shuffle)} title="Lecture aléatoire" className={`zr-mp-btn${p.shuffle ? ' zr-mp-btn--on' : ''}`}><Icon name="shuffle" size={16} /></button>
+          <button onClick={p.prev} title="Précédent" className="zr-mp-btn"><Icon name="backward.fill" size={20} /></button>
+          <button onClick={p.toggle} title={p.playing ? 'Pause' : 'Lecture'} className="zr-mp-btn"><PlayPauseGlyph playing={p.playing} size={20} /></button>
+          <button onClick={() => p.next()} title="Suivant" className="zr-mp-btn"><Icon name="forward.fill" size={20} /></button>
+          <button onClick={() => p.setRepeat(p.repeat === 'off' ? 'all' : p.repeat === 'all' ? 'one' : 'off')} title={p.repeat === 'one' ? 'Répéter cette piste' : p.repeat === 'all' ? 'Répéter la file' : 'Répéter'} className={`zr-mp-btn${p.repeat !== 'off' ? ' zr-mp-btn--on' : ''}`}><Icon name={p.repeat === 'one' ? 'repeat.1' : 'repeat'} size={16} /></button>
+        </div>
+        <div className="zr-mp2-progress">
+          <span>{fmt(seekTime)}</span>
+          <SeekBar value={seekValue} disabled={!p.seekable || !p.dur} onPreview={setSeekDraft} onCancel={() => setSeekDraft(null)}
+            onSeek={(v) => { p.seek(v); setSeekDraft(null) }}
+            className="zr-mp-seek" style={{ flex: 1, height: 14, '--zr-mp-level': `${Math.round(seekValue * 1000) / 10}%` }} />
+          <span style={{ textAlign: 'right' }}>−{fmt(seekRemaining)}</span>
+        </div>
+      </div>
+
+      {/* Droite : file d'attente, volume (slider réel), bascule vue verticale. AirPods retiré (design V2). */}
+      <div className="zr-mp2-tools">
+        {rateNode}
+        <button ref={queueBtnRef} onClick={() => setQueueOpen((v) => !v)} title="File d’attente et playlists" className={`zr-mp-btn${queueOpen ? '' : ' zr-mp-btn--dim'}`}><Icon name="queue.playlist" size={19} /></button>
+        <div className="zr-mp2-volume">
+          <button onClick={toggleMute} title={p.vol > 0 ? 'Muet' : 'Rétablir le son'} className="zr-mp-btn">
+            <Icon name={p.vol <= 0 ? 'speaker.slash' : p.vol < .5 ? 'speaker.wave.1' : 'speaker.wave.2'} size={16} />
+          </button>
+          <input type="range" min="0" max="1" step=".01" value={p.vol} onChange={(e) => p.setVol(Number(e.target.value))}
+            aria-label="Volume" className="zr-mp-volume" style={{ width: 78, height: 14, '--zr-mp-level': `${Math.round(p.vol * 100)}%` }} />
+        </div>
+        {/* Icône changée le 2026-07-19 (demande Matthieu, export SF Symbols réel) : rectangle.grid.1x2
+            (deux rangées symétriques) -> view.align.left (deux rangées + tige verticale, vue "alignée
+            à gauche"), plus cohérente avec ce qu'affiche réellement ce bouton (retour à la liste des
+            dossiers, alignée à gauche). */}
+        {onClose && <button onClick={onClose} title="Revenir aux dossiers" className="zr-mp-btn"><Icon name="view.align.left" size={17} /></button>}
+      </div>
+
+      {queuePopover}
+    </div>
+  )
+}

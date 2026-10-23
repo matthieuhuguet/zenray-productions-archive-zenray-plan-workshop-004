@@ -1,0 +1,209 @@
+import React, { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { glassPanel, RADII, SHADOWS, TRANSITIONS } from '../theme.js'
+import Icon from './Icon.jsx'
+import { loadSearchIndex, scoreMatch, getNodeThumb } from '../search/searchIndexClient.js'
+
+// Recherche façon Spotlight, accessible de PARTOUT dans l'app (Cmd/Ctrl+K). Autonome : gère son propre
+// état ouvert/fermé et son propre listener clavier, aucune prop requise à part `t` (thème) et `onNavigate`.
+//
+// Cmd+Space (comme le vrai Spotlight macOS) était la première idée mais IMPOSSIBLE à capter par une page
+// web : c'est un raccourci SYSTÈME intercepté par l'OS avant même que le navigateur ne reçoive la touche
+// (contrairement à Cmd+V, un raccourci d'ÉDITION standard que le navigateur reçoit — voir ClipboardProvider.jsx).
+// Cmd+K est la convention web pour ce rôle (Linear, Notion, Vercel, Slack) : aucun conflit OS, capturable
+// sans réserve. Décision validée par Matthieu le 2026-07-14.
+//
+// Réutilise l'index de recherche EXISTANT (loadSearchIndex/scoreMatch, src/search/searchIndexClient.js) —
+// le MÊME que la recherche inline de la vue Create (App.jsx) : classement et résultats strictement identiques,
+// zéro logique de scoring réinventée. Norme de normalisation copiée de App.jsx `norm()` (même contrat que
+// scoreMatch, verrouillé — voir son commentaire dans searchIndexClient.js).
+const norm = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[-_./]+/g, ' ').replace(/\s+/g, ' ').trim()
+
+const baseName = (p) => (p || '').split('/').pop()
+  .replace(/\.(img|media|db|file|canvas|embed)\.json$/, '').replace(/\.md$/, '')
+// Portée du résultat (2e ligne, grise, technique — doctrine Design1.md §Itération 4/7 : le détail
+// technique est autorisé mais SECONDAIRE, jamais en bruit dominant).
+const dirOf = (p) => (p || '').split('/').slice(0, -1).join('/')
+
+// Périmètre volontairement réduit (2026-07-14) : sélectionner un résultat NAVIGUE vers son dossier
+// contenant (réutilise setFolder/setView, déjà éprouvé — même mécanisme que le fil d'Ariane). Ouvrir
+// directement l'élément dans son viewer (QuickLook/éditeur) demanderait de reconstruire la forme exacte
+// d'une "entry" (hasKids, contentPath, kind…) hors du contexte de la liste de dossier qui la fabrique
+// normalement — risque de mal faire pour un type de fichier non testé. Amélioration possible plus tard,
+// notée dans le skill design-liquidglass plutôt que devinée ici.
+// 14 October 2026: the palette is now the app's single Cmd/Ctrl+K, mounted at the root so it works from every view (it used to exist only
+// while Create was on screen). It lists the app's own destinations first ("Aller à"), then files from the search index.
+// FR : la palette est desormais le Cmd+K unique de l'app, montee a la racine : elle marche depuis toutes les vues.
+export default function SpotlightSearch({ t, onNavigate, destinations = [], onGo = null }) {
+  const [open, setOpen] = useState(false)
+  const [q, setQ] = useState('')
+  const [hits, setHits] = useState([]) // [{ path, thumb }]
+  const [sel, setSel] = useState(0)
+  const inputRef = useRef(null)
+
+  useEffect(() => {
+    const h = (e) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); setOpen((v) => !v); return }
+      if (e.key === 'Escape' && open) { e.preventDefault(); setOpen(false) }
+    }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [open])
+
+  useEffect(() => { if (open) { setQ(''); setHits([]); setSel(0); requestAnimationFrame(() => inputRef.current && inputRef.current.focus()) } }, [open])
+
+  // Débounce 140ms, identique à la recherche inline (App.jsx) : la frappe reste instantanée (q contrôle
+  // l'input), le scoring lourd attend une pause pour ne jamais faire un aller-retour par caractère.
+  useEffect(() => {
+    if (!open) return
+    const term = q.trim()
+    if (!term) { setHits([]); setSel(0); return }
+    let alive = true
+    const h = setTimeout(() => {
+      const nq = norm(term)
+      loadSearchIndex().then((idx) => {
+        if (!alive || !idx || !Array.isArray(idx.paths)) return
+        const scored = []
+        for (const p of idx.paths) {
+          // BUG PRODUCTION CORRIGÉ (2026-07-14) : l'index global inclut aussi "trash/…" (éléments supprimés,
+          // jamais purgés de l'index) et pourrait un jour inclure d'autres racines (media/, articles/, shelf/…).
+          // Naviguer vers l'une d'elles cassait la vue Create (grille vide persistante, cf. App.jsx validFolder).
+          // Cette recherche ne doit JAMAIS proposer un résultat hors de l'arbre "pages" que Create sait rendre,
+          // et ne doit de toute façon jamais faire réapparaître un fichier supprimé comme s'il était toujours là.
+          if (p !== 'pages' && !p.startsWith('pages/')) continue
+          const sc = scoreMatch(norm(p), norm(baseName(p)), nq)
+          if (sc >= 0) scored.push([sc, p])
+        }
+        scored.sort((a, b) => a[0] - b[0] || a[1].localeCompare(b[1]))
+        setHits(scored.slice(0, 20).map(([, p]) => ({ path: p, thumb: getNodeThumb(p) })))
+        setSel(0)
+      }).catch(() => { if (alive) setHits([]) })
+    }, 140)
+    return () => { alive = false; clearTimeout(h) }
+  }, [q, open])
+
+  // Destinations shown above the files: all of them when nothing is typed, the matching ones (at most 6) otherwise.
+  const term = norm(q)
+  const places = !onGo ? [] : (!term ? destinations : destinations.filter((d) => norm(`${d.label} ${d.zone || ''} ${d.key}`).includes(term)).slice(0, 6))
+  const rows = [...places.map((place) => ({ type: 'place', place })), ...hits.map((hit) => ({ type: 'file', hit }))]
+
+  const choose = (i) => {
+    const row = rows[i]
+    if (!row) return
+    setOpen(false)
+    if (row.type === 'place') onGo(row.place.key)
+    else onNavigate(dirOf(row.hit.path))
+  }
+
+  const onKeyDown = (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); setSel((s) => Math.min(s + 1, Math.max(0, rows.length - 1))) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setSel((s) => Math.max(s - 1, 0)) }
+    else if (e.key === 'Enter') { e.preventDefault(); choose(sel) }
+  }
+
+  if (!open) return null
+
+  const glass = glassPanel(t)
+  const sans = "var(--zr-police-sans)"
+  const mono = "var(--zr-police-sans)"
+
+  // FORME (correction 2026-07-14, retour Matthieu) : le vrai Spotlight macOS montre DEUX éléments arrondis
+  // séparés par un espace — une barre de recherche en CAPSULE (bord totalement arrondi, radius = hauteur/2),
+  // et si besoin un panneau de résultats distinct sous elle. Ce n'est PAS un unique panneau à coins moyennement
+  // arrondis (RADII.lg = 16px, lu comme un « carré arrondi ») : les deux formes sont visuellement différentes,
+  // ne pas les confondre. Le panneau de résultats garde un radius généreux (24px) mais jamais 999 : une liste
+  // de plusieurs lignes ne peut pas être une capsule sans couper les bords en arc de cercle absurde.
+  const BAR_RADIUS = 999
+  const PANEL_RADIUS = 24
+
+  return createPortal(
+    <div
+      onClick={() => setOpen(false)}
+      style={{ position: 'fixed', inset: 0, zIndex: 300, background: 'rgba(0,0,0,0.32)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', paddingTop: '12vh' }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: 'min(640px, 92vw)', display: 'flex', flexDirection: 'column', gap: 10 }}
+      >
+        {/* Barre de recherche — CAPSULE à part entière, jamais fusionnée au panneau de résultats. */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10, padding: '13px 20px', height: 52, flexShrink: 0,
+          borderRadius: BAR_RADIUS, background: t.cardBg, ...glass,
+          boxShadow: `${SHADOWS.lg}, 0 24px 80px rgba(0,0,0,0.28)`, border: `1px solid ${t.border}`,
+        }}>
+          <Icon name="magnifyingglass" size={17} color={t.textSecondary} />
+          <input
+            ref={inputRef}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder={onGo ? 'Aller à une vue, ou rechercher sur tout le site…' : 'Rechercher sur tout le site…'}
+            style={{
+              flex: 1, border: 'none', outline: 'none', background: 'transparent', fontFamily: sans,
+              fontWeight: 400, fontSize: 'var(--zr-ui-2xl)', color: t.textPrimary,
+            }}
+          />
+          <span style={{ fontFamily: mono, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary, background: t.border, borderRadius: 999, padding: '2px 8px' }}>ESC</span>
+        </div>
+
+        {/* Panneau de résultats — rectangle à coins généreusement arrondis, distinct de la capsule au-dessus. */}
+        {(q.trim() || places.length > 0) && (
+          <div style={{
+            maxHeight: '52vh', overflowY: 'auto', borderRadius: PANEL_RADIUS, background: t.cardBg, ...glass,
+            boxShadow: `${SHADOWS.lg}, 0 24px 80px rgba(0,0,0,0.28)`, border: `1px solid ${t.border}`, padding: 6,
+          }}>
+            {!rows.length && (
+              <div style={{ padding: '16px 14px', fontFamily: sans, fontSize: 'var(--zr-ui-md)', color: t.textSecondary }}>Aucun résultat.</div>
+            )}
+            {rows.map((row, i) => row.type === 'place' ? (
+              <div
+                key={`place-${row.place.key}`}
+                role="option"
+                aria-selected={i === sel}
+                onClick={() => choose(i)}
+                onMouseEnter={() => setSel(i)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 12, padding: '9px 12px', cursor: 'pointer',
+                  borderRadius: PANEL_RADIUS - 8, background: i === sel ? t.accentSoft : 'transparent', transition: TRANSITIONS.base,
+                }}
+              >
+                <div style={{ width: 34, height: 34, borderRadius: RADII.sm, flexShrink: 0, background: t.border, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Icon name="chevron.right" size={15} color={t.textSecondary} />
+                </div>
+                <div style={{ minWidth: 0, flex: 1, fontFamily: sans, fontWeight: 500, fontSize: 'var(--zr-ui-md)', color: t.textPrimary }}>{row.place.label}</div>
+                <div style={{ fontFamily: mono, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>{row.place.zone || 'Aller à'}</div>
+              </div>
+            ) : ((hit) => (
+              <div
+                key={hit.path}
+                onClick={() => choose(i)}
+                onMouseEnter={() => setSel(i)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 12, padding: '9px 12px', cursor: 'pointer',
+                  borderRadius: PANEL_RADIUS - 8, background: i === sel ? t.accentSoft : 'transparent', transition: TRANSITIONS.base,
+                }}
+              >
+                <div style={{ width: 34, height: 34, borderRadius: RADII.sm, overflow: 'hidden', flexShrink: 0, background: t.border, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {hit.thumb && hit.thumb.u ? (
+                    <img src={hit.thumb.u} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  ) : (
+                    <Icon name="doc.text" size={15} color={t.textSecondary} />
+                  )}
+                </div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontFamily: sans, fontWeight: 500, fontSize: 'var(--zr-ui-md)', color: t.textPrimary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {baseName(hit.path)}
+                  </div>
+                  <div style={{ fontFamily: mono, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {dirOf(hit.path).replace(/^pages\/?/, '')}
+                  </div>
+                </div>
+              </div>
+            ))(row.hit))}
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  )
+}

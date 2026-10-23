@@ -1,0 +1,122 @@
+// Helper PARTAGÉ (côté serveur) du nommage des repos shard ZenRay.
+//
+// POURQUOI : avant, le nommage était dispersé (regex /^zenray-media-\d{2,}$/ et /^zenray-vid-\d{2,}$/
+// copiées dans upload-shard.js, upload-vid.js, shard.js, repos.js). On centralise ici la SEULE source de
+// vérité du schéma générique :   zenray-<kind>-<vis>-NN
+//   kind ∈ {img, vid, audio, doc, table, markdown}   vis ∈ {public, private}   NN = numéro 2 chiffres.
+// Ex : zenray-img-public-01, zenray-img-private-01, zenray-audio-private-01.
+//
+// RÉTRO-COMPAT (non négociable) : on ne renomme JAMAIS les anciens repos. On accepte donc aussi les deux
+// schémas LEGACY existants :
+//   - zenray-media-NN  = historiquement les IMAGES PRIVÉES  -> on le traite comme (kind=img, vis=private).
+//   - zenray-vid-NN    = historiquement les VIDÉOS PUBLIQUES -> on le traite comme (kind=vid, vis=public).
+// Le but : un manifest .img.json SANS champ vis reste « private » et continue d'être servi par /api/shard,
+// et les repos déjà en place ne bougent pas.
+//
+// ASYMÉTRIE VOLONTAIRE (ne PAS la « corriger » par erreur) : la création de FUTURS shards diverge selon la
+// famille. Familles MIGRÉES vers le nouveau nom : img/private (defaultShard/nextShard renvoient
+// zenray-img-private-NN, même pour un legacy zenray-media). Familles FIGÉES legacy : vid/public
+// (defaultShard/nextShard restent sur zenray-vid-NN, migration hors scope). En LECTURE, parseShard accepte
+// les deux schémas pour toutes les familles, donc cette divergence n'affecte que le NOMMAGE des nouveaux repos.
+
+import { randomBytes } from 'node:crypto'
+
+// 12 October 2026: 'motion' = public CMAF segments and posters of ZenRay Motion Design renders (code-made, neutral paths).
+export const KINDS = ['img', 'vid', 'audio', 'doc', 'pdf', 'table', 'markdown', 'blob', 'archive', 'backup', 'motion']
+export const VIS = ['public', 'private']
+
+// CONVENTION V2 (2026-07-05, décision Matthieu) : zenrayshards-<type>-<hex12>, nom aléatoire façon
+// workflow. TOUTE création de shard passe par ce schéma désormais — plus JAMAIS de nom séquentiel NN
+// (les anciens repos ont été renommés vers v2 ; recréer un ancien nom tuerait la redirection GitHub
+// dont dépendent tous les manifestes historiques). Visibilité par convention de type : img/archive
+// publics (jsDelivr/existant), le reste privé — mais la source de vérité par-manifeste (m.vis,
+// m.private) prime toujours quand elle existe.
+export const shardReV2 = /^zenrayshards-([a-z]+)-[0-9a-f]{8,}$/
+// Audio v2 is public too, but ALWAYS AES-256-GCM encrypted and addressed by hashes.
+// This enables immutable jsDelivr streaming while the Service Worker decrypts locally.
+const V2_PUBLIC_TYPES = new Set(['img', 'audio', 'archive', 'motion'])
+
+// Regex de l'ancien schéma générique (LECTURE seule : repos renommés, mais manifestes/état porteurs des
+// anciens noms — les redirections GitHub les servent toujours).
+export const shardReNew = /^zenray-(img|vid|audio|doc|pdf|table|markdown)-(public|private)-\d{2,}$/
+// Regex LEGACY (anciens repos, non renommés).
+export const legacyMediaRe = /^zenray-media-\d{2,}$/   // = img / private (legacy)
+export const legacyVidRe = /^zenray-vid-\d{2,}$/       // = vid / public (legacy)
+// ARCHIVE UNIVERSELLE (A4, 2026-06-11) : zenray-productions-archive-<NomDuDossier>[-NN] (NN seulement si >5 Go).
+export const archiveRe = /^zenray-productions-archive-[a-z0-9._-]+$/
+
+// Regex GÉNÉRIQUE : accepte v2 + ancien schéma + les deux legacy. À utiliser partout pour valider un repo
+// shard, quel que soit son type/visibilité.
+export const shardRe = new RegExp(
+  '^(?:' +
+    'zenrayshards-[a-z]+-[0-9a-f]{8,}' + // v2 (2026-07-05)
+    '|zenray-(?:img|vid|audio|doc|pdf|table|markdown)-(?:public|private)-\\d{2,}' + // ancien générique
+    '|zenray-media-\\d{2,}' + // legacy img/private
+    '|zenray-vid-\\d{2,}' +   // legacy vid/public
+    '|zenray-productions-archive-[a-z0-9._-]+' + // archive universelle
+  ')$'
+)
+
+// Construit le nom d'un NOUVEAU repo shard — TOUJOURS v2 : zenrayshards-<kind>-<hex12>. La signature
+// (kind, vis, n) est conservée pour les appelants existants ; n est ignoré (les noms ne sont plus
+// séquentiels), vis reste utilisée par l'appelant pour créer le repo public/privé.
+export function shardName(kind, vis, n) {
+  if (!KINDS.includes(kind)) throw new Error('shardName: bad kind ' + kind)
+  if (!VIS.includes(vis)) throw new Error('shardName: bad vis ' + vis)
+  return `zenrayshards-${kind}-${randomBytes(6).toString('hex')}`
+}
+
+// Décompose un nom de repo (v2, ancien OU legacy) en {kind, vis, n}. Renvoie null si non reconnu.
+export function parseShard(name) {
+  const s = String(name || '')
+  let m = shardReV2.exec(s)
+  if (m) {
+    const kind = KINDS.includes(m[1]) ? m[1] : 'blob'
+    return { kind, vis: V2_PUBLIC_TYPES.has(kind) ? 'public' : 'private', n: 0, v2: true }
+  }
+  m = shardReNew.exec(s)
+  if (m) return { kind: m[1], vis: m[2], n: parseInt(s.match(/-(\d{2,})$/)[1], 10) }
+  m = legacyMediaRe.exec(s)
+  if (m) return { kind: 'img', vis: 'private', n: parseInt(s.match(/-(\d{2,})$/)[1], 10), legacy: 'media' }
+  m = legacyVidRe.exec(s)
+  if (m) return { kind: 'vid', vis: 'public', n: parseInt(s.match(/-(\d{2,})$/)[1], 10), legacy: 'vid' }
+  if (archiveRe.test(s)) { const nn = s.match(/-(\d{2,})$/); return { kind: 'archive', vis: 'public', n: nn ? parseInt(nn[1], 10) : 1 } }
+  return null
+}
+
+// Nom du shard SUIVANT dans la même famille. V2 : un shard "suivant" est simplement un NOUVEAU nom
+// aléatoire du même kind — jamais d'incrément, jamais de réutilisation d'un ancien nom (règle dure
+// post-rename : un ancien nom recréé casserait la redirection de tout l'historique).
+export function nextShard(name) {
+  const p = parseShard(name)
+  if (!p) throw new Error('nextShard: bad name ' + name)
+  return shardName(p.kind, p.vis, 0)
+}
+
+// isPublic('public') === true. Tolère un repo name OU une visibilité brute.
+export function isPublic(visOrName) {
+  if (visOrName === 'public') return true
+  if (visOrName === 'private') return false
+  const p = parseShard(visOrName)
+  return p ? p.vis === 'public' : false
+}
+
+// Chemin du fichier d'ÉTAT (dans zenray-data, privé) qui suit le shard actif d'UNE famille (kind+vis).
+// MAPPING LEGACY conservé pour ne RIEN migrer :
+//   (img, private) -> 'pages/.zr-drive.json'      (état historique des zenray-media-NN)
+//   (vid, public)  -> 'pages/.zr-vid-drive.json'  (état historique des zenray-vid-NN)
+// Toute autre famille -> 'pages/.zr-drive-<kind>-<vis>.json'.
+export function driveStatePath(kind, vis) {
+  if (kind === 'img' && vis === 'private') return 'pages/.zr-drive.json'
+  if (kind === 'vid' && vis === 'public') return 'pages/.zr-vid-drive.json'
+  return `pages/.zr-drive-${kind}-${vis}.json`
+}
+
+// Shard PAR DÉFAUT (NN=01) d'une famille. La vidéo reste sur le legacy zenray-vid-01 (hors scope).
+// img/private adopte le NOUVEAU nom zenray-img-private-01 (objectif RENAME) : si aucun état n'existe encore,
+// un drive vierge crée directement le nouveau nom. Les anciens zenray-media-NN restent lus (parseShard).
+export function defaultShard(kind, vis) {
+  // HARMONISÉ (2026-06-09) : la vidéo passe au schéma standard zenray-vid-public-NN (comme zenray-img-public-NN).
+  // parseShard accepte toujours les anciens zenray-vid-NN en LECTURE (legacyVidRe), donc rien ne casse côté lecture.
+  return shardName(kind, vis, 1)
+}

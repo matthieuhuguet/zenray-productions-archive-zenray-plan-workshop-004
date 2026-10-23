@@ -1,0 +1,68 @@
+// 7 October 2026: the notifier. After a pass that found something new, a macOS notification says how many offers appeared and how long
+// ago he was last told, and a dated digest file lists the best of them with their links. It sends nothing to anyone: no mail, no
+// message. Mail.app has no account on this Mac and no credential is stored, so e-mail stays a decision for Matthieu (see docs).
+// FR : le notificateur. Apres une passe qui a trouve du neuf, une notification macOS dit combien d'offres et depuis quand il n'a
+// pas ete prevenu, et un fichier de resume date liste les meilleures avec leurs liens. Il n'envoie rien a personne.
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { mkdir, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+
+const run = promisify(execFile)
+const plural = (n, one, many) => `${n} ${n > 1 ? many : one}`
+
+/** "il y a 6 h" from two instants; coarse on purpose. */
+export function agoLabel(from, to) {
+  if (!from) return ''
+  const minutes = Math.round((to.getTime() - new Date(from).getTime()) / 60000)
+  if (!Number.isFinite(minutes) || minutes < 0) return ''
+  if (minutes < 90) return `il y a ${Math.max(1, minutes)} min`
+  const hours = Math.round(minutes / 60)
+  return hours < 48 ? `il y a ${hours} h` : `il y a ${Math.round(hours / 24)} jours`
+}
+
+/** The text of one digest from a run report; null when nothing new deserves a notification. */
+export function buildDigest(report, { lastNotifiedAt = null, now = new Date(), top = 10, minNew = 1, bigBatch = 150, pageUrl = '' } = {}) {
+  const added = Number(report?.added || 0)
+  if (added < minNew) return null
+  const list = Array.isArray(report.addedSummary) ? report.addedSummary : []
+  const strong = list.filter((offer) => offer.tier === 'high').length
+  const since = agoLabel(lastNotifiedAt, now)
+  const head = `${plural(added, 'nouvelle offre', 'nouvelles offres')}${since ? `, ${since} que tu n’avais pas été prévenu` : ''}`
+  const body = list.slice(0, 3).map((offer) => `${offer.score ?? '–'} · ${offer.name} : ${offer.role}`.replace('–', '-')).join('\n')
+  const lines = [`# ${head}`, '', `Recherche du ${now.toISOString().slice(0, 16).replace('T', ' ')} UTC. ${strong ? `${plural(strong, 'très pertinente', 'très pertinentes')}. ` : ''}${added > bigBatch ? 'Import initial de plusieurs sources : la liste complète est dans la page. ' : ''}${pageUrl ? `Page : ${pageUrl}` : ''}`.trim(), '']
+  for (const offer of list.slice(0, top)) lines.push(`- ${offer.score ?? '-'} | ${offer.name} | ${offer.role} | ${offer.lane === 'other' ? 'autres industries' : 'jeu vidéo'} | ${offer.source}${offer.country ? ` | ${offer.country}` : ''}${offer.applyUrl ? ` | ${offer.applyUrl}` : ''}`)
+  if (added > list.length || added > top) lines.push('', `Les ${Math.max(0, added - Math.min(top, list.length))} autres sont dans la page.`)
+  return { title: 'ZenRay Freelance', subtitle: head, body: body || 'Ouvre la page pour les voir.', markdown: lines.join('\n') + '\n', added, strong }
+}
+
+const escapeAppleScript = (text) => String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ')
+
+export function createNotifier({ config, directory, exec = run, now = () => new Date(), log = () => {} }) {
+  const settings = config.notify || {}
+  return {
+    /** Never throws: a notification is a courtesy, a failing one must not fail the pass. Returns what was done. */
+    async notify(report, { lastNotifiedAt = null } = {}) {
+      const done = { sent: [], skipped: '' }
+      try {
+        if (settings.enabled === false) { done.skipped = 'disabled'; return done }
+        const digest = buildDigest(report, { lastNotifiedAt, now: now(), top: settings.topList, minNew: settings.minNew, bigBatch: settings.bigBatch, pageUrl: settings.pageUrl })
+        if (!digest) { done.skipped = 'nothing new'; return done }
+        if (settings.file !== false && directory) {
+          const file = path.join(directory, 'Digests', `${now().toISOString().replace(/[:.]/g, '-')}.md`)
+          await mkdir(path.dirname(file), { recursive: true })
+          await writeFile(file, digest.markdown)
+          done.sent.push('file'); done.file = file
+        }
+        if (settings.macos !== false) {
+          try {
+            await exec('osascript', ['-e', `display notification "${escapeAppleScript(digest.body)}" with title "${escapeAppleScript(digest.title)}" subtitle "${escapeAppleScript(digest.subtitle)}"`], { timeout: 15000 })
+            done.sent.push('macos')
+          } catch (error) { log(`macOS notification failed: ${String(error.message).split('\n')[0]}`) }
+        }
+        done.added = digest.added
+      } catch (error) { log(`notifier failed: ${error.message}`); done.skipped = `error: ${error.message}` }
+      return done
+    },
+  }
+}

@@ -1,0 +1,109 @@
+// 23 October 2026: the knowledge base on disk. Questions1.jsonl is the machine store (one question per line, merged by question key);
+// Questions1.md is the human book, append only: a question is written once when it first appears, never rewritten.
+// FR : la base sur disque. Questions1.jsonl est la source machine ; Questions1.md est le livre lisible, en ajout seul.
+import { appendFile, mkdir, readFile, rename, rmdir, stat, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { questionKey } from '../../../src/lib/knowledgeIndex.js'
+import { expand, sha } from './Sources.mjs'
+
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+export const longDate = (iso) => { const d = new Date(iso); return Number.isNaN(+d) ? '' : `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}` }
+
+/** "12 October 2026", "2026-08-17" or "17/08/2026" to an ISO date; null when it cannot be read. */
+export function parseDate(text) {
+  if (!text) return null
+  const s = String(text).trim()
+  let m = /(\d{4})-(\d{2})-(\d{2})/.exec(s); if (m) return `${m[1]}-${m[2]}-${m[3]}T12:00:00.000Z`
+  m = /(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i.exec(s)
+  if (m) return new Date(Date.UTC(+m[3], MONTHS.findIndex((x) => x.toLowerCase() === m[2].toLowerCase()), +m[1], 12)).toISOString()
+  m = /(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(s); if (m) return new Date(Date.UTC(+m[3], +m[2] - 1, +m[1], 12)).toISOString()
+  return null
+}
+
+export function storePaths(config) {
+  const dir = expand(config.store.dir)
+  return { dir, jsonl: path.join(dir, config.store.jsonl), markdown: path.join(dir, config.store.markdown) }
+}
+
+/** One writer at a time (service, manual ingest, `add`): a directory lock, stale after 10 minutes. FR : un seul écrivain à la fois. */
+export async function withStoreLock(config, work) {
+  const lock = path.join(storePaths(config).dir, '.questions.lock')
+  await mkdir(path.dirname(lock), { recursive: true })
+  for (let i = 0; ; i++) {
+    try { await mkdir(lock); break } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+      const age = Date.now() - (await stat(lock).catch(() => ({ mtimeMs: Date.now() }))).mtimeMs
+      if (age > 600000) { await rmdir(lock).catch(() => {}); continue }
+      if (i > 600) throw new Error('Questions1 is locked by another writer')
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+  }
+  try { return await work() } finally { await rmdir(lock).catch(() => {}) }
+}
+
+export async function loadStore(config) {
+  const { jsonl } = storePaths(config)
+  let text = ''
+  try { text = await readFile(jsonl, 'utf8') } catch (error) { if (error.code !== 'ENOENT') throw error }
+  return text.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+}
+
+/**
+ * Merge candidates into the entries. A candidate is { q, a, d, kw, src: { kind, ref, at, proof }, asked: boolean }.
+ * Same question key = same question: its sources and dates are added, its first answer is kept. Returns the new entries.
+ */
+export function mergeEntries(entries, candidates, now = new Date().toISOString()) {
+  const byKey = new Map(entries.map((entry) => [questionKey(entry.q), entry]))
+  const added = []
+  for (const c of candidates) {
+    const key = questionKey(c.q)
+    if (!key) continue
+    let entry = byKey.get(key)
+    if (!entry) {
+      entry = { id: `q_${sha(key).slice(0, 16)}`, q: c.q, a: c.a, d: c.d, kw: c.kw, asked: [], src: [], firstAt: c.src.at, lastAt: c.src.at, addedAt: now }
+      byKey.set(key, entry); entries.push(entry); added.push(entry)
+    }
+    const already = entry.src.some((s) => s.kind === c.src.kind && s.ref === c.src.ref && s.at === c.src.at)
+    if (!already) {
+      entry.src.push(c.src)
+      if (c.asked && c.src.at && !entry.asked.includes(c.src.at)) entry.asked.push(c.src.at)
+      entry.kw = [...new Set([...(entry.kw || []), ...(c.kw || [])])].slice(0, 12)
+      if (c.src.at && (!entry.firstAt || c.src.at < entry.firstAt)) entry.firstAt = c.src.at
+      if (c.src.at && (!entry.lastAt || c.src.at > entry.lastAt)) entry.lastAt = c.src.at
+      entry.asked.sort(); entry.updatedAt = now
+    }
+  }
+  return added
+}
+
+/** Rewrite the jsonl atomically, newest question first. */
+export async function saveStore(config, entries) {
+  const { dir, jsonl } = storePaths(config)
+  await mkdir(dir, { recursive: true })
+  entries.sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')) || a.id.localeCompare(b.id))
+  const temp = `${jsonl}.${process.pid}.tmp`
+  await writeFile(temp, entries.map((e) => JSON.stringify(e)).join('\n') + '\n')
+  await rename(temp, jsonl)
+}
+
+const HEADER = `# Questions1 : la mémoire de Matthieu en questions (23 October 2026)
+
+Ce livre est écrit par ZenRay Knowledge, en ajout seul : chaque question apparaît une fois, à la date où elle entre dans la base. La source machine est \`Questions1.jsonl\` dans le même dossier ; la recherche se fait par \`node scripts/Knowledge/knowledge.mjs search "<mots>"\` dans ZenRayProgress, ou par l'onglet Knowledge du site.
+
+Chaque réponse cite sa preuve, copiée mot pour mot de sa source, et une réponse sans preuve n'entre jamais. Une preuve dit où la réponse a été écrite, pas qu'elle est vraie : une conversation ou une note peut contenir des erreurs.
+`
+
+/** Append the new questions to the human book. */
+export async function appendBook(config, added) {
+  if (!added.length) return
+  const { dir, markdown } = storePaths(config)
+  await mkdir(dir, { recursive: true })
+  let exists = true
+  try { await readFile(markdown, 'utf8') } catch { exists = false }
+  const blocks = added.map((e) => {
+    const s = e.src[0], when = longDate(s.at)
+    const origin = s.kind === 'memory' ? `mémoire, ${s.ref}` : `conversation ${s.kind}, ${s.ref}`
+    return `\n### ${e.q}\n\n${e.a.join('\n\n')}\n\n- ${e.d} · ${when || 'date inconnue'} · ${origin} · ${e.id}\n- Preuve : « ${s.proof.replace(/\n+/g, ' ')} »\n`
+  }).join('')
+  await appendFile(markdown, (exists ? '' : HEADER) + `\n## Ajout du ${longDate(new Date().toISOString())}\n` + blocks)
+}

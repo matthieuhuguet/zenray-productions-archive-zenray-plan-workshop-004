@@ -1,0 +1,168 @@
+// media-rename.mjs (12 October 2026): the rename phase that runs BEFORE any upload.
+// FR : phase de renommage prealable. Plan propose -> validation de Matthieu -> renommage LOCAL -> upload : le nom local
+// est le nom cloud, deja range en sous-dossiers. Rien n'est renomme sans `approved`, et tout renommage est annulable.
+import fs from 'node:fs'
+import path from 'node:path'
+import { CLEAN, applySeasonFromFolder, composeCleanName, isCleanMediaName, parseMediaName, proposedFolder } from './clean-media-name.mjs'
+
+// 12 October 2026: tunable values of the rename phase in one place.
+export const RENAME = {
+  skipDirs: new Set(['.git', '.streams', 'node_modules']),
+  logName: 'RenameLog.jsonl',
+  statusProposed: 'proposed',
+  statusApplied: 'applied',
+  unclean: /[\[\]]|\b(?:\d{3,4}p|x26[45]|h26[45]|hevc|vostfr|multi|web-?dl|webrip|bdrip|bluray)\b/i,
+}
+
+function walkVideos(root) {
+  const found = []
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) { if (!RENAME.skipDirs.has(entry.name)) walk(full) }
+      else if (CLEAN.videoExtensions.includes(path.extname(entry.name).toLowerCase())) found.push(full)
+    }
+  }
+  walk(root)
+  return found.sort()
+}
+
+const sidecarsOf = (videoPath) => {
+  const dir = path.dirname(videoPath)
+  const stem = path.basename(videoPath, path.extname(videoPath))
+  return fs.readdirSync(dir).filter((name) => name.startsWith(`${stem}.`) && CLEAN.sidecarExtensions.includes(path.extname(name).toLowerCase()) && name !== path.basename(videoPath))
+    .map((name) => ({ full: path.join(dir, name), suffix: name.slice(stem.length) }))
+}
+
+// aliases: { 'Bleach Thousand Year Blood War': 'Bleach' }, subfolders: group series as <Title>/Saison NN
+export function planRename(root, { aliases = {}, subfolders = true } = {}) {
+  const absRoot = path.resolve(root)
+  const taken = new Map()
+  const items = []
+  const titles = new Set()
+  const entries = walkVideos(absRoot).map((file) => {
+    const parts = parseMediaName(path.basename(file))
+    if (aliases[parts.title]) parts.title = aliases[parts.title]
+    applySeasonFromFolder(parts, path.basename(path.dirname(file)))
+    titles.add(parts.title)
+    return { file, parts }
+  })
+  for (const { file, parts } of entries) {
+    const relDir = path.relative(absRoot, path.dirname(file)).split(path.sep).join('/')
+    const folder = subfolders && proposedFolder(parts) ? proposedFolder(parts) : relDir
+    const reasons = [...parts.reasons]
+    let name = composeCleanName(parts)
+    let key = `${folder}/${name}`.toLowerCase()
+    if (taken.has(key) && taken.get(key) !== file) {
+      reasons.push('collision_disambiguated')
+      const attempts = [composeCleanName(parts, { withYear: true }), composeCleanName(parts, { withYear: true, withLanguage: true })]
+      name = attempts.find((candidate) => !taken.has(`${folder}/${candidate}`.toLowerCase())) || name
+      key = `${folder}/${name}`.toLowerCase()
+      for (let n = 2; taken.has(key); n += 1) {
+        name = composeCleanName(parts, { withYear: true }).replace(/(\.[^.]+)$/, ` (${n})$1`)
+        key = `${folder}/${name}`.toLowerCase()
+      }
+    }
+    taken.set(key, file)
+    // a series whose title extends another series title is probably the same series under two release names
+    for (const other of titles) if (other !== parts.title && parts.title.startsWith(`${other} `)) reasons.push(`series_title_variant:${other}`)
+    if (/\d$/.test(parts.title)) reasons.push('title_ends_with_number')
+    const to = path.join(absRoot, ...folder.split('/').filter(Boolean), name)
+    items.push({ from: file, to, fromRel: path.relative(absRoot, file), toRel: path.relative(absRoot, to), reasons, unchanged: file === to, skip: false })
+    const newStem = path.basename(name, path.extname(name))
+    for (const side of sidecarsOf(file)) {
+      const sideTo = path.join(path.dirname(to), `${newStem}${side.suffix}`)
+      items.push({ from: side.full, to: sideTo, fromRel: path.relative(absRoot, side.full), toRel: path.relative(absRoot, sideTo), reasons: ['sidecar'], unchanged: side.full === sideTo, skip: false })
+    }
+  }
+  const changed = items.filter((item) => !item.unchanged)
+  return {
+    status: RENAME.statusProposed, root: absRoot, createdAt: new Date().toISOString(), subfolders, aliases,
+    counts: { files: items.length, toRename: changed.length, needReview: changed.filter((i) => i.reasons.some((r) => r !== 'sidecar')).length },
+    items,
+  }
+}
+
+// 12 October 2026: where a planned file lands once its top-level folder is judged. A release-named folder ("[Group] Title [1080p]",
+// "Title (2010) (1080p BluRay ...)") is not a place a film keeps living in: its films go to the root, unless an alias maps the folder
+// to a clean one (a special filed under the series). Series episodes are already under <Title>/Saison NN and are left alone.
+// FR : un film range dans un dossier au nom de release remonte a la racine ; un alias de dossier le range plutot dans la serie.
+export function retargetFolder(relativePath, folderAliases = {}) {
+  const parts = relativePath.split(path.sep).filter(Boolean)
+  if (parts.length < 2) return relativePath
+  if (folderAliases[parts[0]]) parts[0] = folderAliases[parts[0]]
+  const seasonFolder = new RegExp(`^${CLEAN.seasonFolderLabel} \\d+$`, 'i')
+  const inSeason = parts.slice(1, -1).some((part) => seasonFolder.test(part))
+  if (!isCleanMediaName(parts[0]) && !inSeason) return parts[parts.length - 1]
+  return parts.join(path.sep)
+}
+
+export function renderPlanTable(plan) {
+  const rows = plan.items.filter((item) => !item.unchanged && !item.skip)
+  const lines = ['| # | Avant | Apres | A verifier |', '|---|---|---|---|']
+  rows.forEach((item, i) => lines.push(`| ${i + 1} | ${item.fromRel} | ${item.toRel} | ${item.reasons.filter((r) => r !== 'sidecar').join(', ')} |`))
+  return lines.join('\n')
+}
+
+function assertSafe(plan) {
+  const seen = new Set()
+  for (const item of plan.items) {
+    if (item.skip || item.unchanged) continue
+    const to = path.resolve(item.to)
+    if (!to.startsWith(plan.root + path.sep)) throw new Error(`Target outside the root: ${item.to}`)
+    if (!fs.existsSync(item.from)) throw new Error(`Source missing: ${item.from}`)
+    if (fs.existsSync(to)) throw new Error(`Target already exists: ${item.to}`)
+    if (seen.has(to.toLowerCase())) throw new Error(`Two files would get the same name: ${item.to}`)
+    seen.add(to.toLowerCase())
+  }
+}
+
+// Applies the plan locally. `approved` must come from Matthieu's validation in chat, never be assumed.
+export function applyRename(plan, { approved = false, dry = false, logPath } = {}) {
+  if (!approved) throw new Error('Rename not approved: show the plan to Matthieu and wait for his validation')
+  if (plan.status !== RENAME.statusProposed) throw new Error(`Plan status is ${plan.status}, expected ${RENAME.statusProposed}`)
+  assertSafe(plan)
+  const todo = plan.items.filter((item) => !item.skip && !item.unchanged)
+  if (dry) return { applied: 0, wouldRename: todo.length }
+  const log = logPath || path.join(plan.root, RENAME.logName)
+  const done = []
+  try {
+    for (const item of todo) {
+      fs.mkdirSync(path.dirname(item.to), { recursive: true })
+      fs.renameSync(item.from, item.to)
+      done.push(item)
+      fs.appendFileSync(log, JSON.stringify({ from: item.from, to: item.to, at: new Date().toISOString() }) + '\n')
+    }
+  } catch (error) {
+    for (const item of done.reverse()) fs.renameSync(item.to, item.from) // roll back what was done
+    throw error
+  }
+  plan.status = RENAME.statusApplied
+  plan.appliedAt = new Date().toISOString()
+  return { applied: done.length, log }
+}
+
+export function undoRename(logPath) {
+  const lines = fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)).reverse()
+  let restored = 0
+  for (const { from, to } of lines) {
+    if (!fs.existsSync(to)) continue
+    if (fs.existsSync(from)) throw new Error(`Cannot undo, ${from} exists`)
+    fs.mkdirSync(path.dirname(from), { recursive: true })
+    fs.renameSync(to, from)
+    restored += 1
+  }
+  return { restored }
+}
+
+// Parity: the local name IS the cloud name, and both are clean. Works on an upload plan or on a list of names.
+export function checkParity(entries) {
+  const problems = []
+  for (const entry of entries) {
+    if (entry.src && path.basename(entry.src) !== entry.name) problems.push({ name: entry.name, verdict: 'local_name_differs_from_cloud_name', src: path.basename(entry.src) })
+    else if (!isCleanMediaName(entry.name)) problems.push({ name: entry.name, verdict: 'name_not_clean' })
+    const folder = String(entry.dest || '')
+    if (RENAME.unclean.test(folder)) problems.push({ name: entry.name, verdict: 'folder_not_clean', dest: folder })
+  }
+  return { ok: problems.length === 0, checked: entries.length, problems }
+}

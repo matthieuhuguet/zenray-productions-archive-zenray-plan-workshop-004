@@ -1,0 +1,63 @@
+import importlib.util, os, sys, tempfile, pathlib, subprocess, json
+os.environ['ZR_UPLOAD_FLOWS'] = '1'
+os.environ['ZR_RETRY_WAITS_S'] = '0.1,0.1,0.1'
+spec = importlib.util.spec_from_file_location('worker', '/Users/zenray/.claude/tmp/tmp-movies-series-upload/Scripts/ProcessFilmsSequentially.py')
+w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
+tmp = pathlib.Path(tempfile.mkdtemp())
+logs, statuses = [], []
+w.log = lambda m: logs.append(m)
+w.write_live_status = lambda status, *a, **k: statuses.append(status)
+w.wait_if_paused = lambda *a, **k: None
+w.time.sleep = lambda s: None
+class R:
+    def __init__(s): s.returncode = 0; s.stdout = ''; s.stderr = ''
+w.subprocess.run = lambda *a, **k: R()
+w.subprocess.check_output = lambda *a, **k: 'token'
+w.flush_index_spool = lambda *a, **k: None
+w.CLONE = tmp / 'clone'; w.CLONE.mkdir()
+@w.contextlib.contextmanager
+def nolock(label, **k): yield
+w.clone_lock = nolock
+w.restore_tracked_changes = lambda clone: []
+
+def make_tasks(names):
+    return [{'source': str(tmp / n), 'name': n, 'dest': 'd', 'absManifest': tmp / (n + '.json'), 'kind': 'ready', 'duplicates': []} for n in names]
+
+def run_case(names, behaviour):
+    logs.clear(); statuses.clear()
+    calls = {}
+    def fake(task, idx, total, env, ts, df=None, dp=None):
+        n = task['name']; calls[n] = calls.get(n, 0) + 1
+        outcome = behaviour(n, calls[n])
+        if outcome == 'fail':
+            raise subprocess.CalledProcessError(1, ['node', '/x/upload-mapped-git.mjs', 'plan.json'])
+        return True
+    w.process_one_task = fake
+    w.build_queues = lambda: make_tasks(names)
+    code = None
+    try:
+        w.main()
+    except SystemExit as e:
+        code = e.code
+    return code, calls
+
+# case 1: film "a" fails its 4 attempts, a retry round brings it back; "b" is fine -> completed, exit normally
+code, calls = run_case(['a', 'b'], lambda n, k: 'fail' if (n == 'a' and k <= 4) else 'ok')
+assert code is None and statuses[-1] == 'completed', (code, statuses[-3:], logs[-5:])
+assert calls['a'] == 5 and calls['b'] == 1, calls
+assert any('Reprise 1/3' in l for l in logs)
+# the breaker needs two DIFFERENT films with the same signature: 'a' alone does not trip it
+assert not any('Disjoncteur' in l for l in logs)
+
+# case 2: two films fail the same way at the same time -> the breaker trips once
+code, calls = run_case(['a', 'b'], lambda n, k: 'fail' if k <= 2 else 'ok')
+assert code is None and statuses[-1] == 'completed', (code, statuses[-3:])
+assert sum('Disjoncteur' in l for l in logs) >= 1, logs
+
+# case 3: a film that never works -> three rounds, honest status, exit code 3
+code, calls = run_case(['a', 'b'], lambda n, k: 'fail' if n == 'a' else 'ok')
+assert code == 3, code
+assert statuses[-1] == 'incomplete', statuses[-3:]
+assert any('INCOMPLETE' in l and 'a' in l for l in logs)
+assert sum('Reprise' in l for l in logs) == 3, [l for l in logs if 'Reprise' in l]
+print('main rounds tests OK; calls', calls)

@@ -1,0 +1,370 @@
+// 3 October 2026 10:38: Verify persisted grouping and reordering through real tile drops.
+import React from 'react'
+import { render, fireEvent, createEvent, waitFor, cleanup } from '@testing-library/react'
+import { vi, test, expect, afterEach } from 'vitest'
+import GalleryView from './GalleryView.jsx'
+import { POINTER_GALLERIES } from '../config/pointerGalleries.js'
+const store = vi.hoisted(() => ({ data: null }))
+vi.mock('../lib/saveJson.js', () => ({
+  readJson: vi.fn(async () => ({ data: store.data, sha: 'one' })),
+  saveJsonWithRetry: vi.fn(async (path, update) => { store.data = update(store.data); return { ok: true, sha: 'two' } }),
+}))
+vi.mock('../clipboard/ClipboardProvider.jsx', () => ({ useClipboardTarget: vi.fn() }))
+vi.mock('./ImageNodeViewer.jsx', () => ({ readImgManifestCached: vi.fn(async () => null), resolveThumbUrl: vi.fn(), resolveFullUrl: vi.fn() }))
+vi.mock('./Notifications.jsx', () => ({ notify: vi.fn() }))
+vi.mock('./LinkedAssetsGallery.jsx', () => ({ default: ({ project }) => <section data-testid="linked-assets-gallery">{project.name} cloud files</section> }))
+afterEach(() => { cleanup(); localStorage.clear() })
+
+// 21 October 2026, 17:11 CEST: Quiet covers preserve group contents and remain keyboard navigable.
+test('one collection cover opens all retained images with the keyboard', async () => {
+  store.data = { v: 1, items: [{ id: 'collection', kind: 'folder', name: 'Collection', items: [
+    { id: 'one', kind: 'image', path: 'https://example.com/one.jpg', title: 'First image' },
+    { id: 'two', kind: 'image', path: 'https://example.com/two.jpg', title: 'Second image' },
+  ] }] }
+  const view = render(<GalleryView galleryKey="design" t={{}} />)
+  const cover = await view.findByRole('button', { name: 'Ouvrir Collection' })
+  expect(cover.querySelectorAll('img')).toHaveLength(1)
+  fireEvent.keyDown(cover, { key: 'Enter' })
+  await waitFor(() => expect(view.container.querySelectorAll('.zr-gallery-grid img')).toHaveLength(2))
+  fireEvent.keyDown(view.getByRole('button', { name: 'First image' }), { key: 'Enter' })
+  await waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeTruthy())
+  expect(store.data.items[0].items).toHaveLength(2)
+})
+
+const image = (id) => ({ id, kind: 'image', path: `https://example.com/${id}.png` })
+async function drop(key, x, initial = [image('a'), image('b')], layout = 'aligned') {
+  store.data = { v: 1, items: initial }
+  localStorage.setItem(`zr:gallery:layout:${key}`, layout)
+  const view = render(<GalleryView galleryKey={key} t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(initial.length))
+  const tile = view.container.querySelectorAll('[draggable="true"]')[1]
+  tile.getBoundingClientRect = () => ({ left: 0, width: 100 })
+  const event = createEvent.drop(tile)
+  Object.defineProperties(event, { clientX: { value: x }, dataTransfer: { value: { types: ['application/zenray-gallery-item'], getData: () => 'a' } } })
+  fireEvent(tile, event)
+  await waitFor(() => expect(store.data.items).not.toEqual(initial))
+  return store.data.items
+}
+for (const gallery of POINTER_GALLERIES) {
+  test(`aligned center groups in ${gallery.key}`, async () => {
+    const items = await drop(gallery.key, 50)
+    expect(items).toHaveLength(1)
+    expect(items[0].items.map(x => x.id)).toEqual(['b', 'a'])
+  })
+}
+test('aligned right edge reorders without grouping', async () => {
+  expect((await drop(POINTER_GALLERIES[0].key, 95)).map(x => x.id)).toEqual(['b', 'a'])
+})
+test('aligned center adds to an existing group', async () => {
+  const items = await drop(POINTER_GALLERIES[0].key, 50, [image('a'), { id: 'folder', kind: 'folder', name: 'Group', items: [image('b')] }])
+  expect(items[0].items.map(x => x.id)).toEqual(['b', 'a'])
+})
+test('grid still groups on tile edges', async () => {
+  expect((await drop(POINTER_GALLERIES[0].key, 95, undefined, 'grid'))[0].kind).toBe('folder')
+})
+
+// 5 October 2026, 12:33 CEST: Completed projects retain their references across reload and restoration.
+vi.mock('./ActionColumnMenu.jsx', () => ({
+  ActionColumnPopover: ({ nodes }) => <div>{nodes.map(node => <button key={node.id} onClick={node.action}>{node.label}</button>)}</div>,
+  ActionColumnMenu: ({ trigger }) => <>{trigger}</>,
+}))
+test('ToDo-3D persists Done and restores a completed group without losing references', async () => {
+  const project = { id: 'project', kind: 'folder', name: 'Finished project', items: [image('a'), image('b')] }
+  store.data = { v: 1, items: [project, image('c')] }
+  let view = render(<GalleryView galleryKey="todo3d" t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(2))
+  fireEvent.contextMenu(view.container.querySelector('[draggable="true"]'))
+  fireEvent.click(view.getByText('Ranger dans Done'))
+  await waitFor(() => expect(store.data.items[0].status).toBe('done'))
+  expect(store.data.items[0].items).toEqual(project.items)
+  view.unmount()
+  view = render(<GalleryView galleryKey="todo3d" t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(1))
+  expect(view.queryByText('Finished project')).toBeNull()
+  fireEvent.click(view.getByRole('button', { name: 'Done' }))
+  expect(view.getByText('Finished project')).toBeTruthy()
+  fireEvent.contextMenu(view.container.querySelector('[draggable="true"]'))
+  fireEvent.click(view.getByText('Remettre en cours'))
+  await waitFor(() => expect(store.data.items[0].status).toBe('active'))
+  fireEvent.click(view.getByRole('button', { name: 'En cours' }))
+  expect(view.getByText('Finished project')).toBeTruthy()
+  expect(store.data.items[0].items).toEqual(project.items)
+})
+test('other galleries keep completed cards visible without a Done section', async () => {
+  store.data = { v: 1, items: [{ ...image('a'), status: 'done' }] }
+  const view = render(<GalleryView galleryKey="characters" t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(1))
+  expect(view.queryByRole('button', { name: 'Done' })).toBeNull()
+})
+
+// 9 October 2026, 01:51 CEST: Switching to cloud files must preserve the curated Gallery collection.
+test('separates cloud files from curated references without changing their order', async () => {
+  const originalItems = [image('first'), image('second')]
+  store.data = { v: 1, items: originalItems }
+  const view = render(<GalleryView galleryKey="todo3d" t={{ accent: 'blue', border: '#ddd', textPrimary: '#111', textSecondary: '#666', surface: '#fff' }} />)
+
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(2))
+  expect(view.getByRole('tab', { name: /projets et images ajoutés ici à la main\. triage et groupes conservés/i })).toBeTruthy()
+  fireEvent.click(view.getByRole('tab', { name: /Fichiers cloud/ }))
+  expect(view.getByRole('tab', { name: /images de tes dossiers locaux, sauvegardées dans le cloud\. sans copie/i })).toBeTruthy()
+  expect(view.getByTestId('linked-assets-gallery').textContent).toContain('Louisiana Bayou')
+  expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(0)
+
+  fireEvent.click(view.getByRole('tab', { name: /Ma sélection/ }))
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(2))
+  expect(store.data.items).toEqual(originalItems)
+})
+
+// 08 October 2026: Navigation dans les sous-groupes enfants et fil dariane hierarchique
+test('navigation dans un sous-groupe enfant et fil dariane hierarchique', async () => {
+  const grandchild = { id: 'grandchild', kind: 'folder', name: 'Sous-groupe 2', items: [image('c')] }
+  const child = { id: 'child', kind: 'folder', name: 'Nouveau groupe', items: [image('b'), grandchild] }
+  const parent = { id: 'parent', kind: 'folder', name: 'Louisiana Bayou', items: [image('a'), child] }
+  store.data = { v: 1, items: [parent] }
+
+  const view = render(<GalleryView galleryKey="todo3d" t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.getAllByText('Louisiana Bayou')).toBeTruthy())
+
+  // Verification que le fil d'ariane Tahoe V9 (.zr-ws-path) est bien present des la racine
+  expect(view.container.querySelector('.zr-ws-path')).toBeTruthy()
+  expect(view.container.querySelector('[data-zr-pathmenu-trigger="true"]')).toBeTruthy()
+
+  // Clic sur la tuile Louisiana Bayou : ouvre le dossier parent
+  fireEvent.click(view.container.querySelector('.zr-ws-rim'))
+  await waitFor(() => expect(view.getAllByText('Nouveau groupe')).toBeTruthy())
+
+  // Clic sur la tuile Nouveau groupe : ouvre le sous-groupe enfant sans revenir au root
+  fireEvent.click(view.container.querySelector('.zr-ws-rim'))
+  await waitFor(() => expect(view.getAllByText('Sous-groupe 2')).toBeTruthy())
+
+  // Verification du fil dariane complet
+  expect(view.getAllByText('ToDo-3D')).toBeTruthy()
+  expect(view.getAllByText('Louisiana Bayou')).toBeTruthy()
+  expect(view.getAllByText('Nouveau groupe')).toBeTruthy()
+
+  // Clic sur la tuile Sous-groupe 2 : descend au 3e niveau enfant
+  fireEvent.click(view.container.querySelector('.zr-ws-rim'))
+  await waitFor(() => expect(view.getAllByText('Sous-groupe 2')).toBeTruthy())
+
+  // Le fil dariane montre tous les ancetres
+  expect(view.getAllByText('ToDo-3D')).toBeTruthy()
+  expect(view.getAllByText('Louisiana Bayou')).toBeTruthy()
+  expect(view.getAllByText('Nouveau groupe')).toBeTruthy()
+
+  // Clic sur Louisiana Bayou dans le fil dariane : remonte directement a Louisiana Bayou
+  fireEvent.click(view.getByText('Louisiana Bayou'))
+  await waitFor(() => expect(view.getAllByText('Nouveau groupe')).toBeTruthy())
+
+  // Clic sur ToDo-3D dans le fil dariane : remonte directement a la racine
+  fireEvent.click(view.getByText('ToDo-3D'))
+  await waitFor(() => expect(view.getAllByText('Louisiana Bayou')).toBeTruthy())
+  // La barre .zr-ws-path reste presente et visible a la racine
+  expect(view.container.querySelector('.zr-ws-path')).toBeTruthy()
+})
+
+// 08 October 2026: Renommage d'un sous-groupe enfant depuis le fil d'ariane
+test('renommer un sous-groupe enfant depuis le fil dariane', async () => {
+  const child = { id: 'child', kind: 'folder', name: 'Nouveau groupe', items: [image('b')] }
+  const parent = { id: 'parent', kind: 'folder', name: 'Louisiana Bayou', items: [child] }
+  store.data = { v: 1, items: [parent] }
+
+  const view = render(<GalleryView galleryKey="todo3d" t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.getByText('Louisiana Bayou')).toBeTruthy())
+
+  // Ouvrir parent puis enfant
+  fireEvent.click(view.container.querySelector('.zr-ws-rim'))
+  await waitFor(() => expect(view.getByText('Nouveau groupe')).toBeTruthy())
+  fireEvent.click(view.container.querySelector('.zr-ws-rim'))
+  await waitFor(() => expect(view.getByTitle('Cliquer pour renommer')).toBeTruthy())
+
+  // Clic sur le nom actif dans le fil dariane pour passer en mode edition
+  fireEvent.click(view.getByTitle('Cliquer pour renommer'))
+  const input = view.getByTitle('Renommer')
+  fireEvent.change(input, { target: { value: 'Persiennes bois' } })
+  fireEvent.blur(input)
+
+  await waitFor(() => expect(store.data.items[0].items[0].name).toBe('Persiennes bois'))
+})
+
+// 10 October 2026: Verification de la galerie Artists, du lien direct vers le portfolio ArtStation et du pop-up widget depliable et agrandissable.
+test('Artists gallery renders portfolio link and opens expandable and resizable projects popover', async () => {
+  expect(POINTER_GALLERIES.some((g) => g.key === 'artists' && g.path === 'pages/Artists/artists.json')).toBe(true)
+  const erwan = {
+    id: 'artist-erwan-gaudichon',
+    kind: 'folder',
+    isArtist: true,
+    name: 'Erwan Gaudichon',
+    handle: 'forflex',
+    url: 'https://www.artstation.com/forflex',
+    role: 'Vegetation / Tech Artist',
+    studio: 'Mundfish',
+    note: 'Vegetation Artist chez Mundfish.',
+    projects: [
+      {
+        id: 'proj-eucalyptus',
+        title: 'Eucalyptus',
+        category: 'Vegetation · Real-time 3D',
+        url: 'https://www.artstation.com/artwork/a0gxvk',
+        note: 'Arbre Eucalyptus temps reel.',
+        items: [image('euc-1')],
+      },
+      {
+        id: 'proj-pampas',
+        title: 'Pampas Grass Pond',
+        category: 'Environment · UE5',
+        url: 'https://www.artstation.com/artwork/5WVB5w',
+        note: 'Scene Pampas Grass Pond.',
+        items: [image('pampas-1')],
+      },
+    ],
+    items: [image('euc-1'), image('pampas-1')],
+  }
+  store.data = { v: 1, items: [erwan] }
+
+  const view = render(<GalleryView galleryKey="artists" t={{ accent: '#0a84ff', textPrimary: '#fff', textSecondary: '#aaa' }} />)
+  await waitFor(() => expect(view.getByText('Erwan Gaudichon')).toBeTruthy())
+
+  const portfolioLink = view.container.querySelector('a[href="https://www.artstation.com/forflex"]')
+  expect(portfolioLink).toBeTruthy()
+  expect(portfolioLink.textContent).toContain('ArtStation · @forflex')
+
+  // Clic sur la carte de l artiste : ouvre le pop-up widget depliable
+  fireEvent.click(view.container.querySelector('.zr-ws-rim'))
+  const dialog = await waitFor(() => document.querySelector('[role="dialog"]'))
+  expect(dialog).toBeTruthy()
+  expect(dialog.textContent).toContain('Eucalyptus')
+  expect(dialog.textContent).toContain('Pampas Grass Pond')
+
+  // Verification du bouton d agrandissement (Normal -> Large -> Max)
+  const expandBtn = Array.from(dialog.querySelectorAll('button')).find((b) => b.textContent.includes('Agrandir'))
+  expect(expandBtn).toBeTruthy()
+  fireEvent.click(expandBtn)
+  expect(expandBtn.textContent).toContain('Max')
+
+  // Verification du repli / depli des projets
+  const collapseAllBtn = Array.from(dialog.querySelectorAll('button')).find((b) => b.textContent.includes('Tout replier'))
+  expect(collapseAllBtn).toBeTruthy()
+  fireEvent.click(collapseAllBtn)
+  expect(dialog.textContent).not.toContain('Arbre Eucalyptus temps reel.')
+  fireEvent.click(collapseAllBtn)
+  expect(dialog.textContent).toContain('Arbre Eucalyptus temps reel.')
+})
+
+
+// 14 October 2026: the text filter only changes what is drawn; the saved order is untouched and a miss says so.
+test('the filter hides non-matching references without touching the saved items', async () => {
+  const key = POINTER_GALLERIES[0].key
+  const many = Array.from({ length: 8 }, (_, index) => ({ id: `r${index}`, kind: 'image', path: `https://example.com/r${index}.png`, title: index % 2 ? `Forest ${index}` : `Castle ${index}`, note: index === 3 ? 'concept art' : '' }))
+  store.data = { v: 1, items: many }
+  localStorage.setItem(`zr:gallery:layout:${key}`, 'aligned')
+  const view = render(<GalleryView galleryKey={key} t={{ accent: 'blue', border: '#ccc', textPrimary: '#000', textSecondary: '#666', surface: '#fff' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(8))
+  const input = view.container.querySelector('input[type="search"]')
+  expect(input).toBeTruthy()
+  fireEvent.change(input, { target: { value: 'forest' } })
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(4))
+  fireEvent.change(input, { target: { value: 'forest concept' } })
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(1))
+  fireEvent.change(input, { target: { value: 'zzzz' } })
+  await waitFor(() => expect(view.getByText(/Aucune référence ne correspond/)).toBeTruthy())
+  expect(store.data.items.map((item) => item.id)).toEqual(many.map((item) => item.id))
+  fireEvent.change(input, { target: { value: '' } })
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(8))
+})
+
+// 22 October 2026: Famille Photos Importantes gallery registered with matching path and rendering.
+test('Famille Photos Importantes gallery is registered in POINTER_GALLERIES and renders cleanly', async () => {
+  const g = POINTER_GALLERIES.find((item) => item.key === 'famille-photos-importantes')
+  expect(g).toBeTruthy()
+  expect(g.label).toBe('Famille Photos Importantes')
+  expect(g.path).toBe('pages/Famille-Photos-Importantes/famille-photos-importantes.json')
+  store.data = { v: 1, items: [{ id: 'fam-1', kind: 'image', path: 'https://example.com/family.jpg', title: 'Photo de famille' }] }
+  const view = render(<GalleryView galleryKey="famille-photos-importantes" t={{ accent: 'blue', border: '#ccc', textPrimary: '#000', textSecondary: '#666', surface: '#fff' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(1))
+  expect(view.container.querySelector('h1').textContent).toBe('Famille Photos Importantes')
+})
+
+// 23 October 2026: Mariage De Clea gallery registered from Create Photos and renders guests groups.
+test('Mariage De Clea gallery is registered in POINTER_GALLERIES and renders cleanly with guest groups', async () => {
+  const g = POINTER_GALLERIES.find((item) => item.key === 'marriage-clea-septembre-2026')
+  expect(g).toBeTruthy()
+  expect(g.label).toBe('Mariage De Cléa')
+  expect(g.path).toBe('pages/Photos/Iphone-9qpx/2026/09 September/marriage-clea-septembre-2026-uyap/gallery.json')
+  store.data = {
+    v: 1,
+    title: 'Mariage De Cléa',
+    items: [
+      { id: 'guest-1', kind: 'folder', name: 'Boris Toffin', items: [{ id: 'img-1', kind: 'image', path: 'https://example.com/boris.jpg', title: 'Boris' }] },
+      { id: 'guest-2', kind: 'folder', name: 'Floriane Fiori', items: [{ id: 'img-2', kind: 'image', path: 'https://example.com/floriane.jpg', title: 'Floriane' }] },
+    ],
+  }
+  const view = render(<GalleryView galleryKey="marriage-clea-septembre-2026" t={{ accent: 'blue', border: '#ccc', textPrimary: '#000', textSecondary: '#666', surface: '#fff' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(2))
+  expect(view.container.querySelector('h1').textContent).toBe('Mariage De Cléa')
+  expect(view.getByText('Boris Toffin')).toBeTruthy()
+  expect(view.getByText('Floriane Fiori')).toBeTruthy()
+})
+
+// 23 October 2026: Columns switcher switches between 3 and 4 columns and persists preference.
+test('Columns switcher toggles between 3 and 4 columns', async () => {
+  store.data = { v: 1, items: [{ id: 'img-1', kind: 'image', path: 'https://example.com/1.jpg' }] }
+  const view = render(<GalleryView galleryKey="design" t={{ accent: 'blue', border: '#ccc', textPrimary: '#000', textSecondary: '#666', surface: '#fff' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(1))
+
+  const col4Btn = view.getByRole('button', { name: '4' })
+  expect(col4Btn).toBeTruthy()
+  fireEvent.click(col4Btn)
+  expect(localStorage.getItem('zr:gallery:cols')).toBe('4')
+
+  const col3Btn = view.getByRole('button', { name: '3' })
+  fireEvent.click(col3Btn)
+  expect(localStorage.getItem('zr:gallery:cols')).toBe('3')
+})
+
+// 23 October 2026: Options button toggles customization controls visibility.
+test('Options button toggles customization controls visibility', async () => {
+  store.data = { v: 1, items: [{ id: 'img-1', kind: 'image', path: 'https://example.com/1.jpg' }] }
+  const view = render(<GalleryView galleryKey="design" t={{ accent: 'blue', border: '#ccc', textPrimary: '#000', textSecondary: '#666', surface: '#fff' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(1))
+
+  const optionsBtn = view.getByRole('button', { name: /Options/i })
+  expect(optionsBtn).toBeTruthy()
+
+  // Initially options are visible by default
+  expect(view.container.querySelector('.zr-gallery-linkbox')).toBeTruthy()
+
+  // Click options button to hide customization controls
+  fireEvent.click(optionsBtn)
+  expect(localStorage.getItem('zr:gallery:showControls')).toBe('false')
+  expect(view.container.querySelector('.zr-gallery-linkbox')).toBeNull()
+
+  // Click options button again to restore them
+  fireEvent.click(optionsBtn)
+  expect(localStorage.getItem('zr:gallery:showControls')).toBe('true')
+  expect(view.container.querySelector('.zr-gallery-linkbox')).toBeTruthy()
+})
+
+// 23 October 2026: galleryPresentationStyle adapts to dark and light themes with a single unified background.
+test('galleryPresentationStyle adapts to light and dark themes with single unified background', async () => {
+  const { galleryPresentationStyle, GALLERY_PRESENTATION } = await import('../config/galleryPresentation.js')
+  const { PALETTE, THEMES } = await import('../theme.js')
+
+  const lightStyle = galleryPresentationStyle(GALLERY_PRESENTATION, THEMES.light)
+  expect(lightStyle['--gallery-background']).toBe(THEMES.light.bg)
+  expect(lightStyle['--gallery-ink']).toBe(THEMES.light.textPrimary)
+
+  const darkStyle = galleryPresentationStyle(GALLERY_PRESENTATION, THEMES.dark)
+  expect(darkStyle['--gallery-background']).toBe(PALETTE.bgDark)
+  expect(darkStyle['--gallery-ink']).toBe(PALETTE.textPrimaryDark)
+})
+
+// 23 October 2026: saveCustomGallery registers custom gallery dynamically.
+test('saveCustomGallery adds a custom gallery to getAllGalleries', async () => {
+  const { getAllGalleries, saveCustomGallery, galleryByKey } = await import('../config/pointerGalleries.js')
+  const custom = { key: 'test-custom-gallery', label: 'Ma Galerie Perso', path: 'pages/test/gallery.json' }
+  saveCustomGallery(custom)
+
+  const all = getAllGalleries()
+  expect(all.some((g) => g.key === 'test-custom-gallery')).toBe(true)
+  expect(galleryByKey('test-custom-gallery')?.label).toBe('Ma Galerie Perso')
+})

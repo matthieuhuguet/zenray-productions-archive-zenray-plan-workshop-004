@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+# Récupère un poster pour chaque item du Shelf SANS image, via les APIs officielles :
+#   - jeux           -> RAWG  (background_image, art horizontal = cartes paysage)
+#   - anime / films  -> TMDB  (poster_path, art portrait = cartes portrait)
+# Garde-fou de similarité : on REJETTE (et on signale) tout match trop éloigné du titre,
+# pour ne jamais écrire un faux poster. Puis ré-hébergement sur le repo PUBLIC
+# zenray-shelf-img (jsDelivr, comme les posters existants) + patch du JSON LIVE.
+#
+# Clés via ENV (jamais en dur — repo public) : RAWG_KEY, TMDB_KEY.
+# Auth GitHub : `gh auth token`. Réseau : stdlib urllib.
+#
+# Usage :
+#   RAWG_KEY=... TMDB_KEY=... python3 Scripts/fetch_shelf_images.py <games|anime-manga|movies> [--write] [--only "Nom"] [--thresh 0.6]
+
+import sys, os, re, json, time, base64, ssl, subprocess, difflib
+import urllib.request, urllib.parse, urllib.error
+
+REPO_DATA = "matthieuhuguet/zenray-data"
+REPO_IMG  = "matthieuhuguet/zenray-shelf-img"
+BRANCH    = "main"
+UA = "zenray-poster-fetch"
+CTX = ssl.create_default_context()
+RAWG_KEY = os.environ.get("RAWG_KEY", "")
+TMDB_KEY = os.environ.get("TMDB_KEY", "")
+TOKEN = subprocess.check_output(["gh", "auth", "token"]).decode().strip()
+
+def http(url, data=None, headers=None, method=None, timeout=30):
+    h = {"User-Agent": UA}
+    if headers: h.update(headers)
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+        return r.status, r.headers, r.read()
+
+def gh_get(path):
+    try:
+        s, hd, body = http(f"https://api.github.com/repos/{path}",
+                           headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"})
+        return s, json.loads(body)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+
+def gh_put(repo, path, content_b64, message, sha=None):
+    payload = {"message": message, "content": content_b64, "branch": BRANCH}
+    if sha: payload["sha"] = sha
+    s, hd, body = http(f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}",
+                       data=json.dumps(payload).encode(), method="PUT",
+                       headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json",
+                                "Content-Type": "application/json"})
+    return s, json.loads(body)
+
+def read_data(cat):
+    s, j = gh_get(f"{REPO_DATA}/contents/shelf/{cat}.json?ref={BRANCH}")
+    if s != 200: raise SystemExit(f"__404__ lecture {cat}: {s} (pas de fichier live)")
+    return json.loads(base64.b64decode(j["content"]).decode("utf-8")), j["sha"]
+
+def has_image(it):
+    im = it.get("image")
+    if not im: return False
+    if isinstance(im, str): return bool(im.strip())
+    if isinstance(im, dict):
+        if im.get("kind") == "url": return bool(im.get("ref"))
+        if im.get("kind") == "shard": return True
+    return False
+
+def search_query(name):
+    # "DoomTheDarkAges"/"eiyuden_chronicle"/"FrierenS02"/"Chainsaw Man Manga" -> requête lisible
+    n = re.sub(r"\s*\(\d+\)\s*$", "", name).strip().replace("_", " ")
+    n = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", n)
+    n = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", n)
+    n = re.sub(r"\bS\d{1,2}\b", " ", n)                       # tag saison S01..
+    n = re.sub(r"\b(Manga|Anime|VOSTFR|VF)\b", " ", n, flags=re.I)
+    n = re.sub(r"\s+(19|20)\d\d$", " ", n)                    # année en fin (ex: "Colorful 2010")
+    return re.sub(r"\s+", " ", n).strip()
+
+def variants(q):
+    toks = q.split()
+    out = [q]
+    if len(toks) > 3: out.append(" ".join(toks[:3]))
+    if len(toks) > 1: out.append(toks[0])
+    seen, r = set(), []
+    for x in out:
+        if x.lower() not in seen: seen.add(x.lower()); r.append(x)
+    return r
+
+def norm(s): return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+def sim(a, b):
+    a, b = norm(a), norm(b)
+    if not a or not b: return 0.0
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    at, bt = set(a.split()), set(b.split())
+    overlap = len(at & bt) / len(at)
+    return max(ratio, overlap)
+
+def best_match(query, candidates):
+    # candidates : [(title, image_url)] -> (image_url, title, score) du plus proche
+    best, bs = None, -1.0
+    for title, img in candidates:
+        if not img: continue
+        sc = sim(query, title)
+        if sc > bs: bs, best = sc, (img, title)
+    return (best[0], best[1], bs) if best else (None, None, 0.0)
+
+def rawg_poster(query):
+    cands = []
+    for extra in ("&search_precise=true", ""):
+        try:
+            s, hd, body = http(f"https://api.rawg.io/api/games?key={RAWG_KEY}&search={urllib.parse.quote(query)}&page_size=8{extra}")
+            for r in json.loads(body).get("results", []):
+                cands.append((r.get("name"), r.get("background_image")))
+        except Exception:
+            pass
+    return best_match(query, cands)
+
+def tmdb_search(q):
+    try:
+        s, hd, body = http(f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_KEY}&query={urllib.parse.quote(q)}&include_adult=false&language=en-US")
+        return [((r.get("title") or r.get("name")),
+                 ("https://image.tmdb.org/t/p/w780" + r["poster_path"]) if r.get("poster_path") else None)
+                for r in json.loads(body).get("results", [])]
+    except Exception:
+        return []
+
+def tmdb_poster(query):
+    cands = []
+    for v in variants(query): cands += tmdb_search(v)
+    return best_match(query, cands)
+
+EXT = {"image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
+
+def fetch_image(u):
+    try:
+        s, hd, body = http(u, headers={"Accept": "image/*,*/*"})
+        ct = (hd.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not ct.startswith("image/") or len(body) < 5000: return None
+        return ct, body
+    except Exception:
+        return None
+
+def slugify(name):
+    return (re.sub(r"[^a-z0-9]+", "-", search_query(name).lower()).strip("-") or "item")[:60]
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ("games", "anime-manga", "movies"):
+        raise SystemExit("usage: fetch_shelf_images.py <games|anime-manga|movies> [--write] [--only NAME] [--thresh 0.6]")
+    cat = sys.argv[1]
+    write = "--write" in sys.argv
+    only = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None
+    qoverride = sys.argv[sys.argv.index("--query") + 1] if "--query" in sys.argv else None
+    skip = set(sys.argv[sys.argv.index("--skip") + 1].split("||")) if "--skip" in sys.argv else set()
+    thresh = float(sys.argv[sys.argv.index("--thresh") + 1]) if "--thresh" in sys.argv else 0.6
+    if cat == "games" and not RAWG_KEY: raise SystemExit("RAWG_KEY manquante (env)")
+    if cat != "games" and not TMDB_KEY: raise SystemExit("TMDB_KEY manquante (env)")
+
+    data, _ = read_data(cat)
+    items = data.get("items", [])
+    missing = [it for it in items if not has_image(it) and it["name"] not in skip and (only is None or it["name"] == only)]
+    print(f"[{cat}] {len(items)} items · {len(missing)} sans image · seuil {thresh} · {'ÉCRITURE' if write else 'DRY-RUN'}\n")
+
+    found, weak, fails = [], [], []
+    for it in missing:
+        q = qoverride if qoverride else search_query(it["name"])
+        src, matched, score = (rawg_poster if cat == "games" else tmdb_poster)(q)
+        if not src:
+            fails.append(it["name"]); print(f"  ✗ {it['name']:42s} aucun résultat"); time.sleep(0.2); continue
+        tag = "✓" if score >= thresh else "≈"
+        line = f"  {tag} {it['name']:42s} → « {matched} »  (sim {score:.2f})"
+        if score < thresh:
+            weak.append((it['name'], matched, score)); print(line + "   [REJETÉ < seuil]"); time.sleep(0.2); continue
+        got = fetch_image(src)
+        if not got:
+            fails.append(it["name"]); print(f"  ✗ {it['name']:42s} image illisible"); time.sleep(0.2); continue
+        ct, body = got
+        found.append((it, EXT.get(ct, "jpg"), body))
+        print(line + f"   [{len(body)//1024} Ko]")
+        time.sleep(0.25)
+
+    print(f"\nbilan : {len(found)} OK · {len(weak)} rejetés (trop loin) · {len(fails)} introuvables")
+    if weak:  print("  rejetés : " + "; ".join(f"{n} (≈{m}, {s:.2f})" for n, m, s in weak))
+    if fails: print("  introuvables : " + ", ".join(fails))
+    if not write or not found:
+        if write: print("\nrien à écrire")
+        return
+
+    # Pass 1 : pousser les images sur zenray-shelf-img
+    for (it, ext, body) in found:
+        path = f"posters/{slugify(it['name'])}.{ext}"
+        s, j = gh_get(f"{REPO_IMG}/contents/{urllib.parse.quote(path)}?ref={BRANCH}")
+        sha = j["sha"] if (s == 200 and j) else None
+        ps, pj = gh_put(REPO_IMG, path, base64.b64encode(body).decode(), f"poster: {slugify(it['name'])}", sha)
+        if ps not in (200, 201): raise SystemExit(f"upload {it['name']} échoué: {ps} {pj}")
+        time.sleep(0.15)
+
+    s, head = gh_get(f"{REPO_IMG}/commits/{BRANCH}")
+    headsha = head["sha"]
+    for (it, ext, body) in found:
+        it["image"] = {"kind": "url", "ref": f"https://cdn.jsdelivr.net/gh/{REPO_IMG}@{headsha}/posters/{slugify(it['name'])}.{ext}"}
+
+    _, sha2 = read_data(cat)
+    newjson = json.dumps(data, ensure_ascii=False, indent=2)
+    ps, pj = gh_put(REPO_DATA, f"shelf/{cat}.json", base64.b64encode(newjson.encode("utf-8")).decode(),
+                    f"shelf({cat}): +{len(found)} posters (RAWG/TMDB)", sha2)
+    if ps not in (200, 201): raise SystemExit(f"écriture {cat}.json échouée: {ps} {pj}")
+    print(f"\n→ {len(found)} posters écrits dans {cat}.json · commit {pj['commit']['sha'][:9]}")
+
+if __name__ == "__main__":
+    main()

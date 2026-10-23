@@ -1,0 +1,234 @@
+// C203 — Drive Dashboard : remonte les repos du drive (content + progress + shards) avec leur taille
+// (GitHub renvoie `size` en Ko, approximatif) et la limite de ~5 Go par repo.
+// Reconnaît les familles génériques zenray-<kind>-<public|private>-NN + les legacy zenray-media-NN / zenray-vid-NN.
+import { shardRe, parseShard, shardName } from './shard-naming.js'
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const LIMIT_MB = 5000 // plafond pratique GitHub par repo
+const SHARD_BRANCH = 'main'
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+function gh(token, path, init = {}) {
+  return fetch(`https://api.github.com/${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) } })
+}
+
+// Retry générique : retente sur erreur réseau et 5xx (panne GitHub transitoire).
+async function ghRetry(fn, { tries = 4, baseMs = 600, retryOn = (r) => r.status >= 500 } = {}) {
+  let last = null
+  for (let i = 0; i < tries; i++) {
+    try { const r = await fn(); if (r.ok || !retryOn(r)) return r; last = r } catch { last = null }
+    if (i < tries - 1) await sleep(baseMs * (i + 1))
+  }
+  return last
+}
+
+// Attend que le repo réponde ET que sa branche main porte un commit (ref créée par auto_init, asynchrone).
+async function waitShardReady(token, name, { tries = 12, delayMs = 1500 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    const pr = await gh(token, `repos/${OWNER}/${name}`)
+    if (pr.ok) {
+      const rr = await gh(token, `repos/${OWNER}/${name}/git/ref/heads/${SHARD_BRANCH}`)
+      if (rr.ok) return true
+    }
+    await sleep(delayMs)
+  }
+  return false
+}
+
+const README_BODY = `# ZenRay media shard
+
+Magasin d'assets media **prive** de l'application ZenRay.
+
+Ce depot fait partie d'un drive shorde facon Git-LFS : les fichiers binaires
+(images, chunks media) sont stockes sous des noms **hashes**, repartis sur
+plusieurs depots \`zenray-media-NN\` quand l'un d'eux approche la limite GitHub
+(~5 Go). L'etat de remplissage est suivi dans \`pages/.zr-drive.json\` du depot
+\`zenray-data\`.
+
+Ne rien committer a la main ici : toutes les ecritures passent par l'API
+serveur de ZenRay (Git Data API). Editer ce depot manuellement peut corrompre
+le drive.
+`
+
+// README d'un shard PUBLIC (drive-7) : jumeau d'upload-shard.js PUBLIC_README_BODY. Un shard public ne doit
+// JAMAIS porter le texte « dépôt privé » ni laisser entendre qu'il est interne. Aucun nom humain ici non plus.
+const PUBLIC_README_BODY = `# ZenRay public shard
+
+Depot **public** d'assets ZenRay.
+
+Les fichiers sont nommes par leur **empreinte SHA-256** (\`ab/cd/<hash>.<ext>\`) accompagnes
+d'une vignette \`.webp\`, et servis via **jsDelivr** (cache immuable pinne sur le commit).
+Aucun nom humain n'apparait : seuls des chemins hashes.
+
+Quand un shard approche ~5 Go, l'application en cree automatiquement un suivant. L'etat de
+remplissage est suivi dans un fichier d'etat du depot prive \`zenray-data\`.
+
+Ne rien committer a la main ici : toutes les ecritures passent par l'API serveur (Git Data API).
+`
+
+// Écrase le README par défaut (créé par auto_init) par un README honnête. Best-effort.
+// drive-7 : choisit le corps selon la visibilité (pub => README public, sinon README privé), comme
+// ensureFamilyReadme d'upload-shard.js. Évite qu'un shard public se déclare « privé » sur une surface publique.
+async function ensureShardReadme(token, name, pub = false) {
+  try {
+    let sha = null
+    const g = await gh(token, `repos/${OWNER}/${name}/contents/README.md?ref=${SHARD_BRANCH}`)
+    if (g.ok) { try { sha = (await g.json()).sha || null } catch {} }
+    const bodyText = pub ? PUBLIC_README_BODY : README_BODY
+    await ghRetry(() => gh(token, `repos/${OWNER}/${name}/contents/README.md`, {
+      method: 'PUT',
+      body: JSON.stringify({ message: 'shard: README', content: Buffer.from(bodyText, 'utf8').toString('base64'), branch: SHARD_BRANCH, ...(sha ? { sha } : {}) }),
+    }), { tries: 3, retryOn: (r) => r.status >= 500 || r.status === 409 })
+  } catch {}
+}
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(200).json({ error: 'no-token' })
+  res.setHeader('Cache-Control', 'no-store')
+
+  // POST { action:'create-shard' } -> crée le prochain repo media privé zenray-media-NN
+  if (req.method === 'POST') {
+    let body = req.body; if (typeof body === 'string') { try { body = JSON.parse(body) } catch { body = {} } }
+    if (body && body.action === 'create-shard') {
+      try {
+        // {kind,vis} optionnels : crée le prochain repo de la famille zenray-<kind>-<vis>-NN.
+        // Défaut (sans kind/vis) = comportement historique : prochain zenray-media-NN privé.
+        const kind = body.kind ? String(body.kind) : 'img'
+        const vis = body.vis ? String(body.vis) : 'private'
+        const pub = vis === 'public'
+        // RENAME (objectif 1) : plus de cas legacy. Toute famille -> zenray-<kind>-<vis>-NN, y compris img/private
+        // (zenray-img-private-NN). On scanne le PREFIXE de la famille MAIS, pour img/private, on prend aussi en
+        // compte les anciens zenray-media-NN pour calculer NN (sinon on recréerait zenray-img-private-01 alors
+        // que zenray-media-07 existe déjà -> collision de numéro). parseShard normalise les deux noms.
+        const prefix = `zenray-${kind}-${vis}`
+        // drive-4 : NN est TOUJOURS >= 2 chiffres (schéma canonique shard-naming.js : \d{2,}, shardName pad sur 2).
+        // L'ancienne famRe en \d+ comptait d'éventuels repos à 1 chiffre que parseShard/shardRe rejettent : un
+        // repo « compté pour le numéro » mais « invisible partout ailleurs ». On aligne sur \d{2,} : une seule vérité.
+        const famRe = new RegExp('^' + prefix.replace(/[-]/g, '\\-') + '-(\\d{2,})$')
+        const existing = []
+        for (let page = 1; page <= 5; page++) {
+          const r = await gh(token, `user/repos?per_page=100&page=${page}&affiliation=owner`)
+          if (!r.ok) break; const arr = await r.json(); if (!Array.isArray(arr) || !arr.length) break
+          for (const x of arr) {
+            const m = famRe.exec(x.name)
+            if (m) { existing.push(parseInt(m[1], 10)); continue }
+            // Legacy de la MÊME famille (zenray-media-NN = img/private) : compte aussi pour le numéro suivant.
+            const p = parseShard(x.name)
+            if (p && p.kind === kind && p.vis === vis) existing.push(p.n)
+          }
+          if (arr.length < 100) break
+        }
+        const nextN = (existing.length ? Math.max(...existing) : 0) + 1
+        const name = shardName(kind, vis, nextN)
+        const description = pub
+          ? 'ZenRay drive — shard PUBLIC (fichiers hashés SHA-256, servis via jsDelivr, aucun nom humain)'
+          : 'ZenRay drive — shard privé (fichiers hashés SHA-256)'
+        const cr = await ghRetry(
+          () => gh(token, 'user/repos', { method: 'POST', body: JSON.stringify({ name, private: !pub, description, auto_init: true }) }),
+          { tries: 4, retryOn: (r) => r.status >= 500 } // 422 (déjà existant) traité plus bas, pas de retry.
+        )
+        if (!cr || (!cr.ok && cr.status !== 422)) { const t = cr ? await cr.text() : 'network'; return res.status(200).json({ error: 'github', detail: String(t).slice(0, 160) }) }
+        // drive-3 : un 422 signifie « le repo existe déjà » (numérotation sous-évaluée, ex. shard hors fenêtre de
+        // pagination). On NE doit PAS le maquiller en « Créé » : on le rapporte tel quel (existed:true) pour que
+        // l'UI dise « Repo déjà présent » au lieu de mentir. Le README/branche existent déjà, rien d'autre à poser.
+        const existed = !!cr && cr.status === 422
+        if (existed) return res.status(200).json({ ok: true, name, existed: true })
+        // Attendre que la branche soit prête avant de poser le README (évite un 409 sur ref absente).
+        const ready = await waitShardReady(token, name)
+        if (!ready) return res.status(200).json({ error: 'github', detail: 'shard-not-ready' })
+        await ensureShardReadme(token, name, pub)
+        return res.status(200).json({ ok: true, name })
+      } catch (e) { return res.status(200).json({ error: 'fetch' }) }
+    }
+    return res.status(400).json({ error: 'bad-action' })
+  }
+  // GET ?action=tree&repo=<name>[&prefix=ab] : ARBORESCENCE d'un repo shard (objectif 2a), lecture seule.
+  //   - sans prefix : groupe les blobs par PRÉFIXE de 2 caractères (ab/) avec compte + octets par groupe,
+  //     + totaux + commit HEAD (pour pinner jsDelivr côté client). 1 seul appel git/trees?recursive=1.
+  //   - avec prefix : liste les feuilles (blobs) sous ce préfixe {path,size}. Si l'arbre complet était tronqué,
+  //     on va chercher le SOUS-ARBRE du préfixe par son sha (1 appel) au lieu du récursif complet.
+  // Petite op REST (lecture d'UN arbre) -> conforme à la règle BULK-via-git (jamais de boucle par fichier).
+  if (req.method === 'GET' && req.query && req.query.action === 'tree') {
+    try {
+      const repo = String(req.query.repo || '')
+      if (!shardRe.test(repo)) return res.status(200).json({ error: 'bad-repo' })
+      const prefix = req.query.prefix ? String(req.query.prefix) : null
+      const p = parseShard(repo)
+
+      // HEAD commit (pour pin jsDelivr) — pattern déjà utilisé pour waitShardReady.
+      const refR = await gh(token, `repos/${OWNER}/${repo}/git/ref/heads/${SHARD_BRANCH}`)
+      if (!refR.ok) return res.status(200).json({ error: 'github', detail: 'ref' })
+      const commit = (await refR.json()).object.sha
+
+      if (!prefix) {
+        // GROS REPO : le git tree RÉCURSIF peut être tronqué (>100k entrées / 7 Mo) OU échouer. On tente
+        // d'abord le récursif (compteurs exacts) ; en cas d'échec OU de troncature, on RETOMBE sur le tree
+        // RACINE non-récursif (≤256 dossiers de préfixe, toujours léger, jamais en erreur) : groupes SANS
+        // compteurs (lazy:true), les compteurs se calculent à l'ouverture d'un préfixe (drill-down).
+        const tr = await gh(token, `repos/${OWNER}/${repo}/git/trees/${SHARD_BRANCH}?recursive=1`)
+        let tj = tr.ok ? await tr.json() : null
+        if (tj && !tj.truncated) {
+          const blobs = (tj.tree || []).filter((x) => x.type === 'blob' && /^[0-9a-f]{2}\//.test(x.path))
+          const groups = new Map()
+          let totalFiles = 0, totalBytes = 0
+          for (const b of blobs) {
+            const g = b.path.slice(0, 2)
+            const cur = groups.get(g) || { prefix: g, files: 0, bytes: 0 }
+            cur.files++; cur.bytes += Number(b.size || 0)
+            groups.set(g, cur)
+            totalFiles++; totalBytes += Number(b.size || 0)
+          }
+          const out = [...groups.values()].sort((a, b) => a.prefix.localeCompare(b.prefix))
+          return res.status(200).json({ ok: true, repo, kind: p?.kind || null, vis: p?.vis || null, private: p?.vis !== 'public', commit, truncated: false, totalFiles, totalBytes, groups: out })
+        }
+        // FALLBACK robuste : tree racine non-récursif (dossiers de préfixe seulement), compteurs lazy.
+        const rootR = await gh(token, `repos/${OWNER}/${repo}/git/trees/${commit}`)
+        if (!rootR.ok) return res.status(200).json({ error: 'github', detail: 'tree' })
+        const dirs = ((await rootR.json()).tree || []).filter((x) => x.type === 'tree' && /^[0-9a-f]{2}$/.test(x.path))
+        const out = dirs.map((d) => ({ prefix: d.path, files: null, bytes: null })).sort((a, b) => a.prefix.localeCompare(b.prefix))
+        return res.status(200).json({ ok: true, repo, kind: p?.kind || null, vis: p?.vis || null, private: p?.vis !== 'public', commit, truncated: true, lazy: true, totalFiles: null, totalBytes: null, groups: out })
+      }
+
+      // Feuilles sous un préfixe donné.
+      if (!/^[0-9a-f]{2}$/.test(prefix)) return res.status(200).json({ error: 'bad-prefix' })
+      // 1) trouver le sha du sous-arbre <prefix> à la racine (1 appel non récursif).
+      const rootR = await gh(token, `repos/${OWNER}/${repo}/git/trees/${commit}`)
+      if (!rootR.ok) return res.status(200).json({ error: 'github', detail: 'root-tree' })
+      const rootEntry = ((await rootR.json()).tree || []).find((x) => x.type === 'tree' && x.path === prefix)
+      if (!rootEntry) return res.status(200).json({ ok: true, repo, prefix, commit, files: [] })
+      // 2) sous-arbre récursif du préfixe (petit : 1/256e du repo).
+      const subR = await gh(token, `repos/${OWNER}/${repo}/git/trees/${rootEntry.sha}?recursive=1`)
+      if (!subR.ok) return res.status(200).json({ error: 'github', detail: 'sub-tree' })
+      const sj = await subR.json()
+      const files = (sj.tree || []).filter((x) => x.type === 'blob').map((x) => ({ path: `${prefix}/${x.path}`, size: Number(x.size || 0) }))
+      return res.status(200).json({ ok: true, repo, prefix, commit, truncated: !!sj.truncated, files })
+    } catch (e) { return res.status(200).json({ error: 'fetch' }) }
+  }
+
+  try {
+    // tous les repos du compte (paginé), on garde ceux du drive ZenRay
+    const repos = []
+    for (let page = 1; ; page++) {
+      const r = await gh(token, `user/repos?per_page=100&page=${page}&affiliation=owner`)
+      if (!r.ok) break
+      const arr = await r.json()
+      if (!Array.isArray(arr) || !arr.length) break
+      for (const x of arr) repos.push(x)
+      if (arr.length < 100) break
+    }
+    // Affichage : 'video-cdn' pour les shards vidéo, 'media' pour tout autre shard (img/audio/doc/table/markdown),
+    // 'content' pour zenray-data, 'app' sinon. parseShard couvre nouveau schéma ET legacy.
+    const driveKind = (name) => {
+      if (name === 'zenray-data') return 'content'
+      const p = parseShard(name)
+      if (p) return p.kind === 'vid' ? 'video-cdn' : p.kind === 'archive' ? 'archive' : 'media'
+      return 'app'
+    }
+    const drive = repos
+      .filter((x) => x.name === 'zenray-data' || x.name === 'zenray-progress' || x.name === 'ZenRayProgress' || shardRe.test(x.name))
+      .map((x) => ({ name: x.name, private: !!x.private, sizeMB: +((x.size || 0) / 1024).toFixed(1), limitMB: LIMIT_MB, pct: Math.min(100, Math.round(((x.size || 0) / 1024) / LIMIT_MB * 100)), kind: driveKind(x.name) }))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })) // tri numérique : -100 APRÈS -99 (alpha le rangeait entre -10 et -11, la liste semblait s'arrêter à 99)
+    const totalMB = +drive.reduce((n, r) => n + r.sizeMB, 0).toFixed(1)
+    return res.status(200).json({ ok: true, owner: OWNER, limitMB: LIMIT_MB, totalMB, repos: drive })
+  } catch (e) { return res.status(200).json({ error: 'fetch' }) }
+}

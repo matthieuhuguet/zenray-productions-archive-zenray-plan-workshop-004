@@ -1,0 +1,706 @@
+// SharedFolderPage.jsx — PAGE PUBLIQUE « galerie / dossier partagé » (lien /folder?d=<token>).
+//
+// Même principe que ShareVideoPage : on n'affiche QUE le contenu du dossier (vignettes + ouverture), sans
+// sidebar, sans drive, sans auth. Le token v1 est opaque, signé, expirant et révocable ; les anciens tokens
+// base64 restent lisibles. On navigue dans les sous-dossiers en restant SOUS la racine partagée.
+//
+// Données : l'arbre global (/api/page?action=tree) donne les chemins ; chaque manifeste (.media.json/.img.json)
+// est lu pour la vignette/titre/durée. Vidéos = posters publics (clair). Images = vignette déchiffrée côté
+// serveur par /api/shared-media : le visiteur ne reçoit jamais la clé du drive.
+import React, { useEffect, useState, useMemo, useRef } from 'react'
+import { THEMES, PALETTE, QUICKLOOK_ANIM_MS } from '../theme.js'
+import { appendShareCredential, resolveShareToken, SHARE_KIND } from '../lib/shareLinks.js'
+import { rememberSharePlacement } from '../lib/shareVia.js'
+import GuestUploadSheet from '../guest/GuestUploadSheet.jsx'
+import { useGuestUploader } from '../guest/useGuestUploader.js'
+import { filesFromDataTransfer } from '../guest/readDrop.js'
+import { useT } from '../i18n/useT.js'
+import { downloadFolderAsZip, resolveSharedEntryBytes, downloadSharedVideo } from '../lib/bulkZip.js'
+import { lazyRetry } from '../lib/lazyRetry.js'
+import Icon from './Icon.jsx'
+import SpinnerApple from './SpinnerApple.jsx'
+import { useInView } from '../media/useImageThumb.js'
+import { isEncrypted, shardThumbUrl } from './ImageNodeViewer.jsx'
+import { readPageCached } from '../lib/manifestReadCache.js'
+import { urlLectureAffichage } from '../lib/urlLecture.js'
+const LazyVideoPlayer2 = lazyRetry(() => import('./VideoPlayer2.jsx'))
+
+const FONTS = { sans: "var(--zr-police-sans)", serif: "var(--zr-police-serif)" }
+// 2 October 2026 : folder names in AnthropicSerif Medium, same px size and weight as the Inter image captions. / FR : noms de dossiers en AnthropicSerif Medium, même taille en px et même graisse que les légendes Inter des images.
+const FOLDER_LABEL_TYPE = { family: FONTS.serif, weight: 500 }
+const fmtDur = (s) => s ? `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}` : ''
+const baseName = (p) => { const n = p.split('/').pop(); return n.replace(/\.(mp4|mov|m4v|avi|mkv)\.media\.json$/i, '').replace(/\.[^.]+\.(img|media|file)\.json$/i, '').replace(/\.[^.]+$/, '') }
+const isSidecar = (p) => /\.(m3u8|mpd)$/i.test(p) || p.endsWith('.hlskey.bin')
+
+// A MEDIA OF THE GALLERY IS A PLACEMENT, NOT NECESSARILY THE IMAGE (2 October 2026). In a gallery made of Eagle links,
+// the path listed in the folder is a link; the manifest and the bytes live at its target. The cards resolved it, but the
+// viewer, the arrows, the selection and the ZIP all kept using the PLACEMENT path: arrows looked for the target path in
+// the list (never found -> « previous/next » dead), the next image was requested at the link's own path (blank), and the
+// selection set mixed the two spellings (highlight and ZIP empty). One resolver, one cache, used by all of them.
+const resolvedNodes = new Map()   // `${token}|${placement}` -> { path, meta } once known
+const resolvingNodes = new Map()  // in-flight promises, so a burst of cards + prefetch asks the server once
+const nodeKey = (node, token) => `${token}|${node.path}`
+export const peekSharedNode = (node, token) => resolvedNodes.get(nodeKey(node, token)) || null
+export function resolveSharedNode(node, token) {
+  const key = nodeKey(node, token)
+  if (resolvedNodes.has(key)) return Promise.resolve(resolvedNodes.get(key))
+  if (resolvingNodes.has(key)) return resolvingNodes.get(key)
+  const job = (async () => {
+    let path = node.path
+    // LECTURE D AFFICHAGE, HORS QUOTA (voir src/lib/urlLecture.js) : une galerie lit un manifeste PAR VIGNETTE.
+    let j = await readPageCached(urlLectureAffichage(path, { share: token }))
+    if (!j) throw new Error('manifest')
+    let m = JSON.parse(j.markdown)
+    if (m.type === 'zenray-eagle-link/v1') {
+      const resolved = await fetch(appendShareCredential(`/api/page?action=resolve-link&path=${encodeURIComponent(path)}`, token), { cache: 'no-store' }).then((r) => r.json())
+      if (!resolved?.ok || !resolved.path) throw new Error('link')
+      rememberSharePlacement(resolved.path, path) // later reads of the target carry `via=<this link>`
+      path = resolved.path
+      j = await readPageCached(urlLectureAffichage(path, { share: token }))
+      if (!j) throw new Error('target')
+      m = JSON.parse(j.markdown)
+    }
+    const value = { path, meta: m }
+    resolvedNodes.set(key, value)
+    return value
+  })()
+  // A transient failure is never remembered: the next look retries.
+  resolvingNodes.set(key, job)
+  job.finally(() => resolvingNodes.delete(key)).catch(() => {})
+  return job
+}
+export const __resetSharedNodes = () => { resolvedNodes.clear(); resolvingNodes.clear() }
+
+// Carte média : résout sa vignette + titre + durée à l'affichage.
+// Un clic sélectionne (Finder), un double-clic ouvre ; la touche Espace ouvre la photo sélectionnée.
+function MediaCard({ node, t, onOpen, selectMode, selected, focused, onSelect, shareToken }) {
+  const [thumb, setThumb] = useState(null)
+  const [meta, setMeta] = useState(null)
+  const [resolvedPath, setResolvedPath] = useState(null)
+  const [imageReady, setImageReady] = useState(false)
+  const [imgTry, setImgTry] = useState(0)             // a thumbnail that failed to load is asked again, a little later each time
+  const { ref, inView } = useInView()
+  useEffect(() => {
+    if (!inView) return
+    let dead = false
+    let timer = null
+    let attempt = 0
+    setThumb(null); setMeta(null); setResolvedPath(null); setImageReady(false)
+    const go = async () => {
+      try {
+        const { path, meta: m } = await resolveSharedNode(node, shareToken)
+        if (dead) return
+        setMeta(m)
+        setResolvedPath(path)
+        if (node.kind === 'video' && m.poster) setThumb(m.poster)
+        // FIX (2026-07-01) : décrypter côté client exigeait fetch('/api/media-key'), gaté -> 401 pour tout
+        // visiteur anonyme du lien /folder = vignettes qui restaient blanches. /api/shared-media déchiffre
+        // CÔTÉ SERVEUR (public, sans exposer la clé) -> une simple <img src> suffit, marche pour n'importe qui.
+        // Comme ShareImagePage.jsx : seules les images RÉELLEMENT chiffrées (isEncrypted) ont besoin de ce
+        // détour serveur — une image publique non chiffrée sert sa vignette directement depuis le CDN.
+        else if (node.kind === 'image') setThumb(isEncrypted(m) ? appendShareCredential(`/api/shared-media?path=${encodeURIComponent(path)}&kind=thumb-s`, shareToken) : shardThumbUrl(m))
+      } catch {
+        // A photo a guest has just added may not be readable for a few seconds: try again, a little later each time, never give up silently.
+        if (!dead && attempt < 6) { attempt += 1; timer = setTimeout(go, 3000 * 2 ** (attempt - 1)) }
+      }
+    }
+    go()
+    return () => { dead = true; if (timer) clearTimeout(timer) }
+  }, [node.path, inView, shareToken])
+  const dur = (meta && (meta.duration || (meta.probe && meta.probe.duration))) || 0
+  const title = (meta && meta.title) || node.name
+  const width = Number(meta && meta.w)
+  const height = Number(meta && meta.h)
+  const ratio = width > 0 && height > 0 ? `${width} / ${height}` : '16 / 9'
+  return (
+    <button ref={ref} data-shared-path={node.path} tabIndex={-1} onPointerDown={(ev) => ev.stopPropagation()} onClick={() => onSelect(node, meta)} onDoubleClick={() => onOpen(node, meta, resolvedPath)} aria-pressed={selectMode ? selected : undefined}
+      style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 9, padding: 0, border: 'none', background: 'transparent', cursor: 'pointer', textAlign: 'center', minWidth: 0, borderRadius: 9 }}>
+      <div style={{ position: 'relative', width: '100%', aspectRatio: ratio, borderRadius: 9, overflow: 'hidden', background: 'rgba(128,128,128,0.10)', boxShadow: selected ? `0 0 0 2px ${PALETTE.primary}` : focused ? `0 0 0 2px ${PALETTE.primary}66` : '0 1px 2px rgba(0,0,0,0.08)' }}>
+        {/* pas de placeholder « … » (2026-07-13) : la case reste un simple fond neutre, l'image fond dedans */}
+        {thumb && <img key={imgTry} src={imgTry ? `${thumb}${thumb.includes('?') ? '&' : '?'}r=${imgTry}` : thumb} alt="" draggable={false} onLoad={() => setImageReady(true)} onError={() => { if (imgTry < 5) setTimeout(() => setImgTry((n) => n + 1), 2500 * (imgTry + 1)) }} style={{ width: '100%', height: '100%', objectFit: 'cover', opacity: imageReady ? 1 : 0, transition: 'opacity 200ms ease' }} />}
+        {node.kind === 'video' && (
+          <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
+            <span style={{ width: 46, height: 46, borderRadius: 99, background: 'rgba(0,0,0,0.45)', backdropFilter: 'blur(4px)', display: 'grid', placeItems: 'center' }}>
+              <span style={{ width: 0, height: 0, borderTop: '8px solid transparent', borderBottom: '8px solid transparent', borderLeft: '13px solid #fff', marginLeft: 3 }} />
+            </span>
+          </span>
+        )}
+        {node.kind === 'video' && dur > 0 && <span style={{ position: 'absolute', right: 6, bottom: 6, background: 'rgba(0,0,0,0.82)', color: '#fff', fontSize: 'var(--zr-ui-xs)', fontWeight: 600, padding: '2px 5px', borderRadius: 4 }}>{fmtDur(dur)}</span>}
+      </div>
+      <div title={title} style={{ width: '100%', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', fontWeight: 500, lineHeight: 1.3, color: t.textPrimary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', padding: '0 2px', boxSizing: 'border-box' }}>{title}</div>
+    </button>
+  )
+}
+
+export default function SharedFolderPage() {
+  const t = THEMES.light
+  const i18nT = useT()
+  const [root, setRoot] = useState(null)
+  const [shareToken] = useState(() => new URLSearchParams(window.location.search).get('d') || '')
+  const [sub, setSub] = useState('')                 // sous-chemin relatif sous la racine (navigation interne)
+  const folder = root && sub ? `${root}/${sub}` : (root || '')
+  const [paths, setPaths] = useState(null)
+  const [err, setErr] = useState(null)
+  // The viewer. `node` is the gallery ENTRY (a link's own path in a gallery of links); `path` is what it resolves to (the
+  // image manifest) and `meta` its manifest. Selection, focus, arrows and the list ALWAYS speak entry paths; only the
+  // image requests use the resolved path.
+  const [open, setOpen] = useState(null)             // { node, path, meta, dir, error }
+  const [closing, setClosing] = useState(false)
+  const openRef = useRef(null)
+  const closingRef = useRef(false)
+  const spaceHeldRef = useRef(false)
+  const gridRef = useRef(null)
+  const swipeRef = useRef(null)
+
+  // ── GUESTS ADD THEIR PHOTOS (2 October 2026) ──────────────────────────────────────────────────────────────────────────────────────────
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [uploadOpen, setUploadOpen] = useState(false)
+  const [dropEntries, setDropEntries] = useState(null)
+  const [dragOver, setDragOver] = useState(false)
+  const uploadOpenRef = useRef(false)
+  uploadOpenRef.current = uploadOpen
+  const refreshTimer = useRef(null)
+  // photos that just landed show up in the gallery: the listing is re-read, at most every few seconds while the upload runs
+  const scheduleRefresh = React.useCallback(() => { if (refreshTimer.current) return; refreshTimer.current = setTimeout(() => { refreshTimer.current = null; setRefreshKey((k) => k + 1) }, 2500) }, [])
+  const guestUp = useGuestUploader({ token: shareToken, onSent: scheduleRefresh })
+
+  // SÉLECTION + ZIP (2026-07-02) : jumeau du bouton ZIP de Create (App.jsx), adapté à la vue PUBLIQUE (aucune
+  // clé de déchiffrement côté client ici — resolveSharedEntryBytes/downloadSharedVideo passent par
+  // /api/shared-media, déchiffrement serveur). "Sélectionner" fait apparaître une case à cocher sur chaque
+  // carte média ; sans sélection active, ZIP porte sur tout le dossier affiché (même convention que Create).
+  const [selectMode, setSelectMode] = useState(false)
+  const [selected, setSelected] = useState(new Set()) // Set de node.path
+  const [focusedNode, setFocusedNode] = useState(null) // dernière photo cochée : cible de la touche Espace
+  const [focusedMeta, setFocusedMeta] = useState(null)
+  const dragRef = useRef(null)
+  const [marquee, setMarquee] = useState(null)
+  const [showSpaceTip, setShowSpaceTip] = useState(false)
+  const [zipBusy, setZipBusy] = useState(false)
+  const [zipLabel, setZipLabel] = useState('')
+  const [zipRatio, setZipRatio] = useState(0)   // 0..1, même valeur que le texte zipLabel — alimente la barre visuelle
+  const [zipMsg, setZipMsg] = useState('')
+  useEffect(() => { setSelectMode(false); setSelected(new Set()); setFocusedNode(null); setFocusedMeta(null); setMarquee(null); setShowSpaceTip(false); setZipMsg(''); setZipRatio(0); setOpen(null); setClosing(false); closingRef.current = false }, [folder]) // reset à la navigation
+
+  useEffect(() => {
+    const controller = new AbortController()
+    ;(async () => {
+      try {
+        const resolved = await resolveShareToken(shareToken, SHARE_KIND.folder, { signal: controller.signal })
+        if (!controller.signal.aborted) setRoot(resolved.path)
+      } catch { if (!controller.signal.aborted) setErr('folder.invalidLink') }
+    })()
+    return () => controller.abort()
+  }, [shareToken])
+
+  useEffect(() => {
+    if (!root || !folder) return
+    // BORNÉ au dossier partagé (dir=root) : la route tree est publique UNIQUEMENT pour un sous-dossier, jamais
+    // pour tout le drive. On ne récupère donc QUE les chemins sous `root` -> aucune fuite du reste du drive,
+    // et aucun code demandé au visiteur du lien.
+    // A listing that fails is asked again, a little later each time, and the error only shows after three failures in a row; the page
+    // keeps asking and clears the error the moment a listing arrives (2 October 2026, a visitor saw "Content not found" on a valid link).
+    // FR : une liste qui échoue est redemandée de plus en plus tard ; l'erreur n'apparaît qu'après trois échecs de suite et disparaît dès qu'une liste arrive.
+    let dead = false
+    let timer = null
+    let attempt = 0
+    const load = () => {
+      fetch(appendShareCredential(`/api/page?action=tree&dir=${encodeURIComponent(folder)}`, shareToken), { cache: 'no-store' }).then((r) => {
+        if (!r.ok) throw new Error('tree')
+        return r.json()
+      })
+        .then((j) => { if (dead) return; setPaths(Array.isArray(j.paths) ? j.paths : []); setErr(null) })
+        .catch(() => {
+          if (dead) return
+          attempt += 1
+          if (attempt >= 3) setErr('folder.contentNotFound')
+          timer = setTimeout(load, Math.min(15000, 1200 * 2 ** (attempt - 1)))
+        })
+    }
+    load()
+    return () => { dead = true; if (timer) clearTimeout(timer) }
+  }, [root, folder, shareToken, refreshKey])
+
+  // enfants DIRECTS du dossier courant : sous-dossiers + médias (.media.json/.img.json), sidecars exclus.
+  const { folders, medias } = useMemo(() => {
+    const pre = folder + '/'
+    const fset = new Set(), med = []
+    for (const p of (paths || [])) {
+      if (!p.startsWith(pre) || isSidecar(p)) continue
+      const rest = p.slice(pre.length)
+      const slash = rest.indexOf('/')
+      if (slash >= 0) { fset.add(rest.slice(0, slash)); continue }   // sous-dossier
+      if (p.endsWith('.media.json')) med.push({ path: p, kind: 'video', name: baseName(p) })
+      else if (p.endsWith('.img.json')) med.push({ path: p, kind: 'image', name: baseName(p) })
+    }
+    med.sort((a, b) => a.name.localeCompare(b.name))
+    return { folders: [...fset].sort(), medias: med }
+  }, [paths, folder])
+
+
+  const crumbs = [root ? root.split('/').pop() : '', ...(sub ? sub.split('/') : [])]
+
+  // TOUT SÉLECTIONNER (2026-07-12, demande Matthieu : un clic au lieu d'un marquee/clics un par un). Toggle :
+  // si tout est déjà sélectionné, un second clic désélectionne tout (comme la case "tout cocher" d'un mailer).
+  const allSelected = selectMode && medias.length > 0 && selected.size === medias.length
+  const selectAll = () => {
+    if (allSelected) { setSelected(new Set()); return }
+    setSelectMode(true)
+    setSelected(new Set(medias.map((m) => m.path)))
+    setFocusedNode(null); setFocusedMeta(null); setMarquee(null); setShowSpaceTip(false)
+  }
+
+  const selectNode = (node, meta) => {
+    const wasSelected = selected.has(node.path)
+    const wasEmpty = selected.size === 0
+    setSelectMode(true)
+    setSelected((s) => { const n = new Set(s); n.has(node.path) ? n.delete(node.path) : n.add(node.path); return n })
+    // The clicked entry becomes the keyboard focus (Space / Enter / arrows), whether it was just ticked or unticked: a click
+    // used to UNtick-and-forget, after which Space did nothing.
+    setFocusedNode(node)
+    setFocusedMeta(meta || null)
+    if (!wasSelected && wasEmpty && node.kind === 'image') setShowSpaceTip(true)
+  }
+
+  // ═══ THE VIEWER (Space / double click), rewritten on 2 October 2026 ══════════════════════════════════════════════════
+  // Bugs fixed, all reported by Matthieu on a gallery of links: arrows dead (the open image was looked up in the list by its
+  // RESOLVED path, never found); Space could not close it; no transition; after Escape the grid was not where he left it;
+  // and Space then stopped working (a focused card button turned the Space KEY-UP into a click that un-ticked the photo).
+  const mediasRef = useRef(medias); mediasRef.current = medias
+  const focusedRef = useRef(focusedNode); focusedRef.current = focusedNode
+  const focusedMetaRef = useRef(focusedMeta); focusedMetaRef.current = focusedMeta
+  openRef.current = open
+
+  const revealCard = (placementPath, block = 'center') => {
+    requestAnimationFrame(() => {
+      const el = document.querySelector(`[data-shared-path="${(window.CSS && CSS.escape) ? CSS.escape(placementPath) : placementPath}"]`)
+      if (el && el.scrollIntoView) el.scrollIntoView({ block, behavior: 'smooth' })
+    })
+  }
+  const showMedia = (node, dir = 0, meta = null, path = null) => {
+    const cached = peekSharedNode(node, shareToken)
+    setOpen({ node, path: path || (cached && cached.path) || null, meta: meta || (cached && cached.meta) || null, dir })
+    setFocusedNode(node)
+  }
+  const openViewer = (node, meta = null, path = null) => {
+    try { if (document.activeElement && document.activeElement.blur) document.activeElement.blur() } catch {}
+    closingRef.current = false; setClosing(false)
+    showMedia(node, 0, meta, path)
+    setShowSpaceTip(false)
+  }
+  const closeViewer = () => {
+    const o = openRef.current
+    if (!o || closingRef.current) return
+    closingRef.current = true; setClosing(true)
+    setTimeout(() => {
+      closingRef.current = false; setClosing(false); setOpen(null)
+      revealCard(o.node.path) // back to the photo he was LOOKING at, not the one he clicked first
+    }, QUICKLOOK_ANIM_MS)
+  }
+  const stepViewer = (delta) => {
+    const o = openRef.current
+    if (!o || closingRef.current) return
+    const list = mediasRef.current
+    const i = list.findIndex((m) => m.path === o.node.path)
+    if (i < 0 || list.length < 2) return
+    showMedia(list[(i + delta + list.length) % list.length], delta)
+  }
+  const openIndex = open ? medias.findIndex((media) => media.path === open.node.path) : -1
+
+  // resolve the entry on demand (arrows reach entries whose card was never scrolled into view)
+  useEffect(() => {
+    if (!open || open.path || open.error) return
+    let dead = false
+    const placement = open.node.path
+    resolveSharedNode(open.node, shareToken)
+      .then((r) => { if (!dead) setOpen((o) => (o && o.node.path === placement ? { ...o, path: r.path, meta: r.meta } : o)) })
+      .catch(() => { if (!dead) setOpen((o) => (o && o.node.path === placement ? { ...o, error: true } : o)) })
+    return () => { dead = true }
+  }, [open && open.node.path, open && open.path, shareToken])
+
+  // warm the neighbours so an arrow press shows an image that is already there
+  useEffect(() => {
+    if (!open || !open.path) return
+    const list = mediasRef.current
+    const i = list.findIndex((m) => m.path === open.node.path)
+    if (i < 0) return
+    for (const d of [1, -1, 2]) {
+      const n = list[(i + d + list.length) % list.length]
+      if (!n || n.path === open.node.path || n.kind !== 'image') continue
+      resolveSharedNode(n, shareToken).then((r) => {
+        const im = new Image()
+        // thumbnails ONLY (see « FULL-SIZE LOADS ARE RATIONED »): the URL is identical to the one SharedImage will use, so it is a cache hit
+        im.src = appendShareCredential(`/api/shared-media?path=${encodeURIComponent(r.path)}&kind=thumb`, shareToken)
+      }).catch(() => {})
+    }
+  }, [open && open.node.path, open && open.path, shareToken])
+
+  // One keyboard listener, in the capture phase, reading everything through refs: React re-subscribes effects between the
+  // capture and bubble phases of the SAME key press, which is how Space once closed and instantly reopened the viewer.
+  useEffect(() => {
+    const typing = (ev) => { const t = ev.target; const tag = t && t.tagName; return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!(t && t.isContentEditable) }
+    const consume = (ev) => { ev.preventDefault(); ev.stopPropagation() }
+    const onKeyDown = (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey || typing(ev) || uploadOpenRef.current) return    // the upload sheet owns the keyboard while it is open
+      const o = openRef.current
+      if (o) {
+        if (closingRef.current) { consume(ev); return }
+        const video = o.node.kind === 'video' // a video keeps Space (play/pause) and the arrows (seek) for its player
+        if (ev.key === 'Escape' || (ev.code === 'Space' && !video)) { consume(ev); if (ev.code === 'Space') spaceHeldRef.current = true; if (!ev.repeat) closeViewer(); return }
+        if (!video && (ev.key === 'ArrowRight' || ev.key === 'ArrowDown')) { consume(ev); stepViewer(1); return }
+        if (!video && (ev.key === 'ArrowLeft' || ev.key === 'ArrowUp')) { consume(ev); stepViewer(-1); return }
+        return
+      }
+      const list = mediasRef.current
+      if (!list.length) return
+      const focus = focusedRef.current
+      if (ev.code === 'Space' || ev.key === 'Enter') {
+        if (!focus) return
+        consume(ev)
+        if (ev.code === 'Space') spaceHeldRef.current = true
+        if (!ev.repeat) openViewer(focus, focusedMetaRef.current)
+        return
+      }
+      const arrows = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: 'up', ArrowDown: 'down' }
+      if (ev.key in arrows) {
+        consume(ev)
+        const cols = Math.max(1, ((gridRef.current && getComputedStyle(gridRef.current).gridTemplateColumns) || '').split(' ').filter(Boolean).length)
+        const delta = arrows[ev.key] === 'up' ? -cols : arrows[ev.key] === 'down' ? cols : arrows[ev.key]
+        const i = focus ? list.findIndex((m) => m.path === focus.path) : -1
+        const next = list[Math.max(0, Math.min(list.length - 1, i < 0 ? 0 : i + delta))]
+        if (next) { setFocusedNode(next); setFocusedMeta(null); revealCard(next.path, 'nearest') }
+      }
+    }
+    // A focused button turns the Space KEY-UP into a click. The key-down was consumed, so swallow the key-up too.
+    const onKeyUp = (ev) => { if (ev.code === 'Space' && (spaceHeldRef.current || openRef.current)) { ev.preventDefault(); ev.stopPropagation(); spaceHeldRef.current = false } }
+    window.addEventListener('keydown', onKeyDown, true)
+    window.addEventListener('keyup', onKeyUp, true)
+    return () => { window.removeEventListener('keydown', onKeyDown, true); window.removeEventListener('keyup', onKeyUp, true) }
+  }, [])
+
+  // Rectangle de sélection à la Finder. Il part du vide de la grille pour ne pas confondre un clic sur
+  // une image avec un glisser, et Cmd/Ctrl conserve la sélection existante.
+  const beginMarquee = (ev) => {
+    if (ev.button !== 0 || ev.target !== ev.currentTarget) return
+    const rect = ev.currentTarget.getBoundingClientRect()
+    const initial = (ev.metaKey || ev.ctrlKey) ? new Set(selected) : new Set()
+    dragRef.current = { x: ev.clientX, y: ev.clientY, initial, tipShown: false, moved: false }
+    setSelectMode(true); setSelected(initial); setFocusedNode(null); setFocusedMeta(null); setShowSpaceTip(false)
+    ev.preventDefault()
+    try { ev.currentTarget.setPointerCapture(ev.pointerId) } catch {}
+    setMarquee({ left: ev.clientX - rect.left, top: ev.clientY - rect.top, width: 0, height: 0 })
+  }
+
+  const moveMarquee = (ev) => {
+    const drag = dragRef.current
+    if (!drag) return
+    const gridRect = ev.currentTarget.getBoundingClientRect()
+    const left = Math.min(drag.x, ev.clientX), right = Math.max(drag.x, ev.clientX)
+    const top = Math.min(drag.y, ev.clientY), bottom = Math.max(drag.y, ev.clientY)
+    if (Math.abs(ev.clientX - drag.x) > 3 || Math.abs(ev.clientY - drag.y) > 3) drag.moved = true
+    setMarquee({ left: left - gridRect.left, top: top - gridRect.top, width: right - left, height: bottom - top })
+    const next = new Set(drag.initial)
+    document.querySelectorAll('[data-shared-path]').forEach((el) => {
+      const r = el.getBoundingClientRect()
+      if (r.right >= left && r.left <= right && r.bottom >= top && r.top <= bottom) next.add(el.dataset.sharedPath)
+    })
+    setSelected(next)
+    const firstImage = medias.find((node) => node.kind === 'image' && next.has(node.path))
+    setFocusedNode(firstImage || null)
+    setFocusedMeta(null)
+    if (firstImage && !drag.tipShown) { drag.tipShown = true; setShowSpaceTip(true) }
+  }
+
+  const endMarquee = (ev) => {
+    const drag = dragRef.current
+    if (!drag) return
+    dragRef.current = null
+    setMarquee(null)
+    // Un simple clic dans le vide a le même comportement que Finder : aucune image ne reste sélectionnée.
+    if (!drag.moved && !ev.metaKey && !ev.ctrlKey) {
+      setSelectMode(false); setSelected(new Set()); setFocusedNode(null); setFocusedMeta(null); setShowSpaceTip(false)
+    }
+    try { if (ev.currentTarget.hasPointerCapture(ev.pointerId)) ev.currentTarget.releasePointerCapture(ev.pointerId) } catch {}
+  }
+
+  const handleZip = async () => {
+    const usingSelection = selectMode && selected.size > 0
+    const entries = usingSelection ? medias.filter((m) => selected.has(m.path)) : medias
+    if (!entries.length) return
+    // gallery of links: the ZIP reads the manifests and bytes at the RESOLVED path (this also records the `via` link)
+    const targets = await Promise.all(entries.map(async (entry) => {
+      const r = await resolveSharedNode(entry, shareToken).catch(() => null)
+      return { ...entry, path: r ? r.path : entry.path, shareToken }
+    }))
+    setZipBusy(true); setZipLabel('0/' + targets.length); setZipRatio(0); setZipMsg('')
+    try {
+      const label = usingSelection ? `${targets.length} élément(s) sélectionné(s)` : (crumbs[crumbs.length - 1] || 'dossier')
+      const res = await downloadFolderAsZip(targets, label, (ratio, txt) => { setZipRatio(ratio); setZipLabel(txt || Math.round(ratio * 100) + '%') }, {
+        resolveBytes: resolveSharedEntryBytes,
+        downloadVideo: downloadSharedVideo,
+        isZippable: (e) => e.kind === 'image',
+        isVideo: (e) => e.kind === 'video',
+      })
+      if (res && res.cancelled) return
+      const parts = []
+      if (res.ok) parts.push(`${res.ok} image(s) zippée(s)`)
+      if (res.videosQueued) parts.push(`${res.videosQueued} vidéo(s) en téléchargement séparé`)
+      if (res.fail) parts.push(`${res.fail} échec(s)`)
+      setZipMsg(parts.join(' · ') || 'terminé')
+    } catch (err) {
+      setZipMsg('Échec : ' + ((err && err.message) || String(err)))
+    } finally { setZipBusy(false); setZipLabel('') }
+  }
+
+  const toolbarButton = (active = false, disabled = false) => ({
+    height: 31, padding: '0 12px', borderRadius: 9, border: `1px solid ${active ? PALETTE.primary : 'rgba(31,31,30,0.20)'}`,
+    background: active ? PALETTE.primary : 'rgba(253,253,252,0.70)', color: active ? '#fff' : t.textPrimary,
+    cursor: disabled ? 'default' : 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', fontWeight: 600,
+    opacity: disabled ? 0.38 : 1, backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)',
+  })
+
+  return (
+    <div style={{ minHeight: '100vh', padding: 'clamp(10px,2.4vw,36px)', boxSizing: 'border-box', color: t.textPrimary, fontFamily: FONTS.sans }}>
+      <main className="zr-stage" style={{ position: 'relative', minHeight: 'calc(100vh - clamp(20px,4.8vw,72px))', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
+        onDragOver={(ev) => { if (shareToken && root && ev.dataTransfer && Array.from(ev.dataTransfer.types || []).includes('Files')) { ev.preventDefault(); if (!dragOver) setDragOver(true) } }}
+        onDragLeave={(ev) => { if (ev.currentTarget === ev.target) setDragOver(false) }}
+        onDrop={async (ev) => { if (!shareToken || !root || !ev.dataTransfer || !ev.dataTransfer.files.length) return; ev.preventDefault(); setDragOver(false); const entries = await filesFromDataTransfer(ev.dataTransfer); if (entries.length) { setDropEntries(entries); setUploadOpen(true) } }}>
+        {dragOver && <div aria-hidden="true" style={{ position: 'absolute', inset: 10, zIndex: 6, borderRadius: 18, border: `2px dashed ${PALETTE.primary}`, background: 'rgba(10,132,255,0.08)', display: 'grid', placeItems: 'center', pointerEvents: 'none', color: PALETTE.primaryDark, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xl)' }}>Déposez vos photos pour les ajouter à la galerie</div>}
+        {/* La galerie partagée est volontairement sans marque, sidebar ni fil d'ariane : seulement les actions
+            utiles à un visiteur en lecture seule. */}
+        {(medias.length > 0 || (shareToken && root)) && <div style={{ position: 'absolute', top: 16, right: 16, zIndex: 4, display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end', maxWidth: 'calc(100% - 64px)' }}>
+          {shareToken && root && <button onClick={() => setUploadOpen(true)} title="Ajouter mes photos à cette galerie" style={{ ...toolbarButton(true), display: 'inline-flex', alignItems: 'center', gap: 7 }}><Icon name="plus" size={14} color="#fff" weight={2.2} />Ajouter mes photos</button>}
+          {medias.length > 0 && <>
+          <button onClick={() => { setSelectMode((v) => !v); setSelected(new Set()); setFocusedNode(null); setFocusedMeta(null); setMarquee(null); setShowSpaceTip(false) }}
+            aria-pressed={selectMode} title="Choisir les images à télécharger" style={toolbarButton(selectMode)}>{selectMode ? 'Annuler' : 'Sélectionner'}</button>
+          <button onClick={selectAll} title="Sélectionner tous les médias du dossier en un clic" style={toolbarButton(allSelected)}>{allSelected ? 'Tout désélectionner' : 'Tout sélectionner'}</button>
+          <button onClick={handleZip} disabled={zipBusy || (selectMode && selected.size === 0)}
+            title="Télécharger les images du dossier ou la sélection" style={toolbarButton(false, zipBusy || (selectMode && selected.size === 0))}>
+            {zipBusy ? (zipLabel || '…') : (selectMode && selected.size ? `ZIP (${selected.size})` : 'ZIP')}
+          </button></>}
+        </div>}
+        {zipBusy && <div style={{ position: 'absolute', top: 53, right: 16, zIndex: 4, width: 220, maxWidth: 'calc(100vw - 32px)' }}>
+          <div style={{ height: 5, borderRadius: 99, background: 'rgba(31,31,30,0.14)', overflow: 'hidden' }}>
+            <div style={{ height: '100%', width: `${Math.round(zipRatio * 100)}%`, background: PALETTE.primary, borderRadius: 99, transition: 'width 200ms ease' }} />
+          </div>
+        </div>}
+        {sub && <button onClick={() => setSub((current) => { const i = current.lastIndexOf('/'); return i < 0 ? '' : current.slice(0, i) })} title="Retour au dossier partagé" aria-label="Retour au dossier partagé"
+          style={{ position: 'absolute', top: 16, left: 16, zIndex: 4, width: 31, height: 31, border: '1px solid rgba(31,31,30,0.16)', borderRadius: 9, background: 'rgba(253,253,252,0.70)', color: t.textPrimary, cursor: 'pointer', display: 'grid', placeItems: 'center', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)' }}><Icon name="chevron.left" size={14} weight={2} /></button>}
+
+        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 'clamp(68px,9vh,94px) clamp(18px,4vw,64px) clamp(38px,5vh,70px)', boxSizing: 'border-box' }}>
+          <div style={{ width: '100%', maxWidth: 1600, margin: '0 auto' }}>
+            {err && <div style={{ color: '#FF3B30', fontSize: 'var(--zr-ui-lg)', padding: 40, textAlign: 'center' }}>{i18nT(err)}</div>}
+            {!err && paths === null && <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-lg)', padding: 40, textAlign: 'center' }}>{i18nT('folder.loading')}</div>}
+            {!err && paths && folders.length === 0 && medias.length === 0 && <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-lg)', padding: 40, textAlign: 'center' }}>{i18nT('folder.emptyFolder')}</div>}
+            {!err && paths && (
+              <div ref={gridRef} onPointerDown={beginMarquee} onPointerMove={moveMarquee} onPointerUp={endMarquee} onPointerCancel={endMarquee}
+                style={{ position: 'relative', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', columnGap: 'clamp(18px,2.6vw,42px)', rowGap: 'clamp(28px,4vw,56px)', alignItems: 'start', userSelect: 'none' }}>
+                {folders.map((f) => (
+                  <button key={f} onClick={() => setSub(sub ? `${sub}/${f}` : f)} style={{ display: 'flex', flexDirection: 'column', gap: 9, padding: 0, border: 'none', background: 'transparent', cursor: 'pointer', textAlign: 'center', color: t.textPrimary }}>
+                    <div style={{ width: '100%', aspectRatio: '16 / 9', borderRadius: 9, background: 'rgba(128,128,128,0.10)', display: 'grid', placeItems: 'center', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }}><Icon name="folder" size={38} color="#5E9EFF" weight={1.5} /></div>
+                    <div style={{ width: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: FOLDER_LABEL_TYPE.family, fontSize: 'var(--zr-ui-sm)', fontWeight: FOLDER_LABEL_TYPE.weight }}>{f}</div>
+                  </button>
+                ))}
+                {medias.map((n) => <MediaCard key={n.path} node={n} t={t} onOpen={(node, meta, path) => openViewer(node, meta, path)} selectMode={selectMode} selected={selected.has(n.path)} focused={!!focusedNode && focusedNode.path === n.path} onSelect={selectNode} shareToken={shareToken} />)}
+                {marquee && <span aria-hidden="true" style={{ position: 'absolute', zIndex: 3, pointerEvents: 'none', left: marquee.left, top: marquee.top, width: marquee.width, height: marquee.height, boxSizing: 'border-box', border: `1px solid ${PALETTE.primary}`, borderRadius: 3, background: 'rgba(10,132,255,0.14)' }} />}
+              </div>
+            )}
+          </div>
+        </div>
+        {zipMsg && <div style={{ position: 'absolute', right: 18, bottom: showSpaceTip ? 58 : 18, zIndex: 4, color: t.textSecondary, fontSize: 'var(--zr-ui-sm)', padding: '6px 9px', borderRadius: 8, background: 'rgba(253,253,252,0.72)', backdropFilter: 'blur(14px)', WebkitBackdropFilter: 'blur(14px)' }}>{zipMsg}</div>}
+        {showSpaceTip && <div style={{ position: 'absolute', left: '50%', bottom: 18, zIndex: 4, transform: 'translateX(-50%)', whiteSpace: 'nowrap', color: t.textSecondary, fontSize: 'var(--zr-ui-sm)', padding: '7px 11px', borderRadius: 9, background: 'rgba(253,253,252,0.74)', border: '1px solid rgba(31,31,30,0.10)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)' }}><kbd style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', fontWeight: 650, color: t.textPrimary }}>Espace</kbd> · voir la photo en détail</div>}
+      </main>
+
+      {/* Upload in progress while the sheet is closed: a small pill, one tap to see it again. */}
+      {!uploadOpen && guestUp.snap && !guestUp.snap.idle && guestUp.snap.counts.total > guestUp.snap.counts.skipped && (
+        <button onClick={() => setUploadOpen(true)} style={{ position: 'fixed', left: 18, bottom: 18, zIndex: 300, display: 'inline-flex', alignItems: 'center', gap: 9, padding: '10px 16px', borderRadius: 99, border: 'none', cursor: 'pointer', background: 'rgba(253,253,252,0.92)', boxShadow: '0 8px 30px rgba(0,0,0,0.18)', color: t.textPrimary, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)' }}>
+          <SpinnerApple taille={14} couleur={PALETTE.primary} titre="Envoi en cours" /> Envoi de vos photos · {guestUp.snap.counts.done} / {guestUp.snap.counts.total - guestUp.snap.counts.skipped}
+        </button>
+      )}
+      {shareToken && root && <GuestUploadSheet open={uploadOpen} onClose={() => setUploadOpen(false)} up={guestUp} rootLabel={crumbs[0] || 'galerie'} initialEntries={dropEntries}
+        onView={(folderName, subPath) => { setSub(subPath ? `${folderName}/${subPath}` : folderName); setRefreshKey((k) => k + 1) }} />}
+
+      {/* OVERLAY ouverture média : vidéo -> lecteur ; image -> plein écran. Fond flouté, clic hors -> ferme.
+          Grows in / shrinks out over QUICKLOOK_ANIM_MS (same duration as the drive's Quick Look); images cross-fade on arrows. */}
+      {open && (
+        <div onClick={closeViewer}
+          onTouchStart={(ev) => { const t0 = ev.touches[0]; swipeRef.current = t0 ? { x: t0.clientX, y: t0.clientY } : null }}
+          onTouchEnd={(ev) => { const a = swipeRef.current; swipeRef.current = null; const t1 = ev.changedTouches[0]; if (!a || !t1 || open.node.kind === 'video') return; const dx = t1.clientX - a.x, dy = t1.clientY - a.y; if (Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.4) stepViewer(dx < 0 ? 1 : -1) }}
+          style={{ position: 'fixed', inset: 0, zIndex: 200, background: 'rgba(20,22,30,0.55)', backdropFilter: 'blur(18px)', WebkitBackdropFilter: 'blur(18px)', display: 'grid', placeItems: 'center', padding: 'clamp(10px,3vw,40px)', touchAction: 'pan-y', animation: `${closing ? 'zrQlFadeOut' : 'zrQlFadeIn'} ${QUICKLOOK_ANIM_MS}ms ease forwards` }}>
+          {medias.length > 1 && <button onClick={(ev) => { ev.stopPropagation(); stepViewer(-1) }} aria-label="Image précédente" title="Image précédente (←)" style={{ position: 'fixed', top: '50%', left: 24, transform: 'translateY(-50%)', zIndex: 201, width: 48, height: 48, border: 'none', borderRadius: 99, background: 'rgba(255,255,255,0.14)', color: '#fff', cursor: 'pointer', display: 'grid', placeItems: 'center' }}><Icon name="chevron.left" size={24} weight={1.8} color="#fff" /></button>}
+          {medias.length > 1 && <button onClick={(ev) => { ev.stopPropagation(); stepViewer(1) }} aria-label="Image suivante" title="Image suivante (→)" style={{ position: 'fixed', top: '50%', right: 24, transform: 'translateY(-50%)', zIndex: 201, width: 48, height: 48, border: 'none', borderRadius: 99, background: 'rgba(255,255,255,0.14)', color: '#fff', cursor: 'pointer', display: 'grid', placeItems: 'center' }}><Icon name="chevron.right" size={24} weight={1.8} color="#fff" /></button>}
+          <div style={{ position: 'fixed', top: 18, right: 22, zIndex: 201, color: 'rgba(255,255,255,0.6)', fontSize: 'var(--zr-ui-sm)', fontFamily: FONTS.sans, pointerEvents: 'none' }}>Espace/Échap fermer · ←/→ naviguer{openIndex >= 0 ? ` · ${openIndex + 1}/${medias.length}` : ''}</div>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: open.node.kind === 'video' ? 1100 : 1400, animation: `${closing ? 'zrQlOut' : 'zrQlIn'} ${QUICKLOOK_ANIM_MS}ms cubic-bezier(.2,.7,.3,1) forwards` }}>
+            {open.node.kind === 'video'
+              ? <div className="zr-liquid" style={{ borderRadius: 18, padding: 'clamp(10px,2vw,18px)' }}>
+                  {open.path
+                    ? <React.Suspense fallback={<div style={{ color: t.textSecondary, padding: 40, textAlign: 'center' }}>{i18nT('folder.loadingPlayer')}</div>}>
+                        <LazyVideoPlayer2 key={open.path} t={t} path={open.path} manifest={open.meta} shared />
+                      </React.Suspense>
+                    : <div style={{ color: t.textSecondary, padding: 40, textAlign: 'center' }}>{open.error ? 'Média indisponible.' : i18nT('folder.loadingPlayer')}</div>}
+                </div>
+              : <SharedStage item={open} t={t} shareToken={shareToken} />}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// FULL-SIZE LOADS ARE RATIONED (2 October 2026, « image grise transparente lorsqu'on défile »). A photo of this gallery weighs
+// 3 to 9 MB at full size and takes the server 3 to 13 s to decrypt. The viewer used to request the full size of EVERY photo the
+// arrow passed over, plus the full size of the next one in advance: a few quick arrow presses queued a dozen multi-megabyte
+// downloads, and the small thumbnails of the photos actually on screen waited behind them for tens of seconds. The viewer then
+// showed an empty grey frame. Now: (1) the thumbnail is requested first and alone; (2) the full size only after the photo has
+// stayed on screen for FULL_DWELL_MS; (3) only ONE full-size download may run, and leaving a photo aborts it; (4) neighbours are
+// warmed with thumbnails only.
+const FULL_DWELL_MS = 700
+const THUMB_RETRIES = 3
+let fullInFlight = null // { img, release }
+function loadFullOnce(url, onDone) {
+  if (fullInFlight) fullInFlight.release()           // a newer photo is now the one that counts
+  const img = new Image()
+  let done = false
+  const release = () => { if (done) return; done = true; img.onload = null; img.onerror = null; try { img.src = '' } catch {} if (fullInFlight && fullInFlight.img === img) fullInFlight = null }
+  fullInFlight = { img, release }
+  img.onload = () => { if (done) return; done = true; if (fullInFlight && fullInFlight.img === img) fullInFlight = null; onDone(true) }
+  img.onerror = () => { if (done) return; done = true; if (fullInFlight && fullInFlight.img === img) fullInFlight = null; onDone(false) }
+  img.decoding = 'async'
+  img.src = url
+  return release
+}
+
+// CROSS-FADE BETWEEN IMAGES (2 October 2026). The image on screen stays until the NEXT ONE HAS ITS THUMBNAIL: the incoming layer
+// is mounted invisible, and only when it reports ready do both fade (and slide a few pixels in the direction of the arrow) over
+// QUICKLOOK_ANIM_MS and the old layer is dropped. Pressing arrows faster than images arrive therefore never shows an empty frame:
+// it keeps the last good image, and only the newest pending layer survives. A failsafe swaps anyway after STAGE_FAILSAFE_MS so a
+// stuck request shows its own loading/retry state instead of freezing the old photo forever.
+const STAGE_FAILSAFE_MS = 4000
+function SharedStage({ item, t, shareToken }) {
+  const i18nT = useT()
+  const idRef = useRef(0)
+  const [layers, setLayers] = useState(() => [{ ...item, id: 0, ready: true, leaving: false }])
+  useEffect(() => {
+    setLayers((prev) => {
+      const newest = prev[prev.length - 1]
+      if (newest && !newest.leaving && newest.node.path === item.node.path) {
+        // same entry: only its resolved data arrived
+        return prev.map((l) => (l === newest ? { ...l, path: item.path, meta: item.meta, error: item.error } : l))
+      }
+      idRef.current += 1
+      // keep what is visible (ready, not leaving); drop pending layers of photos we already moved past
+      return [...prev.filter((l) => l.ready && !l.leaving), { ...item, id: idRef.current, ready: false, leaving: false }]
+    })
+  }, [item.node.path, item.path, item.meta, item.error]) // eslint-disable-line react-hooks/exhaustive-deps
+  const markReady = (id) => setLayers((prev) => {
+    if (!prev.some((l) => l.id === id && !l.ready)) return prev
+    return prev.map((l) => (l.id === id ? { ...l, ready: true } : l.id < id ? { ...l, leaving: true } : l))
+  })
+  // failsafe for the newest pending layer
+  useEffect(() => {
+    const pending = layers.find((l) => !l.ready)
+    if (!pending) return undefined
+    const id = setTimeout(() => markReady(pending.id), STAGE_FAILSAFE_MS)
+    return () => clearTimeout(id)
+  }, [layers])
+  useEffect(() => {
+    if (!layers.some((l) => l.leaving)) return undefined
+    const id = setTimeout(() => setLayers((prev) => prev.filter((l) => !l.leaving)), QUICKLOOK_ANIM_MS + 60)
+    return () => clearTimeout(id)
+  }, [layers])
+  const dir = item.dir || 0
+  const newestId = layers.length ? layers[layers.length - 1].id : 0
+  return (
+    <div style={{ display: 'grid', placeItems: 'center' }}>
+      {layers.map((l) => (
+        <div key={l.id} style={{ gridArea: '1 / 1', width: '100%', '--zr-dir': dir, pointerEvents: l.leaving || !l.ready ? 'none' : 'auto', opacity: l.ready ? undefined : 0, animation: l.leaving ? `zrShareOut ${QUICKLOOK_ANIM_MS}ms ease forwards` : (l.ready && l.id !== 0 ? `zrShareIn ${QUICKLOOK_ANIM_MS}ms cubic-bezier(.2,.7,.3,1) both` : 'none') }}>
+          {l.path
+            ? <SharedImage node={{ ...l.node, path: l.path }} meta={l.meta} t={t} shareToken={shareToken} active={!l.leaving && l.id === newestId} onFirstPaint={() => markReady(l.id)} />
+            : <div style={{ color: '#fff', padding: 40, textAlign: 'center' }}>{l.error ? 'Image indisponible.' : i18nT('folder.loadingImage')}</div>}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// Image plein écran. FIX (2026-07-01) : déchiffrement CÔTÉ SERVEUR via /api/shared-media (public, la clé ne
+// quitte jamais le serveur) au lieu du fetch('/api/media-key') client qui échouait (401) pour tout visiteur
+// anonyme du lien -> l'image plein écran restait invisible pour le destinataire du /folder partagé.
+function SharedImage({ node, meta, t, shareToken, active = true, onFirstPaint }) {
+  const i18nT = useT()
+  const [manifest, setManifest] = useState(meta || null)
+  const [thumb, setThumb] = useState('loading')       // loading | ready | failed
+  const [attempt, setAttempt] = useState(0)
+  const [fullSrc, setFullSrc] = useState(null)        // set once the full size is completely downloaded
+  const [viewport, setViewport] = useState(() => ({ w: typeof window === 'undefined' ? 1200 : window.innerWidth, h: typeof window === 'undefined' ? 800 : window.innerHeight }))
+  const paintedRef = useRef(false)
+
+  useEffect(() => {
+    let dead = false
+    setManifest(meta || null)
+    if (meta) return () => { dead = true }
+    if (!node || !node.path) return () => { dead = true }
+    // Lecture d affichage : hors quota (voir src/lib/urlLecture.js).
+    fetch(urlLectureAffichage(node.path, { share: shareToken }), { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((j) => { const m = JSON.parse(j.markdown); if (!dead) setManifest(m) })
+      .catch(() => {})
+    return () => { dead = true }
+  }, [node && node.path, meta, shareToken])
+
+  useEffect(() => {
+    const onResize = () => setViewport({ w: window.innerWidth, h: window.innerHeight })
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  // tell the stage this layer can be shown: its thumbnail is there, or it definitively failed (then it shows its retry state)
+  useEffect(() => {
+    if (thumb !== 'loading' && !paintedRef.current) { paintedRef.current = true; if (onFirstPaint) onFirstPaint() }
+  }, [thumb]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // thumbnail failures are retried (a transient 5xx / reset must never leave a grey frame)
+  useEffect(() => {
+    if (thumb !== 'failed' || attempt >= THUMB_RETRIES) return undefined
+    const id = setTimeout(() => { setAttempt((n) => n + 1); setThumb('loading') }, 600 * (attempt + 1))
+    return () => clearTimeout(id)
+  }, [thumb, attempt])
+
+  const thumbReady = thumb === 'ready'
+  // the full size: only for the photo that stays on screen, one download at a time, aborted on leaving
+  useEffect(() => {
+    if (!active || !thumbReady || fullSrc || !node || !node.path) return undefined
+    let release = null
+    const id = setTimeout(() => {
+      const url = appendShareCredential(`/api/shared-media?path=${encodeURIComponent(node.path)}&kind=full`, shareToken)
+      release = loadFullOnce(url, (ok) => { if (ok) setFullSrc(url) })
+    }, FULL_DWELL_MS)
+    return () => { clearTimeout(id); if (release) release() }
+  }, [active, thumbReady, fullSrc, node && node.path, shareToken])
+
+  if (!node || !node.path) return <div style={{ color: '#fff', padding: 40, textAlign: 'center' }}>{i18nT('folder.loadingImage')}</div>
+  const width = Number(manifest && manifest.w) || 3
+  const height = Number(manifest && manifest.h) || 4
+  const ratio = width / height
+  const frameWidth = Math.max(1, Math.min(1400, viewport.w * 0.94, viewport.h * 0.88 * ratio))
+  const baseThumb = appendShareCredential(`/api/shared-media?path=${encodeURIComponent(node.path)}&kind=thumb`, shareToken)
+  const thumbUrl = attempt ? `${baseThumb}&r=${attempt}` : baseThumb
+
+  // PLUS DE FLOU (2026-07-13, demande Matthieu — même décision que QuickLookOverlay.jsx) : la vignette 1080p s'affiche nette en
+  // simple fondu, le plein format se superpose en douceur quand il est prêt. Un SPINNER n'apparaît que si la vignette tarde
+  // (il vaut mieux un cadre qui dit « ça charge » qu'un cadre gris muet), et un échec définitif propose de réessayer.
+  // CENTRAGE HORIZONTAL (corrigé le 2026-07-31) : le cadre porte une largeur EXPLICITE et `margin auto` le centre ; passer le
+  // parent en flex recentrerait aussi le lecteur vidéo, qui lui veut la pleine largeur.
+  return <div style={{ position: 'relative', width: frameWidth, maxWidth: '100%', marginInline: 'auto', aspectRatio: `${width} / ${height}`, overflow: 'hidden', borderRadius: 14, background: 'rgba(0,0,0,0.30)', boxShadow: '0 18px 60px rgba(0,0,0,0.28)' }}>
+    {thumb !== 'failed' && <img key={attempt} src={thumbUrl} alt="" fetchPriority="high" onLoad={() => setThumb('ready')} onError={() => setThumb('failed')}
+      style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain', opacity: thumbReady ? 1 : 0, transition: 'opacity 160ms ease' }} />}
+    {fullSrc && <img src={fullSrc} alt="" decoding="async"
+      style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain', animation: `zrQlFadeIn ${QUICKLOOK_ANIM_MS}ms ease both` }} />}
+    {thumb === 'loading' && <div role="status" aria-label="Chargement" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#fff' }}><SpinnerApple taille={26} couleur="#fff" titre="Chargement de l’image" /></div>}
+    {thumb === 'failed' && attempt >= THUMB_RETRIES && (
+      <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', textAlign: 'center', color: '#fff', padding: 20 }}>
+        <div><div style={{ opacity: 0.85, marginBottom: 12 }}>Image indisponible pour le moment.</div>
+          <button onClick={(e) => { e.stopPropagation(); setAttempt(0); setThumb('loading') }} style={{ border: 'none', borderRadius: 9, padding: '7px 16px', background: 'rgba(255,255,255,0.2)', color: '#fff', cursor: 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)' }}>Réessayer</button></div>
+      </div>
+    )}
+  </div>
+}

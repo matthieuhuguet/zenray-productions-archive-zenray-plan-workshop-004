@@ -1,0 +1,178 @@
+// Réindexation des anciennes IMAGES privées vers les bons dépôts/dossiers média selon la visibilité.
+//
+// CE QUE FAIT CE SCRIPT
+//   Il parcourt tous les manifests .img.json du drive (dépôt zenray-data, privé). Pour chaque image, il
+//   regarde la visibilité EFFECTIVE de son dossier (marqueur .zrvis.json hérité, défaut privé).
+//     - Dossier PRIVÉ : rien à faire (l'image est déjà privée, on n'y touche pas).
+//     - Dossier PUBLIC : l'image privée doit devenir publique. On COPIE son binaire hashé + sa vignette
+//       .webp depuis le shard privé (zenray-media-NN) vers un shard PUBLIC (zenray-img-public-NN, servi
+//       par le CDN jsDelivr), puis on réécrit le manifest avec vis:'public' + les refs CDN (cdnRepo,
+//       cdnPath, cdnCommit). L'ORIGINAL PRIVÉ N'EST JAMAIS SUPPRIMÉ (non destructif).
+//
+// SÉCURITÉ : DRY-RUN PAR DÉFAUT. Sans --apply, le script n'écrit RIEN. Il logge précisément, ligne par
+//   ligne, ce qu'il FERAIT. On lit le rapport, puis on relance avec --apply pour exécuter réellement.
+//
+// ANTI-FUITE (P0) : le dépôt public et les messages de commit ne contiennent AUCUN nom de média humain.
+//   Le chemin est hashé (ab/cd/<sha>.<ext>). Le nom humain reste dans le manifest, qui vit dans zenray-data
+//   (PRIVÉ) — on ne le copie jamais dans le dépôt public.
+//
+// USAGE
+//   Le serveur local doit tourner (il porte le token GitHub) :
+//     pkill -f local-server.mjs ; GITHUB_TOKEN=$(gh auth token) node scripts/local-server.mjs 3100 &
+//   Puis :
+//     node scripts/reindex-media.mjs              # DRY-RUN : montre ce qui se passerait
+//     node scripts/reindex-media.mjs --apply      # exécute réellement
+//     node scripts/reindex-media.mjs --base http://localhost:3100   # change l'URL du serveur
+
+const args = process.argv.slice(2)
+const APPLY = args.includes('--apply')
+const BASE = (() => {
+  const i = args.indexOf('--base')
+  return i >= 0 && args[i + 1] ? args[i + 1] : 'http://localhost:3100'
+})()
+const DATA_REPO = 'zenray-data' // dépôt privé qui porte tous les manifests + marqueurs de visibilité.
+
+// ── helpers HTTP vers l'API locale (qui porte le token) ──
+async function api(path, init) {
+  const r = await fetch(BASE + path, init)
+  const txt = await r.text()
+  let json = null
+  try { json = JSON.parse(txt) } catch { /* réponse non-JSON (binaire/erreur) */ }
+  return { ok: r.ok, status: r.status, json, txt }
+}
+const post = (path, body) => api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+
+// Lit l'arbre récursif des nœuds sous pages/ (action tree, en GET : elle lit req.query).
+// Renvoie la liste des chemins de nœuds (dont .img.json). NB : les marqueurs .zrvis.json ne sont PAS
+// dans cette liste (filtre NODE_RE côté serveur), on les lit à la demande via readNode.
+async function readTree() {
+  const r = await api('/api/page?action=tree&dir=pages')
+  if (!r.json) throw new Error('tree: pas de réponse (serveur local lancé ?)')
+  const paths = r.json.paths || []
+  if (r.json.truncated) console.warn('  ATTENTION : arbre tronqué côté GitHub (>100k nœuds) — réindex partiel.')
+  return paths
+}
+
+// Lit un nœud texte (manifest ou marqueur) via /api/page action read (GET : lit req.query).
+async function readNode(path) {
+  const r = await api(`/api/page?action=read&path=${encodeURIComponent(path)}`)
+  if (!r.json || r.json.missing || r.json.error || r.json.markdown == null) return null
+  try { return JSON.parse(r.json.markdown) } catch { return null }
+}
+
+// Visibilité EFFECTIVE d'un dossier (marqueur .zrvis.json hérité, défaut privé). Cache pour ne pas relire.
+const _visCache = new Map()
+async function folderVis(dir) {
+  const norm = String(dir || 'pages').replace(/\/+$/, '') || 'pages'
+  if (_visCache.has(norm)) return _visCache.get(norm)
+  let cur = norm
+  for (;;) {
+    const m = await readNode(cur + '/.zrvis.json')
+    if (m && (m.vis === 'public' || m.vis === 'private')) { _visCache.set(norm, m.vis); return m.vis }
+    const slash = cur.lastIndexOf('/')
+    if (slash < 0) break
+    cur = cur.slice(0, slash) || 'pages'
+    if (cur === norm) break
+  }
+  _visCache.set(norm, 'private')
+  return 'private'
+}
+
+// Récupère le binaire d'un shard privé (octets bruts) via le proxy /api/shard.
+async function fetchPrivateBinary(repo, path) {
+  const r = await fetch(`${BASE}/api/shard?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`)
+  if (!r.ok) return null
+  const ab = await r.arrayBuffer()
+  return Buffer.from(ab)
+}
+
+// Encode un Buffer en base64 (pour l'action blob).
+const toB64 = (buf) => buf.toString('base64')
+
+// Pousse un binaire vers le shard PUBLIC actif (active-shard kind=img vis=public + blob + commit groupé).
+// Retourne { repo, commit } (le commit pin l'URL jsDelivr). N'est appelé qu'en mode --apply.
+async function pushPublic(files /* [{path, buf}] */, addBytes) {
+  const need = files.reduce((s, f) => s + f.buf.length, 0)
+  const act = await post('/api/upload-shard', { action: 'active-shard', kind: 'img', vis: 'public', need })
+  if (!act.json || act.json.error || !act.json.repo) throw new Error('active-shard public: ' + (act.json && act.json.error))
+  const repo = act.json.repo
+  const committed = []
+  for (const f of files) {
+    const b = await post('/api/upload-shard', { action: 'blob', repo, b64: toB64(f.buf) })
+    if (!b.json || !b.json.sha) throw new Error('blob: ' + (b.json && b.json.error))
+    committed.push({ path: f.path, sha: b.json.sha })
+  }
+  const c = await post('/api/upload-shard', { action: 'commit', repo, files: committed, addBytes })
+  if (!c.json || !c.json.ok) throw new Error('commit: ' + (c.json && c.json.error))
+  return { repo, commit: c.json.commit }
+}
+
+// ── programme principal ──
+const thumbPathOf = (path) => path.replace(/\.[^./]+$/, '.webp')
+
+async function main() {
+  console.log(`reindex-media — ${APPLY ? 'APPLY (écriture réelle)' : 'DRY-RUN (aucune écriture)'} — serveur ${BASE}`)
+  const all = await readTree()
+  const manifests = all.filter((p) => p.endsWith('.img.json'))
+  console.log(`${manifests.length} manifest(s) image trouvés.`)
+
+  let toPublic = 0, alreadyPublic = 0, privateKept = 0, skipped = 0, done = 0, failed = 0
+
+  for (const mpath of manifests) {
+    const m = await readNode(mpath)
+    if (!m || m.type !== 'image') { skipped++; continue }
+    const dir = mpath.replace(/\/[^/]+$/, '')
+    const vis = await folderVis(dir)
+
+    if (vis !== 'public') { privateKept++; continue }
+    if (m.vis === 'public' && m.cdnRepo && m.cdnCommit) { alreadyPublic++; continue }
+
+    // L'image vit dans un dossier public mais est encore privée -> à migrer.
+    const srcRepo = m.repo
+    const srcPath = m.path
+    if (!srcRepo || !srcPath) { console.log(`  SKIP ${mpath} : manifest sans repo/path source.`); skipped++; continue }
+    toPublic++
+
+    const thumbSrc = m.thumb || thumbPathOf(srcPath)
+    console.log(`  PUBLIC ${mpath}`)
+    console.log(`    copierait binaire ${srcRepo}:${srcPath} -> zenray-img-public-NN:${srcPath}`)
+    console.log(`    copierait vignette ${srcRepo}:${thumbSrc} -> zenray-img-public-NN:${thumbPathOf(srcPath)}`)
+    console.log(`    réécrirait le manifest avec vis:'public' + cdnRepo/cdnPath/cdnCommit (pinné sur le commit)`)
+
+    if (!APPLY) continue
+
+    try {
+      const bin = await fetchPrivateBinary(srcRepo, srcPath)
+      if (!bin) throw new Error('binaire source introuvable')
+      const files = [{ path: srcPath, buf: bin }]
+      let addBytes = bin.length
+      const thumb = await fetchPrivateBinary(srcRepo, thumbSrc)
+      if (thumb) { files.push({ path: thumbPathOf(srcPath), buf: thumb }); addBytes += thumb.length }
+
+      const { repo, commit } = await pushPublic(files, addBytes)
+      // Manifest public : on garde les méta humaines (name…) DANS zenray-data privé, jamais dans le public.
+      const next = {
+        type: 'image', v: 1, name: m.name, ext: m.ext,
+        w: m.w || 0, h: m.h || 0, size: m.size || bin.length, tags: m.tags || [], addedAt: m.addedAt || new Date().toISOString(),
+        vis: 'public', cdnRepo: repo, cdnPath: srcPath, cdnCommit: commit,
+      }
+      const sv = await post('/api/page', { action: 'save', path: mpath, markdown: JSON.stringify(next) })
+      if (!sv.json || !sv.json.ok) throw new Error('save manifest: ' + (sv.json && sv.json.error))
+      console.log(`    OK -> ${repo}@${commit}`)
+      done++
+    } catch (e) {
+      console.log(`    ÉCHEC : ${(e && e.message) || e}`)
+      failed++
+    }
+  }
+
+  console.log('\n— Récapitulatif —')
+  console.log(`  à migrer vers public : ${toPublic}`)
+  console.log(`  déjà publics         : ${alreadyPublic}`)
+  console.log(`  privés conservés     : ${privateKept}`)
+  console.log(`  ignorés              : ${skipped}`)
+  if (APPLY) console.log(`  migrés OK : ${done}   échecs : ${failed}`)
+  else console.log(`  (DRY-RUN : relancer avec --apply pour exécuter)`)
+}
+
+main().catch((e) => { console.error('erreur fatale :', (e && e.message) || e); process.exit(1) })

@@ -1,0 +1,582 @@
+// video-identity-proof.mjs (12 October 2026): the "proof by object identity" (PIO), the authority that lets a verified film leave the
+// local disk WITHOUT re-reading it from GitHub. Decision of Matthieu (12 October 2026): the full SHA-256 read-back costs 114 s on a
+// quiet line and up to 1 217 s when the next film uploads at the same time; the identity proof costs about 4 s.
+// FR : preuve par identite d'objets. Elle autorise l'effacement de l'original local SANS relire le film chez GitHub.
+//
+// WHAT IT PROVES (all of it is checked, none of it is trusted):
+//   1. the ciphertext of every part is RE-DERIVED from the local source with the key and the IV of the manifest (AES-256-GCM is a
+//      pure function of key + IV + plaintext), its SHA-256 equals the file name the part was pushed under, its Git blob id
+//      (SHA-1 of "blob <size>\0<bytes>") equals the id GitHub computed itself at reception and shows in the tree of the pinned commit;
+//   2. the manifest that holds the IVs is ONLINE: the manifest read from zenray-data/main has the same recovery fingerprint;
+//   3. ONE real part (parameter realPartRereadCount) is downloaded in full: bytes equal to the derived ciphertext, tag GCM, plaintext
+//      equal to the source slice;
+//   4. the parts cover the source exactly and the source did not change while it was proven.
+// WHAT IT DOES NOT PROVE: that a part which was not re-read is still intact on GitHub's disks tomorrow (a full read-back does not
+// prove it either: it proves the instant of the read), and nothing about copies: there is one logical copy after the unload.
+// The sampled controls close part of that gap: 1 film in `fullReadBackEvery` is read back in full, and any REMOTE failure of this
+// proof escalates to the full read-back before the original may be deleted.
+//
+// Every number lives in IDENTITY_PROOF_DEFAULTS (HDA rule); the environment and the caller override them; a missing or invalid
+// parameter raises an error that names it. Comments are English first, then French.
+import fs from 'node:fs'
+import { open, mkdtemp, readFile, rm, stat, readdir } from 'node:fs/promises'
+import { createHash, createCipheriv, createDecipheriv } from 'node:crypto'
+import { execFile, execFileSync } from 'node:child_process'
+import { promisify } from 'node:util'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { performance } from 'node:perf_hooks'
+import { loadMasterKey } from './img-pipeline.mjs'
+import { acquireDirectoryLock, directoryLockOptions } from './directory-lock.mjs'
+import { VERIFICATION_MODES, TRANSIENT_GIT_FAILURE, assertVerificationEvidence, atomicJsonWrite, parsePinnedPartUrl,
+  recoveryFingerprint, sameSourceStat, sourceStatRecord, verifyVideoCloud } from './video-cloud-recovery.mjs'
+
+const execFileAsync = promisify(execFile)
+const MEBIBYTE = 1024 * 1024
+
+// ---- 1. parameters (one place) ------------------------------------------------------------------------------------------------
+export const IDENTITY_PROOF_DEFAULTS = Object.freeze({
+  owner: 'matthieuhuguet',
+  manifestRepository: 'zenray-data',   // where the .media.json manifests live / FR : depot des manifestes
+  manifestBranch: 'main',
+  mode: 'identity',                    // identity | full | shadow (shadow = both run, only the full read-back authorises)
+  fullReadBackEvery: 0,                // 14 October 2026: 0 = no sampled full read-back (it would slow the upload down, Matthieu); N = 1 film in N; identity failures still escalate to a full read-back
+  realPartRereadCount: 1,              // real parts downloaded in full per film, taken from the tail (the smallest part); minimum 1
+  treeFetchConcurrency: 4,             // distinct repo@commit trees fetched at the same time
+  treeFetchTimeoutMs: 120000,          // blobless fetch of one pinned commit (trees only)
+  blobReadTimeoutMs: 600000,           // download of ONE real part (up to 95 MiB)
+  gitAttempts: 4,
+  gitRetryBaseMs: 3000,
+  gitRetryMaxMs: 60000,
+  gitMaxBufferBytes: 256 * MEBIBYTE,
+  restTimeoutMs: 60000,
+  statsFileName: 'VerificationStats.json',
+  shadowReceiptSuffix: '.identity',
+  keyBytes: 32,
+  ivBytes: 12,
+  tagBytes: 16,
+})
+// The same variable names the upload worker already exports (ZR_VERIFY_MODE, ZR_VERIFY_FULL_EVERY).
+export const IDENTITY_PROOF_ENV = Object.freeze({
+  mode: 'ZR_VERIFY_MODE', fullReadBackEvery: 'ZR_VERIFY_FULL_EVERY', realPartRereadCount: 'ZR_VERIFY_REAL_PARTS',
+})
+const NUMERIC_RULES = Object.freeze({
+  fullReadBackEvery: { min: 0 }, realPartRereadCount: { min: 1 }, treeFetchConcurrency: { min: 1 }, treeFetchTimeoutMs: { min: 1000 }, blobReadTimeoutMs: { min: 1000 },
+  gitAttempts: { min: 1 }, gitRetryBaseMs: { min: 0 }, gitRetryMaxMs: { min: 0 }, gitMaxBufferBytes: { min: 1 }, restTimeoutMs: { min: 1000 },
+  keyBytes: { min: 1 }, ivBytes: { min: 1 }, tagBytes: { min: 1 },
+})
+const MODES = Object.freeze(['identity', 'full', 'shadow'])
+
+export function resolveIdentityProofConfig(overrides = {}, env = process.env) {
+  const merged = { ...IDENTITY_PROOF_DEFAULTS }
+  for (const [name, variable] of Object.entries(IDENTITY_PROOF_ENV)) {
+    const raw = env?.[variable]
+    if (raw === undefined || raw === '') continue
+    merged[name] = name in NUMERIC_RULES ? Number(raw) : raw
+  }
+  for (const [name, value] of Object.entries(overrides || {})) {
+    if (!(name in IDENTITY_PROOF_DEFAULTS)) throw new Error(`Unknown identity proof parameter: ${name}`)
+    if (value !== undefined) merged[name] = value
+  }
+  for (const name of Object.keys(IDENTITY_PROOF_DEFAULTS)) {
+    if (merged[name] === undefined || merged[name] === null || merged[name] === '') throw new Error(`Missing identity proof parameter: ${name}`)
+  }
+  for (const [name, rule] of Object.entries(NUMERIC_RULES)) {
+    if (!Number.isInteger(merged[name]) || merged[name] < rule.min) throw new Error(`Invalid identity proof parameter ${name}: ${merged[name]} (integer >= ${rule.min} required)`)
+  }
+  if (!MODES.includes(merged.mode)) throw new Error(`Invalid identity proof parameter mode: ${merged.mode} (one of ${MODES.join(', ')})`)
+  return Object.freeze(merged)
+}
+
+// ---- 2. primitives -------------------------------------------------------------------------------------------------------------
+export const sha256Hex = (bytes) => createHash('sha256').update(bytes).digest('hex')
+/** Git object id of a blob: SHA-1 of "blob <size>\0<bytes>" (git-scm.com Git Internals). Equal ids imply equal sizes and bytes. */
+export const gitBlobId = (bytes) => createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')
+
+/** The exact bytes pushed for a part: AES-256-GCM(key, iv, plain) followed by the 16 byte tag. Deterministic. */
+export function deriveCipherPart({ key, iv, plain }) {
+  const cipher = createCipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'))
+  return Buffer.concat([cipher.update(plain), cipher.final(), cipher.getAuthTag()])
+}
+function decryptCipherPart({ key, iv, cipherBytes, tagBytes }) {
+  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'))
+  decipher.setAuthTag(cipherBytes.subarray(cipherBytes.length - tagBytes))
+  return Buffer.concat([decipher.update(cipherBytes.subarray(0, cipherBytes.length - tagBytes)), decipher.final()])
+}
+function createLimiter(limit) {
+  let active = 0
+  const queue = []
+  const next = () => {
+    if (active >= limit || !queue.length) return
+    active += 1
+    const { work, resolve, reject } = queue.shift()
+    work().then(resolve, reject).finally(() => { active -= 1; next() })
+  }
+  return (work) => new Promise((resolve, reject) => { queue.push({ work, resolve, reject }); next() })
+}
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+
+// ---- 3. the proof core -----------------------------------------------------------------------------------------------------------
+/** A proof failure has a CLASS that decides what happens next: `local` and `manifest` are definitive (the original stays, nothing
+ *  can authorise the unload), `remote` escalates to the full read-back (GitHub may be unreachable or inconsistent right now).
+ *  FR : la classe decide : local et manifeste = definitif ; remote = on escalade vers la relecture integrale. */
+export class ProofFailure extends Error {
+  constructor(failureClass, code, message, partIndex = null) {
+    super(message)
+    this.name = 'ProofFailure'
+    this.failureClass = failureClass
+    this.code = code
+    this.partIndex = partIndex
+  }
+}
+const refuse = (failureClass, code, message, partIndex = null) => { throw new ProofFailure(failureClass, code, message, partIndex) }
+const failureRecord = (error) => ({ class: error.failureClass, code: error.code, partIndex: error.partIndex, message: error.message })
+
+async function readExactly(handle, buffer, position) {
+  let done = 0
+  while (done < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, done, buffer.length - done, position + done)
+    if (bytesRead === 0) return false
+    done += bytesRead
+  }
+  return true
+}
+
+/** `objects` = [{ repo, commit, blobPath, start, end, size, iv|null, nameHash|null }] in reconstruction order.
+ *  iv set: the object is AES-GCM(key, iv, source slice); iv null: the object IS the source slice (archive chunks).
+ *  remote = { treeIds(repo, commit) -> Map(path -> blob id), readBlob(repo, commit, path) -> Buffer }. */
+export async function proveObjectIdentity({ objects, source, expectedSize, key, remote, config }) {
+  const started = performance.now()
+  if (!Array.isArray(objects) || !objects.length) refuse('local', 'manifest-unsupported', 'No part to prove')
+  const encrypted = objects[0].iv !== null
+  if (encrypted && (!Buffer.isBuffer(key) || key.length !== config.keyBytes)) throw new Error('Existing media key unavailable')
+  const before = await stat(source)
+  if (before.size !== expectedSize) refuse('local', 'source-size-mismatch', `Source is ${before.size} bytes, the manifest says ${expectedSize}`)
+
+  // geometry first: nothing is read or fetched for a manifest that cannot describe this source
+  let cursor = 0
+  for (const [index, part] of objects.entries()) {
+    if (!Number.isSafeInteger(part.size) || part.size <= 0 || part.start !== cursor || part.end !== cursor + part.size - 1) {
+      refuse('local', 'part-offsets', `Part ${index}: offsets are not contiguous`, index)
+    }
+    if (part.iv !== null && Buffer.from(part.iv, 'base64').length !== config.ivBytes) refuse('local', 'part-iv', `Part ${index}: invalid IV`, index)
+    cursor += part.size
+  }
+  if (cursor !== expectedSize) refuse('local', 'coverage', `Parts cover ${cursor} bytes, the source has ${expectedSize}`)
+
+  // one tree per distinct pinned commit, fetched in parallel while the parts are derived
+  const gate = createLimiter(config.treeFetchConcurrency)
+  const trees = new Map()
+  for (const part of objects) {
+    const pin = `${part.repo}@${part.commit}`
+    if (trees.has(pin)) continue
+    const promise = gate(() => remote.treeIds(part.repo, part.commit))
+    promise.catch(() => {})
+    trees.set(pin, promise)
+  }
+
+  const whole = createHash('sha256')
+  const partBlobIds = []
+  const counters = { parts: objects.length, nameHashOk: 0, remoteIdOk: 0, gcmRoundTripOk: 0 }
+  const handle = await open(source, 'r')
+  const derive = async (index) => {
+    const part = objects[index]
+    const plain = Buffer.allocUnsafe(part.size)
+    if (!await readExactly(handle, plain, part.start)) refuse('local', 'source-short-read', `Part ${index}: the source is shorter than the manifest`, index)
+    return { plain, bytes: part.iv === null ? plain : deriveCipherPart({ key, iv: part.iv, plain }) }
+  }
+  let deriveSeconds = 0
+  try {
+    for (const [index, part] of objects.entries()) {
+      const t0 = performance.now()
+      const { plain, bytes } = await derive(index)
+      whole.update(plain)
+      if (part.nameHash && sha256Hex(bytes) !== part.nameHash) {
+        refuse('local', 'cipher-name-mismatch', `Part ${index}: the SHA-256 of the derived ciphertext is not the pushed file name`, index)
+      }
+      counters.nameHashOk += 1
+      const blobId = gitBlobId(bytes)
+      deriveSeconds += (performance.now() - t0) / 1000
+      let tree
+      try { tree = await trees.get(`${part.repo}@${part.commit}`) }
+      catch (error) { refuse('remote', 'remote-tree-unavailable', `Tree of ${part.repo}@${part.commit.slice(0, 12)} unavailable: ${String(error.message || error).slice(0, 200)}`, index) }
+      const remoteId = tree.get(part.blobPath)
+      if (!remoteId) refuse('remote', 'remote-part-missing', `Part ${index}: absent from the tree of ${part.repo}@${part.commit.slice(0, 12)}`, index)
+      if (remoteId !== blobId) refuse('remote', 'remote-id-mismatch', `Part ${index}: the object id GitHub holds differs from the derived one`, index)
+      counters.remoteIdOk += 1
+      if (part.iv !== null) {
+        let back = null
+        try { back = decryptCipherPart({ key, iv: part.iv, cipherBytes: bytes, tagBytes: config.tagBytes }) } catch { back = null }
+        if (!back || !back.equals(plain)) refuse('local', 'gcm-roundtrip', `Part ${index}: the GCM round trip differs`, index)
+      }
+      counters.gcmRoundTripOk += 1
+      partBlobIds.push(blobId)
+    }
+    // real bytes: the tail parts are the smallest ones; the count is a parameter
+    const realIndexes = objects.map((_, index) => index).slice(-Math.min(config.realPartRereadCount, objects.length))
+    let realBytes = 0
+    const realStarted = performance.now()
+    for (const index of realIndexes) {
+      const part = objects[index]
+      let received
+      try { received = await remote.readBlob(part.repo, part.commit, part.blobPath) }
+      catch (error) { refuse('remote', 'remote-bytes-unavailable', `Part ${index}: download failed: ${String(error.message || error).slice(0, 200)}`, index) }
+      const { plain, bytes } = await derive(index)
+      if (!Buffer.isBuffer(received) || !received.equals(bytes)) refuse('remote', 'remote-bytes-differ', `Part ${index}: the downloaded bytes differ from the derived ciphertext`, index)
+      if (part.iv !== null) {
+        let back = null
+        try { back = decryptCipherPart({ key, iv: part.iv, cipherBytes: received, tagBytes: config.tagBytes }) } catch { back = null }
+        if (!back || !back.equals(plain)) refuse('remote', 'remote-gcm', `Part ${index}: the downloaded part fails its GCM tag`, index)
+      }
+      realBytes += received.length
+    }
+    const after = await stat(source)
+    if (!sameSourceStat(after, sourceStatRecord(before))) refuse('local', 'source-changed', 'The source changed while it was proven')
+    return {
+      ok: true, sha256: whole.digest('hex'), bytes: expectedSize, sourceStat: sourceStatRecord(before),
+      pinnedShards: [...new Set(objects.map((part) => `${part.repo}@${part.commit}`))],
+      counters: { ...counters, realPartsRequired: Math.min(config.realPartRereadCount, objects.length), realPartsRead: realIndexes.length,
+        realPartIndexes: realIndexes, realPartBytes: realBytes, partBlobIds, coversSource: true, shardTrees: trees.size },
+      seconds: { derive: +deriveSeconds.toFixed(3), realPart: +((performance.now() - realStarted) / 1000).toFixed(3), total: +((performance.now() - started) / 1000).toFixed(3) },
+    }
+  } finally { await handle.close() }
+}
+
+// ---- 4. the film (video-raw manifest) -------------------------------------------------------------------------------------------
+export function planVideoObjects(manifest, { owner = IDENTITY_PROOF_DEFAULTS.owner } = {}) {
+  if (manifest?.type !== 'video-raw' || manifest.enc !== true || !Array.isArray(manifest.parts) || !manifest.parts.length) {
+    refuse('local', 'manifest-unsupported', 'Unsupported video manifest')
+  }
+  return manifest.parts.map((part, index) => {
+    let pin
+    try { pin = parsePinnedPartUrl(part.url, owner) } catch (error) { refuse('local', 'part-url', `Part ${index}: ${error.message}`, index) }
+    return { repo: pin.repo, commit: pin.commit, blobPath: pin.blobPath, nameHash: pin.cipherHash,
+      start: part.start, end: part.end, size: part.size, iv: part.iv }
+  })
+}
+
+/** Returns { ok: true, ... } or { ok: false, failure: { class, code, partIndex, message } }. Never throws for a proof failure. */
+export async function proveVideoIdentity({ manifest, manifestBytes = null, source, key, remote, readRemoteManifestBytes, config, owner = config.owner }) {
+  const started = performance.now()
+  try {
+    const objects = planVideoObjects(manifest, { owner })
+    // the manifest that holds the IVs must be online, before anything heavy runs
+    let remoteBytes
+    try { remoteBytes = await readRemoteManifestBytes() }
+    catch (error) { refuse('manifest', 'manifest-offline', `Remote manifest unreadable: ${String(error.message || error).slice(0, 200)}`) }
+    let remoteManifest
+    try { remoteManifest = JSON.parse(Buffer.from(remoteBytes).toString('utf8')) }
+    catch { refuse('manifest', 'manifest-offline', 'Remote manifest is not valid JSON') }
+    const remoteFingerprint = recoveryFingerprint(remoteManifest)
+    if (remoteFingerprint !== recoveryFingerprint(manifest)) {
+      refuse('manifest', 'manifest-differs', 'The manifest online differs from the local one (parts, IVs, size or pins): it is stale or not pushed')
+    }
+    const manifestSeconds = (performance.now() - started) / 1000
+    const proof = await proveObjectIdentity({ objects, source, expectedSize: manifest.size, key, remote, config })
+    return { ...proof,
+      counters: { ...proof.counters, manifestOnline: true, manifestRecoveryMatches: true, remoteManifestRecoverySha256: remoteFingerprint,
+        remoteManifestBlobId: gitBlobId(Buffer.from(remoteBytes)), localManifestBlobId: manifestBytes ? gitBlobId(manifestBytes) : null,
+        manifestIdentical: manifestBytes ? gitBlobId(Buffer.from(remoteBytes)) === gitBlobId(manifestBytes) : null },
+      seconds: { manifest: +manifestSeconds.toFixed(3), ...proof.seconds, total: +((performance.now() - started) / 1000).toFixed(3) } }
+  } catch (error) {
+    if (error instanceof ProofFailure) return { ok: false, failure: failureRecord(error) }
+    throw error
+  }
+}
+
+export function buildIdentityReceipt({ manifestPath, manifestBytes, manifest, source, proof, config, now = () => new Date() }) {
+  return {
+    verifiedAt: now().toISOString(), source: path.resolve(source), manifestPath: path.resolve(manifestPath),
+    manifestSha256: sha256Hex(manifestBytes), manifestRecoverySha256: recoveryFingerprint(manifest),
+    sourceStat: proof.sourceStat, bytes: proof.bytes, sha256: proof.sha256, localSha256: proof.sha256, restoredSha256: proof.sha256,
+    pinnedShards: proof.pinnedShards, sourceRetained: true, completeCloudRecoveryVerified: true,
+    verificationMode: VERIFICATION_MODES.identity,
+    // `restoredSha256` of this mode is the SHA-256 of the source whose re-derived parts were matched to GitHub's object ids.
+    identityProof: { ...proof.counters, seconds: proof.seconds, fullReadBackEvery: config.fullReadBackEvery },
+  }
+}
+
+// ---- 5. the real remote: Git trees without blobs, one real blob, the manifest through the API -------------------------------------
+export function gitEnvironment(token) {
+  if (!token) throw new Error('GitHub token is required for private video shards')
+  return { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+    GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}` }
+}
+const defaultRemoteUrl = (owner, repo) => `https://github.com/${owner}/${repo}.git`
+const treeEntry = /^\d+ (?:blob|commit) ([0-9a-f]{40})\t([\s\S]*)$/
+
+function createGitRunner({ env, config, sleep = delay }) {
+  return async function git(directory, args, { binary = false, timeoutMs = config.treeFetchTimeoutMs } = {}) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const { stdout } = await execFileAsync('git', ['-C', directory, ...args], { env, timeout: timeoutMs,
+          maxBuffer: config.gitMaxBufferBytes, encoding: binary ? 'buffer' : 'utf8' })
+        return stdout
+      } catch (error) {
+        const stderr = Buffer.isBuffer(error.stderr) ? error.stderr.toString('utf8') : String(error.stderr || '')
+        const details = `${error.code || ''}\n${error.message || ''}\n${stderr}`
+        if (attempt >= config.gitAttempts || !TRANSIENT_GIT_FAILURE.test(details)) {
+          throw new Error(`git ${args[0]} failed: ${(stderr.trim() || String(error.message)).slice(-300)}`)
+        }
+        await sleep(Math.min(config.gitRetryMaxMs, config.gitRetryBaseMs * 2 ** (attempt - 1)))
+      }
+    }
+  }
+}
+
+/** Tree ids come from `git ls-tree -r -z` WITHOUT `-l` (which downloads every blob to read its size: 143 MiB pulled in 2 minutes
+ *  during the 12 October 2026 experiment). The blobless depth-1 fetch brings commit and trees only. */
+export function createGitRemote({ token, config, scratchParent, owner = config.owner, remoteUrlFor = defaultRemoteUrl, env = null }) {
+  const git = createGitRunner({ env: env || gitEnvironment(token), config })
+  const opened = new Map()
+  const directories = []
+  const open = (repo, commit) => {
+    const pin = `${repo}@${commit}`
+    if (!opened.has(pin)) {
+      const promise = (async () => {
+        const directory = await mkdtemp(path.join(scratchParent, 'IdentityRemote-'))
+        directories.push(directory)
+        await git(directory, ['init', '-q', '--bare'])
+        await git(directory, ['remote', 'add', 'origin', remoteUrlFor(owner, repo)])
+        await git(directory, ['config', 'remote.origin.promisor', 'true'])
+        await git(directory, ['config', 'remote.origin.partialclonefilter', 'blob:none'])
+        await git(directory, ['fetch', '-q', '--filter=blob:none', '--depth=1', '--no-tags', 'origin', commit])
+        const ids = new Map()
+        for (const entry of (await git(directory, ['ls-tree', '-r', '-z', commit])).split('\0').filter(Boolean)) {
+          const match = treeEntry.exec(entry)
+          if (match) ids.set(match[2], match[1])
+        }
+        return { directory, ids }
+      })()
+      promise.catch(() => { opened.delete(pin) })
+      opened.set(pin, promise)
+    }
+    return opened.get(pin)
+  }
+  return {
+    async treeIds(repo, commit) { return (await open(repo, commit)).ids },
+    async readBlob(repo, commit, blobPath) {
+      const { directory } = await open(repo, commit)
+      return git(directory, ['cat-file', 'blob', `${commit}:${blobPath}`], { binary: true, timeoutMs: config.blobReadTimeoutMs })
+    },
+    async close() { await Promise.all(directories.map((directory) => rm(directory, { recursive: true, force: true }))) },
+  }
+}
+
+/** Where a local manifest sits in zenray-data: its path relative to the clone root, read from Git itself, and the clone must be
+ *  the zenray-data clone. FR : chemin du manifeste dans le depot, lu par Git ; le clone doit etre celui de zenray-data. */
+export function locateManifestInClone(manifestPath, { config }) {
+  const directory = path.dirname(path.resolve(manifestPath))
+  const git = (args) => execFileSync('git', ['-C', directory, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+  let prefix, origin
+  try { prefix = git(['rev-parse', '--show-prefix']); origin = git(['config', '--get', 'remote.origin.url']) }
+  catch (error) { throw new Error(`The manifest is not inside a Git clone: ${String(error.message || error).slice(0, 160)}`) }
+  const expected = new RegExp(`[/:]${config.owner}/${config.manifestRepository}(\\.git)?/?$`)
+  if (!expected.test(origin)) throw new Error(`The manifest clone is not ${config.owner}/${config.manifestRepository}`)
+  return `${prefix}${path.basename(manifestPath)}`
+}
+
+/** The manifest is read through the contents API with the raw media type, never through raw.githubusercontent.com whose
+ *  five minute cache would answer with the previous version (rule of 31 August 2026). */
+export async function readRemoteManifestBytes({ token, config, repoPath, fetchImpl = fetch, sleep = delay }) {
+  const url = `https://api.github.com/repos/${config.owner}/${config.manifestRepository}/contents/${repoPath.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(config.manifestBranch)}`
+  let last = null
+  for (let attempt = 1; attempt <= config.gitAttempts; attempt++) {
+    try {
+      const response = await fetchImpl(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'ZenRayIdentityProof' },
+        signal: AbortSignal.timeout(config.restTimeoutMs) })
+      if (response.ok) return Buffer.from(await response.arrayBuffer())
+      last = new Error(`HTTP ${response.status}`)
+      if (response.status !== 429 && response.status < 500) break
+    } catch (error) { last = error }
+    if (attempt < config.gitAttempts) await sleep(Math.min(config.gitRetryMaxMs, config.gitRetryBaseMs * 2 ** (attempt - 1)))
+  }
+  throw new Error(`manifest ${repoPath}: ${last?.message || last}`)
+}
+
+// ---- 6. sampling counter and panel counters ------------------------------------------------------------------------------------
+const emptyStats = () => ({ schemaVersion: 1, identityVerified: 0, fullReadBackVerified: 0, sampledFullReadBacks: 0,
+  escalatedFullReadBacks: 0, forcedFullReadBacks: 0, shadowComparisons: 0, shadowDisagreements: 0, identityRefusals: 0,
+  filmsSinceFullReadBack: 0, lastFullReadBackAt: null, updatedAt: null })
+
+async function readStats(statsPath) {
+  try { return { ...emptyStats(), ...JSON.parse(await readFile(statsPath, 'utf8')) } }
+  catch (error) { if (error.code === 'ENOENT') return emptyStats(); throw error }
+}
+async function withStatsLock(statsPath, work) {
+  const lock = await acquireDirectoryLock(`${statsPath}.lock`, directoryLockOptions('court', 'identity proof statistics'))
+  try { return await work() } finally { await lock.release() }
+}
+
+/** Decides, under a lock shared by every verification lane, whether THIS film is read back in full. With fullReadBackEvery = N the
+ *  films 1..N-1 since the last successful full read-back use the identity proof and the Nth is read back in full.
+ *  FR : sous verrou, decide si CE film est relu en entier (1 sur N). */
+export async function reserveVerificationSlot({ statsPath, config, forceFull = false, now = () => new Date() }) {
+  return withStatsLock(statsPath, async () => {
+    const stats = await readStats(statsPath)
+    let plan
+    if (config.mode === 'full') plan = { mode: 'full', reason: 'configured' }
+    else if (config.mode === 'shadow') plan = { mode: 'full', reason: 'shadow' }   // 13 October 2026: shadow never lets identity authorise / FR : shadow = seule la relecture integrale decide
+    else if (forceFull) plan = { mode: 'full', reason: 'forced' }
+    else if (config.fullReadBackEvery > 0 && stats.filmsSinceFullReadBack + 1 >= config.fullReadBackEvery) plan = { mode: 'full', reason: 'sampled' }
+    else plan = { mode: 'identity', reason: 'identity' }
+    if (plan.mode === 'identity') stats.filmsSinceFullReadBack += 1
+    stats.updatedAt = now().toISOString()
+    await atomicJsonWrite(statsPath, stats)
+    return { ...plan, ordinal: stats.filmsSinceFullReadBack }
+  })
+}
+
+export async function recordVerificationOutcome({ statsPath, kind, reason = null, now = () => new Date(), shadowAgreed = null }) {
+  return withStatsLock(statsPath, async () => {
+    const stats = await readStats(statsPath)
+    if (kind === 'identity') stats.identityVerified += 1
+    else if (kind === 'refused') stats.identityRefusals += 1
+    else if (kind === 'full') {
+      stats.fullReadBackVerified += 1
+      // 13 October 2026: a file the identity proof cannot plan (unsupported format) is read back in full by necessity, not by sampling.
+      // It gives its reserved slot back and does not restart the 1 in N cycle, so supported files can still reach the Nth slot.
+      // FR : un format non supporte est relu en entier par necessite : il rend son creneau et ne remet pas le cycle 1 sur N a zero.
+      if (reason === 'unsupported') stats.filmsSinceFullReadBack = Math.max(0, stats.filmsSinceFullReadBack - 1)
+      else stats.filmsSinceFullReadBack = 0
+      stats.lastFullReadBackAt = now().toISOString()
+      if (reason === 'sampled') stats.sampledFullReadBacks += 1
+      if (reason === 'escalated') stats.escalatedFullReadBacks += 1
+      if (reason === 'forced') stats.forcedFullReadBacks += 1
+    }
+    if (shadowAgreed !== null) { stats.shadowComparisons += 1; if (!shadowAgreed) stats.shadowDisagreements += 1 }
+    stats.updatedAt = now().toISOString()
+    await atomicJsonWrite(statsPath, stats)
+    return stats
+  })
+}
+
+/** The separate counters for the panel, derived from the receipts themselves (the only durable evidence), plus the sampling state. */
+export async function summarizeVerificationReceipts(receiptsDirectory, { config = resolveIdentityProofConfig() } = {}) {
+  const summary = { identityProofVerified: 0, fullReadBackVerified: 0, legacyFullReadBack: 0, unknownMode: 0, receipts: 0, stats: null }
+  for (const name of await readdir(receiptsDirectory)) {
+    if (!name.endsWith('.recovery.json')) continue
+    try {
+      const receipt = JSON.parse(await readFile(path.join(receiptsDirectory, name), 'utf8'))
+      if (receipt.completeCloudRecoveryVerified !== true) continue
+      summary.receipts += 1
+      if (receipt.verificationMode === VERIFICATION_MODES.identity) summary.identityProofVerified += 1
+      else if (receipt.verificationMode === VERIFICATION_MODES.fullReadBack) summary.fullReadBackVerified += 1
+      else if (receipt.verificationMode === undefined) summary.legacyFullReadBack += 1
+      else summary.unknownMode += 1
+    } catch { /* an unreadable receipt is not counted as verified */ }
+  }
+  try { summary.stats = await readStats(path.join(receiptsDirectory, config.statsFileName)) } catch { summary.stats = null }
+  return summary
+}
+
+// ---- 7. the policy: reuse, identity, sampled or escalated full read-back, receipt ------------------------------------------------
+/** A receipt is reused after a restart only when it proves THIS manifest (recovery fingerprint) and THIS unchanged source; it is the
+ *  same test the unload applies. FR : un recu n'est reutilise que s'il prouve ce manifeste et cette source inchangee. */
+export async function reusableReceipt({ receiptPath, manifestPath, source }) {
+  try {
+    const saved = JSON.parse(await readFile(receiptPath, 'utf8'))
+    const info = await stat(source)
+    const manifestBytes = await readFile(manifestPath)
+    const manifest = JSON.parse(manifestBytes.toString('utf8'))
+    const sameManifest = saved.manifestRecoverySha256
+      ? recoveryFingerprint(manifest) === saved.manifestRecoverySha256
+      : sha256Hex(manifestBytes) === saved.manifestSha256
+    const sameSource = saved.sourceStat && sameSourceStat(info, saved.sourceStat)
+    if (saved.completeCloudRecoveryVerified === true && saved.sourceRetained === true && saved.source === path.resolve(source)
+      && saved.manifestPath === path.resolve(manifestPath) && saved.sha256 && saved.sha256 === saved.localSha256 && saved.sha256 === saved.restoredSha256
+      && saved.bytes === info.size && sameManifest && sameSource) {
+      assertVerificationEvidence(saved, manifest)
+      return saved
+    }
+  } catch { /* an unreadable or incomplete receipt simply means: verify */ }
+  return null
+}
+
+export class IdentityProofRefused extends Error {
+  constructor(failure) {
+    super(`Identity proof refused (${failure.class}/${failure.code}): ${failure.message}. The local original is retained.`)
+    this.name = 'IdentityProofRefused'
+    this.failure = failure
+  }
+}
+
+export async function verifyVideoCloudByPolicy({ manifestPath, source, receiptPath, token = null, owner = null, config = null, env = process.env,
+  forceFull = false, sample = true, escalate = true, reuseReceipt = true, deps = {}, log = console.log, now = () => new Date() }) {
+  const settings = config || resolveIdentityProofConfig({}, env)
+  const repoOwner = owner || settings.owner
+  const statsPath = path.join(path.dirname(path.resolve(receiptPath)), settings.statsFileName)
+  if (reuseReceipt && !forceFull) {
+    const saved = await reusableReceipt({ receiptPath, manifestPath, source })
+    // 13 October 2026: ZR_VERIFY_MODE=full or shadow demands a full read-back as the authority; an identity receipt does not satisfy it.
+    // FR : en mode full ou shadow, un recu d'identite ne suffit pas, la relecture integrale est exigee.
+    const modeAccepts = !(saved && saved.verificationMode === VERIFICATION_MODES.identity && settings.mode !== 'identity')
+    if (saved && modeAccepts) {
+      log('Complete cloud recovery already verified for this manifest and this unchanged source; read-back skipped')
+      return { receipt: saved, reused: true, verificationMode: saved.verificationMode ?? VERIFICATION_MODES.fullReadBack }
+    }
+  }
+  const manifestBytes = await readFile(manifestPath)
+  const manifest = JSON.parse(manifestBytes.toString('utf8'))
+  const githubToken = token || deps.token || process.env.GITHUB_TOKEN || (deps.remote ? 'unused' : execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim())
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+
+  let plan
+  if (settings.mode === 'shadow') plan = { mode: 'full', reason: 'shadow' }
+  else if (settings.mode === 'full') plan = { mode: 'full', reason: 'configured' }
+  else if (!sample) plan = forceFull ? { mode: 'full', reason: 'forced' } : { mode: 'identity', reason: 'identity' }
+  else plan = await reserveVerificationSlot({ statsPath, config: settings, forceFull, now })
+
+  const runIdentity = async () => {
+    const key = deps.key || loadMasterKey(repoRoot, fs)
+    if (!key || key.length !== settings.keyBytes) throw new Error('Existing media key unavailable')
+    const remote = deps.remote || createGitRemote({ token: githubToken, config: settings, scratchParent: path.dirname(path.resolve(receiptPath)), owner: repoOwner })
+    const readManifest = deps.readRemoteManifestBytes
+      || (async () => readRemoteManifestBytes({ token: githubToken, config: settings, repoPath: locateManifestInClone(manifestPath, { config: settings }) }))
+    try {
+      return await proveVideoIdentity({ manifest, manifestBytes, source, key, remote, readRemoteManifestBytes: readManifest, config: settings, owner: repoOwner })
+    } finally { if (!deps.remote) await remote.close() }
+  }
+  const fullReadBack = deps.fullReadBack || verifyVideoCloud
+  const runFull = (extraFields) => fullReadBack({ manifestPath, source, receiptPath, token: githubToken, owner: repoOwner, key: deps.key || null,
+    readPart: deps.readPart || null, writeReceipt: false, extraFields })
+
+  let escalatedFrom = null
+  let shadow = null
+  if (plan.mode === 'identity' || plan.reason === 'shadow') {
+    let proof
+    try { proof = await runIdentity() }
+    catch (error) {
+      // the shadow comparison must never block the full read-back that authorises the unload
+      if (plan.reason !== 'shadow') throw error
+      proof = { ok: false, failure: { class: 'error', code: 'exception', partIndex: null, message: String(error.message || error).slice(0, 300) } }
+    }
+    if (plan.reason === 'shadow') shadow = proof.ok ? { ok: true, seconds: proof.seconds, counters: { parts: proof.counters.parts, realPartsRead: proof.counters.realPartsRead } }
+      : { ok: false, failure: proof.failure }
+    else if (proof.ok) {
+      const receipt = buildIdentityReceipt({ manifestPath, manifestBytes, manifest, source, proof, config: settings, now })
+      assertVerificationEvidence(receipt, manifest)
+      await atomicJsonWrite(receiptPath, receipt)
+      if (sample) await recordVerificationOutcome({ statsPath, kind: 'identity', now })
+      log(`Identity proof verified (${proof.counters.parts} parts, ${proof.pinnedShards.length} pinned shard(s), ${proof.counters.realPartsRead} real part(s) re-read in ${proof.seconds.total}s); source retained`)
+      return { receipt, reused: false, verificationMode: VERIFICATION_MODES.identity }
+    } else if (proof.failure.class === 'remote' && escalate) {
+      escalatedFrom = proof.failure
+      plan = { mode: 'full', reason: 'escalated' }
+      log(`Identity proof could not be completed remotely (${proof.failure.code}); falling back to the full read-back`)
+    } else {
+      if (sample) await recordVerificationOutcome({ statsPath, kind: 'refused', now })
+      throw new IdentityProofRefused(proof.failure)
+    }
+  }
+
+  const extraFields = { fullReadBackReason: plan.reason, ...(escalatedFrom ? { escalatedFrom } : {}), ...(shadow ? { shadowIdentityVerdict: shadow } : {}) }
+  const receipt = await runFull(extraFields)
+  assertVerificationEvidence(receipt, manifest)
+  await atomicJsonWrite(receiptPath, receipt)
+  if (sample || shadow) await recordVerificationOutcome({ statsPath, kind: 'full', reason: plan.reason, now, shadowAgreed: shadow ? shadow.ok : null })
+  if (shadow && settings.shadowReceiptSuffix) await atomicJsonWrite(`${receiptPath}${settings.shadowReceiptSuffix}`, { at: now().toISOString(), manifestPath: path.resolve(manifestPath), shadow })
+  log(`Complete cloud recovery verified (full read-back, ${plan.reason}); source retained`)
+  return { receipt, reused: false, verificationMode: VERIFICATION_MODES.fullReadBack }
+}

@@ -1,0 +1,202 @@
+// ZenRayMedia — L4 : le registre de thèmes.
+//
+// C'EST LA PIÈCE D'EXTENSIBILITÉ. Elle répond à la contrainte : « je vais t'ajouter des thèmes
+// au compte-goutte, à terme au moins 1024 HTML interchangeables ».
+//
+// Deux formes de thème, découvertes AUTOMATIQUEMENT par Vite, sans jamais toucher au code :
+//
+//   1. `T-FF-S-V.theme.js`            -> thème à tokens (les 7 groupes de 01-PLAN §10.2).
+//   2. `T-FF-S-V--mon-slug.html`      -> gabarit HTML brut (celui que tu produis à la main).
+//
+// Déposer un fichier dans ce dossier SUFFIT : il apparaît dans le Deck au prochain build.
+//
+// COÛT À L'ÉCHELLE (décision d'architecture, pas une optimisation) : les métadonnées d'un
+// thème HTML sont dérivées de son NOM DE FICHIER, jamais de son contenu. Lire 1024 fichiers
+// HTML pour construire la liste ferait entrer des mégaoctets dans le bundle. Ici, lister
+// 1024 thèmes coûte 1024 chaînes de caractères ; seul le thème RÉELLEMENT choisi est chargé.
+
+import { parseThemeFileName, parseThemeId, FAMILIES } from '../taxonomy.js'
+import { validate } from '../contracts.js'
+import { defaultFontFor } from '../themeFonts.js'
+import { inspectTemplate } from '../htmlTemplate.js'
+
+// Thèmes à tokens : peu nombreux, curatés, chargés d'emblée (quelques kilo-octets).
+const JS_THEMES = import.meta.glob('./*.theme.js', { eager: true })
+// Gabarits HTML : potentiellement des centaines. Chargement PARESSEUX, un par un.
+const HTML_THEMES = import.meta.glob('./*.html', { query: '?raw', import: 'default' })
+
+function entriesFromJs() {
+  const out = []
+  for (const [path, mod] of Object.entries(JS_THEMES)) {
+    const theme = mod?.default
+    if (!theme?.id) continue
+    const parsed = parseThemeId(theme.id)
+    if (!parsed) continue
+    out.push({
+      id: theme.id,
+      name: theme.name || parsed.id,
+      description: theme.description || '',
+      family: parsed.family,
+      familyLabel: parsed.familyLabel,
+      sub: parsed.sub,
+      variant: parsed.variant,
+      formats: Array.isArray(theme.formats) ? theme.formats : ['F-web-article'],
+      source: 'js',
+      path,
+    })
+  }
+  return out
+}
+
+function entriesFromHtml() {
+  const out = []
+  for (const path of Object.keys(HTML_THEMES)) {
+    const parsed = parseThemeFileName(path)
+    if (!parsed) {
+      // Nom de fichier hors contrat : on l'ignore SILENCIEUSEMENT côté produit, mais on le
+      // signale en console pour que l'auteur du gabarit comprenne pourquoi il n'apparaît pas.
+      if (typeof console !== 'undefined') console.warn(`[zenraymedia] gabarit ignoré (nom attendu : T-FF-S-V--slug.html) : ${path}`)
+      continue
+    }
+    out.push({
+      id: parsed.id,
+      name: parsed.name,
+      description: `Gabarit HTML — ${parsed.familyLabel}.`,
+      family: parsed.family,
+      familyLabel: parsed.familyLabel,
+      sub: parsed.sub,
+      variant: parsed.variant,
+      formats: ['F-web-article'],
+      source: 'html',
+      path,
+    })
+  }
+  return out
+}
+
+// Liste complète, triée par identifiant. Les thèmes à tokens gagnent en cas de doublon d'id :
+// un gabarit HTML ne doit pas pouvoir masquer un thème curaté.
+export function listThemes() {
+  const js = entriesFromJs()
+  const taken = new Set(js.map((e) => e.id))
+  const html = entriesFromHtml().filter((e) => !taken.has(e.id))
+  return [...js, ...html].sort((a, b) => a.id.localeCompare(b.id))
+}
+
+export function listFamilies() {
+  const present = new Set(listThemes().map((e) => e.family))
+  return Object.entries(FAMILIES)
+    .filter(([code]) => present.has(code))
+    .map(([code, label]) => ({ code, label, count: listThemes().filter((e) => e.family === code).length }))
+}
+
+export function findEntry(id) { return listThemes().find((e) => e.id === id) || null }
+
+// En-tête déclaratif OPTIONNEL d'un gabarit HTML, en tête de fichier :
+//
+//   <!--zr-theme { "description": "...", "formats": ["F-web-article","F-print-a4"],
+//                  "beatCount": { "min": 3, "max": 12 }, "measure": 64 } -->
+//
+// Sans lui, le gabarit reste parfaitement valide et prend les valeurs neutres ci-dessous :
+// c'est le chemin le plus court pour déposer un fichier. Avec lui, un gabarit reconstruit à
+// partir de captures d'écran déclare les formats qu'il sait VRAIMENT servir au lieu d'être
+// cantonné au web. L'en-tête est lu APRÈS chargement du fichier : il ne coûte donc rien au
+// listing du catalogue, qui ne lit que les noms de fichiers -- c'est ce qui tient à 1024.
+export function readThemeHeader(html) {
+  const match = /<!--\s*zr-theme\s*([\s\S]*?)-->/i.exec(String(html || ''))
+  if (!match) return {}
+  try {
+    const parsed = JSON.parse(match[1].trim())
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    // Un en-tête malformé ne doit JAMAIS empêcher le gabarit de fonctionner : on le signale
+    // à l'auteur et on repart des valeurs neutres.
+    if (typeof console !== 'undefined') console.warn('[zenraymedia] en-tête <!--zr-theme …--> illisible (JSON invalide) : valeurs par défaut appliquées.')
+    return {}
+  }
+}
+
+// Groupes par défaut d'un gabarit HTML : il apporte sa mise en page, pas ses tokens.
+// Ces valeurs neutres existent pour que `validateTheme` passe et que le Critique ait des
+// seuils à vérifier, jamais pour imposer un style au gabarit.
+function htmlThemeShell(entry, html) {
+  return {
+    id: entry.id,
+    name: entry.name,
+    description: entry.description,
+    calibration: { ref: '', notes: '' },
+    formats: entry.formats,
+    beatCount: { min: 1, max: 24 },
+    surface: { background: '#ffffff', backgroundDark: '#0f1012', grain: 0, vignette: 0, texture: 'none', shadow: 'none' },
+    palette: { ink: 'rgba(20,22,26,.92)', inkDark: 'rgba(244,245,247,.92)', muted: 'rgba(20,22,26,.60)', mutedDark: 'rgba(244,245,247,.54)', rule: 'rgba(20,22,26,.12)', ruleDark: 'rgba(244,245,247,.14)', accent: '#1a1a1a', accentDark: '#f4f5f7', minContrast: 4.5 },
+    typography: { body: "'AnthropicSans', system-ui, sans-serif", display: "'AnthropicSans', system-ui, sans-serif", mono: "'AnthropicMono', ui-monospace, monospace", scale: { base: 17, ratio: 1.25, steps: { h1: 3, h2: 2, h3: 1, body: 0, small: -1 } }, lineHeight: { body: 1.55, display: 1.15 }, tracking: { display: '-0.02em', body: '0em', mono: '0.06em' }, measure: 66, weights: { body: 400, display: 500, emphasis: 500 }, case: { display: 'none', label: 'none' } },
+    grid: { columns: 1, gutter: 0, margin: { top: 72, bottom: 96, sides: 24 }, rhythm: 8, align: 'left', maxWidth: 760 },
+    motion: { enabled: false, ease: 'cubic-bezier(.16,1,.3,1)', enter: 0, stagger: 0, cut: 'none' },
+    chrome: { kicker: true, byline: true, readingTime: true, rules: false, dropCap: false, footer: true, numbering: false },
+    sound: { bed: null, bedLufs: null, cues: [], allowed: [] },
+    html,
+  }
+}
+
+const cache = new Map()
+
+// Charge un thème et le VALIDE avant de le rendre. Un thème invalide ne doit jamais atteindre
+// le compilateur : il produirait une page cassée sans dire pourquoi.
+export async function loadTheme(id) {
+  if (cache.has(id)) return cache.get(id)
+  const entry = findEntry(id)
+  if (!entry) throw new Error(`Thème introuvable : ${id}`)
+
+  let theme
+  if (entry.source === 'js') {
+    theme = JS_THEMES[entry.path]?.default
+  } else {
+    const loader = HTML_THEMES[entry.path]
+    if (!loader) throw new Error(`Gabarit introuvable : ${entry.path}`)
+    const raw = await loader()
+    const html = String(raw || '')
+    // AUDIT P0-T8 · `inspectTemplate` existait, testé, mais jamais appelé ICI : le commentaire du
+    // module promettait un contrôle du gabarit que le runtime contournait entièrement. Non
+    // bloquant PAR CHOIX (les huit thèmes déjà chargeables n'ont jamais été mesurés contre ce
+    // diagnostic, un rejet dur pourrait donc casser un thème réel sans preuve) — le diagnostic
+    // devient visible (console + champ sur le thème) au lieu de rester une promesse tenue
+    // seulement par les tests.
+    const diagnostic = inspectTemplate(html)
+    if (!diagnostic.hasHtmlSkeleton) {
+      console.warn(`Thème ${id} : aucun squelette <html> détecté dans le gabarit.`)
+    }
+    theme = htmlThemeShell(entry, html)
+    theme.templateDiagnostics = diagnostic
+    // L'en-tête n'a AUCUN droit sur l'identité : ni sur l'id (il vient du nom de fichier, seule
+    // source de vérité du catalogue), ni sur le nom public (règle anti-marque, 02-RISQUES R5).
+    // Il n'enrichit que ce que le gabarit sait de lui-même.
+    const header = readThemeHeader(html)
+    if (typeof header.description === 'string') theme.description = header.description
+    if (Array.isArray(header.formats) && header.formats.length) theme.formats = header.formats
+    if (header.beatCount && Number.isFinite(header.beatCount.min) && Number.isFinite(header.beatCount.max)) {
+      theme.beatCount = { min: header.beatCount.min, max: header.beatCount.max }
+    }
+    if (Number.isFinite(header.measure)) theme.typography = { ...theme.typography, measure: header.measure }
+    if (header.calibration && typeof header.calibration === 'object') theme.calibration = header.calibration
+    // Polices déclarées par le gabarit. Elles sont servies pour l'aperçu et embarquées à l'export ;
+    // celles qui ne sont pas installées retombent proprement sur leur pile système (fonts.js).
+    if (Array.isArray(header.fonts) && header.fonts.length) theme.fonts = header.fonts
+    // Sans déclaration, le gabarit hérite de la police de SA SOUS-FAMILLE (themeFonts.js).
+    // Un thème de presse quotidienne reçoit ainsi un serif de labeur et un thème de chaîne
+    // d'info un condensé, sans que l'auteur ait à y penser — et il garde le droit de choisir.
+    else { const fallback = defaultFontFor(entry.id); if (fallback) theme.fonts = [fallback] }
+    if (header.typography && typeof header.typography === 'object') theme.typography = { ...theme.typography, ...header.typography }
+  }
+
+  const errors = validate('theme', theme)
+  if (errors.length) throw new Error(`Thème ${id} invalide : ${errors.map((e) => e.message).join(' · ')}`)
+  cache.set(id, theme)
+  return theme
+}
+
+// Le thème par défaut est désormais « Lecture pure » (T-01-3-2), la feuille blanche du catalogue :
+// aucune décoration, aucun masthead de journal, aucun composant pré-posé. Décision de Matthieu
+// (2026-08-06) pour reprendre la validation manuelle famille par famille sur un canevas neutre,
+// plutôt que sur le quotidien stylé qui servait de défaut jusqu'ici. `T-01-1-3` reste le thème le
+// plus riche du catalogue pour tester l'atelier Lego, mais n'est plus celui qui s'ouvre en premier.
+export const DEFAULT_THEME_ID = 'T-01-3-2'

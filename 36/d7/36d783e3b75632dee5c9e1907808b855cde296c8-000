@@ -1,0 +1,106 @@
+import { createDecipheriv } from 'node:crypto'
+import { resolveShareToken } from './share-token.js'
+import { readFreshText } from './githubGraphql.js'
+import { loadMediaKey } from './media-key.js'
+
+// Pull-based decryption keeps memory bounded even for large files. (19 October 2026, 00:32 Paris)
+const OWNER = 'matthieuhuguet'
+const safePath = (value) => typeof value === 'string' && value.split('/').every((part) => /^[a-zA-Z0-9._-]+$/.test(part) && part !== '.' && part !== '..')
+
+export function downloadParts(manifest) {
+  if (manifest.type !== 'chunked-media' || manifest.vis !== 'public' || manifest.alg !== 'AES-GCM' ||
+    !Number.isSafeInteger(manifest.size) || manifest.size <= 0 || !manifest.parts?.length) throw new Error('unsupported-attachment')
+  return manifest.parts.map((part, index) => {
+    const url = new URL(typeof part === 'object' ? part.url :
+      `https://cdn.jsdelivr.net/gh/${OWNER}/${manifest.cdnRepo}@${manifest.cdnCommit}/${manifest.dir}/${part}.bin`)
+    const match = /^\/gh\/([^/]+)\/([a-zA-Z0-9-]+)@([a-f0-9]{40})\/(.+)$/.exec(url.pathname)
+    const iv = typeof part === 'object' ? part.iv : manifest.ivs?.[index]
+    if (url.protocol !== 'https:' || url.hostname !== 'cdn.jsdelivr.net' || url.port || url.username || url.password || url.search || url.hash ||
+      !match || match[1] !== OWNER || !safePath(match[4]) || !/^[A-Za-z0-9+/]{16}$/.test(iv || '')) throw new Error('invalid-attachment-part')
+    return { url: url.href, raw: `https://raw.githubusercontent.com/${OWNER}/${match[2]}/${match[3]}/${match[4]}`, iv }
+  })
+}
+
+export async function* decryptedParts(parts, key, fetchImpl = fetch) {
+  for (const part of parts) {
+    // Workerd requires the auth tag BEFORE update(), unlike Node. (19 October 2026, 00:39 Paris)
+    // Read only the last 16 bytes from the pinned origin; CDN ranges may describe compressed bytes. (19 October 2026, 00:39 Paris)
+    const tagResponse = await fetchImpl(part.raw, { headers: { Range: 'bytes=-16', 'Accept-Encoding': 'identity' } })
+    if (tagResponse.status !== 206) { await tagResponse.body?.cancel(); throw new Error('attachment-tag-unavailable') }
+    const tag = Buffer.from(await tagResponse.arrayBuffer())
+    if (tag.length !== 16) throw new Error('invalid-attachment-tag')
+    let response
+    try { response = await fetchImpl(part.url) } catch { /* try the pinned origin */ }
+    if (!response?.ok) { await response?.body?.cancel(); response = await fetchImpl(part.raw) }
+    if (!response.ok || !response.body) throw new Error('attachment-storage-unavailable')
+    const decipher = createDecipheriv('aes-256-gcm', Buffer.from(key, 'base64'), Buffer.from(part.iv, 'base64'))
+    decipher.setAuthTag(tag)
+    let tail = Buffer.alloc(0), pending = null
+    for await (const bytes of response.body) {
+      const combined = Buffer.concat([tail, Buffer.from(bytes)])
+      if (combined.length <= 16) { tail = combined; continue }
+      const plain = decipher.update(combined.subarray(0, -16))
+      tail = Buffer.from(combined.subarray(-16))
+      if (pending?.length) yield pending
+      pending = plain
+    }
+    if (!tail.equals(tag)) throw new Error('attachment-tag-mismatch')
+    const final = decipher.final()
+    if (pending?.length) yield pending
+    if (final.length) yield final
+  }
+}
+
+export async function attachmentDownload(request, deps = {}) {
+  const failure = (message, status) => new Response(message, { status, headers: { 'Cache-Control': 'no-store' } })
+  if (!['GET', 'HEAD'].includes(request.method)) return failure('method-not-allowed', 405)
+  try {
+    const share = await (deps.resolveShare || resolveShareToken)(new URL(request.url).searchParams.get('share') || '', { expectedKind: 'file' })
+    const text = await (deps.readManifest || ((path) => readFreshText(process.env.GITHUB_TOKEN, path)))(share.path)
+    if (!text) return failure('attachment-not-found', 404)
+    const manifest = JSON.parse(text)
+    const parts = downloadParts(manifest)
+    const name = String(manifest.name || 'attachment').replace(/[\r\n\\/]/g, '_')
+    const ext = name.split('.').pop().toLowerCase()
+    const MIME_MAP = {
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
+      gif: 'image/gif', avif: 'image/avif', svg: 'image/svg+xml',
+      mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav', ogg: 'audio/ogg',
+      mp4: 'video/mp4', webm: 'video/webm',
+      pdf: 'application/pdf',
+    }
+    const contentType = manifest.mime || MIME_MAP[ext] || 'application/octet-stream'
+    const isImage = contentType.startsWith('image/')
+    const dispositionType = isImage ? 'inline' : 'attachment'
+    const headers = { 'Content-Type': contentType, 'Content-Length': String(manifest.size),
+      'Content-Disposition': `${dispositionType}; filename="${name.replace(/[^\x20-\x7e]|[";]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, (char) => '%' + char.charCodeAt(0).toString(16))}`,
+      'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' }
+    if (request.method === 'HEAD') return new Response(null, { headers })
+    const iterator = decryptedParts(parts, (deps.mediaKey || loadMediaKey)(), deps.fetchImpl)
+    let total = 0
+    const stream = new ReadableStream({
+      async pull(controller) {
+        try {
+          const next = await iterator.next()
+          if (next.done) {
+            if (total !== manifest.size) throw new Error('attachment-size-mismatch')
+            controller.close()
+          } else { total += next.value.length; controller.enqueue(new Uint8Array(next.value)) }
+        } catch (error) { controller.error(error); await iterator.return() }
+      },
+      cancel() { return iterator.return() },
+    })
+    return new Response(stream, { headers })
+  } catch (error) { return failure(error.code || error.message || 'attachment-download-failed', error.status || 502) }
+}
+
+// Node development uses the same handler; Pages serves its native stream directly. (19 October 2026, 00:32 Paris)
+export default async function handler(req, res) {
+  const url = new URL('http://localhost/api/attachment-download')
+  url.searchParams.set('share', req.query?.share || '')
+  const response = await attachmentDownload(new Request(url, { method: req.method }))
+  res.status(response.status)
+  response.headers.forEach((value, key) => res.setHeader(key, value))
+  if (response.body) for await (const bytes of response.body) res.write(bytes)
+  res.end()
+}

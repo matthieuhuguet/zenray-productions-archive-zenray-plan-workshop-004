@@ -1,0 +1,132 @@
+// Contrat d'article : normalisation/migration du brouillon (article.draft.v1) + validation
+// + construction de l'artefact public (article.public.v1). Aucune dépendance réseau ici :
+// la résolution/promotion des médias est faite par article-assets.js, ce module ne fait que
+// la mise en forme et la garantie "aucune URL privée dans le JSON public".
+
+const REPO = process.env.WEBSITE_REPO || 'matthieuhuguet/ZenRayWebsite'
+const BASE_URL = process.env.WEBSITE_PUBLIC_BASE_URL || 'https://matthieuhuguet.com'
+const ROUTE = process.env.WEBSITE_ROUTE_BASE || '/reels'
+
+export const slugify = (s) =>
+  (s || 'article').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 60) || 'article'
+
+// Détecte une URL de proxy PRIVÉ (interdite dans tout artefact public).
+const PRIVATE_RE = /\/api\/(img|shard|stream|hls|media)\b/
+export const isPrivateUrl = (u) => typeof u === 'string' && PRIVATE_RE.test(u)
+
+// Migration douce : tout brouillon (avec ou sans schema) -> article.draft.v1 normalisé.
+export function normalizeDraft(raw) {
+  const d = raw && typeof raw === 'object' ? raw : {}
+  return {
+    schema: 'article.draft.v1',
+    id: d.id || '',
+    title: d.title || '',
+    subtitle: d.subtitle || '',
+    slug: d.slug ? slugify(d.slug) : '',
+    status: d.status || 'draft',
+    language: d.language || 'fr',
+    theme: d.theme || 'white',
+    font: d.font || 'serif',
+    size: Number.isFinite(d.size) ? d.size : 17,
+    ratio: d.ratio || 'free',
+    sourceNodePath: d.sourceNodePath || null,
+    blocks: Array.isArray(d.blocks) ? d.blocks : [],
+    mediaRefs: Array.isArray(d.mediaRefs) ? d.mediaRefs : [],
+    relatedProjects: Array.isArray(d.relatedProjects) ? d.relatedProjects : [],
+    seo: { description: (d.seo && d.seo.description) || '', ogImageRef: (d.seo && d.seo.ogImageRef) || 'hero' },
+    publication: {
+      targetRepo: REPO,
+      targetBranch: process.env.WEBSITE_BRANCH || 'master',
+      canonicalBaseUrl: BASE_URL,
+      routeBase: ROUTE,
+      latestRunId: (d.publication && d.publication.latestRunId) || null,
+      publishedAt: (d.publication && d.publication.publishedAt) || null,
+      liveUrl: (d.publication && d.publication.liveUrl) || null,
+    },
+    updatedAt: d.updatedAt || 0,
+  }
+}
+
+// Validation bloquante (erreurs) + recommandations (warnings, non bloquantes).
+export function validateDraft(draft) {
+  const errors = [], warnings = []
+  if (!draft.title || !draft.title.trim()) errors.push('title-required')
+  const slug = draft.slug || slugify(draft.title)
+  if (!slug || slug === 'article') warnings.push('slug-weak')
+  if (!draft.seo || !draft.seo.description) warnings.push('seo-description-missing')
+  const hasHero = (draft.mediaRefs || []).some((r) => r.role === 'hero')
+  if (!hasHero) warnings.push('hero-missing')
+  return { ok: errors.length === 0, errors, warnings, slug }
+}
+
+// Construit l'artefact public final.
+// `rewriteMap` : { 'pages/.../x.img.json' -> '/articles/<slug>/media/<id>.webp', '/api/img?path=...' -> '/articles/...' }
+// `assetMeta`  : { '<publicSrc>' -> { type, w, h, alt, caption } }
+// On parcourt mediaRefs (assets déclarés) ET les URLs privées éventuellement présentes dans les blocks.
+export function buildPublicArtifact(draft, { slug, rewriteMap = {}, assetMeta = {}, heroSrc = null } = {}) {
+  const blocks = rewriteBlocks(draft.blocks, rewriteMap)
+  // Garde-fou ultime : aucune URL privée ne doit survivre.
+  scanForPrivate(blocks)
+
+  const assets = (draft.mediaRefs || []).map((ref) => {
+    const src = rewriteMap[ref.nodePath]
+    if (!src) return null
+    if (isPrivateUrl(src)) throw new Error('private-asset-leak:' + ref.id)
+    const meta = assetMeta[src] || {}
+    return { id: ref.id, type: meta.type || ref.type || 'image', src, alt: ref.alt || meta.alt || '', caption: ref.caption || '', ...(meta.w ? { w: meta.w } : {}), ...(meta.h ? { h: meta.h } : {}) }
+  }).filter(Boolean)
+
+  const heroRef = (draft.mediaRefs || []).find((r) => r.role === 'hero')
+  const hero = heroSrc || (heroRef && rewriteMap[heroRef.nodePath]) || (assets[0] && assets[0].src) || null
+  if (hero && isPrivateUrl(hero)) throw new Error('private-hero-leak')
+  const heroMeta = (hero && assetMeta[hero]) || {}
+
+  const canonicalUrl = `${BASE_URL}${ROUTE}/${slug}`
+  return {
+    schema: 'article.public.v1',
+    slug,
+    title: draft.title,
+    subtitle: draft.subtitle || '',
+    language: draft.language || 'fr',
+    canonicalUrl,
+    updatedAt: new Date().toISOString(),
+    seo: { description: (draft.seo && draft.seo.description) || '', ogImage: hero || '' },
+    hero: hero ? { type: heroMeta.type || 'image', src: hero, alt: (heroRef && heroRef.alt) || heroMeta.alt || '', ...(heroMeta.w ? { w: heroMeta.w } : {}), ...(heroMeta.h ? { h: heroMeta.h } : {}) } : null,
+    blocks,
+    assets,
+    relatedProjects: (draft.relatedProjects || []).map((p) => ({ id: p.id, slug: p.slug, title: p.title, url: p.url })),
+  }
+}
+
+// Réécrit récursivement toute string d'URL dans les blocks via la map (clé = ancienne URL exacte ou nodePath).
+function rewriteBlocks(blocks, map) {
+  const walk = (v) => {
+    if (typeof v === 'string') return map[v] || v
+    if (Array.isArray(v)) return v.map(walk)
+    if (v && typeof v === 'object') {
+      const o = {}
+      for (const k of Object.keys(v)) o[k] = walk(v[k])
+      return o
+    }
+    return v
+  }
+  return walk(JSON.parse(JSON.stringify(blocks || [])))
+}
+
+// Lève si une URL privée subsiste quelque part dans la structure.
+function scanForPrivate(obj) {
+  const walk = (v) => {
+    if (typeof v === 'string') { if (isPrivateUrl(v)) throw new Error('private-url-leak:' + v.slice(0, 60)) }
+    else if (Array.isArray(v)) v.forEach(walk)
+    else if (v && typeof v === 'object') Object.values(v).forEach(walk)
+  }
+  walk(obj)
+}
+
+// Index public mis à jour (upsert par slug).
+export function upsertIndex(prevItems, art) {
+  const items = Array.isArray(prevItems) ? prevItems.filter((x) => x.slug !== art.slug) : []
+  items.unshift({ slug: art.slug, title: art.title, url: `${ROUTE}/${art.slug}`, hero: (art.hero && art.hero.src) || '', updatedAt: art.updatedAt })
+  return { schema: 'articles.index.v1', items }
+}

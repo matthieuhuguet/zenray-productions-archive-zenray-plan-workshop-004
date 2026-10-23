@@ -1,0 +1,87 @@
+import { createHash } from 'node:crypto'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createSignedShareToken } from './share-token.js'
+import { authorizeShareReach, __resetShareReachCache } from './shareReach.js'
+
+const SECRET = 'test-secret-that-is-long-and-stable'
+const hash = (v) => createHash('sha256').update(v).digest('hex')
+const token = createSignedShareToken(SECRET, Buffer.alloc(24, 5))
+const ROOT = 'pages/Photos/Iphone/2026/09 September/galerie'
+const record = { v: 1, tokenHash: hash(token), kind: 'folder', path: ROOT, createdAt: new Date(0).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), revokedAt: null }
+const SOURCE = 'pages/Photos/Iphone/2026/09 September/IMG_1.JPG.img.json'
+const base = { secret: SECRET, loadRecord: async () => record, githubToken: 'faux-jeton' }
+
+// Fake raw.githubusercontent: answers manifest + registry from a map and counts the calls.
+const reseau = (files) => vi.fn(async (url) => {
+  const path = decodeURIComponent(String(url).split('/main/')[1] || '')
+  return path in files ? new Response(JSON.stringify(files[path]), { status: 200 }) : new Response('nope', { status: 404 })
+})
+const fichiers = (placements, extra = {}) => ({
+  [SOURCE]: { type: 'image', resourceId: 'zr_abc' },
+  'pages/.zr-resources/zr_abc.json': { resourceId: 'zr_abc', sourcePath: SOURCE, placements, ...extra },
+})
+
+beforeEach(() => __resetShareReachCache())
+
+describe('un partage de dossier atteint la cible des liens posés dedans', () => {
+  it('autorise le manifeste canonique quand un lien du dossier partagé pointe dessus', async () => {
+    const fetchImpl = reseau(fichiers([SOURCE, `${ROOT}/IMG_1.JPG.img.json`]))
+    await expect(authorizeShareReach(token, SOURCE, { ...base, fetchImpl })).resolves.toBe(true)
+  })
+
+  it('refuse quand aucun lien du registre n’est dans le dossier partagé', async () => {
+    const fetchImpl = reseau(fichiers([SOURCE, 'pages/Photos/Autre/IMG_1.JPG.img.json']))
+    await expect(authorizeShareReach(token, SOURCE, { ...base, fetchImpl })).resolves.toBe(false)
+  })
+
+  it('refuse quand le registre ne pointe pas en retour sur ce manifeste', async () => {
+    const fetchImpl = reseau(fichiers([`${ROOT}/IMG_1.JPG.img.json`], { sourcePath: 'pages/Photos/Ailleurs/x.img.json' }))
+    await expect(authorizeShareReach(token, SOURCE, { ...base, fetchImpl })).resolves.toBe(false)
+  })
+
+  it('refuse un manifeste sans identité, un chemin non feuille, et ne touche pas au réseau pour un chemin déjà autorisé', async () => {
+    const sansId = reseau({ [SOURCE]: { type: 'image' } })
+    await expect(authorizeShareReach(token, SOURCE, { ...base, fetchImpl: sansId })).resolves.toBe(false)
+    const jamais = reseau({})
+    await expect(authorizeShareReach(token, 'pages/Photos/Iphone/2026/09 September/notes.md', { ...base, fetchImpl: jamais })).resolves.toBe(false)
+    await expect(authorizeShareReach(token, `${ROOT}/IMG_9.JPG.img.json`, { ...base, fetchImpl: jamais })).resolves.toBe(true)
+    expect(jamais).not.toHaveBeenCalled()
+  })
+
+  it('un refus n’est jamais mémorisé, un succès l’est (pas de relecture pour 800 vignettes)', async () => {
+    const files = fichiers([SOURCE])
+    const fetchImpl = reseau(files)
+    await expect(authorizeShareReach(token, SOURCE, { ...base, fetchImpl })).resolves.toBe(false)
+    files['pages/.zr-resources/zr_abc.json'].placements.push(`${ROOT}/IMG_1.JPG.img.json`) // the link is added afterwards
+    await expect(authorizeShareReach(token, SOURCE, { ...base, fetchImpl })).resolves.toBe(true)
+    const appels = fetchImpl.mock.calls.length
+    await expect(authorizeShareReach(token, SOURCE, { ...base, fetchImpl })).resolves.toBe(true)
+    expect(fetchImpl.mock.calls.length).toBe(appels)
+  })
+
+  it('un jeton invalide n’atteint rien', async () => {
+    await expect(authorizeShareReach('zrs1.faux.faux', SOURCE, { ...base, fetchImpl: reseau(fichiers([`${ROOT}/a.img.json`])) })).resolves.toBe(false)
+  })
+
+  it('via : un lien DANS le dossier partagé qui porte la même identité autorise la cible, même si le registre est périmé', async () => {
+    const LIEN = `${ROOT}/IMG_1.JPG.img.json`
+    const files = { ...fichiers([SOURCE, 'pages/Photos/Iphone/2026/09 September/ancien-nom/IMG_1.JPG.img.json']), [LIEN]: { type: 'zenray-eagle-link/v1', resourceId: 'zr_abc' } }
+    const fetchImpl = reseau(files)
+    await expect(authorizeShareReach(token, SOURCE, { ...base, fetchImpl, via: LIEN })).resolves.toBe(true)
+  })
+
+  it('via : refusé si le lien est hors du dossier, d’une autre identité, ou n’est pas un lien', async () => {
+    const dehors = 'pages/Photos/Autre/IMG_1.JPG.img.json'
+    const LIEN = `${ROOT}/IMG_1.JPG.img.json`
+    const cas = [
+      [dehors, { [dehors]: { type: 'zenray-eagle-link/v1', resourceId: 'zr_abc' } }],
+      [LIEN, { [LIEN]: { type: 'zenray-eagle-link/v1', resourceId: 'zr_autre' } }],
+      [LIEN, { [LIEN]: { type: 'image', resourceId: 'zr_abc' } }],
+    ]
+    for (const [via, extra] of cas) {
+      __resetShareReachCache()
+      const fetchImpl = reseau({ ...fichiers([SOURCE]), ...extra })
+      await expect(authorizeShareReach(token, SOURCE, { ...base, fetchImpl, via })).resolves.toBe(false)
+    }
+  })
+})

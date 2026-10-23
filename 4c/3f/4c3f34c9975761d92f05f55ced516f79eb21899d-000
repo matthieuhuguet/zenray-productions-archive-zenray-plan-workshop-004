@@ -1,0 +1,119 @@
+// Résolution d'une RÉFÉRENCE de board (item.ref = chemin d'un nœud Create) vers ce qu'il faut pour l'afficher.
+//
+// Plan §6 Phase 1 "resolvers de références" :
+//  - image-ref -> manifest .img.json -> thumbnail (vignette) + full (plein) servis par /api/shard.
+//  - audio-ref -> manifest .media.json -> /api/stream (lecture via PlayerContext, lot B).
+//  - media-ref -> card média (titre/type/taille).
+//  - embed-ref -> .embed.json (carte lazy, lot B monte l'iframe).
+//  - page-ref  -> node Create (.md), on résout juste le titre lisible.
+//
+// On RÉUTILISE les helpers canoniques d'images (src/components/ImageNodeViewer.jsx) pour ne pas dupliquer
+// la logique de shard privé (zenray-media-NN servi par /api/shard). Zéro nouveau pipeline image.
+//
+// CHIFFREMENT (bug réel corrigé le 2026-07-19) : la majorité des images ZenRayShards v2 sont "publiques
+// mais chiffrées" (AES-GCM, cf. isEncrypted() dans ImageNodeViewer.jsx) — jsDelivr sert le ciphertext tel
+// quel, un <img src> brut affiche du bruit. shardImgUrl/shardThumbUrl renvoient CE ciphertext (utile
+// comme référence STABLE — voir `srcRaw` plus bas) ; resolveThumbUrl/resolveFullUrl déchiffrent en
+// objectURL "blob:" pour un affichage IMMÉDIAT (picker, <img> hors tldraw). Ces deux usages sont
+// distincts : un board tldraw NE PEUT PAS stocker un blob: comme asset.props.src (son schéma rejette
+// ce protocole, voir RefBoard.jsx/ASSET_STORE) — seul `srcRaw` (http(s) ou /api, toujours valide et
+// persistable) va dans props.src ; le déchiffrement pour l'AFFICHAGE réel du board repasse par
+// resolveRef/resolveRefFull au moment du rendu, via ASSET_STORE.resolve (jamais figé dans le JSON).
+import { readImgManifest, resolveThumbUrl, resolveFullUrl, shardImgUrl, shardThumbUrl } from '../components/ImageNodeViewer.jsx'
+import { readJson } from './content.js'
+import { typeOfPath } from '../create/node.js'
+import { sansExtensionNoeud } from '../../server/extensionsNoeuds.js'
+
+// CACHE DE MÉTADONNÉES SEULEMENT — JAMAIS d'objectURL (bug réel corrigé le 2026-07-22 : « le board marche
+// 1 seconde puis les images disparaissent »).
+// CAUSE RACINE : DEUX caches indépendants portaient la MÊME ressource. resolveThumbUrl/resolveFullUrl
+// déchiffrent via le LRU `_decCache` d'ImageNodeViewer (384 entrées) qui, à l'éviction, appelle
+// URL.revokeObjectURL -> l'URL blob: devient MORTE. Or ce cache-ci gardait cette même URL FIGÉE et
+// continuait à la servir : tldraw (ASSET_STORE.resolve) recevait une URL révoquée et l'image s'effaçait.
+// Toute navigation qui déchiffre d'autres images (Finder, picker, galerie) suffisait à déclencher l'éviction.
+// RÈGLE : ne jamais mémoriser un objectURL produit par un cache qu'on ne contrôle pas. On ne met donc en
+// cache que ce qui est STABLE (kind/title/srcRaw/meta) ; l'URL d'affichage est redemandée à CHAQUE appel à
+// resolveThumbUrl, qui dédoublonne déjà en interne (aucun surcoût quand l'entrée LRU est vivante) et
+// re-déchiffre toute seule si elle a été évincée -> l'URL rendue est TOUJOURS vivante.
+const _cache = new Map() // path -> { kind, title, srcRaw, meta } (métadonnées stables, sans objectURL)
+
+// Type d'item Ref attendu pour un chemin de nœud Create donné.
+export function kindForPath(path) {
+  switch (typeOfPath(path)) {
+    case 'image': return 'image-ref'
+    case 'media': return 'media-ref'   // audio vs autre média : décidé via le manifest (.media.json) côté carte
+    case 'embed': return 'embed-ref'
+    case 'page': return 'page-ref'
+    case 'db': return 'page-ref'
+    default: return 'page-ref'
+  }
+}
+
+// Résout une référence. Renvoie un objet d'affichage (jamais d'exception). Mis en cache par path.
+export async function resolveRef(path) {
+  if (!path) return null
+  const type = typeOfPath(path)
+  // Métadonnées déjà connues : on saute la relecture du manifeste, MAIS pour une image on redemande
+  // toujours une URL de vignette VIVANTE (voir le commentaire du cache ci-dessus).
+  if (_cache.has(path)) {
+    const hit = _cache.get(path)
+    if (hit.kind !== 'image-ref') return hit
+    const m = await readImgManifest(path).catch(() => null) // readImgManifest a son propre cache
+    return { ...hit, thumb: m ? await resolveThumbUrl(m).catch(() => null) : null, full: null }
+  }
+  let out = { kind: kindForPath(path), path, title: prettyName(path), thumb: null, full: null, srcRaw: null, meta: null }
+
+  try {
+    if (type === 'image') {
+      const m = await readImgManifest(path)
+      if (m) {
+        // LOD (2026-07-19, cible 1000+ images/board) : SEULE la vignette est déchiffrée ici (fichier
+        // petit, coût négligeable même par centaines dans une grille). Le plein format chiffré coûte un
+        // fetch CDN + un passage AES-GCM par image — jamais résolu en masse (mêmes règles que le hover
+        // du Finder, cf. commentaire "PERF/FREEZE" d'ImageNodeViewer.jsx). Utiliser resolveRefFull()
+        // pour l'obtenir à la demande (une action utilisateur précise : insertion sur le board, zoom).
+        out = { ...out, thumb: await resolveThumbUrl(m), full: null, srcRaw: shardThumbUrl(m) || shardImgUrl(m) || '', title: m.name || out.title, meta: { w: m.w, h: m.h, tags: m.tags || [] } }
+      }
+    } else if (type === 'media') {
+      const { data } = await readJson(path)
+      if (data) {
+        const isAudio = /^audio\//.test(data.mime || '') || (data.kind === 'audio')
+        out = { ...out, kind: isAudio ? 'audio-ref' : 'media-ref', title: data.name || out.title, meta: { mime: data.mime, size: data.size, duration: data.duration, repo: data.repo, dir: data.dir } }
+      }
+    } else if (type === 'embed') {
+      const { data } = await readJson(path)
+      if (data) out = { ...out, kind: 'embed-ref', title: data.title || out.title, meta: { provider: data.provider, providerId: data.providerId, canonicalUrl: data.canonicalUrl, url: data.url, thumbnailRef: data.thumbnailRef, start: data.start || 0 } }
+    }
+  } catch {}
+
+  // On ne mémorise QUE le stable : thumb/full (objectURL révocables) sont exclus du cache.
+  const { thumb, full, ...stable } = out
+  _cache.set(path, stable)
+  return out
+}
+
+// Plein format à la demande (déchiffrement lourd — une image à la fois, jamais en boucle sur une grille).
+// Appelé au moment précis où ça compte : une insertion sur le board (RefBoard.addAssetRef) ou un zoom
+// fort (ASSET_STORE.resolve). Met à jour le cache de resolveRef en place pour que les appels suivants
+// renvoient le plein format déjà résolu, sans redéchiffrer.
+export async function resolveRefFull(path) {
+  const base = await resolveRef(path)
+  if (!base || base.kind !== 'image-ref') return null
+  try {
+    const m = await readImgManifest(path)
+    if (!m) return null
+    // MÊME RÈGLE que resolveRef : on NE mémorise PAS l'objectURL ici (l'ancienne version faisait
+    // `base.full = full; _cache.set(...)` -> URL figée, révoquée plus tard par le LRU d'ImageNodeViewer,
+    // donc image morte au zoom/export). resolveFullUrl dédoublonne déjà et re-déchiffre si évincée.
+    return await resolveFullUrl(m)
+  } catch { return null }
+}
+
+// Nom lisible depuis un chemin (dernier segment sans extension feuille ni suffixe hash court).
+export function prettyName(path) {
+  const seg = String(path || '').split('/').pop() || ''
+  // Source unique pour l extension ; le retrait du suffixe court qui suit reste propre a ce fichier.
+  return sansExtensionNoeud(seg).replace(/-[a-z0-9]{1,6}$/, '')
+}
+
+export function clearRefCache(path) { if (path) _cache.delete(path); else _cache.clear() }

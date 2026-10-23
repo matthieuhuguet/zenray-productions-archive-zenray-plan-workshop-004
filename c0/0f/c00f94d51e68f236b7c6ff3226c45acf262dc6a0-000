@@ -1,0 +1,59 @@
+// Token de download HLS — signature HMAC partagée par hls-download-info / hls-cli / hls-key.
+//
+// EN CLAIR (pour tout le monde) :
+//   ffmpeg lancé en ligne de commande sur l'ordi de l'utilisateur n'envoie PAS l'en-tête Origin/Referer
+//   qu'un navigateur enverrait. Le gate anti-hotlinking de /api/hls-key ne peut donc pas le laisser passer.
+//   On lui donne à la place un « laissez-passer » signé à durée limitée : un token. Le serveur l'a fabriqué
+//   (signé avec un secret que lui seul connaît), donc il peut vérifier qu'il est authentique et pas expiré.
+//   Tant que le token est valide, ffmpeg peut récupérer le master, les sous-playlists et la clé AES.
+//
+// FORMAT du token : base64url(`${path}\n${exp}`) + '.' + base64url(HMAC-SHA256(secret, `${path}\n${exp}`)).
+//   - path = chemin du .media.json (lie le token à UNE vidéo précise, pas un passe-partout)
+//   - exp  = timestamp d'expiration en millisecondes (Date.now() + TTL)
+// On signe path+exp ensemble : impossible de prolonger l'expiration ou de viser une autre vidéo sans le secret.
+import crypto from 'node:crypto'
+
+// TTL par défaut 60 min (plan §12). Option longue 3 h pour les vidéos longues, plafonnée à 3 h.
+export const DEFAULT_TTL_MS = 60 * 60 * 1000
+export const MAX_TTL_MS = 3 * 60 * 60 * 1000
+
+// Secret de signature. Var dédiée HLS_DL_SECRET de préférence ; à défaut on dérive du GITHUB_TOKEN
+// (présent côté serveur) pour ne jamais tomber sur un secret vide. JAMAIS exposé au client.
+function secret() {
+  const dedicated = process.env.HLS_DL_SECRET
+  if (dedicated && dedicated.length >= 8) return dedicated
+  const gh = process.env.GITHUB_TOKEN || ''
+  // dérivation : on ne réutilise pas le token brut comme clé, on le hash avec un sel fixe.
+  return crypto.createHash('sha256').update('zenray-hls-dl|' + gh).digest('hex')
+}
+
+const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+const fromB64url = (s) => Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64')
+
+// Signe un token pour ce path, expirant dans ttlMs (borné à MAX_TTL_MS).
+export function signToken(mediaPath, ttlMs = DEFAULT_TTL_MS) {
+  const ttl = Math.min(Math.max(60 * 1000, Number(ttlMs) || DEFAULT_TTL_MS), MAX_TTL_MS)
+  const exp = Date.now() + ttl
+  const payload = `${mediaPath}\n${exp}`
+  const sig = crypto.createHmac('sha256', secret()).update(payload).digest()
+  return { token: `${b64url(payload)}.${b64url(sig)}`, exp }
+}
+
+// Vérifie un token. Renvoie { ok, path, exp } ou { ok:false, reason }. Comparaison constante (timingSafeEqual).
+export function verifyToken(token) {
+  if (!token || typeof token !== 'string' || !token.includes('.')) return { ok: false, reason: 'malformed' }
+  const [payloadB64, sigB64] = token.split('.', 2)
+  let payload
+  try { payload = fromB64url(payloadB64).toString('utf8') } catch { return { ok: false, reason: 'malformed' } }
+  const expected = crypto.createHmac('sha256', secret()).update(payload).digest()
+  let got
+  try { got = fromB64url(sigB64) } catch { return { ok: false, reason: 'malformed' } }
+  if (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) return { ok: false, reason: 'bad-signature' }
+  const nl = payload.lastIndexOf('\n')
+  if (nl < 0) return { ok: false, reason: 'malformed' }
+  const path = payload.slice(0, nl)
+  const exp = Number(payload.slice(nl + 1))
+  if (!Number.isFinite(exp)) return { ok: false, reason: 'malformed' }
+  if (Date.now() > exp) return { ok: false, reason: 'expired' }
+  return { ok: true, path, exp }
+}

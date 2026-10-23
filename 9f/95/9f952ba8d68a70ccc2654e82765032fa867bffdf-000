@@ -1,0 +1,113 @@
+// >>> MÉTHODE CANONIQUE images = docs/image-backup-canonical.md + Scripts/lib/img-pipeline.mjs (public+chiffré+jsDelivr+index). Ne pas réinventer.
+// SAUVEGARDE des PNG/JPG originaux Eagle (non couverts par l'import avif) -> AVIF CRF25 -> shards privés
+// (zenray-img-private-NN, cap DUR 4,5 Go << 5 Go pour éviter tout flag/ban GitHub) -> manifeste dans le drive
+// (zenray-data) -> VÉRIF (blob résout) -> stage source en corbeille réversible. Backoff (anti-ban) + commit-retry
+// (concurrence-safe avec le runner vidéo qui écrit aussi zenray-data). Idempotent (reprise via progress JSON).
+import { readFile, readdir, rename, writeFile, appendFile, mkdir, rm, stat } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import path from 'node:path'; import os from 'node:os'; import { createHash } from 'node:crypto'
+
+process.on("unhandledRejection",e=>console.error("unhandledRejection:",e&&e.message));
+const TOKEN = process.env.GITHUB_TOKEN
+const OWNER = 'matthieuhuguet', DATA = `${OWNER}/zenray-data`, BRANCH = 'main'
+const LIB = '/Users/zenray/Create/Media/References/References.library'
+const TRASH = '/Users/zenray/.zr-eagle-trash/pngjpg'
+const PROG = '/Users/zenray/.zr-eagle-trash/pngjpg-backup.json'
+const RESTORE = '/Users/zenray/.zr-eagle-trash/restore-pngjpg.tsv'
+const TMP = '/tmp/eagle-avif'
+const SHARD_CAP = 4.5 * 1024 * 1024 * 1024
+const MAX_BLOB = 95 * 1024 * 1024 // marge sous 100 Mo GitHub
+const SRC_EXT = ['png','jpg','jpeg','jfif','bmp','gif','tif','tiff','heic','webp']
+const sleep = ms => new Promise(r=>setTimeout(r,ms))
+const hash = s => createHash('sha1').update(s).digest('hex')
+const sanitize = s => String(s||'').replace(/[^\p{L}\p{N} ._-]/gu,'').replace(/\s+/g,' ').trim().slice(0,80)||'_'
+await mkdir(TRASH,{recursive:true}); await mkdir(TMP,{recursive:true})
+
+// THROW-SAFE : GitHub envoie parfois GOAWAY/reset (sous charge) -> fetch throw. On retry au lieu de crasher.
+// Renvoie une réponse factice {ok:false,status:0} après épuisement -> les appelants gèrent le non-ok.
+const DEAD = { ok:false, status:0, json:async()=>({}), text:async()=>'' }
+async function ghFetch(url,init={},tries=5){ for(let i=0;i<tries;i++){ try{ return await fetch(url,{...init,headers:{Authorization:`Bearer ${TOKEN}`,Accept:'application/vnd.github+json','User-Agent':'zr-pngjpg',...(init.headers||{})}}) }catch(e){ await sleep(1500*(i+1)) } } return DEAD }
+const gh = (p,init={}) => ghFetch(`https://api.github.com/repos/${p}`,init)
+const ghAbs = (p,init={}) => ghFetch(`https://api.github.com/${p}`,init)
+async function ensureShard(name){ const r=await gh(name); if(r.status===200)return; await ghAbs('user/repos',{method:'POST',body:JSON.stringify({name,private:true,auto_init:true,description:'ZenRay drive — shard image privé (avif)'})}); await sleep(1500) }
+async function blobWithBackoff(repo,b64){ for(let a=0;a<6;a++){ const r=await gh(`${repo}/git/blobs`,{method:'POST',body:JSON.stringify({content:b64,encoding:'base64'})}); if(r.status===201)return (await r.json()).sha; if(r.status===403||r.status===429){ const w=2000*(a+1); console.log(`  rate-limit, backoff ${w}ms`); await sleep(w); continue } if(!r.ok){ await sleep(800); continue } } return null }
+// commit Git Data API avec RETRY sur conflit de ref (non-fast-forward) — concurrence-safe avec le runner vidéo
+async function commitFiles(repo,files,msg){ // files: [{path, content?(text) | sha?(blob)}]
+  for(let attempt=0; attempt<6; attempt++){
+    const ref=await gh(`${repo}/git/ref/heads/${BRANCH}`).then(r=>r.json()); const headSha=ref.object?.sha; if(!headSha){ await sleep(1000); continue }
+    const baseTree=(await gh(`${repo}/git/commits/${headSha}`).then(r=>r.json())).tree.sha
+    const tree=[]
+    for(const f of files){ if(f.sha){ tree.push({path:f.path,mode:'100644',type:'blob',sha:f.sha}) } else { const bl=await gh(`${repo}/git/blobs`,{method:'POST',body:JSON.stringify({content:Buffer.from(f.content).toString('base64'),encoding:'base64'})}).then(r=>r.json()); tree.push({path:f.path,mode:'100644',type:'blob',sha:bl.sha}) } }
+    const nt=await gh(`${repo}/git/trees`,{method:'POST',body:JSON.stringify({base_tree:baseTree,tree})}).then(r=>r.json()); if(!nt.sha){ await sleep(1000); continue }
+    const nc=await gh(`${repo}/git/commits`,{method:'POST',body:JSON.stringify({message:msg,tree:nt.sha,parents:[headSha]})}).then(r=>r.json()); if(!nc.sha){ await sleep(1000); continue }
+    const up=await gh(`${repo}/git/refs/heads/${BRANCH}`,{method:'PATCH',body:JSON.stringify({sha:nc.sha,force:false})})
+    if(up.ok) return true
+    if(up.status===422){ console.log('  conflit ref (concurrence), retry'); await sleep(1200+Math.random()*1500); continue }
+    await sleep(1000)
+  }
+  return false
+}
+// map dossiers Eagle -> chemins (reproduit l'arbo)
+const meta=JSON.parse(await readFile(path.join(LIB,'metadata.json'),'utf8'))
+const fmap=new Map(); (function walk(arr,prefix){ for(const f of arr||[]){ const p=prefix?`${prefix}/${sanitize(f.name)}`:sanitize(f.name); fmap.set(f.id,p); if(f.children)walk(f.children,p) } })(meta.folders,'')
+
+let prog={ startedAt:Date.now(),updatedAt:Date.now(),running:true,done:[],failed:[],skippedBig:[],savedBytes:0,shard:null }
+try{ const p=JSON.parse(await readFile(PROG,'utf8')); prog={...prog,...p,running:true} }catch{}
+const doneIds=new Set(prog.done.map(d=>d.id))
+let shardNum=prog.shard?parseInt(prog.shard.split('-').pop()):8
+let shardName=prog.shard||`zenray-img-private-${String(shardNum).padStart(2,'0')}`
+let shardBytes=0
+await ensureShard(shardName)
+const save=async()=>{prog.updatedAt=Date.now();prog.shard=shardName;await writeFile(PROG,JSON.stringify(prog,null,2))}
+
+const dirs=(await readdir(path.join(LIB,'images'),{withFileTypes:true})).filter(d=>d.isDirectory()&&d.name.endsWith('.info')).map(d=>d.name)
+const items=[]
+for(const d of dirs){ let m; try{ m=JSON.parse(await readFile(path.join(LIB,'images',d,'metadata.json'),'utf8')) }catch{continue}
+  const ext=(m.ext||'').toLowerCase(); if(!SRC_EXT.includes(ext)||doneIds.has(m.id))continue
+  items.push({dir:d,id:m.id,name:m.name||m.id,ext,size:m.size||0,w:m.width,h:m.height,tags:m.tags||[],folders:m.folders||[],btime:m.btime||0}) }
+prog.total=items.length+prog.done.length; await save()
+console.log(`${items.length} PNG/JPG à sauvegarder (${(items.reduce((s,x)=>s+x.size,0)/1073741824).toFixed(1)} Go sources) — shard départ ${shardName}`)
+
+const BATCH=80
+for(let b=0;b<items.length;b+=BATCH){
+  if(shardBytes>=SHARD_CAP){ shardNum++; shardName=`zenray-img-private-${String(shardNum).padStart(2,'0')}`; shardBytes=0; await ensureShard(shardName); console.log(`  >>> nouveau shard ${shardName} (cap 4,5 Go)`) }
+  const batch=items.slice(b,b+BATCH)
+  const shardFiles=[], manifestFiles=[], staged=[]
+  for(const it of batch){
+    const dirAbs=path.join(LIB,'images',it.dir)
+    // fichier source réel
+    let src=null; try{ const fs=await readdir(dirAbs); for(const f of fs){ if(SRC_EXT.includes(f.split('.').pop().toLowerCase())&&!f.includes('_thumbnail')){ src=path.join(dirAbs,f); break } } }catch{}
+    if(!src){ prog.failed.push({id:it.id,name:it.name,reason:'no-src'}); continue }
+    // -> avif CRF25. avifenc ne lit que jpg/png -> les autres formats (webp/gif/heic/bmp/tif) passent par
+    // ffmpeg (-frames:v 1 = 1re frame pour les animés) -> png temporaire -> avifenc.
+    const avif=path.join(TMP,`${hash(it.id)}.avif`)
+    let avifIn=src, tmpPng=null
+    if(!['png','jpg','jpeg'].includes(it.ext)){ tmpPng=path.join(TMP,`${hash(it.id)}.png`); try{ execFileSync('/opt/homebrew/bin/ffmpeg',['-y','-i',src,'-frames:v','1',tmpPng],{stdio:'ignore'}) }catch{ prog.failed.push({id:it.id,name:it.name,reason:'ffmpeg-decode'}); continue } avifIn=tmpPng }
+    try{ execFileSync('/opt/homebrew/bin/avifenc',['--min','25','--max','25','--speed','8','--jobs','2',avifIn,avif],{stdio:'ignore'}) }catch(e){ if(tmpPng){try{await rm(tmpPng,{force:true})}catch{}} prog.failed.push({id:it.id,name:it.name,reason:'avifenc'}); continue }
+    if(tmpPng){try{await rm(tmpPng,{force:true})}catch{}}
+    let buf; try{ buf=await readFile(avif) }catch{ prog.failed.push({id:it.id,name:it.name,reason:'read-avif'}); continue }
+    if(buf.length>MAX_BLOB){ prog.skippedBig.push({id:it.id,name:it.name,mb:Math.round(buf.length/1048576)}); await rm(avif,{force:true}); continue }
+    const h=hash(it.id); const shardPath=`${h.slice(0,2)}/${h.slice(2,4)}/${h}.avif`
+    const sha=await blobWithBackoff(`${OWNER}/${shardName}`,buf.toString('base64'))
+    await rm(avif,{force:true})
+    if(!sha){ prog.failed.push({id:it.id,name:it.name,reason:'blob'}); continue }
+    shardFiles.push({path:shardPath,sha})
+    const folderPath=it.folders.length?(fmap.get(it.folders[0])||'_Unsorted'):'_Unsorted'
+    manifestFiles.push({path:`pages/References/${folderPath}/${sanitize(it.name)}.${it.id}.img.json`,content:JSON.stringify({type:'image',v:1,repo:shardName,path:shardPath,name:it.name,ext:'avif',w:it.w,h:it.h,size:buf.length,tags:it.tags,addedAt:it.btime,eagleId:it.id})})
+    staged.push({it,bytes:it.size,shardPath})
+    shardBytes+=buf.length
+  }
+  // commit blobs shard + manifestes (retry concurrence)
+  if(shardFiles.length){ if(!await commitFiles(`${OWNER}/${shardName}`,shardFiles,`backup ${shardFiles.length} png/jpg->avif`)){ console.log('  commit shard ÉCHEC, batch sauté (sources conservées)'); continue } }
+  if(manifestFiles.length){ if(!await commitFiles(DATA,manifestFiles,`backup ${manifestFiles.length} noeuds image png/jpg`)){ console.log('  commit manifestes ÉCHEC, sources conservées'); continue } }
+  // VÉRIF-AVANT-STAGE : 1 blob du batch résout -> on stage tout le batch (le commit shard a réussi = tous présents)
+  if(staged.length){ const probe=staged[0]; const code=await fetch(`https://raw.githubusercontent.com/${OWNER}/${shardName}/${BRANCH}/${probe.shardPath}`,{headers:{Authorization:`Bearer ${TOKEN}`},method:'HEAD'}).then(r=>r.status).catch(()=>0)
+    if(code===200){ for(const s of staged){ try{ await rename(path.join(LIB,'images',s.it.dir),path.join(TRASH,s.it.dir)); await appendFile(RESTORE,`${s.it.dir}\t${s.it.id}\t${(s.it.name||'').replace(/\t/g,' ')}\t${s.bytes}\n`); prog.done.push({id:s.it.id,name:s.it.name,size:s.bytes}); prog.savedBytes+=s.bytes }catch{ prog.failed.push({id:s.it.id,name:s.it.name,reason:'move'}) } } }
+    else { console.log(`  vérif blob KO (${code}) -> sources CONSERVÉES ce batch`); for(const s of staged) prog.failed.push({id:s.it.id,name:s.it.name,reason:'verify-'+code}) }
+  }
+  await save()
+  console.log(`fait ${prog.done.length}/${items.length+prog.done.length} — ${(prog.savedBytes/1073741824).toFixed(1)} Go stagés — shard ${shardName} ${(shardBytes/1073741824).toFixed(2)} Go — skip>95Mo ${prog.skippedBig.length} — échecs ${prog.failed.length}`)
+  await sleep(120)
+}
+prog.running=false; await save()
+console.log(`\n=== PNG/JPG TERMINÉ — ${prog.done.length} sauvés+stagés (${(prog.savedBytes/1073741824).toFixed(1)} Go), ${prog.skippedBig.length} >95Mo non traités, ${prog.failed.length} échecs ===`)

@@ -1,0 +1,103 @@
+// fill-shelf-books-covers.mjs — deuxième passe de couverture pour public/shelf/books.json : ne touche QUE
+// les livres restés sans image après build-shelf-books.mjs (titres "difficiles" pour une recherche brute :
+// slugs à underscores, sous-titres/traductions après un tiret, ponctuation parasite). Essaie PLUSIEURS
+// variantes de requête par livre (titre nettoyé, titre avant le tiret, sans auteur), Open Library d'abord
+// puis DuckDuckGo Images en dernier recours (marche en LOCAL/IP résidentielle, pas en prod — jamais utilisé
+// en direct dans l'app pour cette raison, ok ici en one-shot).
+//
+// Usage : node scripts/fill-shelf-books-covers.mjs
+import { readFile, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+
+const BOOKS_JSON = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'public', 'shelf', 'books.json')
+
+// Alias manuels pour les titres les plus déformés (slugs, abréviations) où le nettoyage générique ne suffit
+// pas à retrouver le vrai titre d'édition. Clé = nom EXACT dans books.json.
+const ALIASES = {
+  '100MOffers': '$100M Offers',
+  'Ulimited Power': 'Unlimited Power',
+  'Composer ses images pour le cinéma (The Visual Story)': 'The Visual Story Bruce Block',
+  "Histoire de l'Art E. H. Gombrich": 'The Story of Art Gombrich',
+  "La grâce de l'imperfection / the power of vulnerability + TED Talk": 'The Gifts of Imperfection Brené Brown',
+  'Sprint Jake Knapp et al.': 'Sprint Jake Knapp',
+  'The $100 Startup – Chris Guillebeau': 'The $100 Startup',
+  'structures_or_why_things_don_t_fall_down': "Structures: Or Why Things Don't Fall Down",
+  'techniques_d_animation_the_animator_s_survival_kit': "The Animator's Survival Kit",
+  'les_principes_premiers': 'First Principles Herbert Spencer',
+  'Le Dit des Heike : Heike Monogatari': 'Heike Monogatari',
+}
+
+const jget = async (u) => { try { const r = await fetch(u); return r.ok ? r.json() : null } catch { return null } }
+
+function cleanTitle(name) {
+  let t = ALIASES[name] || name
+  // slug à underscores (aucun espace) -> espaces
+  if (t.includes('_') && !t.includes(' ')) t = t.replace(/_/g, ' ')
+  return t.trim()
+}
+// Titre avant un tiret (souvent : titre original anglais, la partie après = sous-titre/traduction FR).
+function beforeDash(t) { const m = t.match(/^(.+?)\s+[-–]\s+.+$/); return m ? m[1].trim() : null }
+function stripDeco(t) { return t.replace(/[!?:]+$/g, '').replace(/\s*\([^)]*\)\s*$/, '').trim() }
+
+async function openLibrary(q) {
+  const j = await jget(`https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=1&fields=cover_i`)
+  const doc = j && j.docs && j.docs[0]
+  return doc && doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg` : null
+}
+const DDG_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+async function duckduckgo(q) {
+  try {
+    const page = await fetch(`https://duckduckgo.com/?q=${encodeURIComponent(q)}&iax=images&ia=images`, { headers: { 'User-Agent': DDG_UA } }).then((r) => r.text())
+    const m = page.match(/vqd=["']?([\d-]+)["']?/)
+    if (!m) return null
+    const j = await fetch(`https://duckduckgo.com/i.js?l=us-en&o=json&q=${encodeURIComponent(q)}&vqd=${m[1]}&f=,,,&p=1`, { headers: { 'User-Agent': DDG_UA, Referer: 'https://duckduckgo.com/' } }).then((r) => r.json()).catch(() => null)
+    const first = j && j.results && j.results[0]
+    return (first && first.image) || null
+  } catch { return null }
+}
+
+// Essaie plusieurs variantes dans l'ordre, s'arrête à la 1re trouvée.
+async function findCover(name, author) {
+  const cleaned = cleanTitle(name)
+  const dashPart = beforeDash(cleaned)
+  const bare = stripDeco(cleaned)
+  const variants = [
+    author ? `${bare} ${author}` : null,
+    bare,
+    dashPart && author ? `${dashPart} ${author}` : null,
+    dashPart,
+  ].filter(Boolean)
+  for (const q of [...new Set(variants)]) {
+    const u = await openLibrary(q)
+    if (u) return { url: u, via: 'openlibrary', q }
+  }
+  for (const q of [...new Set(variants)]) {
+    const u = await duckduckgo(`${q} book cover`)
+    if (u) return { url: u, via: 'duckduckgo', q }
+  }
+  return null
+}
+
+async function runPool(items, limit, fn) {
+  let i = 0
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) { const idx = i++; await fn(items[idx], idx) }
+  }))
+}
+
+async function main() {
+  const data = JSON.parse(await readFile(BOOKS_JSON, 'utf8'))
+  const missing = data.items.filter((it) => !it.image)
+  console.log(`${missing.length} livre(s) sans couverture à traiter`)
+  let found = 0
+  await runPool(missing, 4, async (it) => {
+    const r = await findCover(it.name, it.extra && it.extra.author)
+    if (r) { it.image = { kind: 'url', ref: r.url }; found++; console.log(`  ✓ [${r.via}] ${it.name} (requête: "${r.q}")`) }
+    else console.log(`  ✗ ${it.name}`)
+  })
+  console.log(`${found}/${missing.length} nouvelles couvertures trouvées`)
+  await writeFile(BOOKS_JSON, JSON.stringify(data, null, 2))
+  console.log('books.json mis à jour')
+}
+
+main().catch((e) => { console.error(e); process.exit(1) })

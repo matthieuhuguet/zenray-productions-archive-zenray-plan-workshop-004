@@ -1,0 +1,269 @@
+import React from 'react'
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const authState = vi.hoisted(() => ({ loggedIn: false }))
+
+vi.mock('./spotifyAuth.js', () => ({
+  isLoggedIn: () => authState.loggedIn,
+  getValidToken: vi.fn(async () => null),
+  forceRefreshToken: vi.fn(async () => null),
+}))
+
+import { PlayerProvider, usePlayer } from './PlayerContext.jsx'
+import { getValidToken } from './spotifyAuth.js'
+
+let player
+
+function Probe() {
+  player = usePlayer()
+  return <output data-testid="state">{`${player.playerPhase}|${player.current?.title || ''}|${player.idx}|${player.playing}`}</output>
+}
+
+function mountPlayer() {
+  return render(<PlayerProvider><Probe /></PlayerProvider>)
+}
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
+describe('PlayerProvider local transport', () => {
+  beforeEach(() => {
+    player = null
+    authState.loggedIn = false
+    vi.mocked(getValidToken).mockResolvedValue(null)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    cleanup()
+    document.querySelectorAll('script[src="https://www.youtube.com/iframe_api"],script[src="https://sdk.scdn.co/spotify-player.js"]').forEach((node) => node.remove())
+    delete window.YT
+    delete window.Spotify
+    delete window.onYouTubeIframeAPIReady
+    delete window.onSpotifyWebPlaybackSDKReady
+    vi.restoreAllMocks()
+  })
+
+  it('ignore la résolution tardive de la piste précédente du même provider', async () => {
+    const first = deferred()
+    const second = deferred()
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play')
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+    const view = mountPlayer()
+
+    act(() => player.playTrack({ title: 'A', path: 'pages/Music/a.mp3', dur: 100 }))
+    await waitFor(() => expect(play).toHaveBeenCalledTimes(1))
+    act(() => player.playTrack({ title: 'B', path: 'pages/Music/b.mp3', dur: 100 }))
+    await waitFor(() => expect(play).toHaveBeenCalledTimes(2))
+
+    await act(async () => { second.resolve(); await second.promise })
+    expect(view.getByTestId('state')).toHaveTextContent('playing|B|0|true')
+
+    await act(async () => { first.resolve(); await first.promise })
+    expect(view.getByTestId('state')).toHaveTextContent('playing|B|0|true')
+  })
+
+  it('ne redémarre pas la dernière piste à la fin de la file', async () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    const view = mountPlayer()
+    act(() => player.playQueue([{ title: 'Dernière', path: 'pages/Music/last.mp3', dur: 80 }], 0))
+    await waitFor(() => expect(view.getByTestId('state')).toHaveTextContent('playing|Dernière|0|true'))
+
+    fireEvent.ended(view.container.querySelector('audio'))
+
+    await waitFor(() => expect(view.getByTestId('state')).toHaveTextContent('paused|Dernière|0|false'))
+    expect(play).toHaveBeenCalledTimes(1)
+  })
+
+  it('avance à la piste suivante sans perdre son identité', async () => {
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    const view = mountPlayer()
+    act(() => player.playQueue([
+      { title: 'A', path: 'pages/Music/a.mp3', dur: 80 },
+      { title: 'B', path: 'pages/Music/b.mp3', dur: 90 },
+    ], 0))
+    await waitFor(() => expect(view.getByTestId('state')).toHaveTextContent('playing|A|0|true'))
+
+    fireEvent.ended(view.container.querySelector('audio'))
+
+    await waitFor(() => expect(view.getByTestId('state')).toHaveTextContent('playing|B|1|true'))
+  })
+
+  it('seek sur un flux local avec la durée du manifeste quand duration est inexploitable', async () => {
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    const view = mountPlayer()
+    act(() => player.playTrack({ title: 'Seek', path: 'pages/Music/seek.mp3', dur: 120 }))
+    await waitFor(() => expect(view.getByTestId('state')).toHaveTextContent('playing|Seek|0|true'))
+    const audio = view.container.querySelector('audio')
+    Object.defineProperty(audio, 'currentTime', { configurable: true, writable: true, value: 0 })
+
+    act(() => player.seek(0.25))
+
+    expect(audio.currentTime).toBe(30)
+    expect(player.time).toBe(30)
+  })
+
+  it('lit un manifeste audio par le fallback HTTP Range, sans dépendre du registre volatile du Service Worker', async () => {
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    const view = mountPlayer()
+    const streamPath = 'pages/Music/Psycho-Pass/a-world.media.json'
+    act(() => player.playTrack({ title: 'Local', streamPath, dur: 240 }))
+    await waitFor(() => expect(view.getByTestId('state')).toHaveTextContent('playing|Local|0|true'))
+    expect(view.container.querySelector('audio').getAttribute('src')).toBe(`/api/stream?path=${encodeURIComponent(streamPath)}`)
+  })
+})
+
+describe('PlayerProvider provider transports', () => {
+  beforeEach(() => {
+    player = null
+    authState.loggedIn = false
+    vi.mocked(getValidToken).mockResolvedValue(null)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    cleanup()
+    document.querySelectorAll('script[src="https://www.youtube.com/iframe_api"],script[src="https://sdk.scdn.co/spotify-player.js"]').forEach((node) => node.remove())
+    delete window.YT
+    delete window.Spotify
+    delete window.onYouTubeIframeAPIReady
+    delete window.onSpotifyWebPlaybackSDKReady
+    vi.restoreAllMocks()
+  })
+
+  it('sérialise les PUT Spotify et laisse seule la dernière commande acquitter le lecteur', async () => {
+    vi.mocked(getValidToken).mockResolvedValue('token')
+    const firstResponse = deferred()
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockImplementationOnce(() => firstResponse.promise)
+      .mockResolvedValue({ ok: true, status: 204 })
+    const view = mountPlayer()
+
+    let firstCommand
+    act(() => { firstCommand = player.playSpotify(['spotify:track:a']) })
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    let secondCommand
+    act(() => { secondCommand = player.playSpotify(['spotify:track:b']) })
+    await act(async () => { await Promise.resolve() })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(view.getByTestId('state')).toHaveTextContent('loading||-1|false')
+
+    firstResponse.resolve({ ok: true, status: 204 })
+    await act(async () => { await firstCommand })
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await act(async () => { await secondCommand })
+
+    const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body)
+    const secondBody = JSON.parse(fetchMock.mock.calls[1][1].body)
+    expect(firstBody.uris).toEqual(['spotify:track:a'])
+    expect(secondBody.uris).toEqual(['spotify:track:b'])
+    expect(view.getByTestId('state')).toHaveTextContent('ready||-1|false')
+  })
+
+  it('corrèle next/prev à la nouvelle URI Spotify, pas au dernier événement de l’ancienne piste', async () => {
+    authState.loggedIn = true
+    vi.mocked(getValidToken).mockResolvedValue('token')
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true, status: 204 })
+    let sdk
+    class SpotifyPlayerFake {
+      constructor() { sdk = this; this.listeners = new Map(); this.nextTrack = vi.fn(); this.previousTrack = vi.fn(); this.seek = vi.fn(); this.pause = vi.fn(); this.togglePlay = vi.fn() }
+      addListener(name, callback) { this.listeners.set(name, callback) }
+      connect() { return Promise.resolve(true) }
+      disconnect() {}
+      emit(name, payload) { this.listeners.get(name)?.(payload) }
+    }
+    window.Spotify = { Player: SpotifyPlayerFake }
+    const view = mountPlayer()
+    await waitFor(() => expect(sdk).toBeTruthy())
+    act(() => sdk.emit('ready', { device_id: 'device-1' }))
+    await waitFor(() => expect(player.sdkReady).toBe(true))
+
+    await act(async () => { await player.playSpotify(['spotify:track:a']) })
+    act(() => sdk.emit('player_state_changed', spotifyState('spotify:track:a', 'A')))
+    expect(view.getByTestId('state')).toHaveTextContent('playing|A|-1|true')
+
+    act(() => player.seek(0.5))
+    expect(sdk.seek).toHaveBeenCalledWith(90_000)
+    expect(player.time).toBe(90)
+
+    act(() => player.next())
+    expect(sdk.nextTrack).toHaveBeenCalledTimes(1)
+    expect(view.getByTestId('state')).toHaveTextContent('loading|A|-1|false')
+    act(() => sdk.emit('player_state_changed', spotifyState('spotify:track:a', 'A')))
+    expect(view.getByTestId('state')).toHaveTextContent('loading|A|-1|false')
+    act(() => sdk.emit('player_state_changed', spotifyState('spotify:track:b', 'B')))
+    expect(view.getByTestId('state')).toHaveTextContent('playing|B|-1|true')
+
+    act(() => player.prev())
+    expect(sdk.previousTrack).toHaveBeenCalledTimes(1)
+    expect(view.getByTestId('state')).toHaveTextContent('loading|B|-1|false')
+    act(() => sdk.emit('player_state_changed', spotifyState('spotify:track:b', 'B')))
+    expect(view.getByTestId('state')).toHaveTextContent('loading|B|-1|false')
+    act(() => sdk.emit('player_state_changed', spotifyState('spotify:track:a', 'A')))
+    expect(view.getByTestId('state')).toHaveTextContent('playing|A|-1|true')
+  })
+
+  it('restaure le handler YouTube global précédent au démontage', async () => {
+    const previous = vi.fn()
+    window.onYouTubeIframeAPIReady = previous
+    const view = mountPlayer()
+    act(() => player.playMixedQueue([{ source: 'youtube', videoId: 'abc123xyz', title: 'YouTube' }]))
+
+    await waitFor(() => expect(window.onYouTubeIframeAPIReady).not.toBe(previous))
+    const installed = window.onYouTubeIframeAPIReady
+    act(() => installed())
+    expect(previous).toHaveBeenCalledTimes(1)
+
+    view.unmount()
+    expect(window.onYouTubeIframeAPIReady).toBe(previous)
+  })
+
+  it('seek YouTube utilise la durée provider et actualise immédiatement la barre', async () => {
+    let youtube
+    class YouTubePlayerFake {
+      constructor(_host, options) { youtube = this; this.options = options; this.videoId = options.videoId; this.seekTo = vi.fn(); this.playVideo = vi.fn(); this.pauseVideo = vi.fn(); this.setVolume = vi.fn() }
+      getVideoData() { return { video_id: this.videoId } }
+      getCurrentTime() { return 12 }
+      getDuration() { return 200 }
+      loadVideoById(videoId) { this.videoId = videoId }
+    }
+    window.YT = { Player: YouTubePlayerFake }
+    mountPlayer()
+
+    act(() => player.playMixedQueue([{ source: 'youtube', videoId: 'abc123xyz', title: 'YouTube' }]))
+    await waitFor(() => expect(youtube).toBeTruthy())
+    act(() => youtube.options.events.onReady({ target: youtube }))
+    act(() => youtube.options.events.onStateChange({ target: youtube, data: 1 }))
+    await new Promise((resolve) => setTimeout(resolve, 520))
+    expect(player.dur).toBe(200)
+
+    act(() => player.seek(0.25))
+    expect(youtube.seekTo).toHaveBeenCalledWith(50, true)
+    expect(player.time).toBe(50)
+  })
+})
+
+function spotifyState(uri, title, paused = false) {
+  return {
+    paused,
+    position: 2_000,
+    duration: 180_000,
+    context: { uri: 'spotify:playlist:test' },
+    track_window: {
+      current_track: {
+        id: uri.split(':').pop(),
+        uri,
+        name: title,
+        artists: [{ name: 'Artist' }],
+        album: { images: [] },
+      },
+    },
+  }
+}

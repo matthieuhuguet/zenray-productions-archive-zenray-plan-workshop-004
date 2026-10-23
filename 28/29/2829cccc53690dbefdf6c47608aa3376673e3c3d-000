@@ -1,0 +1,443 @@
+// video-dash-lib.mjs — MOTEUR STREAMING v2 « définitif » : échelle adaptative H.264 (360p→4K), packagée
+// CMAF (fMP4), avec DOUBLE manifeste DASH (.mpd) + HLS (.m3u8) émis depuis LES MÊMES segments.
+//
+// EN CLAIR (du sales à la mamie) : une vidéo est ré-encodée en PLUSIEURS qualités à la fois (360p pour la 4G
+// pourrie, jusqu'à la 4K pour la fibre). Le lecteur choisit tout seul la qualité selon la connexion, en direct
+// (« adaptatif », comme YouTube/Netflix). Un seul jeu de petits fichiers .m4s sert DEUX standards de lecture :
+// DASH (.mpd, lu par dash.js sur desktop et iPhone récent via Managed Media Source) ET HLS (.m3u8, lu
+// nativement par Safari/iOS, robuste sur connexions et appareils faibles). Définitif = un encodage, lisible
+// partout.
+//
+// CE QUI CHANGE vs l'ancien video-hls-lib (déprécié) :
+//   - AVANT : 1 seule qualité vidéo (mono-débit), segments MPEG-TS chiffrés AES-128.
+//   - MAINTENANT : ÉCHELLE 360/720/1080/2160 (adaptatif réel), segments CMAF fMP4, double manifeste.
+//   - CHIFFREMENT : retiré du nouveau pipeline (ffmpeg ne sait pas CENC proprement + pas de shaka-packager).
+//     À la place, mêmes noms de fichiers HACHÉS SHA-256 sur shard PUBLIC, servis jsDelivr pinné commit —
+//     exactement le modèle des shards IMAGE (déjà non chiffrés). Footage perso : obscurité d'URL suffisante.
+//     Les ANCIENNES vidéos AES-128 restent lisibles (le lecteur gère les deux types de manifeste).
+//
+// RÉUTILISE l'infra éprouvée : probe/ffmpegProgress/pushBlobs (video-mse-lib), rollover de shard vidéo public
+// (zenray-vid-public-NN, cap 5 Go), jsDelivr pinné sur le commit. Aucune nouvelle dépendance (ffmpeg seul).
+
+import { readFile, writeFile, mkdir, readdir, stat, rm, open } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { createReadStream } from 'node:fs'
+import { CDN_CHUNK, PUBLIC_VIDEO_GIT_PUSH_BATCH_BYTES, PUBLIC_VIDEO_SHARD_BIN_BYTES } from '../src/config/chunkPolicy.js'
+import path from 'node:path'
+import { probe, ffmpegProgress, pushBlobs } from './video-mse-lib.mjs'
+import { openVideoGitShard } from './lib/video-git-shard.mjs'
+
+const noop = () => {}
+const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`
+const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
+const sha256File = async (file) => {
+  const hash = createHash('sha256')
+  for await (const chunk of createReadStream(file)) hash.update(chunk)
+  return hash.digest('hex')
+}
+const sha256Range = async (file, offset, size) => {
+  const hash = createHash('sha256')
+  for await (const chunk of createReadStream(file, { start: offset, end: offset + size - 1 })) hash.update(chunk)
+  return hash.digest('hex')
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const VID_SHARD_RE = /^zenray-vid(-public)?-\d{2,}$/
+// 2 s par segment CMAF. RAISON DURE : jsDelivr REFUSE les fichiers > 20 Mo. À 40 Mbit/s (barreau 4K), un
+// segment de 4 s ferait ~20 Mo et tombait en « not available » sur le CDN. 2 s -> ~10 Mo, large marge sous la
+// limite, sans baisser la qualité (le débit reste 40 Mbit/s). Compromis : un peu plus de requêtes, négligeable.
+// 10 s par segment : MOINS de requêtes (latence jsDelivr = cause du lag) — possible car le maxrate adaptatif
+// (voir buildArgs) plafonne le débit crête pour que 10 s × crête ≤ 19 Mo, donc aucun segment ne dépasse la
+// limite jsDelivr quoi qu'il arrive. Conséquence assumée : à 10 s le plafond crête est ~15,2 Mbit/s, donc le 4K
+// (cible 16) est bridé ~15,5 ; qualité quasi identique. Test empirique sur vidéo fort mouvement.
+const SEG_DURATION = 10
+
+// Échelle adaptative : barreau {h, bitrate}. On ne garde QUE les barreaux <= hauteur source (jamais d'upscale).
+// Bitrates H.264 raisonnables pour du contenu réel (drone/caméra) ; 4K à 16M reste fluide en VOD.
+// Débits VOLONTAIREMENT HAUTS : le stockage est infini (git), la priorité est la QUALITÉ, surtout au barreau
+// 4K (une source 4K caméra/drone monte à 60-80 Mbit/s ; un 4K à 16M était trop compressé). Le barreau bas reste
+// léger pour la 4G faible. L'adaptatif choisit le bon barreau selon la connexion ; le haut sert la fibre.
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+// CONFIG STREAMING VALIDÉE EMPIRIQUEMENT (2026-06-29, FINALE) — NE PAS RÉGRESSER. Lecture 4K fluide, zéro lag.
+//   • Codec : HEVC matériel (hevc_videotoolbox, tag hvc1). ~2× moins d'octets que H.264 = la clé anti-lag.
+//   • Échelle : 360/720/1080/2160. Débits : 4K 16 / 1080 8 / 720 4,5 / 360 1,5 Mbit/s.
+//   • Segments : 10 s -> moitié moins de requêtes qu'à 5 s (jsDelivr n'est PAS un CDN vidéo : latence/requête).
+//   • LA TROUVAILLE qui débloque tout = maxrate ADAPTATIF : maxrate = min(1.5×cible, 19Mo×8/durée), bufsize=maxrate.
+//     Le 2e terme PLAFONNE le débit crête pour que crête×durée ≤ 19 Mo -> AUCUN segment ne dépasse la limite DURE
+//     20 Mo/fichier de jsDelivr, quelle que soit la durée/le débit. Sans ça, un 4K de 6 s spikait à 23 Mo (cassé).
+//     Mesuré 10 s : segments 4K aplatis ~15 Mo, max < 19 Mo, sur vidéo 3,4 min fort mouvement.
+//   • Démarrage : dash.js initialBitrate 1080p (pas 360p) sinon 1re image bloquée en 360p pendant tout le 1er
+//     segment (10 s). + buffer dash.js agressif (précharge ~60 s) côté lecteur (VideoPlayer2.jsx).
+//   Si un jour le lag revient malgré ça -> seule vraie option = CDN vidéo dédié (Bunny/Cloudflare R2).
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Débits HEVC (H.265) : ~2× plus efficace que H.264 -> mêmes débits visuels pour MOITIÉ des octets. Conséquence
+// directe : segments 2× plus légers, servis 2× plus vite par jsDelivr (qui n'est pas un CDN vidéo) -> lecture
+// 4K fluide. 4K à 16 Mbit/s HEVC ≈ qualité d'un H.264 à 30-35 Mbit/s. Encodage matériel (hevc_videotoolbox),
+// rapide. Lu par Safari, iPhone 15 Pro, Chrome/Edge sur Mac (décodage HEVC matériel). Firefox ne lit pas HEVC
+// (compromis assumé, usage perso). Le barreau bas reste léger pour la 4G faible.
+const LADDER = [
+  { h: 360, b: 1500 },
+  { h: 720, b: 4500 },
+  { h: 1080, b: 8000 },
+  { h: 2160, b: 16000 },
+]
+// Plafond DUR : aucun fichier au-dessus de ~19 Mo (limite jsDelivr 20 Mo, marge 1 Mo). Un segment au débit
+// crête `maxrate` pendant SEG_DURATION fait maxrate×SEG_DURATION/8 octets. On en déduit le débit crête MAX
+// autorisé pour la durée choisie -> le maxrate de chaque barreau est borné par ce plafond. Ainsi, quels que
+// soient la durée et les débits cibles, AUCUN segment ne peut dépasser 19 Mo. C'est ce qui rend la config sûre.
+const MAX_SEG_BYTES = CDN_CHUNK
+
+function shardPathFor(hash, ext) { return `${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.${ext}` }
+
+function gh(token, apiPath, init = {}) {
+  return fetch(`https://api.github.com/${apiPath}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) },
+  })
+}
+
+// Résout le shard vidéo PUBLIC actif (rollover serveur auto quand >4,5 Go). Jumeau de video-hls-lib.
+async function activeVidShard(apiBase, need = 0) {
+  let last = 'fail'
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), 120000)
+    try {
+      const r = await fetch(`${apiBase}/api/upload-shard`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'active-shard', kind: 'vid', vis: 'public', need }), signal: ac.signal,
+      }).then((x) => x.json())
+      if (r && r.repo) return r.repo
+      last = (r && r.error) || 'fail'
+    } catch (e) { last = e && e.name === 'AbortError' ? 'timeout' : 'fetch' }
+    finally { clearTimeout(timer) }
+    if (attempt < 2) await sleep(2000 * 3 ** attempt)
+  }
+  throw new Error('active-vid-shard: ' + last)
+}
+
+async function commitVidBytes(apiBase, repo, addBytes, log = noop) {
+  if (!(addBytes > 0)) return
+  try {
+    const r = await fetch(`${apiBase}/api/upload-shard`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'vid-commit-bytes', repo, addBytes }),
+    }).then((x) => x.json()).catch(() => null)
+    if (!r || r.error) log(`  vid-commit-bytes best-effort: ${(r && r.error) || 'fail'}`)
+  } catch { /* best-effort */ }
+}
+
+async function ensurePublicRepo(token, name, log = noop) {
+  const probeRepo = await gh(token, `repos/${OWNER}/${name}`)
+  if (probeRepo.ok) return true
+  log(`  repo public ${OWNER}/${name} absent -> création...`)
+  const cr = await gh(token, 'user/repos', {
+    method: 'POST',
+    body: JSON.stringify({ name, private: false, auto_init: true, description: 'ZenRay media — segments CMAF (fMP4) streaming adaptatif DASH+HLS, servis via jsDelivr.' }),
+  })
+  if (!cr.ok && cr.status !== 422) throw new Error(`create public repo -> ${cr.status} ${(await cr.text()).slice(0, 200)}`)
+  for (let i = 0; i < 12; i++) {
+    const rr = await gh(token, `repos/${OWNER}/${name}/git/ref/heads/main`)
+    if (rr.ok) return true
+    await sleep(1500)
+  }
+  throw new Error(`public repo ${name} pas prêt (branche main absente après attente)`)
+}
+
+// --- TRANSCODE : échelle H.264 matériel -> CMAF + .mpd + .m3u8, SANS rien pousser ----------------------
+// Renvoie l'objet consommé par pushDash(). Options : { workDir, sampleSec, log, onProgress(stage,pct) }
+export async function transcodeDash(file, opts = {}) {
+  const log = opts.log || noop
+  const onProgress = opts.onProgress || noop
+  const sampleSec = opts.sampleSec != null ? Number(opts.sampleSec) : null
+  const work = opts.workDir || '/tmp/zr_dash'
+  const codec = opts.codec || 'hevc'
+  const segDuration = opts.segDuration || SEG_DURATION
+
+  const base = opts.base || path.basename(file).replace(/\.[^.]+$/, '')
+  const id = newId()
+  const outDir = path.join(work, 'out', id)
+  await mkdir(outDir, { recursive: true })
+
+  const p = probe(file)
+  if (!p.video.length) throw new Error('aucune piste vidéo')
+  const v0 = p.video[0] || {}
+  const srcW = Number(v0.width) || 1920
+  const srcH = Number(v0.height) || 1080
+  const outDuration = sampleSec ? Math.min(p.duration || sampleSec, sampleSec) : p.duration
+
+  // Barreaux retenus : si ladder custom fourni, l'utiliser.
+  // Sinon si codec === 'h264' (films/partage universel), barreaux adaptés au ratio de la source.
+  let rungs
+  if (Array.isArray(opts.ladder) && opts.ladder.length) {
+    rungs = opts.ladder
+  } else if (codec === 'h264') {
+    const h360 = Math.min(srcH, Math.max(180, Math.round(640 * srcH / srcW / 2) * 2))
+    const w360 = Math.min(srcW, Math.max(320, Math.round(h360 * srcW / srcH / 2) * 2))
+    const h720 = Math.min(srcH, Math.max(360, Math.round(1280 * srcH / srcW / 2) * 2))
+    const w720 = Math.min(srcW, Math.max(640, Math.round(h720 * srcW / srcH / 2) * 2))
+    rungs = [
+      { w: w360, h: h360, b: 600 },
+      ...(srcW > 640 ? [{ w: w720, h: h720, b: 1800 }] : []),
+      ...(srcW > 1280 ? [{ w: srcW, h: srcH, b: 3500 }] : []),
+    ]
+  } else {
+    rungs = LADDER.filter((r) => r.h <= srcH)
+    if (!rungs.length) rungs = [LADDER[0]]
+  }
+  log(`${base} : ${outDuration.toFixed(0)}s, source ${v0.width}x${srcH} ${v0.codec_name} -> échelle ${rungs.map((r) => r.h + 'p').join('/')} (${codec})`)
+
+  const hasAudio = p.audio.length > 0
+  const tlim = sampleSec ? ['-t', String(sampleSec)] : []
+
+  // filter_complex : split de la source en N copies, chacune scalée à son barreau.
+  const splitOuts = rungs.map((_, i) => `[v${i}]`).join('')
+  const scaleChain = rungs.map((r, i) => `[s${i}]scale=${r.w || -2}:${r.h}[v${i}]`).join(';')
+  const splitIns = rungs.map((_, i) => `[s${i}]`).join('')
+  const filter = `[0:v]split=${rungs.length}${splitIns};${scaleChain}`
+
+  // -hwaccel videotoolbox : DÉCODAGE matériel de la source.
+  const args = ['-y', '-hwaccel', 'videotoolbox', '-i', file, ...tlim, '-filter_complex', filter]
+  const peakCeilKbps = Math.floor((MAX_SEG_BYTES * 8 / 1000) / segDuration)
+  const isH264 = codec === 'h264'
+  const encoder = isH264 ? 'h264_videotoolbox' : 'hevc_videotoolbox'
+  const profile = isH264 ? 'high' : 'main'
+
+  rungs.forEach((r, i) => {
+    const maxr = Math.min(Math.round(r.b * 1.5), peakCeilKbps)
+    const rungArgs = [
+      '-map', `[v${i}]`,
+      `-c:v:${i}`, encoder,
+      '-realtime', '1',
+      `-b:v:${i}`, `${Math.min(r.b, maxr)}k`,
+      `-maxrate:v:${i}`, `${maxr}k`,
+      `-bufsize:v:${i}`, `${maxr}k`,
+      `-profile:v:${i}`, profile,
+    ]
+    if (!isH264) {
+      rungArgs.push(`-tag:v:${i}`, 'hvc1')
+    }
+    args.push(...rungArgs)
+  })
+  let adaptation
+  if (hasAudio) {
+    args.push('-map', '0:a:0', '-c:a', 'aac', '-ac', '2', '-b:a', '160k')
+    adaptation = `id=0,streams=v id=1,streams=a`
+  } else {
+    adaptation = `id=0,streams=v`
+  }
+  args.push('-force_key_frames', `expr:gte(t,n_forced*${segDuration})`)
+  args.push(
+    '-f', 'dash', '-seg_duration', String(segDuration), '-use_template', '0', '-hls_playlist', '1',
+    '-adaptation_sets', adaptation, path.join(outDir, 'manifest.mpd'),
+  )
+
+  log(`  encode échelle ${codec.toUpperCase()} matériel (${encoder}) + packaging CMAF DASH+HLS...`)
+  await ffmpegProgress(args, outDuration, (pct) => onProgress('video', pct))
+
+  const all = await readdir(outDir)
+  if (!all.includes('manifest.mpd')) throw new Error('ffmpeg DASH: manifest.mpd absent')
+  if (!all.includes('master.m3u8')) throw new Error('ffmpeg DASH: master.m3u8 absent (hls_playlist)')
+  const segments = all.filter((f) => /\.m4s$/.test(f))           // init-stream*.m4s + chunk-stream*.m4s
+  const mediaPlaylists = all.filter((f) => /^media_\d+\.m3u8$/.test(f))
+  log(`  produit: manifest.mpd + master.m3u8 + ${mediaPlaylists.length} media playlists, ${segments.length} segments CMAF`)
+
+  // POSTER : frame du MILIEU (pas le début, souvent noir), en JPEG 640px. Best-effort.
+  // JPEG (mjpeg) et PAS webp : cet ffmpeg n'a pas d'encodeur libwebp -> poster.webp échouait silencieusement
+  // (« Encoder not found ») => aucune miniature. Le mjpeg est intégré partout. -q:v 3 = haute qualité.
+  let posterFile = null
+  try {
+    const at = Math.max(0.3, (outDuration || 2) / 2)
+    await new Promise((res, rej) => execFile('ffmpeg', ['-y', '-ss', String(at), '-i', file, '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '3', path.join(outDir, 'poster.jpg')], { timeout: 30000 }, (e) => e ? rej(e) : res()))
+    await stat(path.join(outDir, 'poster.jpg')); posterFile = 'poster.jpg'
+  } catch { posterFile = null }
+
+  // DOWNLOAD MP4 (vidéo + audio MUXÉES) pour le téléchargement : on RECOLLE les segments fMP4 déjà encodés du
+  // barreau le plus haut (init + chunks = un fMP4 valide) + la piste audio, puis ffmpeg les REMUX en un MP4
+  // progressif (-c copy, AUCUN ré-encodage, quasi instantané ; +faststart pour lecture immédiate). C'est le seul
+  // moyen d'avoir le SON dans le fichier téléchargé (en DASH l'audio est une piste séparée des segments vidéo).
+  let downloadFile = null
+  if (opts.includeDownload === true) try {
+    const catStream = async (streamIdx, outName) => {
+      const init = `init-stream${streamIdx}.m4s`
+      const chunks = all.filter((f) => new RegExp(`^chunk-stream${streamIdx}-\\d+\\.m4s$`).test(f)).sort()
+      if (!all.includes(init) || !chunks.length) throw new Error(`stream ${streamIdx} incomplet`)
+      const fd = await open(path.join(outDir, outName), 'w')
+      try { for (const f of [init, ...chunks]) await fd.write(await readFile(path.join(outDir, f))) } finally { await fd.close() }
+    }
+    const topV = rungs.length - 1 // barreau vidéo le plus haut (4K)
+    await catStream(topV, '_v.mp4')
+    const inputs = ['-i', path.join(outDir, '_v.mp4')]
+    const maps = ['-map', '0:v:0']
+    if (hasAudio) { await catStream(rungs.length, '_a.mp4'); inputs.push('-i', path.join(outDir, '_a.mp4')); maps.push('-map', '1:a:0') }
+    await new Promise((res, rej) => execFile('ffmpeg', ['-y', ...inputs, ...maps, '-c', 'copy', '-movflags', '+faststart', path.join(outDir, 'download.mp4')], { timeout: 180000 }, (e) => e ? rej(e) : res()))
+    await stat(path.join(outDir, 'download.mp4')); downloadFile = 'download.mp4'
+    await rm(path.join(outDir, '_v.mp4'), { force: true }).catch(() => {}); await rm(path.join(outDir, '_a.mp4'), { force: true }).catch(() => {})
+    log('  download.mp4 muxé (remux -c copy, avec audio)')
+  } catch (e) { log(`  ⚠ download.mp4 échoué (${(e.message || e).toString().slice(0, 100)}) -> pas de téléchargement direct`); downloadFile = null }
+  else log('  téléchargement MP4 séparé désactivé pour limiter les fichiers temporaires')
+
+  const result = {
+    id, base, outDir, outDuration,
+    segments, mediaPlaylists, posterFile, downloadFile,
+    rungs: rungs.map((r) => r.h), hasAudio,
+    dest: opts.dest || 'pages/Videos',
+  }
+  // 10 October 2026, 19:14 CEST: Keep one complete stream package resumable after a network failure.
+  await writeFile(path.join(outDir, '.zr-meta.json'), JSON.stringify({
+    id, base, outDuration, segments, mediaPlaylists, posterFile, downloadFile,
+    rungs: result.rungs, hasAudio, dest: result.dest,
+  }, null, 2))
+  return result
+}
+
+// --- RÉÉCRITURE des manifestes : noms locaux -> URLs jsDelivr hachées ---------------------------------
+// .mpd (SegmentList) : <Initialization sourceURL="X"/> et <SegmentURL media="X"/> -> X = URL jsDelivr du hash.
+function rewriteMpd(text, segMap) {
+  return text
+    .replace(/sourceURL="([^"]+)"/g, (full, n) => segMap[n] ? `sourceURL="${segMap[n]}"` : full)
+    .replace(/media="([^"]+)"/g, (full, n) => segMap[n] ? `media="${segMap[n]}"` : full)
+}
+// media_N.m3u8 : #EXT-X-MAP:URI="init-streamN.m4s" + lignes de segments -> URLs jsDelivr.
+function rewriteMediaPlaylist(text, segMap) {
+  return text.split('\n').map((line) => {
+    const mm = /^#EXT-X-MAP:URI="([^"]+)"(.*)$/.exec(line)
+    if (mm) { const u = segMap[mm[1].trim()]; return u ? `#EXT-X-MAP:URI="${u}"${mm[2]}` : line }
+    if (line && !line.startsWith('#')) { const u = segMap[line.trim()]; return u || line }
+    return line
+  }).join('\n')
+}
+// master.m3u8 : les URI media_N.m3u8 -> /api/hls?path=<contentRepo path> (playlists servies texte).
+function rewriteMaster(text, playlistUrlFor) {
+  return text.split('\n').map((line) => {
+    const out = line.replace(/URI="([^"]+)"/g, (full, uri) => { const u = playlistUrlFor(uri.trim()); return u ? `URI="${u}"` : full })
+    if (out !== line) return out
+    if (line && !line.startsWith('#')) { const u = playlistUrlFor(line.trim()); return u || line }
+    return out
+  }).join('\n')
+}
+
+// --- PUSH COMPLET : segments hachés -> shard public ; manifestes texte -> zenray-data -----------------
+// Renvoie { publicRepo, commitPublic, manifest, manifestPath, mpdPath, masterPath, commitContent }.
+export async function pushDash(token, result, { apiBase = 'http://localhost:3000', contentRepo = 'zenray-data', publicRepo = null, title = null, author = null, onProgress = noop, log = noop } = {}) {
+  const { outDir, base, dest, segments, mediaPlaylists, outDuration, posterFile, downloadFile, rungs, hasAudio } = result
+  const enc = encodeURIComponent
+
+  // 0) shard vidéo public actif (rollover serveur, cap 5 Go).
+  let need = 0
+  for (const f of segments) { try { need += (await stat(path.join(outDir, f))).size } catch {} }
+  if (!publicRepo) publicRepo = await activeVidShard(apiBase, need)
+  if (!VID_SHARD_RE.test(publicRepo)) throw new Error(`shard vidéo invalide: ${publicRepo}`)
+  log(`  shard vidéo public actif: ${publicRepo}`)
+  await ensurePublicRepo(token, publicRepo, log)
+  const jsdelivrUrl = (commitSha, hashPath) => `https://cdn.jsdelivr.net/gh/${OWNER}/${publicRepo}@${commitSha}/${hashPath}`
+
+  // 1) hacher + collecter tous les binaires (segments CMAF + poster).
+  const binBlobs = []
+  const segHashPath = {}
+  let totalSize = 0
+  const addBinary = async (localName) => {
+    const buf = await readFile(path.join(outDir, localName))
+    if (buf.length > 19.5 * 1024 * 1024) log(`  ⚠ segment ${localName} = ${(buf.length / 1048576).toFixed(1)} Mo > limite jsDelivr 20 Mo : la 4K de cette vidéo pourrait ne pas charger (réduire SEG_DURATION).`)
+    const ext = localName.split('.').pop()
+    const h = sha256(buf)
+    const sp = shardPathFor(h, ext)
+    segHashPath[localName] = sp
+    binBlobs.push({ path: sp, content: buf.toString('base64'), encoding: 'base64' })
+    totalSize += buf.length
+  }
+  for (const f of segments) await addBinary(f)
+  if (posterFile) { try { await addBinary(posterFile) } catch {} }
+
+  // DOWNLOAD : le MP4 muxé est découpé en parts ~15 Mo (sous la limite jsDelivr), hachées et poussées comme les
+  // segments. Au téléchargement, fetchAsset recolle ces parts en streaming -> le MP4 d'origine (avec audio).
+  const downloadHashPaths = []; let downloadSize = 0
+  if (downloadFile) {
+    try {
+      // Lecture STREAMÉE par tranches de 15 Mo (pas de readFile du MP4 entier en RAM -> blinde les grosses vidéos
+      // contre l'OOM pendant le push). Chaque tranche : hash + push comme un segment.
+      const st = await stat(path.join(outDir, downloadFile)); downloadSize = st.size
+      const PART = 15 * 1024 * 1024
+      const fd = await open(path.join(outDir, downloadFile), 'r')
+      const b = Buffer.alloc(PART)
+      try {
+        let off = 0
+        while (off < downloadSize) {
+          const { bytesRead } = await fd.read(b, 0, PART, off)
+          if (!bytesRead) break
+          const slice = b.subarray(0, bytesRead)
+          const h = sha256(slice); const sp = shardPathFor(h, 'bin')
+          binBlobs.push({ path: sp, content: slice.toString('base64'), encoding: 'base64' })
+          downloadHashPaths.push(sp); totalSize += bytesRead; off += bytesRead
+        }
+      } finally { await fd.close() }
+    } catch (e) { log(`  ⚠ découpe download.mp4 échouée: ${(e.message || e).toString().slice(0, 80)}`) }
+  }
+
+  onProgress('uploading', 0)
+  // ROUTAGE PUSH : beaucoup de fichiers (grosse vidéo) -> git CLI (pas de timeout Data API) ; peu -> Data API
+  // (rapide, éprouvé). Seuil 120 : au-delà, le git/trees commençait à timeouter sur les shards qui grossissent.
+  const pushMsg = `dash cmaf segment batch ${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '').slice(0, 12)}`
+  const commitPublic = binBlobs.length > 120
+    ? await pushBlobsGit(token, publicRepo, binBlobs, pushMsg, log)
+    : await pushBlobs(token, publicRepo, binBlobs, pushMsg, log)
+  log(`  ${binBlobs.length} segments CMAF poussés sur ${publicRepo} (commit ${commitPublic.slice(0, 7)}, ${binBlobs.length > 120 ? 'git CLI' : 'data API'})`)
+  onProgress('uploading', 55)
+  await commitVidBytes(apiBase, publicRepo, totalSize, log)
+
+  // map { nom local -> URL jsDelivr@sha }
+  const segMap = {}
+  for (const [name, hp] of Object.entries(segHashPath)) segMap[name] = jsdelivrUrl(commitPublic, hp)
+
+  // 2) réécrire les manifestes. STRUCTURE PLATE : tout vit DIRECTEMENT dans `dest` (pas de sous-dossier par
+  // vidéo, qui apparaissait comme un dossier parasite). Les playlists/mpd sont préfixées par `<base>.` pour
+  // rester uniques ; le Finder les ignore (isStreamSidecar). Seul `<base>.mp4.media.json` est la vidéo affichée.
+  const flat = (name) => `${dest}/${base}.${name}`
+  const hlsUrl = (name) => `/api/hls?path=${enc(flat(name))}`
+  const textBlobs = []
+
+  // media playlists : segments + EXT-X-MAP -> jsDelivr
+  const knownPlaylists = new Set(mediaPlaylists)
+  for (const pl of mediaPlaylists) {
+    const raw = await readFile(path.join(outDir, pl), 'utf8')
+    textBlobs.push({ path: flat(pl), content: rewriteMediaPlaylist(raw, segMap), encoding: 'utf-8' })
+  }
+  // master HLS : media_N.m3u8 -> /api/hls (chemin plat préfixé)
+  let masterRaw = await readFile(path.join(outDir, 'master.m3u8'), 'utf8')
+  masterRaw = rewriteMaster(masterRaw, (uri) => knownPlaylists.has(uri) ? hlsUrl(uri) : null)
+  const masterPath = flat('master.m3u8')
+  textBlobs.push({ path: masterPath, content: masterRaw, encoding: 'utf-8' })
+  // mpd DASH : sourceURL/media -> jsDelivr (segments servis direct par le CDN, pas par /api).
+  let mpdRaw = await readFile(path.join(outDir, 'manifest.mpd'), 'utf8')
+  mpdRaw = rewriteMpd(mpdRaw, segMap)
+  const mpdPath = flat('manifest.mpd')
+  textBlobs.push({ path: mpdPath, content: mpdRaw, encoding: 'utf-8' })
+
+  // 3) manifest .media.json {type:'dash', v:2}
+  const manifest = {
+    type: 'dash', v: 2, name: `${base}.mp4`, mime: 'application/dash+xml',
+    duration: outDuration,
+    mpd: mpdPath,              // manifeste DASH (servi via /api/hls, texte) -> dash.js
+    master: masterPath,        // manifeste HLS jumeau (servi via /api/hls) -> hls.js / Safari natif
+    ladder: rungs,             // hauteurs des barreaux (ex [360,720,1080,2160])
+    hasAudio,
+    poster: (posterFile && segMap[posterFile]) || undefined,
+    // Téléchargement direct (MP4 muxé vidéo+audio) : parts recollées en streaming par fetchAsset côté client.
+    download: downloadHashPaths.length ? { parts: downloadHashPaths.map((hp) => jsdelivrUrl(commitPublic, hp)), name: `${base}.mp4`, size: downloadSize, mime: 'video/mp4' } : undefined,
+    publicRepo, commitPublic,
+    probe: { duration: outDuration },
+    size: totalSize,
+    segments: segments.length,
+    author: author || 'ZenRay',          // auteur par défaut (éditable côté UI)
+    title: title || base,               // titre par défaut = nom de fichier (éditable)
+    createdAt: new Date().toISOString(),
+  }
+  const manifestPath = flat('mp4.media.json')
+  textBlobs.push({ path: manifestPath, content: JSON.stringify(manifest, null, 2), encoding: 'utf-8' })
+
+  const commitContent = await pushBlobs(token, contentRepo, textBlobs, `content update ${new Date().toISOString().slice(0, 10)}`, log)
+  log(`  ${textBlobs.length} manifestes (mpd+hls+media.json) poussés sur ${contentRepo} (commit ${commitContent.slice(0, 7)})`)
+  onProgress('uploading', 100)
+  return { publicRepo, commitPublic, manifest, manifestPath, mpdPath, masterPath, commitContent }
+}

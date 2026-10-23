@@ -1,0 +1,152 @@
+import { webcrypto } from 'node:crypto'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+class MessagePortStub {
+  constructor() {
+    this.onmessage = null
+    this.onmessageerror = null
+    this.closed = false
+    this.reply = (data) => queueMicrotask(() => this.peer?.onmessage?.({ data }))
+  }
+  close() { this.closed = true }
+}
+
+class MessageChannelStub {
+  constructor() {
+    this.port1 = new MessagePortStub()
+    this.port2 = new MessagePortStub()
+    this.port1.peer = this.port2
+    this.port2.peer = this.port1
+  }
+}
+
+const validManifest = (url = 'https://cdn.example.test/media/part-000.bin') => ({
+  type: 'video-raw',
+  name: 'clip.mov',
+  mime: 'video/quicktime',
+  size: 4,
+  parts: [{ url, start: 0, end: 3, size: 4 }],
+})
+
+function makeWorker(onPost) {
+  return { postMessage: vi.fn((message, ports) => onPost?.(message, ports?.[0])) }
+}
+
+function installServiceWorker(controller) {
+  const listeners = new Set()
+  const container = {
+    controller,
+    register: vi.fn(async () => ({ active: container.controller })),
+    ready: Promise.resolve({ active: controller }),
+    addEventListener: vi.fn((type, listener) => { if (type === 'controllerchange') listeners.add(listener) }),
+    removeEventListener: vi.fn((type, listener) => { if (type === 'controllerchange') listeners.delete(listener) }),
+    dispatchControllerChange() { for (const listener of [...listeners]) listener() },
+  }
+  Object.defineProperty(navigator, 'serviceWorker', { configurable: true, value: container })
+  return container
+}
+
+async function freshModule() {
+  vi.resetModules()
+  return import('./vidStream.js')
+}
+
+beforeEach(() => {
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: webcrypto })
+  vi.stubGlobal('MessageChannel', MessageChannelStub)
+  const values = new Map()
+  vi.stubGlobal('localStorage', {
+    getItem: (key) => values.has(key) ? values.get(key) : null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+    clear: () => values.clear(),
+  })
+})
+
+describe('mediaId', () => {
+  it('est déterministe et distingue deux URLs partageant le même long suffixe', async () => {
+    const { mediaId } = await freshModule()
+    const suffix = '/same-owner/same-repo/same-commit/' + 'x'.repeat(90) + '.bin'
+    const one = await mediaId(validManifest(`https://a.example${suffix}`))
+    const again = await mediaId(validManifest(`https://a.example${suffix}`))
+    const two = await mediaId(validManifest(`https://b.example${suffix}`))
+    expect(one).toBe(again)
+    expect(one).toMatch(/^m2-[a-f0-9]{64}$/)
+    expect(two).not.toBe(one)
+  })
+
+  it('donne priorité à la clé stable explicite', async () => {
+    const { mediaId } = await freshModule()
+    expect(await mediaId(validManifest('https://a.test/one'), 'pages/Music/a.media.json'))
+      .toBe(await mediaId(validManifest('https://b.test/two'), 'pages/Music/a.media.json'))
+  })
+})
+
+describe('registerRawMedia', () => {
+  it('ne rend l’URL qu’après un ACK typé portant le bon ID', async () => {
+    const worker = makeWorker((message, port) => port.reply({ type: 'zr-reg-ack', ok: true, id: message.id }))
+    installServiceWorker(worker)
+    const { registerRawMedia } = await freshModule()
+    await expect(registerRawMedia(validManifest(), 'pages/clip.media.json')).resolves.toMatch(/^\/zr-stream\/m2-[a-f0-9]{64}$/)
+    expect(worker.postMessage).toHaveBeenCalledOnce()
+  })
+
+  it('rejette un ancien ACK non corrélé au lieu de produire une URL fantôme', async () => {
+    const worker = makeWorker((_message, port) => port.reply({ ok: true }))
+    installServiceWorker(worker)
+    const { registerRawMedia } = await freshModule()
+    await expect(registerRawMedia(validManifest())).rejects.toMatchObject({ code: 'stream_ack_invalid' })
+  })
+
+  it('attend un controller réel lors de la première activation', async () => {
+    const worker = makeWorker((message, port) => port.reply({ type: 'zr-reg-ack', ok: true, id: message.id }))
+    const container = installServiceWorker(null)
+    const { registerRawMedia } = await freshModule()
+    const pending = registerRawMedia(validManifest())
+    setTimeout(() => {
+      container.controller = worker
+      container.dispatchControllerChange()
+    }, 10)
+    await expect(pending).resolves.toContain('/zr-stream/m2-')
+  })
+
+  it('réenregistre une seule fois sur le nouveau controller après un timeout', async () => {
+    let container
+    const replacement = makeWorker((message, port) => port.reply({ type: 'zr-reg-ack', ok: true, id: message.id }))
+    const retiring = makeWorker(() => {
+      container.controller = replacement
+      container.dispatchControllerChange()
+    })
+    container = installServiceWorker(retiring)
+    const { registerRawMedia } = await freshModule()
+    await expect(registerRawMedia(validManifest())).resolves.toContain('/zr-stream/m2-')
+    expect(retiring.postMessage).toHaveBeenCalledOnce()
+    expect(replacement.postMessage).toHaveBeenCalledOnce()
+  }, 2500)
+
+  it('rejette proprement si aucun ACK ni nouveau controller n’arrive', async () => {
+    const silent = makeWorker(() => {})
+    installServiceWorker(silent)
+    const { registerRawMedia } = await freshModule()
+    await expect(registerRawMedia(validManifest())).rejects.toMatchObject({ code: 'stream_ack_timeout' })
+  }, 2500)
+})
+
+describe('page non contrôlée (rechargement forcé ⇧⌘R)', () => {
+  it('demande au worker actif de prendre le contrôle, puis enregistre', async () => {
+    const worker = makeWorker((message, port) => port.reply({ type: 'zr-reg-ack', ok: true, id: message.id }))
+    const container = installServiceWorker(null)
+    const actif = { postMessage: vi.fn(() => { setTimeout(() => { container.controller = worker; container.dispatchControllerChange() }, 5) }) }
+    container.getRegistration = vi.fn(async () => ({ active: actif }))
+    const { registerRawMedia } = await freshModule()
+    await expect(registerRawMedia(validManifest())).resolves.toContain('/zr-stream/m2-')
+    expect(actif.postMessage).toHaveBeenCalledWith({ type: 'zr-claim' })
+  })
+
+  it('sans prise de contrôle, l’erreur typée dit quoi faire et porte le code attendu par le lecteur', async () => {
+    const container = installServiceWorker(null)
+    container.getRegistration = vi.fn(async () => ({ active: { postMessage: vi.fn() } }))
+    const { registerRawMedia } = await freshModule()
+    await expect(registerRawMedia(validManifest())).rejects.toMatchObject({ code: 'stream_controller_missing', message: expect.stringContaining('recharge la page') })
+  }, 10000)
+})

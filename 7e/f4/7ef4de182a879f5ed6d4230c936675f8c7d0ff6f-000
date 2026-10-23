@@ -1,0 +1,96 @@
+// Vignette WebP best-effort à partir d'un File/Blob image.
+// Réglage : src/config/thumbnail.js (SEUL fichier à éditer, partagé Node + navigateur + worker).
+// Best-effort : renvoie null sur le moindre échec (pas d'exception remontée).
+//
+// P8 — Le travail (décodage pixel + réencodage WebP) est lourd. Par défaut il part dans un Web Worker
+// (thumbWorker.js) via OffscreenCanvas : pendant un import multi-images, le thread UI reste fluide
+// (scroll, clics). Si le navigateur n'a ni Worker ni OffscreenCanvas, ou si le worker casse, on retombe
+// AUTOMATIQUEMENT sur le calcul inline (ancien comportement exact) : aucune régression possible.
+
+import { THUMB_MAX_SHORT as THUMB_SHORT_EDGE, THUMB_QUALITY as THUMB_WEBP_QUALITY } from '../config/thumbnail.js'
+
+// --- Repli inline (thread principal). ---
+async function makeThumbInline(fileOrBlob, maxShort, quality) {
+  try {
+    if (!fileOrBlob) return null
+    const bmp = await createImageBitmap(fileOrBlob)
+    const w0 = bmp.width, h0 = bmp.height
+    if (!w0 || !h0) { bmp.close && bmp.close(); return null }
+    const scale = Math.min(1, maxShort / Math.min(w0, h0))
+    const w = Math.max(1, Math.round(w0 * scale))
+    const h = Math.max(1, Math.round(h0 * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) { bmp.close && bmp.close(); return null }
+    ctx.drawImage(bmp, 0, 0, w, h)
+    bmp.close && bmp.close()
+    const blob = await new Promise((res) => canvas.toBlob(res, 'image/webp', quality))
+    return blob || null
+  } catch {
+    return null
+  }
+}
+
+// --- Worker singleton (créé à la première vignette, partagé par tout l'app). ---
+let _worker = null
+let _workerBroken = false
+let _seq = 0
+const _pending = new Map() // id -> { resolve, reject }
+
+function getWorker() {
+  if (_workerBroken) return null
+  if (_worker) return _worker
+  // Support requis : Worker (thread) + OffscreenCanvas (canvas hors DOM). Sinon, repli inline définitif.
+  if (typeof Worker === 'undefined' || typeof OffscreenCanvas === 'undefined') { _workerBroken = true; return null }
+  try {
+    _worker = new Worker(new URL('./thumbWorker.js', import.meta.url), { type: 'module' })
+    _worker.onmessage = (e) => {
+      const { id, blob } = e.data || {}
+      const p = _pending.get(id)
+      if (p) { _pending.delete(id); p.resolve(blob || null) }
+    }
+    // Panne d'infrastructure du worker (pas une image indécodable) : on rejette les jobs en vol pour
+    // qu'ils repassent en inline, on marque le worker mort et on bascule tout le monde en inline ensuite.
+    _worker.onerror = () => {
+      _workerBroken = true
+      for (const [, p] of _pending) p.reject(new Error('thumb worker error'))
+      _pending.clear()
+      try { _worker.terminate() } catch { /* déjà mort */ }
+      _worker = null
+    }
+    return _worker
+  } catch {
+    _workerBroken = true
+    return null
+  }
+}
+
+function runInWorker(worker, blob, maxShort, quality) {
+  return new Promise((resolve, reject) => {
+    const id = ++_seq
+    _pending.set(id, { resolve, reject })
+    try {
+      worker.postMessage({ id, blob, maxShort, quality })
+    } catch (e) {
+      _pending.delete(id)
+      reject(e)
+    }
+  })
+}
+
+export async function makeThumbWebp(fileOrBlob, maxShort = THUMB_SHORT_EDGE, quality = THUMB_WEBP_QUALITY) {
+  if (!fileOrBlob) return null
+  const worker = getWorker()
+  if (worker) {
+    try {
+      // Résolution = réponse FINALE du worker (Blob WebP, ou null si l'image est indécodable : l'inline
+      // échouerait pareil, donc inutile de le refaire). Seul un rejet (panne worker) déclenche le repli.
+      return await runInWorker(worker, fileOrBlob, maxShort, quality)
+    } catch {
+      // Worker cassé -> on calcule sur le thread principal, sans perdre la vignette.
+    }
+  }
+  return makeThumbInline(fileOrBlob, maxShort, quality)
+}

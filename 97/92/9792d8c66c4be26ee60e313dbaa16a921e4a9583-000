@@ -1,0 +1,66 @@
+// LIRE LE CONTENU D'UN DOSSIER DU DÉPÔT SANS SE FAIRE TRONQUER ═══════════════════════════════════
+//
+// LE PIÈGE, ET IL A ÉTÉ PAYÉ QUATRE FOIS DANS CE PROJET. `git/trees/<branche>?recursive=1` rend
+// l'arbre ENTIER du dépôt, et GitHub le COUPE quand il est trop gros : la réponse porte
+// `truncated: true` et s'arrête, sans erreur, sans 4xx, sans rien qui ressemble à une panne. Filtrer
+// cette liste par préfixe pour « obtenir le contenu d'un dossier » marche donc parfaitement, jusqu'au
+// jour où le dossier visé tombe après la coupure ; il rend alors zéro fichier, avec l'assurance
+// tranquille d'une réponse réussie.
+//
+// Mesuré sur zenray-data le 2026-08-29 : 34 932 entrées rendues, `truncated: true`, et ZÉRO sous
+// `pages/Photos/DJI` — un dossier de 749 manifestes fraîchement commités et vérifiés.
+//
+// LA VOIE JUSTE demande le sous-arbre du dossier LUI-MÊME, par le tree-ish `branche:chemin`. Il ne
+// contient que ce dossier, donc il est petit, donc il n'est pas tronqué. Si par extraordinaire il
+// l'était, on descend en largeur par `contents/`, qui plafonne à mille entrées PAR DOSSIER et non
+// pour l'arbre entier.
+//
+// CE QUE CE MODULE NE PEUT PAS RÉPARER, et il faut le dire plutôt que de le laisser croire : lister
+// un dossier ÉNORME comme `pages/` tout entier reste soumis à la troncature, puisque le sous-arbre
+// EST alors quasiment l'arbre. C'est pourquoi `truncated` est TOUJOURS rendu et ne doit jamais être
+// ignoré : un appelant qui décide d'une SUPPRESSION sur une liste incomplète détruit des données
+// (voir la garde ajoutée dans `upload-shard.js`, où une liste tronquée aurait fait passer un binaire
+// encore référencé pour un orphelin).
+
+// Contrat des deux lecteurs injectés, pour que ce module se teste sans réseau :
+//   `readTreeish(root)`        -> `{ ok, tree: [{ type, path }], truncated }`, chemins RELATIFS à root
+//   `readDirContents(dir)`     -> `[{ type: 'dir'|'file', path }]` chemins ABSOLUS, ou `[]`
+//
+// `keep(cheminAbsolu)` reçoit TOUJOURS le chemin absolu, dans les deux voies. C'est délibéré et ce
+// n'est pas un détail : `isExposedTreeNode` teste `pages/.zr-resources`, donc un prédicat nourri au
+// chemin relatif laisserait passer ce que l'autre voie exclut, et les deux chemins de code ne
+// rendraient pas la même liste. Une divergence pareille ne se voit qu'en production, le jour où le
+// repli se déclenche.
+//
+// Rend `{ paths, truncated }`, `paths` RELATIFS à `root` : l'appelant recompose le chemin logique
+// qu'il veut exposer, qui n'est pas toujours le chemin physique (cas d'un dossier lié Eagle).
+export async function collectSubtreeBlobPaths(readTreeish, readDirContents, root, keep = () => true, skipDir = () => false) {
+  const direct = await readTreeish(root)
+  if (direct && direct.ok && !direct.truncated) {
+    return {
+      paths: (direct.tree || [])
+        .filter((x) => x.type === 'blob' && keep(`${root}/${x.path}`))
+        .map((x) => x.path),
+      truncated: false,
+    }
+  }
+
+  // Repli en largeur. `guard` borne le nombre de dossiers VISITÉS, pas la profondeur : une
+  // arborescence pathologique ne doit pas pouvoir occuper une invocation jusqu'à son délai maximal.
+  const paths = []
+  let frontier = [root]
+  let guard = 0
+  while (frontier.length && guard < 5000) {
+    guard += frontier.length
+    const levels = await Promise.all(frontier.map((dir) => readDirContents(dir)))
+    const next = []
+    for (const level of (levels || [])) {
+      for (const item of (level || [])) {
+        if (item.type === 'dir') { if (!skipDir(item.path)) next.push(item.path) }
+        else if (item.type === 'file' && keep(item.path)) paths.push(item.path.slice(root.length + 1))
+      }
+    }
+    frontier = next
+  }
+  return { paths, truncated: frontier.length > 0 }
+}

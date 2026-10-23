@@ -1,0 +1,56 @@
+// @vitest-environment node
+// Prove that Plan uses the shared encrypted uploader, not a new transfer implementation. (19 October 2026, 00:49 Paris)
+import { afterEach, expect, test, vi } from 'vitest'
+import { captureAttachment } from './universalCapture.js'
+import { ATTACHMENT_POLICY } from '../config/attachmentPolicy.js'
+import { storageChunkFor } from '../config/chunkPolicy.js'
+
+afterEach(() => vi.unstubAllGlobals())
+test('refuses an oversized attachment before any API or encryption work', async () => {
+  const network = vi.fn()
+  vi.stubGlobal('fetch', network)
+  await expect(captureAttachment({ name: 'too-large.bin', size: ATTACHMENT_POLICY.maxFileBytes + 1 })).rejects.toThrow('95 MiB')
+  expect(network).not.toHaveBeenCalled()
+})
+test('preserves the original bytes through the existing shard API, shared chunk policy and encryption', async () => {
+  const key = Buffer.alloc(32, 1).toString('base64')
+  const writes = [], stages = [], ratios = []
+  vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+    if (url === '/api/media-key') return Response.json({ key })
+    const body = JSON.parse(options.body); writes.push({ url, ...body })
+    if (body.action === 'active-shard') return Response.json({ ok: true, repo: 'zenray-doc-public-01' })
+    if (body.action === 'blob') return Response.json({ ok: true, sha: 'b'.repeat(40) })
+    if (body.action === 'commit') return Response.json({ ok: true, commit: 'c'.repeat(40) })
+    if (body.action === 'save' || body.action === 'index-add') return Response.json({ ok: true })
+    throw new Error('Unexpected API call')
+  }))
+  const original = Buffer.from('Original text\n日本語')
+  const file = new File([original], 'source.txt', { type: 'text/plain' })
+  const result = await captureAttachment(file, { folder: 'pages/PlanAttachments/task-1', onStage: (stage) => stages.push(stage), onProgress: (ratio) => ratios.push(ratio) })
+  const manifest = JSON.parse(writes.find((write) => write.action === 'save').markdown)
+  expect(result.nodePath).toMatch(/^pages\/PlanAttachments\/task-1\/.+\.media\.json$/)
+  expect(writes.find((write) => write.action === 'active-shard')).toMatchObject({ kind: 'doc', vis: 'public', need: original.length })
+  expect(manifest.chunkSize).toBe(storageChunkFor(file.size, { perChunkEncrypted: true }))
+  expect(stages).toEqual(['storage', 'encrypting', 'uploading', 'publishing', 'saving'])
+  expect(ratios.at(-1)).toBe(1)
+  const imported = await crypto.subtle.importKey('raw', Buffer.from(key, 'base64'), 'AES-GCM', false, ['decrypt'])
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: Buffer.from(manifest.ivs[0], 'base64') }, imported, Buffer.from(writes.find((write) => write.action === 'blob').b64, 'base64'))
+  expect(Buffer.from(decrypted)).toEqual(original)
+})
+
+test('reports accepted 3 MiB transport fragments before final publication', async () => {
+  const { TRANSPORT_CHUNK } = await import('../config/chunkPolicy.js')
+  const ratios = [], stages = [], calls = []
+  vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+    if (url === '/api/media-key') return Response.json({ key: Buffer.alloc(32, 1).toString('base64') })
+    const body = JSON.parse(options.body); calls.push(body)
+    return Response.json({ ok: true, repo: 'zenray-doc-public-01', sha: 'b'.repeat(40), commit: 'c'.repeat(40) })
+  }))
+  const file = new File([Buffer.alloc(TRANSPORT_CHUNK * 2 + 17, 7)], 'fragmented.bin')
+  await captureAttachment(file, { folder: 'pages/PlanAttachments/task-1', onProgress: (ratio) => ratios.push(ratio), onStage: (stage) => stages.push(stage) })
+  expect(calls.filter((call) => call.action === 'blob')).toHaveLength(3)
+  expect(calls.some((call) => call.action === 'assemble-blob')).toBe(true)
+  expect(ratios.filter((ratio) => ratio > 0 && ratio < 0.9).length).toBeGreaterThanOrEqual(2)
+  expect(ratios.at(-1)).toBe(1)
+  expect(stages).toContain('assembling')
+})

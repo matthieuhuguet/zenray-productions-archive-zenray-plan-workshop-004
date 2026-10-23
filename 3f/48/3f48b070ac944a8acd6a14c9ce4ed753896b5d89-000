@@ -1,0 +1,95 @@
+// ═══ DÉPRÉCIÉ (2026-07-13) — NE PLUS UTILISER ═══════════════════════════════════════════════════
+// Ce script date de l'ère vignettes 384px/q72, remplacée par le standard 1080px/q60 (makeThumbAt,
+// scripts/img-ingest.mjs). Pour régénérer des vignettes aujourd'hui : scripts/regen-thumbs-bulk.mjs
+// (en masse, association par hash) ou scripts/regen-thumbs-oriented.mjs (correction EXIF).
+// Gardé UNIQUEMENT comme référence historique. Le garde ci-dessous empêche toute exécution accidentelle.
+if (!process.env.ZR_RUN_DEPRECATED) { console.error("DÉPRÉCIÉ : voir l'en-tête du fichier. (ZR_RUN_DEPRECATED=1 pour forcer, déconseillé.)"); process.exit(1) }
+
+// Génère les VIGNETTES (webp ~6 Ko, 384px) pour les images déjà importées, et les pousse dans les shards.
+// Convention : vignette = même chemin que l'AVIF avec extension .webp (le frontend la dérive, fallback AVIF).
+// Source = l'AVIF LOCAL d'Eagle (pas de re-download). N'écrit RIEN dans zenray-content (pas de manifest à changer).
+// CPU local en parallèle pour la génération ; git push par shard pour l'upload (zéro API).
+// Usage : GITHUB_TOKEN=$(gh auth token) node scripts/thumb-backfill.mjs [--shard zenray-media-01] [--jobs 12]
+import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import path from 'node:path'
+
+const LIB = process.env.EAGLE_LIB || '/Users/zenray/Create/Media/References/References.library'
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const TOKEN = process.env.GITHUB_TOKEN
+const WORK = '/tmp/zr_thumbs'
+const SCRIPT_DIR = path.dirname(new URL(import.meta.url).pathname)
+const TRACK = path.join(SCRIPT_DIR, '.eagle-import.json')
+const args = process.argv.slice(2)
+const getArg = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d }
+const ONLY_SHARD = getArg('--shard', null)
+const JOBS = parseInt(getArg('--jobs', '12'), 10)
+if (!TOKEN) { console.error('no GITHUB_TOKEN'); process.exit(1) }
+
+const remote = (name) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${name}.git`
+const git = (dir, ...a) => execFileSync('git', ['-C', dir, ...a], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+// génère une vignette webp depuis un avif : ffmpeg (decode av1) -> png scalé -> cwebp -> webp
+function genThumb(avif, outWebp) {
+  return new Promise((resolve) => {
+    const ff = spawn('ffmpeg', ['-y', '-i', avif, '-vf', "scale='min(384,iw)':-2", '-f', 'image2pipe', '-c:v', 'png', '-'], { stdio: ['ignore', 'pipe', 'ignore'] })
+    const cw = spawn('cwebp', ['-quiet', '-q', '72', '-o', outWebp, '--', '-'], { stdio: ['pipe', 'ignore', 'ignore'] })
+    ff.stdout.pipe(cw.stdin)
+    cw.on('close', (code) => resolve(code === 0 && existsSync(outWebp)))
+    cw.on('error', () => resolve(false)); ff.on('error', () => resolve(false))
+  })
+}
+
+// trouve l'AVIF source local d'un item Eagle
+const avifCache = new Map()
+async function sourceAvif(id) {
+  if (avifCache.has(id)) return avifCache.get(id)
+  const dir = path.join(LIB, 'images', `${id}.info`)
+  let f = null
+  try { f = (await readdir(dir)).find((x) => x.toLowerCase().endsWith('.avif')) } catch {}
+  const res = f ? path.join(dir, f) : null; avifCache.set(id, res); return res
+}
+
+// ---- MAIN ----
+await mkdir(WORK, { recursive: true })
+const track = JSON.parse(await readFile(TRACK, 'utf8'))
+const byShard = {}
+for (const [id, d] of Object.entries(track.done)) { if (ONLY_SHARD && d.shard !== ONLY_SHARD) continue; (byShard[d.shard] = byShard[d.shard] || []).push({ id, path: d.path }) }
+console.log(`shards: ${Object.entries(byShard).map(([s, a]) => `${s}=${a.length}`).join(', ')}`)
+
+for (const [shard, items] of Object.entries(byShard)) {
+  const dir = path.join(WORK, shard)
+  if (!existsSync(dir)) {
+    // MÉTHODE SÛRE (validée 01/02/03) : clone avec checkout -> les AVIF existants sont MATÉRIALISÉS dans le
+    // working tree. On écrit les .webp à côté, puis `git add -A` (ci-dessous) voit avif PRÉSENTS -> il ne les
+    // supprime pas. NE PAS utiliser --no-checkout (le push d'un clone blobless sans les blobs échoue + risque
+    // de commit "vignettes seules" = perte des AVIF, cf incident shard 04). Le coût = téléchargement des AVIF.
+    git(WORK, 'clone', '--depth', '1', remote(shard), dir)
+    git(dir, 'config', 'user.email', 'thumb@zenray'); git(dir, 'config', 'user.name', 'zenray-thumb')
+  }
+  console.log(`\n${shard}: ${items.length} vignettes...`)
+
+  let i = 0, done = 0, fail = 0
+  const t0 = performance.now()
+  const worker = async () => {
+    while (i < items.length) {
+      const it = items[i++]
+      const outWebp = path.join(dir, it.path.replace(/\.[^./]+$/, '.webp'))
+      if (existsSync(outWebp)) { done++; continue }
+      const src = await sourceAvif(it.id)
+      if (!src) { fail++; continue }
+      await mkdir(path.dirname(outWebp), { recursive: true })
+      const ok = await genThumb(src, outWebp); ok ? done++ : fail++
+      if ((done + fail) % 500 === 0) process.stdout.write(`\r  ${done + fail}/${items.length} (${((done + fail) / ((performance.now() - t0) / 1000)).toFixed(0)}/s, ${fail} échecs)`)
+    }
+  }
+  await Promise.all(Array.from({ length: JOBS }, worker))
+  console.log(`\n  généré ${done}, échecs ${fail}. Push...`)
+  git(dir, 'add', '-A') // sûr : les AVIF sont checkout (présents) -> add -A n'en supprime aucun, n'ajoute que les .webp
+  try { git(dir, 'commit', '-q', '-m', `vignettes ${done} images`); git(dir, 'push', '-q', 'origin', 'HEAD:main'); console.log(`  ${shard} poussé.`) }
+  catch (e) { console.log(`  ${shard} rien à pousser ou erreur: ${String(e.message || e).slice(0, 80)}`) }
+  // nettoie le clone du shard (borne le disque scratch à ~1 clone à la fois)
+  try { execFileSync('rm', ['-rf', dir]) } catch {}
+}
+console.log('\nbackfill vignettes terminé.')

@@ -1,0 +1,81 @@
+// fmp4-single.test.mjs (14 October 2026): FMP4-SINGLE, green on a good case and RED on corrupted ones. FR : vert sur un bon cas, rouge sur un cas casse.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import {
+  fillSubtitleGaps, comparableCues, probeSource, extractSubtitles, muxSingleFmp4, splitFmp4, joinParts, verifyAgainstSource, readBoxes,
+} from './fmp4-single.mjs'
+
+const work = fs.mkdtempSync(path.join(os.tmpdir(), 'fmp4-'))
+const srt = '1\n00:00:00,500 --> 00:00:02,000\nBonjouré\n\n2\n00:00:05,000 --> 00:00:07,000\nSecond\n\n'
+const source = path.join(work, 'source.mkv')
+
+test('fixture: a 12 s film with video, 2 audio tracks and a subtitle', () => {
+  fs.writeFileSync(path.join(work, 's.srt'), srt)
+  const r = spawnSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=d=12:s=320x180:r=24', '-f', 'lavfi', '-i', 'sine=d=12',
+    '-f', 'lavfi', '-i', 'sine=f=880:d=12', '-i', path.join(work, 's.srt'), '-map', '0', '-map', '1', '-map', '2', '-map', '3',
+    '-c:v', 'libx264', '-g', '24', '-c:a', 'aac', '-c:s', 'srt', source])
+  assert.equal(r.status, 0)
+})
+
+test('gap filling keeps the real cues and adds empty ones', () => {
+  const filled = fillSubtitleGaps(srt)
+  assert.ok(filled.includes('00:00:00,000 --> 00:00:00,500'), 'leading gap filled')
+  assert.ok(filled.includes('00:00:02,000 --> 00:00:05,000'), 'inner gap filled')
+  assert.deepEqual(comparableCues(filled), comparableCues(srt))
+})
+
+test('GREEN: mux, split below the limit, join is byte identical, source streams and subtitles verified', async () => {
+  const probe = probeSource(source)
+  const tracks = extractSubtitles(source, probe, work)
+  assert.equal(tracks.length, 1)
+  const single = path.join(work, 'single.mp4')
+  await muxSingleFmp4(source, probe, tracks, single)
+  const split = splitFmp4(single, path.join(work, 'parts'), { limitBytes: 60 * 1024 })
+  assert.ok(split.parts.length > 1, 'cut in several parts')
+  assert.ok(split.parts.every((p) => p.bytes <= 60 * 1024))
+  const joined = path.join(work, 'joined.mp4')
+  const j = joinParts(split.parts.map((p) => path.join(work, 'parts', p.name)), joined)
+  assert.equal(j.sha256, split.sha256)
+  assert.ok(readBoxes(joined).some((b) => b.type === 'moov'))
+  const check = verifyAgainstSource(source, joined, probe)
+  assert.ok(check.ok, JSON.stringify(check.checks.filter((c) => !c.ok)))
+  assert.ok(check.checks.length >= 6)
+})
+
+test('RED: a flipped byte in a part is caught by the whole file hash', () => {
+  const dir = path.join(work, 'parts')
+  const names = fs.readdirSync(dir).sort()
+  const victim = path.join(dir, names[1])
+  const original = fs.readFileSync(victim)
+  const broken = Buffer.from(original); broken[Math.floor(broken.length / 2)] ^= 0xff
+  fs.writeFileSync(victim, broken)
+  const single = fs.readFileSync(path.join(work, 'single.mp4'))
+  const joined = joinParts(names.map((n) => path.join(dir, n)), path.join(work, 'bad.mp4'))
+  const expected = splitFmp4(path.join(work, 'single.mp4'), path.join(work, 'again'), { limitBytes: 60 * 1024 }).sha256
+  assert.notEqual(joined.sha256, expected)
+  assert.ok(single.length > 0)
+  fs.writeFileSync(victim, original)
+})
+
+test('RED: a subtitle whose text changed is reported', async () => {
+  const probe = probeSource(source)
+  const tracks = extractSubtitles(source, probe, work)
+  fs.writeFileSync(tracks[0].path, fs.readFileSync(tracks[0].path, 'utf8').replace('Second', 'Altered'))
+  const single = path.join(work, 'single-altered.mp4')
+  await muxSingleFmp4(source, probe, tracks, single)
+  const check = verifyAgainstSource(source, single, probe)
+  assert.equal(check.ok, false)
+  assert.ok(check.checks.some((c) => /text/.test(c.name) && !c.ok))
+})
+
+test('RED: a fragment larger than the part limit is refused, not silently split', async () => {
+  const probe = probeSource(source)
+  const tracks = extractSubtitles(source, probe, work)
+  const single = path.join(work, 'single2.mp4')
+  await muxSingleFmp4(source, probe, tracks, single)
+  assert.throws(() => splitFmp4(single, path.join(work, 'tiny'), { limitBytes: 500 }), /does not fit/)
+})

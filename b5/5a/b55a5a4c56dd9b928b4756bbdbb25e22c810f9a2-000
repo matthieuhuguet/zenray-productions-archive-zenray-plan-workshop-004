@@ -1,0 +1,96 @@
+// 8 October 2026, 21:09 CEST: test token-shape scanning and guarded local exclusions.
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { Readable } from 'node:stream'
+import { describe, expect, it } from 'vitest'
+import { addFindingsToLocalExclusions, isPendingWorkspaceFile, isScannableTextFile, scanPendingTextFiles, scanTextStream } from './ScanGithubTokenShapes.mjs'
+
+const makeShape = (prefix, size = 36) => prefix + '_' + 'x'.repeat(size)
+
+describe('GitHub token-shape scan', () => {
+  it('counts a token-shaped string without returning its value', async () => {
+    const candidate = makeShape('gho')
+    const sample = 'before ' + candidate + ' after'
+    const result = await scanTextStream(Readable.from([Buffer.from(sample)]))
+    expect(result).toEqual({ bytesRead: Buffer.byteLength(sample), matches: 1, prefixTypes: ['gho'] })
+    expect(JSON.stringify(result)).not.toContain(candidate)
+  })
+
+  it('detects a candidate split across read boundaries exactly once', async () => {
+    const candidate = makeShape('github_pat', 24)
+    const sample = 'left ' + candidate + ' right'
+    const split = sample.indexOf(candidate) + 15
+    const result = await scanTextStream(Readable.from([Buffer.from(sample.slice(0, split)), Buffer.from(sample.slice(split))]))
+    expect(result.matches).toBe(1)
+    expect(result.prefixTypes).toEqual(['github'])
+  })
+
+  it('scans only pending text files and ignores unchanged or binary files', async () => {
+    const candidate = makeShape('ghp')
+    const state = {
+      backups: { 'workshop:old.jsonl': { changeToken: 'same' } },
+      inventory: { localFiles: [
+        { id: 'workshop:new.jsonl', sourceId: 'workshop', relativePath: 'new.jsonl', localPath: '/fixture/new.jsonl', size: 100, changeToken: 'new' },
+        { id: 'workshop:old.jsonl', sourceId: 'workshop', relativePath: 'old.jsonl', localPath: '/fixture/old.jsonl', size: 100, changeToken: 'same' },
+        { id: 'workshop:binary.bin', sourceId: 'workshop', relativePath: 'binary.bin', localPath: '/fixture/binary.bin', size: 100, changeToken: 'new' },
+      ] },
+    }
+    const result = await scanPendingTextFiles(state, {
+      openStream: (filename) => Readable.from([Buffer.from(filename.endsWith('new.jsonl') ? candidate : 'ordinary')]),
+    })
+    expect(result).toMatchObject({ scannedFiles: 1, candidateFiles: 1, findings: [{ relativePath: 'new.jsonl', matches: 1 }] })
+    expect(isPendingWorkspaceFile(state.inventory.localFiles[1], state.backups['workshop:old.jsonl'])).toBe(false)
+    expect(isScannableTextFile(state.inventory.localFiles[2])).toBe(false)
+    expect(JSON.stringify(result)).not.toContain(candidate)
+  })
+
+  it('adds findings to local exclusions only after confirming the watcher and queue are idle', async () => {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), 'assets-token-scan-'))
+    const registryPath = path.join(stateDir, 'Projects.json')
+    const project = { id: 'agent-conversations', sources: [{ id: 'workshop', exclude: ['existing.json'] }] }
+    await writeFile(registryPath, JSON.stringify({ projects: [project] }))
+    const actions = []
+    let registeredProject
+    try {
+      const result = await addFindingsToLocalExclusions('agent-conversations', [
+        { sourceId: 'workshop', relativePath: 'sensitive-one.jsonl' },
+        { sourceId: 'workshop', relativePath: 'sensitive-two.jsonl' },
+      ], {
+        stateDir,
+        request: async (request) => {
+          actions.push(request.action)
+          if (request.action === 'status') return { project: { sync: { watched: false }, jobs: [] } }
+          registeredProject = request.project
+          return { ok: true }
+        },
+      })
+      expect(result).toEqual({ added: 2, exclusions: 2 })
+      expect(registeredProject.sources[0].exclude).toEqual(['existing.json', 'sensitive-one.jsonl', 'sensitive-two.jsonl'])
+      expect(actions).toEqual(['status', 'register'])
+    } finally {
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to apply findings while a watcher is active', async () => {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), 'assets-token-scan-'))
+    const registryPath = path.join(stateDir, 'Projects.json')
+    await writeFile(registryPath, JSON.stringify({ projects: [{ id: 'agent-conversations', sources: [{ id: 'workshop' }] }] }))
+    const actions = []
+    try {
+      await expect(addFindingsToLocalExclusions('agent-conversations', [
+        { sourceId: 'workshop', relativePath: 'sensitive.jsonl' },
+      ], {
+        stateDir,
+        request: async (request) => {
+          actions.push(request.action)
+          return { project: { sync: { watched: true }, jobs: [] } }
+        },
+      })).rejects.toThrow('Stop the source watcher')
+      expect(actions).toEqual(['status'])
+    } finally {
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+})

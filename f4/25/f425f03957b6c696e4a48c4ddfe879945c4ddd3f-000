@@ -1,0 +1,517 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react'
+import { Tldraw, getSnapshot, loadSnapshot, AssetRecordType, createShapeId } from 'tldraw'
+import 'tldraw/tldraw.css'
+import './ref.css'
+import { useRefAutosave } from './useRefAutosave.js'
+import { readJson } from './content.js'
+import { normalizeCanvas, makeCanvas, makeRefItem, newId, nowIso } from './schema.js'
+import { resolveRef, resolveRefFull } from './resolveRef.js'
+import { RefUiContext } from './refUiContext.js'
+import RefToolbar from './RefToolbar.jsx'
+import RefTextPanel from './RefTextPanel.jsx'
+import { diagnostiquerBoard, PHRASES, SEUILS } from './autoDiagnostic.js'
+import RefImagePicker from './RefImagePicker.jsx'
+import { PALETTE } from '../theme.js'
+import { notify } from '../components/Notifications.jsx'
+
+// RefBoard — coeur du canvas infini ZenRay Ref, basé sur tldraw (plan §5.1, design validé).
+//
+// tldraw fournit GRATUITEMENT : pan/zoom, sélection, marquee, déplacement, redimensionnement, rotation,
+// groupage, alignement/distribution, texte/notes (sticky), z-order, undo/redo, raccourcis, snapping,
+// et le CULLING viewport (les shapes hors écran ne rendent pas) — clé pour les gros boards.
+//
+// UI 2026-07-19 : toolbar tldraw REMPLACÉE par la toolbar verticale gauche V9 (RefToolbar, via
+// components.Toolbar) ; menus tldraw non essentiels masqués ; picker d'images du drive (RefImagePicker)
+// partagé par le contexte RefUiContext. Style panel et zoom tldraw conservés (choix de forme/couleur).
+//
+// PERSISTANCE (plan §4.1, §13 P0) : le board ne stocke jamais de binaire. On enregistre :
+//   - `canvas.tldraw` : snapshot du store tldraw (formes natives : texte, notes, formes, flèches, frames).
+//   - `canvas.items`  : notre carte d'assets-références par id (image-ref/media-ref/...), source de vérité
+//                       des liens vers les manifests Create. Les images sont des ASSETS tldraw dont l'URL
+//                       pointe vers /api/shard (shard privé) — aucune donnée binaire dans le JSON.
+//
+// LOD (2026-07-19, cible >= 1000 images par board) : les assets image sont insérés avec la VIGNETTE
+// webp 1080 (THUMB_MAX_SHORT/THUMB_QUALITY, déjà générée pour tout le drive) comme src par défaut ;
+// meta {thumbSrc, fullSrc} permet au resolver TLAssetStore.resolve de basculer sur le plein format
+// uniquement quand le zoom écran le justifie (steppedScreenScale > 1) ou à l'export.
+//
+// Autosave débouncé + flush sur pointerup (plan §6 Phase 1, §7.4 write amplification).
+
+// Toolbar V9 + menus réduits : la barre native, le menu principal/page et les panneaux debug/share
+// disparaissent ; le style panel (formes, couleurs) et la navigation (zoom) restent.
+const TL_COMPONENTS = {
+  Toolbar: RefToolbar,
+  // PANNEAU DE PROPRIÉTÉS DU TEXTE (2026-08-07). Il REMPLACE celui de tldraw plutôt que de s'y
+  // ajouter : le panneau natif propose quatre polices étrangères au produit et aucune graisse, or
+  // Matthieu n'en veut que trois, les siennes, plus la taille et le gras. Deux panneaux pour le même
+  // objet auraient été la seconde source de vérité que ce rework supprime.
+  StylePanel: RefTextPanel,
+  MenuPanel: null,
+  TopPanel: null,
+  SharePanel: null,
+  HelpMenu: null,
+  DebugMenu: null,
+  DebugPanel: null,
+}
+
+// Résolution LOD des assets référencés (jamais de binaire dans le JSON) : vignette par défaut,
+// plein format au zoom fort et à l'export. Le collage binaire direct est refusé — les fichiers
+// passent par le pipeline d'import ZenRay (drop Finder sur le board, géré par RefBoardHost).
+//
+// PIÈGE tldraw (bug réel corrigé le 2026-07-19) : le schéma d'asset valide `props.src` contre une
+// liste stricte de protocoles (http:, https:, data:, asset: — PAS blob:). La majorité des images
+// ZenRayShards sont chiffrées (AES-GCM) et leur déchiffrement produit un blob: — donc `props.src` ne
+// peut JAMAIS contenir directement ce blob (createAssets levait une ValidationError silencieuse côté
+// store, l'image n'apparaissait jamais). Solution : `props.src` porte la référence STABLE et
+// persistable (srcRaw : URL http(s)/relative, ciphertext ou non, peu importe — jamais rendue
+// directement), et resolve() ci-dessous fait le VRAI déchiffrement à CHAQUE rendu via `meta.refPath`
+// (jamais figé dans le JSON du board, donc jamais de blob mort après un reload/une éviction du cache
+// LRU de décryptage). resolveRef() est cache-par-path : un second rendu ne redéchiffre pas.
+//
+// upload() ne DOIT JAMAIS lever (bug réel corrigé le 2026-07-19, "écran blanc peu importe l'action") :
+// tldraw appelle cette méthode dès qu'un contenu externe atterrit sur le canvas par un chemin qu'on
+// n'a pas explicitement désactivé (voir handleMount -> registerExternalContentHandler('files', null),
+// qui coupe le drop/paste natif de fichiers). Si malgré ça un appel survit et que upload() THROW, la
+// promesse rejetée n'est pas rattrapée par tldraw -> plantage React sans ErrorBoundary -> écran blanc.
+// On retourne donc un échec DOUX (source vide 1x1) + une notification, jamais une exception.
+// ═══ LES POLICES DU BOARD SONT CELLES DE ZENRAY, ET RIEN D'AUTRE (2026-08-07) ═══════════════════
+// Retour de Matthieu, mot pour mot : « tu n'utilises pas mes textes par défaut, c'est soit
+// AnthropicSerif soit AnthropicSans soit Mono, il n'y a que trois choix possibles ».
+//
+// tldraw embarque ses propres fichiers de police (Shantell Sans pour « draw », etc.) et les charge
+// depuis son paquet. `assetUrls.fonts` est le point de substitution prévu par la bibliothèque : on
+// remplace chaque fichier par le nôtre, si bien que le texte du board REND réellement en Anthropic
+// sans qu'aucune shape n'ait à changer de forme ni le schéma d'être touché.
+//
+// Le quatrième style de tldraw (`draw`, la manuscrite) reçoit AnthropicSans plutôt qu'un fichier
+// vide : le supprimer du schéma casserait les boards existants qui le portent déjà, alors que le
+// faire pointer vers Sans le rend simplement indistinct. Le SÉLECTEUR, lui, n'en propose que trois
+// (voir RefTextPanel) — c'est là que se tient la contrainte « trois choix », pas dans le schéma.
+const A = (f) => `/fonts/${f}`
+const ZENRAY_FONTS = {
+  tldraw_sans: A('AnthropicSans-Romans.woff2'),
+  tldraw_sans_bold: A('AnthropicSans-Romans.woff2'),
+  tldraw_sans_italic: A('AnthropicSans-Italics.woff2'),
+  tldraw_sans_italic_bold: A('AnthropicSans-Italics.woff2'),
+  tldraw_serif: A('AnthropicSerif-Romans.woff2'),
+  tldraw_serif_bold: A('AnthropicSerif-Romans.woff2'),
+  tldraw_serif_italic: A('AnthropicSerif-Italics.woff2'),
+  tldraw_serif_italic_bold: A('AnthropicSerif-Italics.woff2'),
+  tldraw_mono: A('AnthropicMono.woff2'),
+  tldraw_mono_bold: A('AnthropicMono.woff2'),
+  tldraw_mono_italic: A('AnthropicMono.woff2'),
+  tldraw_mono_italic_bold: A('AnthropicMono.woff2'),
+  // `draw` retombe sur Sans : jamais de manuscrite étrangère dans un board ZenRay.
+  tldraw_draw: A('AnthropicSans-Romans.woff2'),
+  tldraw_draw_bold: A('AnthropicSans-Romans.woff2'),
+  tldraw_draw_italic: A('AnthropicSans-Italics.woff2'),
+  tldraw_draw_italic_bold: A('AnthropicSans-Italics.woff2'),
+}
+const ZENRAY_ASSET_URLS = { fonts: ZENRAY_FONTS }
+
+// ═══ IMAGES PROVISOIRES : VOIR TOUT DE SUITE, TÉLÉVERSER ENSUITE (2026-08-07) ═══════════════════
+// Demande de Matthieu : « tu poses un fichier dans le cache du navigateur, ça te permet de l'avoir
+// direct pour pouvoir le manipuler, on sauvegarde la position, et ensuite une fois qu'il a fini
+// d'être uploadé il faut le remplacer par le vrai fichier hébergé sur le drive ».
+//
+// LE CACHE EST CETTE TABLE, EN MÉMOIRE, ET C'EST VOULU. Un `URL.createObjectURL` ne survit pas au
+// rechargement de la page, ce qui donne GRATUITEMENT la seconde moitié de la consigne : « si tu
+// quittes la page avant que ce soit fini d'être uploadé, t'as pas ton média qui reste sur la page ».
+//
+// Pourquoi la table plutôt que `props.src` : le schéma tldraw refuse le protocole `blob:` (piège
+// déjà payé le 2026-07-19, commentaire d'ASSET_STORE ci-dessus). L'asset provisoire porte donc un
+// `src` vide et un `meta.pendingId` ; c'est `resolve()` qui rend l'URL locale, à chaque rendu.
+const PROVISOIRES = new Map()   // pendingId -> objectURL
+
+export function poserProvisoire(pendingId, objectUrl) { PROVISOIRES.set(pendingId, objectUrl) }
+export function oublierProvisoire(pendingId) {
+  const u = PROVISOIRES.get(pendingId)
+  if (u) { try { URL.revokeObjectURL(u) } catch {} }
+  PROVISOIRES.delete(pendingId)
+}
+
+const ASSET_STORE = {
+  upload: async () => {
+    notify({ icon: 'exclamationmark.triangle', tint: PALETTE.red, label: 'ZenRay Ref', title: 'Collage direct refusé', body: 'Dépose le fichier sur le board (import ZenRay) au lieu de le coller — aucun binaire n’est stocké directement dans un board.' })
+    return { src: '' } // forme exacte attendue par TLAssetStore.upload ; '' est un src valide (aucun rendu).
+  },
+  resolve: async (asset, ctx) => {
+    // IMAGE PROVISOIRE : l'octet vit dans le cache du navigateur, jamais dans le board. Au premier
+    // rendu après un rechargement, la table est vide -> rien ne rend, ce qui EST le comportement
+    // demandé pour un média dont l'upload n'a pas abouti.
+    const pendingId = asset && asset.meta && asset.meta.pendingId
+    if (pendingId) return PROVISOIRES.get(pendingId) || null
+    const refPath = asset && asset.meta && asset.meta.refPath
+    if (!refPath) return (asset.props && asset.props.src) || null
+    const wantFull = !!(ctx && (ctx.shouldResolveToOriginal || ctx.steppedScreenScale > 1))
+    if (wantFull) { const full = await resolveRefFull(refPath); if (full) return full }
+    const r = await resolveRef(refPath)
+    return (r && r.thumb) || (asset.props && asset.props.src) || null
+  },
+}
+
+// ═══ UN BOARD DÉJÀ CHARGÉ NE SE RECHARGE PAS, ET SURTOUT NE REDEVIENT JAMAIS UN ÉCRAN D'ATTENTE ══
+//
+// LE SYMPTÔME, corrigé par Matthieu le 2026-08-30 après que je l'aie lu à l'envers. Ses mots : « ça
+// charge AVEC les icônes puis tout disparaît en gris ». Donc le board monte, s'affiche, et REVIENT
+// en arrière. Ce n'est pas un chargement lent, c'est un retour à l'état d'attente.
+//
+// LA MÉCANIQUE. `loaded` part à faux et l'effet de chargement le remet à faux à chaque exécution.
+// Tant que RefBoard garde la même instance, cela n'arrive qu'une fois ; mais toute cause de
+// REMONTAGE quelque part au-dessus (un ancêtre qui repasse par un état de chargement, une bascule
+// d'onglet, une branche de rendu qui change) redonne une instance neuve, donc `loaded` à faux, donc
+// l'écran d'attente à la place d'un board qui marchait une seconde plus tôt.
+//
+// PLUTÔT QUE DE COURIR APRÈS CHAQUE CAUSE DE REMONTAGE, on rend le remontage INOFFENSIF : le board
+// lu reste ici, indexé par chemin, et une instance neuve repart avec ses données au lieu de repartir
+// de zéro. C'est aussi ce qui rend une réouverture instantanée, sans un appel réseau.
+//
+// Le cache est volontairement PETIT et sans expiration : un board est un objet léger (aucun binaire,
+// c'est le principe même du format), et il est réécrit à chaque sauvegarde par `canvasRef`. Il vit
+// le temps de l'onglet, ce qui est exactement la durée pendant laquelle un remontage peut survenir.
+const BOARDS_EN_MEMOIRE = new Map()   // chemin -> board normalisé
+export function oublierBoardEnMemoire(chemin) {
+  if (chemin) BOARDS_EN_MEMOIRE.delete(chemin); else BOARDS_EN_MEMOIRE.clear()
+}
+
+export default function RefBoard({ path, theme = 'light', onStatus }) {
+  // L'état initial VIENT DU CACHE : un remontage repart donc avec son board, sans écran d'attente.
+  const [canvas, setCanvas] = useState(() => BOARDS_EN_MEMOIRE.get(path) || null)
+  const [loaded, setLoaded] = useState(() => BOARDS_EN_MEMOIRE.has(path))
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const editorRef = useRef(null)
+  const racineRef = useRef(null)
+  const [verdict, setVerdict] = useState(null)   // null tant qu'aucune anomalie n'est constatee
+  const canvasRef = useRef(null)          // dernier board connu (pour merge items côté save)
+  const { status, save, flush, setSha } = useRefAutosave(path)
+
+  // Chargement initial du board depuis GitHub (zenray-data). Crée un board vierge si absent.
+  useEffect(() => {
+    let live = true
+    // Un board déjà en mémoire s'affiche TOUT DE SUITE. On relit quand même en fond, pour attraper
+    // une modification faite depuis un autre onglet, mais l'écran ne rembobine pas pendant ce temps.
+    const dejaLa = BOARDS_EN_MEMOIRE.get(path)
+    if (dejaLa) {
+      // On NE RELIT PAS. Relire écraserait `canvasRef` avec la version distante, donc perdrait les
+      // modifications faites depuis le dernier enregistrement. La cohérence entre onglets est déjà
+      // le travail de l'autosave, qui relit et fusionne au moment du conflit 409 : la refaire ici
+      // serait une seconde vérité, et c'est elle qui se tromperait.
+      canvasRef.current = dejaLa
+      setCanvas(dejaLa)
+      setLoaded(true)
+      return () => { live = false }
+    }
+    setLoaded(false)
+    readJson(path).then(({ data, sha, missing }) => {
+      if (!live) return
+      if (sha) setSha(sha)
+      const c = missing || !data ? makeCanvas({ projectPath: path, title: titleFromPath(path) }) : normalizeCanvas(data, { projectPath: path })
+      BOARDS_EN_MEMOIRE.set(path, c)
+      canvasRef.current = c
+      setCanvas(c)
+      setLoaded(true)
+    }).catch((err) => {
+      // UN ÉCHEC DE LECTURE DOIT SE VOIR (2026-08-30). Sans ce `catch`, un rejet de `readJson`
+      // (réseau coupé, jeton refusé, JSON illisible) laissait `loaded` à faux POUR TOUJOURS : l'écran
+      // gardait « Ouverture du board… » sans une erreur, sans une ligne de console, sans rien qui
+      // permette de distinguer un chargement lent d'un chargement mort. C'est l'échec muet que la
+      // bannière « sortir du prototype » interdit, et c'était la deuxième moitié du « fond gris sans
+      // rien » signalé par Matthieu.
+      //
+      // Le board vierge est le bon repli : il rend l'outil UTILISABLE tout de suite, et l'autosave
+      // ne peut pas écraser le distant puisque `setSha` n'a rien reçu, donc la sauvegarde partira en
+      // création et échouera proprement plutôt que d'effacer un board existant.
+      if (!live) return
+      console.error('[RefBoard] lecture du board impossible :', path, err)
+      if (BOARDS_EN_MEMOIRE.has(path)) return   // on garde ce qu'on avait plutôt que de l'effacer
+      const c = makeCanvas({ projectPath: path, title: titleFromPath(path) })
+      canvasRef.current = c
+      setCanvas(c)
+      setLoaded(true)
+      if (onStatus) onStatus('error')
+    })
+    return () => { live = false }
+  }, [path, setSha, onStatus])
+
+  useEffect(() => { if (onStatus) onStatus(status) }, [status, onStatus])
+
+  // Le thème peut changer PENDANT qu'un board est ouvert (bascule clair/sombre de l'app). Sans ce
+  // suivi, la correction du montage ne vaudrait que pour la première ouverture, et l'incohérence
+  // reviendrait au premier basculement.
+  useEffect(() => {
+    const e = editorRef.current
+    if (!e) return
+    try { e.setColorMode(theme === 'dark' ? 'dark' : 'light') } catch {}
+  }, [theme])
+
+  // Capture l'éditeur tldraw, recharge le snapshot, et branche la persistance.
+  const handleMount = useCallback((editor) => {
+    editorRef.current = editor
+    // L'éditeur est exposé pour le DIAGNOSTIC (scripts/diagnostic-board-ref.js) : sans lui, un board
+    // « gris et vide » ne peut pas être distingué d'un board CASSÉ, et les deux demandent des
+    // correctifs opposés. Une référence de lecture, jamais utilisée par le produit lui-même.
+    try { window.__zrRefEditor = editor } catch {}
+    // ═══ LE THÈME DE TLDRAW SUIT CELUI DE L'APP, ET IL FAUT LE LUI DIRE ══════════════════════════
+    //
+    // LE SYMPTOME, signalé par Matthieu le 2026-08-30 : « j'ouvre board ref, écran blanc deux
+    // secondes puis fond gris sans rien ». Reproduit en laboratoire (ref-lab.html) : la barre
+    // d'outils EST montée, ses douze boutons et ses douze icônes sont dans le DOM, opacité 1,
+    // visibilité visible, aucune erreur en console. Elle est simplement INVISIBLE.
+    //
+    // LA CAUSE. `inferDarkMode` n'existe plus dans tldraw 5 : la prop passée ici était IGNORÉE en
+    // silence, et l'éditeur restait sur son défaut, `colorScheme: 'light'`, donc un canevas blanc.
+    // Pendant ce temps, la barre d'outils est du CSS à nous : elle suit `.zr-dark` de l'app et prend
+    // `--g9-fg: #fff`. Des icônes blanches sur un canevas blanc ne se voient pas. Les deux moitiés
+    // du board suivaient deux thèmes différents, et personne ne pouvait le voir puisque rien
+    // n'échouait.
+    //
+    // `setColorMode` est l'API réelle de cette version ; elle écrit dans les préférences
+    // utilisateur, qui sont la source de vérité du mode de couleur.
+    try { editor.setColorMode(theme === 'dark' ? 'dark' : 'light') } catch {}
+    const c = canvasRef.current
+    if (c && c.tldraw) {
+      try { loadSnapshot(editor.store, c.tldraw) } catch {}
+    }
+    // Recrée les images-références comme assets+shapes tldraw si le snapshot ne les portait pas encore.
+    rehydrateRefs(editor, c)
+
+    // Coupe le drop/paste NATIF de fichiers de tldraw (bug réel corrigé le 2026-07-19, "écran blanc
+    // peu importe l'action") : par défaut, tldraw intercepte tout drop/paste de fichier binaire et
+    // appelle ASSET_STORE.upload() pour le stocker lui-même — exactement ce que ZenRay refuse (aucun
+    // binaire ne doit vivre dans un board). Sans ce garde-fou, glisser une image depuis le Finder sur
+    // le canvas déclenchait le chemin natif de tldraw AVANT que RefBoardHost (le vrai import ZenRay,
+    // wrapper autour de ce composant) ne voie l'événement, plantant l'app. Le SEUL chemin d'import de
+    // binaire reste RefBoardHost -> captureFiles -> addAssetRef (ci-dessous).
+    try { editor.registerExternalContentHandler('files', () => {}) } catch {}
+
+    // PURGE DES PROVISOIRES ORPHELINES (2026-08-07). Si la page a été quittée pendant un upload, le
+    // board a pu enregistrer une shape `pendingId` dont l'octet ne vit nulle part : le cache
+    // navigateur est mort avec l'onglet, et rien ne l'a jamais remplacée par une vraie référence.
+    // On les retire à l'ouverture — c'est le « t'as pas ton média qui reste sur la page » de la
+    // consigne, appliqué au cas où l'autosave a devancé la fin de l'upload.
+    try {
+      const orphelines = editor.getCurrentPageShapes().filter((s) => s.meta && s.meta.pendingId && !PROVISOIRES.has(s.meta.pendingId))
+      if (orphelines.length) editor.deleteShapes(orphelines.map((s) => s.id))
+    } catch {}
+
+    // Persistance : à chaque changement du store (débouncé par l'autosave hook), on sérialise le snapshot.
+    const persist = () => {
+      const cur = canvasRef.current || makeCanvas({ projectPath: path })
+      let snap = null
+      try { snap = getSnapshot(editor.store) } catch {}
+      const next = { ...cur, tldraw: snap, updatedAt: nowIso() }
+      canvasRef.current = next
+      // LE CACHE SUIT LES MODIFICATIONS. Sans cette ligne, un remontage après une édition
+      // restaurerait le board tel qu'il était au chargement : le travail serait bien enregistré sur
+      // le drive, mais l'écran rembobinerait, ce qui est pire qu'une perte franche puisque rien ne
+      // le signale.
+      BOARDS_EN_MEMOIRE.set(path, next)
+      save(next)
+    }
+    const unsub = editor.store.listen(persist, { source: 'user', scope: 'document' })
+    // Flush ferme à la fin d'un geste (pointerup) : économise les écritures pendant un drag continu.
+    const onUp = () => flush()
+    window.addEventListener('pointerup', onUp)
+    editor.__refCleanup = () => { try { unsub() } catch {}; window.removeEventListener('pointerup', onUp) }
+  }, [path, save, flush, theme])
+
+  useEffect(() => () => { const e = editorRef.current; if (e && e.__refCleanup) e.__refCleanup() }, [])
+
+  // LA MESURE APRÈS LE MONTAGE, une seule fois par ouverture. Elle ne corrige rien : elle constate,
+  // et elle fait parler un écran qui, sans elle, resterait gris sans jamais dire pourquoi.
+  useEffect(() => {
+    if (!loaded) return
+    const t = setTimeout(() => {
+      const r = diagnostiquerBoard(racineRef.current, editorRef.current)
+      // On n'affiche QUE les anomalies. Un board sain n'a rien à annoncer, et un bandeau permanent
+      // deviendrait du décor qu'on cesse de lire, donc un vérificateur mort.
+      if (!r.sain) { console.warn('[RefBoard] diagnostic', r.cause, r.details); setVerdict(r) }
+      else { console.info('[RefBoard] board sain,', r.details.formes, 'formes, mode', r.details.modeCouleur); setVerdict(null) }
+    }, SEUILS.delaiMesure)
+    return () => clearTimeout(t)
+  }, [loaded, path])
+
+  // API impérative exposée au parent (lot B) via window event : ajouter une référence d'asset Create au board.
+  // Découplé pour ne PAS toucher App.jsx ici (lot B). Le détail : { ref, x, y }.
+  //
+  // x/y = coordonnées ÉCRAN (event.clientX/Y, posées par RefBoardHost et RefImagePicker au moment du
+  // drop) — bug réel corrigé le 2026-07-19 : addAssetRef les utilisait directement comme coordonnées
+  // PAGE tldraw (un espace totalement différent, dépendant du zoom/pan de la caméra), donc toute image
+  // déposée atterrissait à un endroit incohérent, parfois loin hors champ. Conversion ICI (seul endroit
+  // qui a accès à `editor`) via screenToPage, avant de transmettre à addAssetRef.
+  useEffect(() => {
+    const onAdd = (ev) => {
+      const editor = editorRef.current
+      if (!editor || !ev.detail) return
+      const { x, y, ...rest } = ev.detail
+      const page = (x != null && y != null) ? editor.screenToPage({ x, y }) : null
+      addAssetRef(editor, canvasRef, ev.detail.ref, { ...rest, x: page?.x, y: page?.y })
+    }
+    const ch = 'zenray-ref-add:' + path
+    window.addEventListener(ch, onAdd)
+    return () => window.removeEventListener(ch, onAdd)
+  }, [path])
+
+  // ═══ LE CYCLE D'UNE IMAGE DÉPOSÉE : provisoire, puis réelle ═══════════════════════════════════
+  // Deux gestes, deux événements, même patron que `zenray-ref-add` ci-dessus.
+  //   · `pending` pose TOUT DE SUITE une shape image tirée du cache navigateur : elle est
+  //     manipulable (déplacement, redimensionnement) pendant que l'octet monte vers le drive.
+  //   · `settle` la remplace par la vraie référence, EN CONSERVANT sa position et sa taille — c'est
+  //     le « on sauvegarde la position » de la consigne. Un échec retire la shape plutôt que de
+  //     laisser un trou muet sur le board.
+  useEffect(() => {
+    const onPending = (ev) => {
+      const editor = editorRef.current
+      const d = ev.detail
+      if (!editor || !d || !d.pendingId) return
+      const page = (d.x != null && d.y != null) ? editor.screenToPage({ x: d.x, y: d.y }) : editor.getViewportPageBounds().center
+      const l = Math.max(1, d.w || 320)
+      const h = Math.max(1, d.h || 240)
+      const largeur = Math.min(420, l)
+      const hauteur = Math.round(largeur * (h / l))
+      const assetId = AssetRecordType.createId()
+      editor.createAssets([{
+        id: assetId, type: 'image', typeName: 'asset',
+        // `src` VIDE et non un blob: — le schéma tldraw refuse ce protocole. L'octet passe par
+        // `meta.pendingId` et la table PROVISOIRES, lue à chaque rendu par ASSET_STORE.resolve.
+        props: { name: d.name || 'image', src: '', w: l, h, mimeType: d.mime || 'image/png', isAnimated: false },
+        meta: { pendingId: d.pendingId },
+      }])
+      editor.createShape({
+        id: createShapeId(), type: 'image',
+        x: page.x - largeur / 2, y: page.y - hauteur / 2,
+        props: { assetId, w: largeur, h: hauteur },
+        meta: { pendingId: d.pendingId, kind: 'image-ref' },
+      })
+    }
+
+    const onSettle = async (ev) => {
+      const editor = editorRef.current
+      const d = ev.detail
+      if (!editor || !d || !d.pendingId) return
+      const shape = editor.getCurrentPageShapes().find((s) => s.meta && s.meta.pendingId === d.pendingId)
+      // Échec d'upload : on retire la shape provisoire. Un board ne garde jamais une image dont
+      // l'octet n'existe nulle part.
+      if (!d.ref) {
+        if (shape) editor.deleteShapes([shape.id])
+        oublierProvisoire(d.pendingId)
+        return
+      }
+      const resolved = await resolveRef(d.ref)
+      if (!resolved || !shape) { oublierProvisoire(d.pendingId); return }
+      const assetId = AssetRecordType.createId()
+      editor.createAssets([{
+        id: assetId, type: 'image', typeName: 'asset',
+        props: { name: resolved.title || d.name || 'image', src: resolved.srcRaw || '', w: (resolved.meta && resolved.meta.w) || shape.props.w, h: (resolved.meta && resolved.meta.h) || shape.props.h, mimeType: 'image/webp', isAnimated: false },
+        meta: { refPath: d.ref },
+      }])
+      // La position ET la taille survivent : seul l'asset change dessous. C'est exactement
+      // « on sauvegarde la position » de la consigne.
+      editor.updateShapes([{ id: shape.id, type: 'image', props: { assetId }, meta: { refPath: d.ref, kind: 'image-ref' } }])
+      oublierProvisoire(d.pendingId)
+      // La carte d'items reste la source de vérité des références du board.
+      const cur = canvasRef.current || makeCanvas({})
+      const item = makeRefItem({ kind: 'image-ref', ref: d.ref, x: shape.x, y: shape.y, w: shape.props.w, h: shape.props.h, meta: { title: resolved.title } })
+      canvasRef.current = { ...cur, items: { ...cur.items, [item.id]: item }, updatedAt: nowIso() }
+    }
+
+    const chP = 'zenray-ref-pending:' + path
+    const chS = 'zenray-ref-settle:' + path
+    window.addEventListener(chP, onPending)
+    window.addEventListener(chS, onSettle)
+    return () => { window.removeEventListener(chP, onPending); window.removeEventListener(chS, onSettle) }
+  }, [path])
+
+  if (!loaded) {
+    // LISIBLE DANS LES DEUX THÈMES. Cet écran s'écrivait en `PALETTE.gray600`, une valeur en dur
+    // pensée pour un fond clair : sur le fond sombre `#1d1d1f` de l'app, c'était du gris sur du
+    // gris, illisible. D'où « fond gris sans rien » : le texte ÉTAIT là, et ne se voyait pas. Un
+    // jeton qui suit le thème (`--g9-fg`) répare les deux cas d'un coup, et c'est la loi HDA :
+    // une valeur en dur dans une définition est un défaut, pas une préférence.
+    return (
+      <div style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', gap: 10, alignContent: 'center', fontFamily: 'var(--zr-police-sans)' }}>
+        <span style={{ width: 20, height: 20, borderRadius: 999, justifySelf: 'center', border: '2px solid color-mix(in srgb, var(--g9-fg) 22%, transparent)', borderTopColor: 'var(--g9-fg)', animation: 'zrRefLoad .8s linear infinite' }} />
+        <span style={{ color: 'var(--g9-fg)', fontSize: 'var(--zr-ui-md)', opacity: .82 }}>Ouverture du board…</span>
+        <style>{'@keyframes zrRefLoad{to{transform:rotate(360deg)}}'}</style>
+      </div>
+    )
+  }
+
+  return (
+    <RefUiContext.Provider value={{ pickerOpen, setPickerOpen, boardPath: path }}>
+      <div ref={racineRef} className="zr-ref-host" style={{ position: 'absolute', inset: 0 }}>
+        <Tldraw onMount={handleMount} components={TL_COMPONENTS} assets={ASSET_STORE} assetUrls={ZENRAY_ASSET_URLS} />
+        {pickerOpen && <RefImagePicker />}
+        {verdict && (
+          <div style={{
+            position: 'absolute', left: 16, bottom: 16, zIndex: 1200, maxWidth: 460,
+            background: 'rgba(28,28,30,.96)', color: '#fff', borderRadius: 12, padding: '12px 14px',
+            fontFamily: 'var(--zr-police-sans)', fontSize: 'var(--zr-ui-xs)', lineHeight: 1.45,
+            boxShadow: '0 14px 34px -10px rgba(0,0,0,.55)',
+          }}>
+            <div style={{ fontWeight: 600, marginBottom: 5 }}>Le board ne s’affiche pas correctement</div>
+            <div style={{ opacity: .85 }}>{PHRASES[verdict.cause]}</div>
+            <div style={{ opacity: .5, marginTop: 6, fontFamily: 'var(--zr-police-mono)', fontSize: 'var(--zr-ui-3xs)' }}>
+              cause {verdict.cause} · {JSON.stringify(verdict.details)}
+            </div>
+          </div>
+        )}
+      </div>
+    </RefUiContext.Provider>
+  )
+}
+
+// ─── helpers d'intégration des références (assets sans binaire dans le JSON) ─────────────────────────
+
+const titleFromPath = (p) => (String(p || '').split('/').pop() || 'Board').replace(/\.(canvas|ref)\.json$/, '')
+
+// Crée un asset image tldraw pointant vers une URL /api/shard (jamais de base64) + une shape qui le porte.
+// src par défaut = VIGNETTE (LOD) ; meta {thumbSrc, fullSrc} consommé par ASSET_STORE.resolve.
+async function addAssetRef(editor, canvasRef, refPath, { x, y } = {}) {
+  if (!editor || !refPath) return
+  const resolved = await resolveRef(refPath)
+  if (!resolved) return
+  const cur = canvasRef.current || makeCanvas({})
+  const item = makeRefItem({ kind: resolved.kind, ref: refPath, x: x ?? 0, y: y ?? 0, w: 320, h: (resolved.meta && resolved.meta.h && resolved.meta.w) ? Math.round(320 * resolved.meta.h / resolved.meta.w) : 240, meta: { title: resolved.title } })
+
+  if (resolved.kind === 'image-ref' && (resolved.srcRaw || resolved.thumb)) {
+    const assetId = AssetRecordType.createId()
+    // props.src = référence STABLE et schema-valide (srcRaw : http(s)/relatif, jamais un blob: — le
+    // schéma tldraw rejette ce protocole). Le déchiffrement réel se fait à chaque rendu dans
+    // ASSET_STORE.resolve via meta.refPath, jamais figé ici (voir commentaire sur ASSET_STORE).
+    editor.createAssets([{
+      id: assetId, type: 'image', typeName: 'asset',
+      props: { name: resolved.title || 'image', src: resolved.srcRaw || '', w: (resolved.meta && resolved.meta.w) || 320, h: (resolved.meta && resolved.meta.h) || 240, mimeType: 'image/webp', isAnimated: false },
+      meta: { refPath },
+    }])
+    const center = editor.getViewportPageBounds().center
+    editor.createShape({
+      id: createShapeId(), type: 'image',
+      x: (x ?? center.x) - item.w / 2, y: (y ?? center.y) - item.h / 2,
+      props: { assetId, w: item.w, h: item.h },
+      meta: { refPath, kind: 'image-ref' },
+    })
+  } else {
+    // media/audio/embed/page : carte texte minimale en V1 (lot B fournira les cartes riches).
+    const center = editor.getViewportPageBounds().center
+    editor.createShape({
+      id: createShapeId(), type: 'text',
+      x: (x ?? center.x), y: (y ?? center.y),
+      props: { text: resolved.title || refPath },
+      meta: { refPath, kind: resolved.kind },
+    })
+  }
+  // Met à jour notre carte d'items (source de vérité des références).
+  const next = { ...cur, items: { ...cur.items, [item.id]: item }, updatedAt: nowIso() }
+  canvasRef.current = next
+}
+
+// Au chargement, garantit que les images-références présentes dans `items` ont bien leur asset+shape.
+// Best-effort : si le snapshot tldraw les portait déjà, loadSnapshot a suffi ; sinon on les recrée.
+function rehydrateRefs(editor, canvas) {
+  if (!editor || !canvas || !canvas.items) return
+  // Si le snapshot tldraw existe, on ne double pas : il contient déjà les shapes. On ne recrée que si vide.
+  if (canvas.tldraw && canvas.tldraw.document) return
+  const items = Object.values(canvas.items).filter((it) => it && it.kind === 'image-ref' && it.ref)
+  items.forEach((it) => { addAssetRef(editor, { current: canvas }, it.ref, { x: it.x, y: it.y }) })
+}

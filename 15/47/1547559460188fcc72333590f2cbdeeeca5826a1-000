@@ -1,0 +1,57 @@
+// 23 October 2026: load the published knowledge base (index mapping + shards) by display reads (outside the REST quota),
+// and talk to the local engine. A failed read is never cached as an empty base.
+// FR : charger la base publiée par lectures d'affichage, et parler au moteur local. Un échec de lecture n'est jamais une base vide.
+import { KNOWLEDGE } from '../config/knowledge.js'
+import { urlLectureAffichage } from '../lib/urlLecture.js'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+
+let cache = null // { at, base }
+
+async function readDisplay(path, fresh = false) {
+  const response = await fetch(urlLectureAffichage(path, { fresh }), { cache: 'no-cache' })
+  if (response.status === 404) return null
+  if (!response.ok) throw new Error(`lecture ${path} : ${response.status}`)
+  const text = await response.text()
+  // The raw route answers the file itself; the JSON envelope ({ markdown }) is accepted too.
+  let value = JSON.parse(text)
+  if (value && typeof value.markdown === 'string') { if (value.missing) return null; value = JSON.parse(value.markdown) }
+  return value
+}
+
+/** { index, entries, engine } ; entries keep the index order, so a position from the map is an entry. */
+export async function loadKnowledge({ force = false } = {}) {
+  if (!force && cache && Date.now() - cache.at < KNOWLEDGE.cacheMinutes * 60000) return cache.base
+  const index = await readDisplay(KNOWLEDGE.paths.index, force)
+  if (!index) return { index: null, entries: [], engine: null, empty: true }
+  const shards = await Promise.all(index.shards.map((s) => readDisplay(s.path, force)))
+  if (shards.some((s) => !Array.isArray(s))) throw new Error('un morceau de la base est illisible')
+  const entries = shards.flat()
+  if (entries.length !== index.count) throw new Error(`base incomplète : ${entries.length} sur ${index.count}`)
+  const engine = await readDisplay(KNOWLEDGE.paths.engine, force).catch(() => null)
+  const base = { index, entries, engine }
+  cache = { at: Date.now(), base }
+  return base
+}
+
+export async function readInbox() {
+  try { return (await readDisplay(KNOWLEDGE.paths.inbox, true)) || { questions: [] } } catch { return { questions: [] } }
+}
+
+/** Ask the local engine for a pass now (Mac on, service running). Resolves false when the service does not answer. */
+export async function runEngineNow() {
+  try {
+    const r = await fetch(KNOWLEDGE.bridge.url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-zr-knowledge-client': KNOWLEDGE.bridge.client }, body: JSON.stringify({ action: 'run' }), signal: AbortSignal.timeout(KNOWLEDGE.bridge.timeoutMs) })
+    return r.ok
+  } catch { return false }
+}
+
+/** A new question goes to the inbox; the engine answers it from memory, with a proof, on its next pass. */
+export async function askQuestion(question) {
+  const q = question.trim()
+  const item = { id: `ask_${Date.now().toString(36)}`, q, askedAt: new Date().toISOString(), status: 'pending' }
+  const saved = await saveJsonWithRetry(KNOWLEDGE.paths.inbox, (cur) => ({ questions: [...((cur && cur.questions) || []), item] }))
+  if (!saved.ok) throw new Error(saved.error)
+  // Wake the local engine when the Mac is on; silent when it is not, the next scheduled pass reads the inbox anyway.
+  fetch(`${KNOWLEDGE.bridge.url}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-zr-knowledge-client': KNOWLEDGE.bridge.client }, body: JSON.stringify({ action: 'inbox' }), signal: AbortSignal.timeout(KNOWLEDGE.bridge.timeoutMs) }).catch(() => {})
+  return item
+}

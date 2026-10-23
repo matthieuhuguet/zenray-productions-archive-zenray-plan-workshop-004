@@ -1,0 +1,206 @@
+// @vitest-environment node
+import { beforeEach, describe, expect, it } from 'vitest'
+import { processGuestUpload, importMediaKey } from './guestUploadCore.js'
+import { makeFakeGitHub } from './testing/fakeGithub.js'
+import { GhError } from './githubGraphql.js'
+import { GUEST } from '../src/config/guestUpload.js'
+import { packFrame, unpackFrame } from '../src/lib/guestFrame.js'
+
+const ROOT = 'pages/Photos/Mariage'
+const TOKEN = 'zrs1.token-for-tests'
+const KEYRAW = crypto.getRandomValues(new Uint8Array(32))
+const SECRET = 'receipt-secret'
+const jpeg = (n, seed = 1) => { const u = new Uint8Array(n); for (let i = 0; i < n; i++) u[i] = (i * 31 + seed) & 255; u.set([0xff, 0xd8, 0xff, 0xe0, 0, 16, 0x4a, 0x46, 0x49, 0x46, 0, 1], 0); return u }
+const webpThumb = (seed = 9) => { const u = new Uint8Array(300); u.fill(seed); u.set([0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4, 0x57, 0x45, 0x42, 0x50], 0); return u }
+const sha256Hex = async (u8) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', u8)), (b) => b.toString(16).padStart(2, '0')).join('')
+const decryptWith = async (cipher, ivB64) => new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: Uint8Array.from(atob(ivB64), (c) => c.charCodeAt(0)) }, await crypto.subtle.importKey('raw', KEYRAW, 'AES-GCM', false, ['decrypt']), cipher))
+
+let gh, key
+const base = () => ({ gh, key, secret: SECRET, resolveShare: async (t) => (t === TOKEN ? { kind: 'folder', path: ROOT } : Promise.reject(new Error('invalid-share'))), sleep: async () => {} })
+beforeEach(async () => { gh = makeFakeGitHub();  key = await importMediaKey(btoa(String.fromCharCode(...KEYRAW))) })
+
+// Build a request exactly like the browser does, then run it through the real frame code.
+async function send({ name = 'Marie', sub = '', op = 'put', photos = [], shard = null, token = TOKEN, extra = {} } = {}) {
+  const payloads = []; const parts = []
+  for (const ph of photos) for (const pt of ph.parts || []) { parts.push({ pid: ph.pid, role: pt.role, idx: pt.idx || 0, len: pt.bytes.length }); payloads.push(pt.bytes) }
+  const head = { v: 1, d: token, name, sub, op, shard, parts, photos: photos.map((ph) => ({ pid: ph.pid, name: ph.name, size: ph.size, hash: ph.hash, nChunks: ph.nChunks, w: 1920, h: 1080, thumbW: 1920, thumbH: 1080, finalize: ph.finalize !== false, receipts: ph.receipts || [] })), ...extra }
+  const { header, payload } = unpackFrame(packFrame(head, payloads))
+  return processGuestUpload({ ...base(), header, payload })
+}
+async function onePhoto(name, bytes, seed = 9) {
+  return { pid: `p-${name}`.replace(/[^A-Za-z0-9_-]/g, '_'), name, size: bytes.length, hash: await sha256Hex(bytes), nChunks: 1, parts: [{ role: 'chunk', idx: 0, bytes }, { role: 'thumb', bytes: webpThumb(seed) }, { role: 'thumbs', bytes: webpThumb(seed + 50) }] }
+}
+
+describe('une photo de Marie', () => {
+  it('est chiffrée dans le shard, son manifeste est rangé sous « Marie », le compteur monte', async () => {
+    const bytes = jpeg(5000)
+    const r = await send({ photos: [await onePhoto('IMG_0001.JPG', bytes)] })
+    expect(r.ok).toBe(true); expect(r.results[0].status).toBe('added'); expect(r.folder).toBe('Marie')
+    const path = `${ROOT}/Marie/IMG_0001.JPG.img.json`
+    expect(r.results[0].path).toBe(path)
+    const m = JSON.parse(gh.file('zenray-data', path).text)
+    expect(m).toMatchObject({ type: 'image', vis: 'public', alg: 'AES-GCM', name: 'IMG_0001.JPG', title: 'IMG_0001', ext: 'jpg', size: 5000, by: 'Marie', cdnRepo: r.shard })
+    expect(m.cdnChunks).toHaveLength(1); expect(m.ivs).toBeUndefined()
+    // the stored chunk decrypts to the exact original bytes, with the manifest's own IV
+    const stored = gh.file(r.shard, m.cdnChunks[0]).bytes
+    expect(Array.from(await decryptWith(stored, m.iv))).toEqual(Array.from(bytes))
+    expect(m.thumb).toContain(`${r.shard}@${m.cdnCommit}/`); expect(gh.file(r.shard, m.thumb.split(`@${m.cdnCommit}/`)[1])).toBeTruthy()
+    // the light grid thumbnail is stored beside the standard one, with its own IV, and the manifest points at it
+    expect(m.thumbS).toContain(`${r.shard}@${m.cdnCommit}/`); expect(m.thumbSIv).toBeTruthy(); expect(m.thumbS).not.toBe(m.thumb)
+    expect(gh.file(r.shard, m.thumbS.split(`@${m.cdnCommit}/`)[1])).toBeTruthy()
+    expect(gh.file('zenray-data', `${ROOT}/Marie/${GUEST.GUEST_MARKER}`)).toBeTruthy()
+    expect(JSON.parse(gh.file('zenray-data', `${GUEST.STATE_DIR}/ledger/${new Date().toISOString().slice(0, 10)}.json`).text).n).toBe(1)
+    expect(JSON.parse(gh.file('zenray-data', `${GUEST.STATE_DIR}/shard.json`).text).repo).toBe(r.shard)
+  })
+
+  it('rejouer la MÊME requête ne crée rien de plus (idempotent)', async () => {
+    const ph = await onePhoto('IMG_0001.JPG', jpeg(4000))
+    await send({ photos: [ph] })
+    const commits = gh.stats.commits
+    const again = await send({ photos: [ph] })
+    expect(again.results[0].status).toBe('exists')
+    expect(gh.stats.commits).toBe(commits)
+  })
+
+  it('réponse perdue APRÈS le commit : le renvoi rend « exists », jamais un doublon', async () => {
+    const ph = await onePhoto('IMG_0002.JPG', jpeg(4000, 3))
+    gh.faults.commit = [null, null, 'lose']                // shard-state commit ok, parts commit ok, drive commit applied but its reply is lost
+    const first = await send({ photos: [ph] })
+    expect(first.ok).toBe(false); expect(first.retry).toBe(true)
+    const second = await send({ photos: [ph] })
+    expect(second.results[0].status).toBe('exists')
+    expect(gh.listPaths('zenray-data', `${ROOT}/Marie/`).filter((p) => p.endsWith('.img.json'))).toHaveLength(1)
+  })
+
+  it('réponse perdue après le commit des PARTIES : le renvoi ne les réécrit pas et écrit le manifeste une seule fois', async () => {
+    const ph = await onePhoto('IMG_0003.JPG', jpeg(4000, 4))
+    gh.faults.commit = [null, 'lose']                      // shard-state ok, parts applied but reply lost
+    const first = await send({ photos: [ph] })
+    expect(first.retry).toBe(true)
+    const partsCommits = gh.stats.byRepo[Object.keys(gh.stats.byRepo).find((k) => k.startsWith('zenrayshards-img-'))]
+    const second = await send({ photos: [ph] })
+    expect(second.results[0].status).toBe('added')
+    expect(gh.stats.byRepo[Object.keys(gh.stats.byRepo).find((k) => k.startsWith('zenrayshards-img-'))]).toBe(partsCommits)   // parts not committed twice
+  })
+
+  it('un nom de fichier déjà pris par une AUTRE photo reçoit un suffixe d’empreinte, sans rien écraser', async () => {
+    const a = await onePhoto('IMG_0001.JPG', jpeg(4000, 1))
+    const b = await onePhoto('IMG_0001.JPG', jpeg(4000, 2)); b.pid = 'p-second'
+    await send({ photos: [a] })
+    const r = await send({ photos: [b] })
+    expect(r.results[0].status).toBe('added')
+    expect(r.results[0].path).toBe(`${ROOT}/Marie/IMG_0001-${b.hash.slice(0, 8)}.JPG.img.json`)
+    expect(JSON.parse(gh.file('zenray-data', `${ROOT}/Marie/IMG_0001.JPG.img.json`).text).contentHash).toBe(a.hash)   // first one untouched
+  })
+
+  it('deux photos au même nom dans UNE requête : la seconde est suffixée', async () => {
+    const a = await onePhoto('IMG_0001.JPG', jpeg(3000, 1)), b = await onePhoto('IMG_0001.JPG', jpeg(3000, 2)); b.pid = 'p-b'
+    const r = await send({ photos: [a, b] })
+    expect(r.results.map((x) => x.status)).toEqual(['added', 'added'])
+    expect(new Set(r.results.map((x) => x.path)).size).toBe(2)
+  })
+})
+
+describe('une grosse photo d’Anne, en plusieurs morceaux et plusieurs requêtes', () => {
+  async function big(nChunks) {
+    const chunks = Array.from({ length: nChunks }, (_, i) => jpeg(70_000 + i * 11, i + 5)); const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0)); let o = 0; for (const c of chunks) { all.set(c, o); o += c.length }
+    return { chunks, all, hash: await sha256Hex(all) }
+  }
+  it('chaque morceau est chiffré à part (ivs[]), le manifeste n’est écrit qu’à la dernière requête', async () => {
+    const { chunks, all, hash } = await big(3)
+    const mk = (i, final, receipts) => ({ pid: 'p-big', name: 'DSC_9999.JPG', size: all.length, hash, nChunks: 3, finalize: final, receipts, parts: [{ role: 'chunk', idx: i, bytes: chunks[i] }, ...(i === 0 ? [{ role: 'thumb', bytes: webpThumb() }] : [])] })
+    const r0 = await send({ name: 'Anne', photos: [mk(0, false, [])] })
+    expect(r0.results[0].status).toBe('part'); expect(gh.listPaths('zenray-data', `${ROOT}/Anne/`)).toEqual([])
+    const r1 = await send({ name: 'Anne', shard: r0.shard, photos: [mk(1, false, r0.results[0].receipts)] })
+    const r2 = await send({ name: 'Anne', shard: r0.shard, photos: [mk(2, true, [...r0.results[0].receipts, ...r1.results[0].receipts])] })
+    expect(r2.results[0].status).toBe('added')
+    const m = JSON.parse(gh.file('zenray-data', `${ROOT}/Anne/DSC_9999.JPG.img.json`).text)
+    expect(m.cdnChunks).toHaveLength(3); expect(m.ivs).toHaveLength(3); expect(m.iv).toBe(m.ivs[0])
+    const plain = []
+    for (let i = 0; i < 3; i++) plain.push(await decryptWith(gh.file(r0.shard, m.cdnChunks[i]).bytes, m.ivs[i]))
+    expect(Array.from(plain.flatMap((p) => Array.from(p)))).toEqual(Array.from(all))
+  })
+
+  it('des reçus falsifiés ne produisent PAS de manifeste', async () => {
+    const { chunks, all, hash } = await big(2)
+    const mk = (i, final, receipts) => ({ pid: 'p-forged', name: 'X.JPG', size: all.length, hash, nChunks: 2, finalize: final, receipts, parts: [{ role: 'chunk', idx: i, bytes: chunks[i] }] })
+    const r0 = await send({ name: 'Anne', photos: [mk(0, false, [])] })
+    const forged = r0.results[0].receipts.map((x) => ({ ...x, path: 'ab/cd/not-mine.bin' }))
+    const r1 = await send({ name: 'Anne', shard: r0.shard, photos: [mk(1, true, forged)] })
+    expect(r1.results[0].status).toBe('incomplete')
+    expect(gh.listPaths('zenray-data', `${ROOT}/Anne/`).filter((p) => p.endsWith('.img.json'))).toEqual([])
+  })
+})
+
+describe('le dossier d’un invité et les limites', () => {
+  it('un dossier du propriétaire du même nom n’est jamais réutilisé : « Photos (invité) »', async () => {
+    await gh.commit('zenray-data', { expectedHeadOid: 'c0000', headline: 'owner', additions: [{ path: `${ROOT}/Photos/owner.img.json`, text: '{}' }] })
+    const r = await send({ name: 'Photos', photos: [await onePhoto('a.jpg', jpeg(3000))] })
+    expect(r.folder).toBe('Photos (invité)')
+    expect(gh.file('zenray-data', `${ROOT}/Photos (invité)/a.jpg.img.json`)).toBeTruthy()
+    expect(gh.file('zenray-data', `${ROOT}/Photos/a.jpg.img.json`)).toBeNull()
+  })
+
+  it('un dossier à soi : les sous-dossiers se créent (mkdir) et reçoivent les photos', async () => {
+    const mk = await send({ name: 'Marie', sub: 'Soirée/Danse', op: 'mkdir' })
+    expect(mk.ok).toBe(true)
+    expect(gh.file('zenray-data', `${ROOT}/Marie/Soirée/Danse/${GUEST.FOLDER_MARKER}`)).toBeTruthy()
+    const r = await send({ name: 'Marie', sub: 'Soirée/Danse', photos: [await onePhoto('d.jpg', jpeg(3000))] })
+    expect(r.results[0].path).toBe(`${ROOT}/Marie/Soirée/Danse/d.jpg.img.json`)
+  })
+
+  it('un nom piégé reste dans le dossier partagé', async () => {
+    const r = await send({ name: '../../secret', photos: [await onePhoto('a.jpg', jpeg(3000))] })
+    expect(r.folder).toBe('secret')
+    expect(gh.listPaths('zenray-data').every((p) => p.startsWith(`${ROOT}/secret/`) || p.startsWith(GUEST.STATE_DIR))).toBe(true)
+  })
+
+  it('1024 photos par jour : au-delà, un arrêt poli avec l’heure de reprise', async () => {
+    const day = new Date().toISOString().slice(0, 10)
+    await gh.commit('zenray-data', { expectedHeadOid: 'c0000', headline: 'ledger', additions: [{ path: `${GUEST.STATE_DIR}/ledger/${day}.json`, text: JSON.stringify({ n: GUEST.DAILY_MAX }) }] })
+    const r = await send({ photos: [await onePhoto('a.jpg', jpeg(3000))] })
+    expect(r).toMatchObject({ ok: false, retry: false, reason: 'daily' }); expect(r.waitMs).toBeGreaterThan(0)
+  })
+
+  it('refuse ce qui n’est pas une image, ou dépasse 95 Mo', async () => {
+    const txt = new TextEncoder().encode('hello this is definitely not an image file at all')
+    const notImg = { pid: 'p-t', name: 'a.jpg', size: txt.length, hash: await sha256Hex(txt), nChunks: 1, parts: [{ role: 'chunk', idx: 0, bytes: txt }] }
+    const huge = { ...(await onePhoto('b.jpg', jpeg(3000))), pid: 'p-h', size: GUEST.MAX_PHOTO_BYTES + 1 }
+    const pdf = { ...(await onePhoto('c.pdf', jpeg(3000))), pid: 'p-p' }
+    const r = await send({ photos: [notImg, huge, pdf] })
+    expect(r.results.map((x) => `${x.status}:${x.reason}`).sort()).toEqual(['rejected:size', 'rejected:type', 'rejected:type'])
+    expect(gh.listPaths('zenray-data', ROOT)).toEqual([])
+  })
+
+  it('un lien invalide ou révoqué : arrêt poli, rien d’écrit', async () => {
+    const r = await send({ token: 'zrs1.other', photos: [await onePhoto('a.jpg', jpeg(3000))] })
+    expect(r).toMatchObject({ ok: false, retry: false, reason: 'invalid-link' }); expect(gh.stats.commits).toBe(0)
+    const off = await processGuestUpload({ ...base(), resolveShare: async () => ({ kind: 'folder', path: ROOT, guestUpload: false }), header: { v: 1, d: TOKEN, name: 'M', photos: [], parts: [] }, payload: new Uint8Array(0) })
+    expect(off.reason).toBe('disabled')
+  })
+})
+
+describe('GitHub qui flanche : les invités ne voient rien, le client réessaie', () => {
+  it('commits « stale » (course avec un autre invité) : refaits jusqu’à réussir, sans écraser', async () => {
+    gh.faults.commit = ['stale', 'stale', null, 'stale', 'stale']
+    const r = await send({ photos: [await onePhoto('a.jpg', jpeg(3000))] })
+    expect(r.ok).toBe(true); expect(r.results[0].status).toBe('added')
+  })
+  it('limite de débit : réponse « réessaie dans X s », jamais une erreur', async () => {
+    gh.read = async () => { throw new GhError('rate', 'rl', 45_000) }
+    const r = await send({ photos: [await onePhoto('a.jpg', jpeg(3000))] })
+    expect(r).toMatchObject({ ok: false, retry: true, reason: 'rate', waitMs: 45_000 })
+  })
+  it('panne GitHub : réponse « busy » à réessayer', async () => {
+    gh.faults.commit = ['down', 'down', 'down', 'down', 'down', 'down', 'down', 'down', 'down']
+    const r = await send({ photos: [await onePhoto('a.jpg', jpeg(3000))] })
+    expect(r).toMatchObject({ ok: false, retry: true })
+  })
+  it('shard presque plein : un nouveau shard est ouvert et mémorisé', async () => {
+    const first = await send({ photos: [await onePhoto('a.jpg', jpeg(3000))] })
+    gh.repos.get(first.shard).extraKb = GUEST.SHARD_ROLLOVER_KB
+    const next = await send({ photos: [await onePhoto('b.jpg', jpeg(3100, 7))] })
+    expect(next.shard).not.toBe(first.shard); expect(gh.stats.shards).toBe(2)
+    expect(JSON.parse(gh.file('zenray-data', `${GUEST.STATE_DIR}/shard.json`).text).repo).toBe(next.shard)
+  })
+})

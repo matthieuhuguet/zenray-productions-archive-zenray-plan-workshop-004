@@ -1,0 +1,340 @@
+import { CONVERSATION_SETTINGS } from '../../lib/assetsConversations.js'
+import FileLocations from './FileLocations.jsx'
+// 2 October 2026, 15:15 CEST: release reports measured bytes and retains production sources.
+import { isTextPreviewFile } from '../../lib/projectPreview.js'
+import { readableSize } from '../../lib/assetsProjects.js'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import ProjectWorkspace from './ProjectWorkspace.jsx'
+import QuickLookOverlay from '../QuickLookOverlay.jsx'
+import { notifyProgress } from '../Notifications.jsx'
+import { downloadMedia } from '../ImageNodeViewer.jsx'
+import { downloadUrls } from '../../lib/archiveChunks.js'
+import { streamDownload } from '../../lib/fetchAsset.js'
+import { downloadFolderAsZip, resolveEntryBytes } from '../../lib/bulkZip.js'
+import { createProjectBridge } from '../../lib/projectBridge.js'
+import { loadSearchIndex, getIndexPaths, getNodeSize } from '../../search/searchIndexClient.js'
+import { urlLectureAffichage } from '../../lib/urlLecture.js'
+import { lazyRetry } from '../../lib/lazyRetry.js'
+import { ASSETS_WORKSPACE_PATHS, mergeWorkspaceProjects, previewWorkspaceFile, workspaceSelection, workspaceSlug, workspaceSnapshotRequest } from '../../lib/assetsWorkspaceViewModel.js'
+import { loadWorkspaceCatalogue } from '../../lib/assetsWorkspaceCatalogue.js'
+import { readLocalWorkspaces, readProjectConversationIndex } from '../../lib/assetsWorkspaceBridge.js'
+import { loadProjectArticle, isArticleName } from '../../lib/assetsProjectArticle.js'
+import ProjectArticle from './ProjectArticle.jsx'
+
+// 2 October 2026, 13:28 CEST: the live workspace keeps cloud browsing usable when its Mac bridge is offline.
+const DesignControls = import.meta.env.DEV ? lazyRetry(() => import('./AssetsDesignControls.jsx')) : null
+const bridge = createProjectBridge()
+const SETTINGS = { pollMs: 1500, jobTimeoutMs: 3600000, namespaces: ['tmp', 'memory', 'houdini', 'unreal'] }
+
+async function readCloud(path, { optional = false, fresh = false } = {}) {
+  const response = await fetch(urlLectureAffichage(path, { fresh: fresh || Object.values(ASSETS_WORKSPACE_PATHS).includes(path) }), { cache: 'no-store' })
+  if (response.status === 404 && optional) return null
+  if (!response.ok) throw new Error(`Lecture du cloud impossible (${response.status}).`)
+  const result = await response.json()
+  if (optional && result.missing) return null
+  if (result.error) {
+    if (optional && /not.found|introuvable/i.test(result.error)) return null
+    throw new Error(result.error)
+  }
+  if (typeof result.markdown !== 'string') throw new Error('Le cloud ne fournit pas de contenu lisible.')
+  return result.markdown
+}
+
+function LocalThumbnail({ file }) {
+  const [url, setUrl] = useState(null)
+  useEffect(() => {
+    if (!file.sourceId || !/\.(png|jpe?g|webp|avif|gif)$/i.test(file.name)) return
+    let active = true
+    bridge.request('preview-url', { projectId: file.projectId, fileId: file.id }).then((result) => { if (active) setUrl(result.url) }).catch((failure) => { console.warn('Local asset preview:', failure.message) })
+    return () => { active = false }
+  }, [file.id, file.projectId, file.mtimeMs])
+  return url ? <img src={url} loading="lazy" alt="" /> : null
+}
+
+function LinkProjectDialog({ project, namespace, onSave, onClose, t }) {
+  const [name, setName] = useState(project?.name || '')
+  const [paths, setPaths] = useState({})
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const initialRef = useRef(null)
+  useEffect(() => { initialRef.current?.focus() }, [])
+  const submit = async (event) => {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      const id = project?.id || workspaceSlug(name)
+      const sources = [...(project?.sources || []).filter((source) => source.id && source.namespace)]
+      for (const kind of SETTINGS.namespaces) if (paths[kind]?.trim()) {
+        const prefix = `${kind}-source`
+        let suffix = 1
+        while (sources.some((source) => source.id === `${prefix}-${suffix}`)) suffix++
+        sources.push({ id: `${prefix}-${suffix}`, namespace: kind, localPath: paths[kind].trim(), keep: kind === 'memory' || kind === 'unreal' })
+      }
+      if (!name.trim() || !id) throw new Error('Indiquez le nom du projet.')
+      await onSave({ ...project, id, name: name.trim(), sources, folder: undefined, files: undefined, feedbackPath: undefined })
+      onClose()
+    } catch (failure) { setError(failure.message) } finally { setBusy(false) }
+  }
+  return createPortal(<div className="assets-dialog-backdrop" style={{ '--assets-ink': t.textPrimary, '--assets-surface': t.surface, '--assets-background': t.bg }} onKeyDown={(event) => { if (event.key === 'Escape' && !busy) onClose() }}><section role="dialog" aria-modal="true" aria-label="Relier un projet" className="assets-dialog"><header><h2>{project ? 'Relier un dossier' : 'Commencer un projet'}</h2><button type="button" onClick={onClose} disabled={busy} aria-label="Fermer">×</button></header><p>Les fichiers restent à leur place. ZenRay Assets les réunit sous un seul projet.</p><form onSubmit={submit}><label>Nom du projet<input ref={initialRef} value={name} onChange={(event) => setName(event.target.value)} required readOnly={!!project} /></label>{SETTINGS.namespaces.filter((kind) => !namespace || kind === namespace).map((kind) => <label key={kind}>{({ tmp: 'tmp, travail en cours', memory: 'Memory, suivi du projet', houdini: 'Houdini, scènes et outils', unreal: 'Unreal, projet de jeu' })[kind]}<input value={paths[kind] || ''} onChange={(event) => setPaths({ ...paths, [kind]: event.target.value })} placeholder="Chemin absolu du dossier" spellCheck={false} /></label>)}{error && <p role="alert">{error}</p>}<footer><button type="button" onClick={onClose} disabled={busy}>Annuler</button><button type="submit" disabled={busy}>{busy ? 'Lecture des dossiers…' : 'Relier et activer la sauvegarde'}</button></footer></form></section></div>, document.body)
+}
+
+export default function AssetsWorkspaceView({ t, NodeThumb, LegacyView }) {
+  const [legacy, setLegacy] = useState([])
+  const [local, setLocal] = useState([])
+  const [cloud, setCloud] = useState([])
+  const cloudRef = useRef([])
+  // 9 October 2026, 10:07 CEST: Keep only the selected full snapshot in browser memory.
+  const [cloudSnapshot, setCloudSnapshot] = useState(null)
+  const [lightweightCloudIndex, setLightweightCloudIndex] = useState(false)
+  const [cloudSnapshotError, setCloudSnapshotError] = useState(null)
+  const [paths, setPaths] = useState(() => getIndexPaths())
+  const [connected, setConnected] = useState(false)
+  // 20 October 2026, 15:15 CEST: read only the selected article, reusing registered local previews and the existing archive resolver.
+  const readArticle = useCallback((file, target) => loadProjectArticle(file, {
+    connected,
+    readLocal: selected => bridge.request('preview-text', { projectId: target.id, fileId: selected.id, format: 'html' }),
+    readCloudBytes: selected => resolveEntryBytes(previewWorkspaceFile(selected)),
+  }), [connected])
+  const [checkedAt, setCheckedAt] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [activeId, setActiveId] = useState(() => new URLSearchParams(location.search).get('project'))
+  const activeIdRef = useRef(activeId)
+  useEffect(() => { activeIdRef.current = activeId }, [activeId])
+  const [operation, setOperation] = useState(null)
+  const [preview, setPreview] = useState(null)
+  const [localPreview, setLocalPreview] = useState(null)
+  useEffect(() => {
+    if (!localPreview) return
+    const close = (event) => { if (event.key === 'Escape') setLocalPreview(null) }
+    window.addEventListener('keydown', close)
+    return () => window.removeEventListener('keydown', close)
+  }, [localPreview])
+  const [conversations, setConversations] = useState([])
+  const [conversationMirrorStatus, setConversationMirrorStatus] = useState(null)
+  const [projectConversationLinks, setProjectConversationLinks] = useState(null)
+  const readConversation = useCallback(async (conversationId, before) => { const result = await bridge.request('conversation', { conversationId, ...(before !== undefined ? { before } : {}) }); if (result.conversation) setConversations(previous => previous.map(item => item.id === conversationId ? result.conversation : item)); return result }, [])
+  useEffect(() => {
+    if (!connected) return
+    let alive = true, running = false
+    const refresh = async () => {
+      if (running) return
+      running = true
+      try { const result = await bridge.request('conversations'); if (alive) { setConversations(result.conversations || []); setConversationMirrorStatus(result.mirror || null); if (result.mirror?.error) setError(`Sauvegarde des conversations : ${result.mirror.error}`); if (result.failures?.length) setError(`${result.failures.length} sources de conversations n’ont pas pu être lues. Les autres restent disponibles.`) } }
+      catch (failure) { if (alive) setError(`Catalogue des conversations : ${failure.message}`) }
+      finally { running = false }
+    }
+    refresh(); const timer = setInterval(refresh, CONVERSATION_SETTINGS.refreshMs)
+    return () => { alive = false; clearInterval(timer) }
+  }, [connected])
+  const [linkDialog, setLinkDialog] = useState(null)
+  const [legacyId, setLegacyId] = useState(null)
+  const [refreshKey, setRefreshKey] = useState(0)
+  const alive = useRef(true)
+  useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
+  const refresh = useCallback(async () => {
+    setLoading(true); setError(null)
+    const outcomes = await Promise.allSettled([
+      readCloud(ASSETS_WORKSPACE_PATHS.legacy), loadWorkspaceCatalogue(readCloud),
+      loadSearchIndex(), readLocalWorkspaces(bridge, activeIdRef.current, cloudRef.current),
+    ])
+    if (!alive.current) return
+    const [legacyResult, catalogueResult, index, bridgeState] = outcomes
+    if (legacyResult.status === 'fulfilled') {
+      try { const data = JSON.parse(legacyResult.value); setLegacy(data.projects || data.projets || []) } catch { setError('Le registre des projets est illisible.') }
+    } else setError(legacyResult.reason.message)
+    if (catalogueResult.status === 'fulfilled') {
+      cloudRef.current = catalogueResult.value.projects
+      setCloud(catalogueResult.value.projects)
+      setCloudSnapshot(null)
+      setLightweightCloudIndex(catalogueResult.value.lightweight)
+      setCloudSnapshotError(null)
+    } else setError(`Le catalogue cloud des espaces de travail est indisponible : ${catalogueResult.reason.message}`)
+    if (index.status === 'fulfilled') setPaths(getIndexPaths())
+    else setError('L’index des fichiers ne répond pas. Les projets restent consultables.')
+    if (bridgeState.status === 'fulfilled') {
+      setLocal(bridgeState.value.projects || [])
+      if (bridgeState.value.activeProjectId && bridgeState.value.activeProjectId !== activeIdRef.current) {
+        activeIdRef.current = bridgeState.value.activeProjectId
+        setActiveId(bridgeState.value.activeProjectId)
+      }
+      setConnected(true)
+      setCheckedAt(bridgeState.value.checkedAt)
+    }
+    else { setConnected(false); setLocal([]) }
+    setLoading(false)
+    setRefreshKey((value) => value + 1)
+  }, [])
+  useEffect(() => { refresh() }, [refresh])
+  useEffect(() => {
+    if (connected) return
+    const timer = setInterval(() => readLocalWorkspaces(bridge, activeIdRef.current, cloudRef.current).then((result) => {
+      if (alive.current) {
+        setLocal(result.projects || [])
+        if (result.activeProjectId && result.activeProjectId !== activeIdRef.current) {
+          activeIdRef.current = result.activeProjectId
+          setActiveId(result.activeProjectId)
+        }
+        setCheckedAt(result.checkedAt)
+        setConnected(true)
+      }
+    }).catch(() => {}), SETTINGS.pollMs * 10)
+    return () => clearInterval(timer)
+  }, [connected])
+  useEffect(() => { if (!connected) setConversations(cloud.find(item => item.id === 'agent-conversations')?.conversations || []) }, [connected, cloud])
+  const cloudWorkspaces = cloud.map((item) => cloudSnapshot?.id === item.id ? cloudSnapshot : item)
+  const localById = new Map(local.map((item) => [item.id, item]))
+  const cloudIds = new Set(cloudWorkspaces.map((item) => item.id))
+  const workspaces = connected ? [
+    ...cloudWorkspaces.map((item) => ({ ...item, ...localById.get(item.id) })),
+    ...local.filter((item) => !cloudIds.has(item.id)),
+  ] : cloudWorkspaces
+  const projects = useMemo(() => mergeWorkspaceProjects(legacy, workspaces, paths, getNodeSize).map((item) => {
+    const files = item.files.map((file) => ({ ...file, projectId: item.id }))
+    return { ...item, files, coverFile: files.find((file) => file.id === item.coverFileId) || item.coverFile || files.find((file) => /\.(png|jpe?g|webp|avif)$/i.test(file.name) && /render|preview|lookdev/i.test(file.relativePath)) }
+  }), [legacy, workspaces, paths])
+  const project = projects.find((item) => item.id === activeId) || projects.find((item) => item.id === 'ceramic-tiles') || projects[0]
+  const workspace = workspaces.find((item) => item.id === project?.id)
+  useEffect(() => {
+    if (connected || !lightweightCloudIndex || !workspace?.id || cloudSnapshot?.id === workspace.id) return undefined
+    let cancelled = false
+    setCloudSnapshotError(null)
+    const snapshotRequest = workspaceSnapshotRequest(workspace.folder)
+    readCloud(snapshotRequest.path, { fresh: snapshotRequest.fresh }).then((markdown) => {
+      const snapshot = JSON.parse(markdown)
+      if (snapshot.id !== workspace.id || snapshot.folder !== workspace.folder) throw new Error('L’identité du snapshot ne correspond pas à son index.')
+      if (!cancelled) setCloudSnapshot(snapshot)
+    }).catch((failure) => {
+      if (!cancelled) setCloudSnapshotError(`Détails du projet indisponibles : ${failure.message}`)
+    })
+    return () => { cancelled = true }
+  }, [connected, lightweightCloudIndex, workspace?.id, workspace?.folder, cloudSnapshot?.id])
+  useEffect(() => {
+    if (!connected || !workspace?.id) return
+    let cancelled = false
+    // 9 October 2026, 11:22 CEST: Keep newly selected cloud projects in the local status cache.
+    const update = () => bridge.status(workspace.id).then(({ project: snapshot }) => {
+      if (!cancelled && alive.current) setLocal((previous) => {
+        const existing = previous.find((item) => item.id === snapshot.id)
+        const next = { ...snapshot, ...(existing?.events ? { events: existing.events } : {}) }
+        return existing ? previous.map((item) => item.id === snapshot.id ? next : item) : [...previous, next]
+      })
+    }).catch(() => { if (!cancelled && alive.current) setConnected(false) })
+    update()
+    const timer = setInterval(update, SETTINGS.pollMs * 4)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [connected, workspace?.id])
+  useEffect(() => {
+    if (!connected || !workspace?.id) { setProjectConversationLinks(null); return undefined }
+    let cancelled = false
+    const refreshLinks = () => readProjectConversationIndex(bridge, workspace.id, workspace).then((result) => {
+      if (!cancelled && alive.current) setProjectConversationLinks(result)
+    }).catch((failure) => {
+      if (!cancelled && alive.current) setProjectConversationLinks({ projectId: workspace.id, state: 'error', error: failure.message, conversations: [] })
+    })
+    refreshLinks()
+    const timer = setInterval(refreshLinks, CONVERSATION_SETTINGS.refreshMs)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [connected, workspace?.id])
+  const changeProject = (id) => { activeIdRef.current = id; setActiveId(id); const url = new URL(location.href); url.searchParams.set('project', id); history.replaceState(null, '', url) }
+  const updateProject = (value) => { if (alive.current) setLocal((previous) => [...previous.filter((item) => item.id !== value.id), value]) }
+  useEffect(() => {
+    if (!connected || !workspace?.id) return
+    let cancelled = false
+    Promise.allSettled([bridge.inventory(workspace.id), bridge.request('history', { projectId: workspace.id })]).then(([inventory, events]) => {
+      if (cancelled) return
+      if (inventory.status === 'fulfilled') updateProject({ ...inventory.value.project, ...(events.status === 'fulfilled' ? { events: events.value.events } : {}) })
+    })
+    return () => { cancelled = true }
+  }, [connected, workspace?.id, refreshKey])
+  const runJob = async (kind, target, files, payload = {}) => {
+    if (!local.some((item) => item.id === target.id)) throw new Error('Reliez les dossiers de ce projet dans Emplacements pour utiliser le Mac.')
+    const ids = workspaceSelection(files)
+    const label = { archive: 'Sauvegarde du projet', restore: 'Chargement sur le Mac', unload: 'Déchargement de la copie chargée', recover: 'Récupération depuis le cloud', 'prepare-scene': 'Vérification Houdini' }[kind]
+    const notice = notifyProgress({ title: label, body: target.name, indeterminate: true })
+    setOperation({ state: 'queued', label, projectId: target.id })
+    try {
+      // 3 October 2026, 09:19 CEST: name the missing copies or archives before launching an isolated scene verification.
+      if (kind === 'prepare-scene') {
+        const { plan } = await bridge.request('scene-preparation-plan', { projectId: target.id, ...payload })
+        if (!plan.ready) {
+          const loadCount = plan.loadRequirements.filter((entry) => entry.reason.endsWith('copy-required')).length
+          const archiveCount = plan.loadRequirements.length - loadCount
+          throw new Error([loadCount ? `Chargez les ${loadCount} fichiers nécessaires à cette scène et à ses ressources.` : '', archiveCount ? `Sauvegardez les ${archiveCount} copies modifiées avant la vérification.` : ''].filter(Boolean).join(' '))
+        }
+      }
+      const response = await ({ archive: () => bridge.archive(target.id, ids), restore: () => bridge.load(target.id, ids), unload: () => bridge.unload(target.id, ids), recover: () => bridge.recover(target.id), 'prepare-scene': () => bridge.request('prepare-scene', { projectId: target.id, ...payload }) }[kind]())
+      const started = Date.now()
+      while (Date.now() - started < SETTINGS.jobTimeoutMs) {
+        const current = await bridge.status(target.id)
+        updateProject(current.project)
+        const job = current.project.jobs?.find((item) => item.id === response.jobId)
+        if (!job) throw new Error('L’état de l’opération est perdu. Actualisez avant de réessayer.')
+        if (job.state === 'error') throw new Error(job.error || 'L’opération échoue.')
+        if (job.state === 'done') { notice.done({ body: kind === 'unload' ? `${job.count ?? 0} copies déchargées, ${readableSize(job.freedBytes || 0)} libérés. Les sources de production sont conservées.` : kind === 'prepare-scene' ? `${job.count ?? 0} ressources vérifiées en session isolée. La scène enregistrée conserve ses fichiers d’origine.` : kind === 'restore' && job.retainedCount !== undefined ? `${job.count ?? 0} fichiers ajoutés et vérifiés. ${job.retainedCount} fichiers déjà présents conservés.` : `${job.count ?? 0} fichiers vérifiés.${job.preservedVersions?.length ? ` ${job.preservedVersions.length} versions originales conservées séparément dans le cloud.` : ''}` }); setOperation({ state: 'complete', label, projectId: target.id }); await refresh(); return }
+        const detail = job.state === 'queued' ? 'En attente de la fin du lot en cours' : job.progress?.message || job.progress?.ev || 'Vérification des fichiers en cours'
+        setOperation({ state: job.state, label, detail, projectId: target.id }); notice.set({ label: detail })
+        await new Promise((resolve) => setTimeout(resolve, SETTINGS.pollMs))
+      }
+      throw new Error('L’opération continue dans le service local. Actualisez son état.')
+    } catch (failure) { notice.fail({ body: failure.message }); setOperation({ state: 'error', label, detail: failure.message, projectId: target.id }); throw failure }
+  }
+  const download = async (files, target) => {
+    const notice = notifyProgress({ title: 'Téléchargement', body: target.name, indeterminate: true })
+    try {
+      const nodes = files.map((file) => { const node = previewWorkspaceFile(file); return { ...node, archivePath: `${file.namespace || 'cloud'}/${file.sourceId || 'archive'}/${file.relativePath || file.name}${node.type === 'page' && !/\.md$/i.test(file.relativePath || file.name) ? '.md' : ''}` } })
+      if (nodes.length === 1 && /\.(?:file|img|media)\.json$/.test(nodes[0].contentPath)) {
+        const manifest = JSON.parse(await readCloud(nodes[0].contentPath))
+        if (nodes[0].contentPath.endsWith('.file.json')) {
+          const urls = downloadUrls(manifest)
+          if (!urls?.length) throw new Error('Ce fichier ne fournit pas de copie téléchargeable.')
+          await streamDownload({ urls, name: manifest.name || nodes[0].name, mime: manifest.mime, onProgress: (progress) => notice.set({ progress, indeterminate: false }) })
+        } else await downloadMedia(nodes[0].contentPath, nodes[0].name)
+      } else {
+        const result = await downloadFolderAsZip(nodes, target.name, (progress, label) => notice.set({ progress, label, indeterminate: false }), {
+          preservePaths: true,
+          isZippable: (file) => file.type === 'page' || /\.(?:file|img)\.json$/.test(file.contentPath),
+          resolveBytes: async (file) => {
+            if (file.type !== 'page') return resolveEntryBytes(file)
+            const bytes = new TextEncoder().encode(await readCloud(file.contentPath))
+            return { name: `${file.name}.md`, bytes, size: bytes.length }
+          },
+        })
+        if (result.cancelled) { notice.done({ body: 'Téléchargement annulé.' }); return }
+        if (result.fail) throw new Error(`${result.fail} fichiers n’ont pas pu être téléchargés. Le ZIP est incomplet.`)
+      }
+      notice.done({ body: `${files.length} fichiers téléchargés.` })
+    } catch (failure) { notice.fail({ body: failure.message }); throw failure }
+  }
+  if (legacyId !== null) return <><button type="button" className="assets-button" onClick={() => setLegacyId(null)}>Revenir au projet</button>{project.legacyCollections?.length > 1 && <select aria-label="Collection du projet" value={legacyId} onChange={(event) => setLegacyId(event.target.value)}>{project.legacyCollections.map((collection) => <option key={collection.id} value={collection.id}>{collection.name}</option>)}</select>}<LegacyView key={legacyId} t={t} NodeThumb={NodeThumb} initialProjectId={legacyId} /></>
+  return <>
+    <ProjectWorkspace conversationMirrorStatus={conversationMirrorStatus} conversations={conversations} projectConversationLinks={projectConversationLinks} readConversation={readConversation} readArticle={readArticle} key={project?.id} t={t} projects={projects} activeProjectId={project?.id} onSelectProject={changeProject} files={project?.files} activity={project?.events}
+      loading={loading} error={error || (!connected ? cloudSnapshotError : null)} offline={typeof navigator !== 'undefined' && !navigator.onLine} bridgeConnected={connected} bridgeCheckedAt={checkedAt} operation={operation?.projectId === project?.id ? operation : null}
+      onRetry={refresh} onLinkProject={(target, namespace) => setLinkDialog({ project: target?.id ? target : null, namespace })}
+      onArchive={(target, files) => runJob('archive', target, files)} onLoad={(target, files) => runJob('restore', target, files)} onUnload={(target, files) => runJob('unload', target, files)} onRecover={(target) => runJob('recover', target, [])}
+      onPrepareScene={(target, scene) => runJob('prepare-scene', target, [], { fileId: scene.sceneFileId })}
+      onOpenWorkshop={(target) => bridge.request('open-workshop', { projectId: target.id })}
+      onWatch={async (target, enabled) => { const result = await bridge.watch(target.id, enabled); updateProject(result.project); await refresh() }}
+      onDownload={download} onPreview={async (file) => {
+        if (isArticleName(file.name || file.relativePath)) { setLocalPreview({ ...file, htmlArticle: true }); return }
+        if (connected && file.present && file.sourceId && /\.(png|jpe?g|webp|avif|gif)$/i.test(file.name)) {
+          const result = await bridge.request('preview-url', { projectId: file.projectId || project.id, fileId: file.id })
+          setLocalPreview({ ...file, url: result.url }); return
+        }
+        if (connected && file.present && file.sourceId && isTextPreviewFile(file.name)) {
+          const result = await bridge.request('preview-text', { projectId: file.projectId || project.id, fileId: file.id })
+          setLocalPreview({ ...file, ...result }); return
+        }
+        const node = previewWorkspaceFile(file)
+        if (!node) { setLocalPreview(file); return }
+        setPreview({ ...node, assetsFile: file })
+      }}
+      onOpenLegacy={(target) => setLegacyId(target.legacyProjectIds?.[0] || target.id)}
+      renderThumbnail={(file, options) => connected && file.present && file.sourceId && /\.(png|jpe?g|webp|avif|gif)$/i.test(file.name) ? <LocalThumbnail file={{ ...file, projectId: file.projectId || project?.id }} /> : file.contentPath ? NodeThumb ? <NodeThumb e={previewWorkspaceFile(file)} size={options.size} /> : null : <LocalThumbnail file={{ ...file, projectId: file.projectId || project?.id }} />} />
+    {localPreview && createPortal(<div className="assets-preview-backdrop" onClick={() => setLocalPreview(null)}><section role="dialog" aria-modal="true" aria-label={`Aperçu de ${localPreview.name}`} className="assets-local-preview" onClick={(event) => event.stopPropagation()}><header><h2>{localPreview.name}</h2><button type="button" className="assets-button" autoFocus onClick={() => setLocalPreview(null)}>Fermer</button></header>{localPreview.htmlArticle ? <ProjectArticle project={{ ...project, article: { title: localPreview.name } }} file={localPreview} readArticle={readArticle} /> : localPreview.text !== undefined ? <><pre className="assets-text-preview">{localPreview.text}</pre>{localPreview.truncated && <p>Apercu limite au debut du fichier. L'original reste complet.</p>}</> : localPreview.url ? <img src={localPreview.url} alt={localPreview.name} /> : <p>Ce fichier s’ouvre dans son application de création. Son emplacement reste disponible ci-dessous.</p>}<FileLocations file={localPreview} project={project} connected={connected} compact={false} /></section></div>, document.body)}
+    {preview && <QuickLookOverlay t={t} item={preview} onClose={() => setPreview(null)} extraDetails={<div className="assets-preview-locations"><FileLocations file={preview.assetsFile} project={project} connected={connected} /></div>} />}
+    {/* 3 October 2026, 03:32 CEST: every linked project receives canonical memory, feedback and automatic tracking. */}
+    {linkDialog && <LinkProjectDialog {...linkDialog} t={t} onClose={() => setLinkDialog(null)} onSave={async (definition) => { const result = await bridge.request('start', { id: definition.id, name: definition.name, project: definition }); updateProject(result.project); changeProject(result.project.id); await refresh() }} />}
+    {DesignControls && <React.Suspense fallback={null}><DesignControls t={t} /></React.Suspense>}
+  </>
+}

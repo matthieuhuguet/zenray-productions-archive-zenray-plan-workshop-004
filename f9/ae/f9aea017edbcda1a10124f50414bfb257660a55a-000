@@ -1,0 +1,70 @@
+// Sert les playlists HLS (.m3u8) en TEXTE depuis le repo content zenray-data, avec le Content-Type
+// EXIGÉ par Safari : application/vnd.apple.mpegurl. Sans ce type, Safari refuse de lire le master.
+//
+// Endpoint DÉDIÉ (clone minimal du GET de img.js) pour ZÉRO risque de régression sur /api/img :
+//   - n'accepte qu'un path commençant par pages/ et finissant par .m3u8 ou .mpd ;
+//   - rejette tout '..' (pas de path traversal) et tout path absolu ;
+//   - lit le blob via le token serveur (repo content peut être privé) ;
+//   - cache Edge Cloudflare (s-maxage=86400) + cache mémoire process pour ZÉRO surconsommation du quota GitHub.
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+// Cache mémoire process : évite les requêtes réseau répétées vers GitHub pour les mêmes manifestes.
+const memCache = new Map()
+const CACHE_TTL_MS = 60 * 60 * 1000 // 1 heure
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(500).end()
+  if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return res.status(405).end() }
+
+  const path = (req.query.path || '').toString()
+  // Sert les manifestes texte de streaming : .m3u8 (HLS) ET .mpd (DASH, streaming v2). Même garde anti-traversal.
+  const isMpd = path.endsWith('.mpd')
+  if (!path.startsWith('pages/') || !(path.endsWith('.m3u8') || isMpd) || path.includes('..') || path.startsWith('/')) {
+    return res.status(400).end()
+  }
+
+  // 1. Vérifie le cache mémoire local
+  const cached = memCache.get(path)
+  if (cached && Date.now() < cached.exp) {
+    res.setHeader('Content-Type', isMpd ? 'application/dash+xml' : 'application/vnd.apple.mpegurl')
+    res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=86400')
+    res.setHeader('Content-Length', String(cached.buf.length))
+    return res.status(200).send(cached.buf)
+  }
+
+  try {
+    // 2. Tente raw.githubusercontent.com d'abord (ne consomme pas le quota REST 5000/h de l'API GitHub)
+    let buf = null
+    try {
+      const rawRes = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(path)}`, {
+        headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress' },
+      })
+      if (rawRes.ok) {
+        buf = Buffer.from(await rawRes.arrayBuffer())
+      }
+    } catch {}
+
+    // 3. Fallback sur l'API contents si raw n'a pas répondu 200
+    if (!buf) {
+      const r = await fetch(`https://api.github.com/repos/${REPO}/contents/${encodeURI(path)}?ref=${BRANCH}`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zenray-progress' },
+      })
+      if (!r.ok) return res.status(r.status === 404 ? 404 : 502).end()
+      buf = Buffer.from(await r.arrayBuffer())
+    }
+
+    // 4. Mémorise dans le cache local
+    if (memCache.size > 200) {
+      const oldestKey = memCache.keys().next().value
+      memCache.delete(oldestKey)
+    }
+    memCache.set(path, { buf, exp: Date.now() + CACHE_TTL_MS })
+
+    res.setHeader('Content-Type', isMpd ? 'application/dash+xml' : 'application/vnd.apple.mpegurl')
+    res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=86400')
+    res.setHeader('Content-Length', String(buf.length))
+    return res.status(200).send(buf)
+  } catch { return res.status(500).end() }
+}

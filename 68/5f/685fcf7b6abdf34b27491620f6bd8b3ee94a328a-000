@@ -1,0 +1,859 @@
+import React from 'react'
+import { PROVENANCE } from '../lib/mediaProvenance.js'
+import { RADII, SHADOWS } from '../theme.js'
+import SmartThumb from '../media/SmartThumb.jsx'
+import { imageCache } from '../media/imageCache.js'
+import { prefetchOne } from '../media/prefetch.js'
+import { buildJsDelivrUrl, buildRawUrl } from '../capture/shardNaming.js'
+import { shardApi, abToB64 } from '../capture/universalCapture.js'
+import { makeThumbWebp } from '../capture/thumbnailer.js'
+import { decryptToObjectUrl, decryptBytes } from '../media/crypto.js'
+import { streamDownloadChunks, streamDownload } from '../lib/fetchAsset.js'
+import { downloadUrls as fileDownloadUrls } from '../lib/archiveChunks.js'
+import { fitAspectWithinSquare } from '../media/thumbGeometry.js'
+import { createLruCache, createLruSet } from '../media/lruCache.js'
+
+// RENDERING PUBLIC ENCRYPTED IMAGES (public + encrypted + jsDelivr model, see docs/phase-upload.md).
+//
+// Plainly: on a public repo the image is encrypted gibberish. jsDelivr serves it as-is; an <img>
+// cannot display it. So the browser must: fetch the ciphertext (CDN) -> decrypt (AES-GCM, master
+// key + manifest IV) -> get a local blob: objectURL of the PLAINTEXT -> hand that to the <img>.
+//
+// DETECTION: a manifest is encrypted iff vis==='public' AND it carries an `iv` (written at upload).
+//   A public manifest WITHOUT iv (old unencrypted public) or a private/legacy one is served as-is.
+//
+// PLAINTEXT RAM CACHE: decrypt once per CDN URL and retain a wide working set. It is deliberately
+// larger than QuickLook's 96-image preload window, but bounded for tabs kept open for days.
+// Eviction revokes the plaintext objectURL; plaintext never leaves browser RAM.
+// Exported: every other view that renders an image (QuickLook, DriveThumb, refs, paste collage)
+//   must go through THIS same test and THIS same resolver so ciphertext is NEVER displayed.
+export const isEncrypted = (m) => !!(m && m.vis === 'public' && m.iv)
+
+// RAM cache: cache key -> Promise<plaintext objectURL>. We store the PROMISE (not the final URL)
+//   so concurrent decrypts deduplicate (two tiles of the same image decrypt only once).
+//   On failure the entry is removed to allow a retry (no negative caching).
+export const IMAGE_NODE_CACHE_LIMITS = Object.freeze({ decrypted: 384, manifests: 4096, backfills: 4096, backfillQueue: 128 })
+const revokeDecrypted = (promise) => {
+  Promise.resolve(promise).then((url) => {
+    if (typeof url === 'string' && url.startsWith('blob:')) URL.revokeObjectURL(url)
+  }).catch(() => {})
+}
+const _decCache = createLruCache({ maxEntries: IMAGE_NODE_CACHE_LIMITS.decrypted, onEvict: revokeDecrypted })
+function cachedDecrypt(key, produce) {
+  if (_decCache.has(key)) return _decCache.get(key)
+  const p = produce()
+  p.catch(() => { if (_decCache.peek(key) === p) _decCache.delete(key) })
+  _decCache.set(key, p)
+  return p
+}
+
+// Fetch ciphertext from a single CDN URL, decrypt with the given IV, return a cached plaintext objectURL.
+//   cdnUrl: jsDelivr URL of the ciphertext. iv: base64 from the manifest. mime: plaintext type for the Blob.
+async function decryptedObjectUrl(cdnUrl, iv, mime) {
+  if (!cdnUrl || !iv) return null
+  return cachedDecrypt(cdnUrl, async () => {
+    const buf = await fetch(cdnUrl).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error('cdn ' + r.status))))
+    return decryptToObjectUrl(buf, iv, mime)
+  })
+}
+
+// ── CHUNKED RECONSTRUCTION (2026-07-07) — replaces the old "raw.github original + jsDelivr dispPath derivative" duo ──
+// A `cdnChunks[]` image (new schema, ALWAYS present on recent uploads) is split into pieces ≤19 MB,
+// each served by jsDelivr. We fetch them ALL (parallel), concatenate IN ORDER -> we land back on the
+// EXACT original ciphertext (bit-exact, never recompressed), then decrypt normally. jsDelivr STRICT
+// (Matthieu's decision 2026-07-07): no raw.github fallback here — only a retry (CDN propagation right
+// after a fresh upload); if jsDelivr still fails, the image does not render rather than falling back
+// to raw.github (which would burn the quota we are trying to spare while browsing many images).
+// OLD-schema images (single cdnPath, never migrated) are UNCHANGED: see resolveFullUrl/resolveOriginalUrl.
+export const hasChunks = (m) => !!(m && Array.isArray(m.cdnChunks) && m.cdnChunks.length)
+
+async function fetchWithRetry(url, tries = 4, delayMs = 1500) {
+  for (let i = 0; i < tries; i++) {
+    try { const r = await fetch(url); if (r.ok) return await r.arrayBuffer() } catch {}
+    if (i < tries - 1) await new Promise((r) => setTimeout(r, delayMs))
+  }
+  return null
+}
+// BOUNDED chunk-download queue, same FIFO+active-counter pattern as queuedManifest above: without it,
+// browsing a folder of several multi-chunk images fires every chunk of every visible image at once
+// (each chunk up to 19 MB). Global (not per-image), so all images compete for the same budget.
+const CHUNK_CONC = 8
+let _cActive = 0
+const _cQ = []
+const _pumpC = () => { while (_cActive < CHUNK_CONC && _cQ.length) { const job = _cQ.shift(); _cActive++; job().finally(() => { _cActive--; _pumpC() }) } }
+const queuedChunkFetch = (url) => new Promise((resolve) => { _cQ.push(() => fetchWithRetry(url).then(resolve, () => resolve(null))); _pumpC() })
+// Fetch + concatenate all chunks of an image in order. Returns null if ANY single chunk fails after
+// retries (a clean failure beats a silently truncated/corrupted image).
+// PER-CHUNK ENCRYPTION (`ivs[]`, photos added by guests, 2 October 2026): a photo bigger than one chunk is stored as several
+// INDEPENDENT AES-GCM messages (the Worker that receives it cannot hold a 95 MB photo in memory to encrypt it whole). Each chunk is
+// decrypted with its own IV and the plaintexts are joined. A single-chunk photo has no `ivs` and takes the ordinary path below.
+export const hasChunkIvs = (m) => !!(m && Array.isArray(m.ivs) && Array.isArray(m.cdnChunks) && m.ivs.length === m.cdnChunks.length && m.ivs.length > 1)
+async function fetchChunkBuffers(m) {
+  const urls = m.cdnChunks.map((p) => buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, p))
+  const bufs = await Promise.all(urls.map((u) => queuedChunkFetch(u)))
+  return bufs.some((b) => !b) ? null : bufs
+}
+async function fetchChunkedCipher(m) {
+  const urls = m.cdnChunks.map((p) => buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, p))
+  const bufs = await Promise.all(urls.map((u) => queuedChunkFetch(u)))
+  if (bufs.some((b) => !b)) return null
+  const total = bufs.reduce((n, b) => n + b.byteLength, 0)
+  const out = new Uint8Array(total)
+  let off = 0
+  for (const b of bufs) { out.set(new Uint8Array(b), off); off += b.byteLength }
+  return out.buffer
+}
+// Chunked variant of decryptedObjectUrl: same RAM cache (dedupes concurrent decrypts), stable key
+// per manifest (repo+commit+chunk list is unique per image).
+async function decryptedObjectUrlChunked(m, iv, mime) {
+  if (!hasChunks(m) || !iv) return null
+  return cachedDecrypt(`chunked:${m.cdnRepo}@${m.cdnCommit}:${m.cdnChunks.join(',')}`, async () => {
+    if (hasChunkIvs(m)) {
+      const bufs = await fetchChunkBuffers(m)
+      if (!bufs) throw new Error('chunk fetch failed')
+      const plains = []
+      for (let i = 0; i < bufs.length; i++) plains.push(await decryptBytes(bufs[i], m.ivs[i]))
+      return URL.createObjectURL(new Blob(plains, { type: mime }))
+    }
+    const buf = await fetchChunkedCipher(m)
+    if (!buf) throw new Error('chunk fetch failed')
+    return decryptToObjectUrl(buf, iv, mime)
+  })
+}
+
+// Plaintext MIME for the decrypted Blob. Original extension lives in m.ext; generic image/* otherwise.
+const EXT_MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', tiff: 'image/tiff', heic: 'image/heic' }
+const fullMimeOf = (m) => EXT_MIME[(m && m.ext || '').toLowerCase()] || 'image/*'
+
+// OLD SCHEMA (single cdnPath, images never migrated) resolution chain, shared by resolveFullUrl and
+// resolveOriginalUrl. raw.github first (100 MB limit, not 20), then a fallback if raw is unavailable:
+//   - proxyForBig=false -> plain jsDelivr on cdnPath (display path, historical behavior).
+//   - proxyForBig=true  -> for files >19.5 MB use the private /api/shard proxy instead of jsDelivr
+//     (jsDelivr 403s above ~20 MB; download must still get the full original). Historical behavior too.
+async function legacyDecrypt(m, proxyForBig) {
+  const raw = buildRawUrl(m.cdnRepo, m.cdnCommit, m.cdnPath)
+  if (raw) { const u = await decryptedObjectUrl(raw, m.iv, fullMimeOf(m)).catch(() => null); if (u) return u }
+  const big = proxyForBig && (m.size || 0) > 19.5 * 1024 * 1024
+  const src = big && m.cdnRepo && m.cdnPath
+    ? `/api/shard?repo=${enc2(m.cdnRepo)}&path=${enc2(m.cdnPath)}`
+    : buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, m.cdnPath)
+  return decryptedObjectUrl(src, m.iv, fullMimeOf(m)).catch(() => null)
+}
+
+// SHARED ASYNC RESOLVER (for NON-React call sites: resolveRef, App.jsx paste collage, or any code that
+//   has a manifest and wants a displayable URL). Returns a plaintext objectURL (RAM-cached).
+//   Unencrypted -> returns the usual synchronous URL. React components prefer the useResolved* hooks.
+export async function resolveFullUrl(m) {
+  if (!isEncrypted(m)) return shardImgUrl(m)
+  // NEW SCHEMA (cdnChunks): strict jsDelivr, bit-exact reconstruction. "Full screen" and "original"
+  // are now the SAME thing (no recompressed derivative) -> a single resolution path.
+  if (hasChunks(m)) return decryptedObjectUrlChunked(m, m.iv, fullMimeOf(m)).catch(() => null)
+  return legacyDecrypt(m, false)
+}
+// ORIGINAL (full quality) URL for DOWNLOAD. New schema: strict chunked jsDelivr (identical to
+// resolveFullUrl — the original IS the full-screen image). Old schema (cdnPath): raw.github then
+// jsDelivr/proxy fallback, unchanged.
+export async function resolveOriginalUrl(m) {
+  if (!isEncrypted(m)) return shardImgUrl(m)
+  if (hasChunks(m)) return decryptedObjectUrlChunked(m, m.iv, fullMimeOf(m)).catch(() => null)
+  return legacyDecrypt(m, true)
+}
+export async function resolveThumbUrl(m) {
+  if (!isEncrypted(m)) return shardThumbUrl(m)
+  if (!m.thumbIv) return resolveFullUrl(m) // no encrypted thumbnail -> fall back to the decrypted full image
+  // FIX (2026-06-30): the thumbnail has its OWN content hash (≠ the original's). The old
+  // cdnPath.replace(.webp) computation wrongly assumed the original's hash -> 404 -> ALL gallery
+  // thumbnails broken (invisible images). Use `m.thumb` (correct URL written by the pipeline);
+  // legacy computation as fallback if absent, then the full decrypted image if even that fails ->
+  // never an empty tile.
+  const cdn = m.thumb || (m.cdnPath ? buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, m.cdnPath.replace(/\.[^./]+$/, '.webp')) : null)
+  if (!cdn) return resolveFullUrl(m)
+  const u = await decryptedObjectUrl(cdn, m.thumbIv, 'image/webp').catch(() => null)
+  return u || resolveFullUrl(m)
+}
+
+// Quick Look : réchauffe uniquement les vignettes 1080p autour de l'image courante. La grille
+// virtuelle suit le scroll, mais les flèches du Quick Look n'en changent pas la fenêtre : sans ce
+// cache glissant, une navigation assez longue finit donc sur des vignettes jamais demandées.
+// Les objectURL chiffrées restent dans _decCache ET leur bitmap décodé entre dans le vrai LRU partagé.
+// Les originaux 4K voisins ne sont jamais chargés ici.
+export function prefetchThumbImages(paths, signal, max = 192) {
+  const list = [...new Set((Array.isArray(paths) ? paths : []).filter((p) => p && p.endsWith('.img.json')))].slice(0, max)
+  if (!list.length) return Promise.resolve()
+  let cursor = 0
+  const worker = async () => {
+    while (!(signal && signal.aborted)) {
+      const i = cursor++
+      if (i >= list.length) return
+      const m = await readImgManifestCached(list[i])
+      if (!m || (signal && signal.aborted)) continue
+      const url = await resolveThumbUrl(m).catch(() => null)
+      if (url && !(signal && signal.aborted)) await imageCache.load(url, { signal })
+    }
+  }
+  return Promise.all(Array.from({ length: Math.min(6, list.length) }, worker)).then(() => undefined)
+}
+
+// V — Rendering of a .img.json node ("pure media file" model, Finder/Eagle style).
+// The manifest points at a shard. URL resolution depends on visibility:
+//   - PUBLIC (m.vis==='public' + cdnRepo/cdnPath/cdnCommit) -> jsDelivr PINNED on the commit (immutable).
+//   - PRIVATE / LEGACY (no vis, or vis:'private') -> /api/shard?repo=&path= (server token proxy), unchanged.
+// Backward compat: a manifest without `vis` is treated as private (exact old behavior).
+const enc2 = encodeURIComponent
+// Full image URL. Public -> pinned CDN; otherwise private proxy.
+export const shardImgUrl = (m) => {
+  if (!m) return null
+  if (m.vis === 'public' && m.cdnRepo && m.cdnPath && m.cdnCommit) {
+    return buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, m.cdnPath)
+  }
+  // Public without cdnCommit: if a private mirror exists (repo+path) serve it through the proxy; else null.
+  return m.repo && m.path ? `/api/shard?repo=${enc2(m.repo)}&path=${enc2(m.path)}` : null
+}
+// Light thumbnail (.webp), same path as the binary with a .webp extension. Falls back to the full image (onError).
+// search-8: MIRROR of thumbEntry (scripts/build-search-index.mjs and server/page.js index-add). This
+// function produces the final URL; the other two produce {u}|{r,p}. Same visibility invariant —
+// keep all three in sync if the public/private rule ever changes.
+export const shardThumbUrl = (m) => {
+  if (!m) return null
+  // Widened gate (2026-07-07): accept the OLD schema (single cdnPath) AND the NEW one (cdnChunks[]) —
+  // the thumbnail itself is NEVER chunked (always small); only the "valid public manifest" DETECTION
+  // gate must recognize both shapes, otherwise a chunked image would slip through and lose its thumbnail.
+  if (m.vis === 'public' && m.cdnRepo && (m.cdnPath || hasChunks(m)) && m.cdnCommit) {
+    // FIX (2026-06-30): the thumbnail has its OWN hash (≠ original). The pipeline writes the correct
+    // URL into `m.thumb` -> use it. cdnPath.replace(.webp) wrongly assumed the original's hash -> 404
+    // (gallery thumbnail broken on ALL bulk images). Legacy computation only as a fallback when there
+    // is no thumb field (only possible on cdnPath: a cdnChunks image without m.thumb simply has no thumbnail).
+    if (m.thumb) return m.thumb
+    return m.cdnPath ? buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, m.cdnPath.replace(/\.[^./]+$/, '.webp')) : null
+  }
+  // B(1): no source repo -> no thumbnail available. Return null (the tile shows a clean placeholder)
+  // instead of the full image, so the grid NEVER pulls the complete binary.
+  if (!m.repo) return null
+  // Thumbnail = hashed binary path with a .webp extension (single truth: no `thumb` field is ever
+  // written into .img.json manifests, the convention is "thumbnail derived from the path").
+  const tp = m.path ? m.path.replace(/\.[^./]+$/, '.webp') : null
+  return tp ? `/api/shard?repo=${enc2(m.repo)}&path=${enc2(tp)}` : null
+}
+
+// Full-size prefetch (Eagle-like perf). Once a folder's .webp thumbnails are placed, warm the real
+// image source in the browser cache so left/right scrolling and QuickLook do not start from zero.
+// Folder-scoped: bounded concurrency, scheduled on idle time, cancellable via AbortSignal.
+// Receives .img.json node paths: resolves manifests (cached), then pulls the FULL images in the
+// background through the shared prioritized queue (imageQueue). Cancellable via signal.aborted.
+const _ric = (cb) => (typeof requestIdleCallback === 'function' ? requestIdleCallback(cb, { timeout: 1500 }) : setTimeout(cb, 200))
+// Encrypted originals cannot be handed to <img>: they are ciphertext (and recent images are split
+// into CDN chunks). Warm their immutable CDN bytes one source at a time, then QuickLook reuses the
+// browser cache before decrypting. One task avoids competing with the visible WebP thumbnails or
+// allocating several 8K decrypted images in RAM at once.
+const FULL_WARM_CONC = 1
+let _fullWarmActive = 0
+const _fullWarmQ = []
+const pumpFullWarm = () => {
+  while (_fullWarmActive < FULL_WARM_CONC && _fullWarmQ.length) {
+    const job = _fullWarmQ.shift()
+    if (job.signal && job.signal.aborted) continue
+    _fullWarmActive++
+    job.run().catch(() => {}).finally(() => { _fullWarmActive--; _ric(pumpFullWarm) })
+  }
+}
+const queueFullWarm = (run, signal) => { _fullWarmQ.push({ run, signal }); pumpFullWarm() }
+
+async function warmEncryptedOriginal(m, signal) {
+  // New schema: all original chunks are immutable jsDelivr files. Reading their bodies lets the
+  // browser retain them in HTTP cache without attempting to decode ciphertext as an image.
+  const paths = hasChunks(m) ? m.cdnChunks : []
+  if (!m.cdnRepo || !m.cdnCommit || !paths.length) return
+  for (const path of paths) {
+    if (signal && signal.aborted) return
+    const r = await fetch(buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, path), { cache: 'force-cache', signal })
+    if (!r.ok) return
+    await r.arrayBuffer()
+  }
+}
+// F: `max` hard-caps how many full images get prefetched (the visible+overscan window, not the whole
+// folder). `priority:false` ALWAYS -> full-size prefetch never jumps ahead of visible thumbnails in
+// the shared queue (concurrency 6). At scale, prefetch stays subordinate to display.
+export function prefetchFullImages(paths, signal, max = Infinity) {
+  if (!Array.isArray(paths) || !paths.length) return
+  const list = max < paths.length ? paths.slice(0, max) : paths
+  for (const path of list) {
+    _ric(async () => {
+      if (signal && signal.aborted) return
+      try {
+        // ═══ LE VRAI POLLUEUR DE LA PASTILLE ORANGE (mesuré le 2026-08-31) ══════════════════════
+        //
+        // AVANT : `readImgManifest(path)` rend le corps BRUT du fichier. Pour un raccourci Eagle,
+        // c'est le manifeste du LIEN — 172 octets, type 'zenray-eagle-link/v1', sans `vis`, sans
+        // `cdnRepo`. Ce préchargement le mettait alors dans le cache PARTAGÉ `_cache`, sous le chemin
+        // du lien.
+        //
+        // Ensuite la tuile (`ImgNodeThumb` -> `useManifest` -> `readImgManifestCached`) trouvait ce
+        // cache déjà rempli et rendait le lien NON RÉSOLU : `onCdn` faux (pas de cdnRepo) -> pastille
+        // ORANGE, et aucune vignette. La frontière nette venait de la fenêtre de préchargement
+        // (visible + overscan) : elle atteignait les images sous le pli AVANT que la tuile ne les
+        // résolve, empoisonnant leur cache la première.
+        //
+        // La donnée était parfaite (prouvé sur le drive : lien, registre et source identiques à une
+        // image verte). Le bug était uniquement ce cache partagé rempli d'un manifeste de lien.
+        //
+        // `readImgManifestCached` résout le lien AVANT de mettre en cache, et range le manifeste
+        // CANONIQUE sous le chemin du lien. Le préchargement partage donc désormais le bon manifeste
+        // au lieu de le corrompre.
+        const m = await readImgManifestCached(path)
+        if (!m || (signal && signal.aborted)) return
+        // Current ZenRayShards images are public-but-encrypted. `shardImgUrl` intentionally has no
+        // display URL for chunked ciphertext, so the old branch silently skipped them here. Warm the
+        // encrypted bytes instead; QuickLook's resolveFullUrl then hits HTTP cache and decrypts once.
+        if (isEncrypted(m)) { queueFullWarm(() => warmEncryptedOriginal(m, signal), signal); return }
+        const url = shardImgUrl(m)
+        if (url) prefetchOne(url, { priority: false, signal })
+      } catch { /* best-effort */ }
+    })
+  }
+}
+
+// Read a .img.json manifest. CRITICAL DISTINCTION:
+//  - manifest genuinely absent (missing) -> return null (definitive answer, cacheable).
+//  - TRANSIENT failure (network, secondary GitHub rate-limit, j.error) -> RETRY with backoff; THROW if exhausted.
+// ABOVE ALL: never cache null on a transient failure. Previously, a rate-limit during a burst would
+// poison the cache (_cache.set(path, null)) -> the thumbnail stayed grey FOREVER until a manual
+// reload. That was THE cause of "lots of images never load".
+export async function readImgManifest(path, tries = 5) {
+  for (let i = 0; i < tries; i++) {
+    let j = null
+    try { const r = await fetch(`/api/page?action=read&raw=1&path=${encodeURIComponent(path)}`, { cache: 'no-store' }); if (r.ok) j = await r.json() } catch {}
+    if (j && j.missing) return null
+    // serving-quota-3: GitHub quota exhausted (the server contents fallback returns rateLimited+resetAt).
+    // Arm the global banner and STOP dead: retrying 5 times on a zeroed quota is pointless (8 s of
+    // spinner + a longer ban). Throw like a transient failure (caller keeps the placeholder, no
+    // negative caching).
+    if (j && j.rateLimited) { try { window.__zrMarkRateLimited && window.__zrMarkRateLimited(j.resetAt) } catch {}; throw new Error('rate-limited') }
+    if (j && !j.error && j.markdown != null) {
+      let m = null
+      try { m = JSON.parse(j.markdown) } catch { return null }
+      // La résolution d'un lien vit dans `readImgManifestCached` juste en dessous, qui le faisait
+      // DÉJÀ avant que je n'ajoute ici un second chemin — doublon retiré le 2026-08-31, avec son
+      // `await import()` qui tirait un module de plus sur la route la plus chaude de l'app.
+      return m
+    }
+    await new Promise((res) => setTimeout(res, Math.min(4000, 300 * (i + 1))))
+  }
+  throw new Error('manifest-unavailable')
+}
+
+// In-memory manifest cache (avoids re-fetching the same .img.json). Only DEFINITIVE answers are
+// stored (valid manifest OR confirmed absence); never a transient failure.
+const _cache = createLruCache({ maxEntries: IMAGE_NODE_CACHE_LIMITS.manifests })
+// Clear the manifest cache (after a migration: a manifest changed URL/visibility).
+export function clearManifestCache() { _cache.clear() }
+// T(1) — TARGETED invalidation of a single manifest (after copy-paste: the NEW path's manifest may
+// have been cached as `null` (missing) BEFORE copyNode wrote it -> permanently grey tile). Remove
+// the offending entry to allow a clean re-fetch. Preferred over a global clear (which would throw
+// away hundreds of valid manifests and trigger a fetch burst -> rate-limit risk).
+export function invalidateManifest(path) { if (path) _cache.delete(path) }
+
+// Manifest read that REUSES the in-memory cache populated by grid thumbnails.
+// QuickLook (Space) must be instant: if the grid already displayed this node, its .img.json is
+// already in _cache -> zero network round-trip. Otherwise read + cache for next time.
+export async function readImgManifestCached(path) {
+  if (_cache.has(path)) return _cache.get(path)
+  try {
+    let m = await readImgManifest(path)
+    // Grid thumbnails also resolve placements. Keep the cache under the placement
+    // path so an Eagle image appears instantly without a second manifest route.
+    if (m && m.type === 'zenray-eagle-link/v1') {
+      // ═══ UN ÉCHEC PASSAGER N'EST PAS UNE IMAGE INTROUVABLE (2026-08-31) ═══════════════════════
+      //
+      // SYMPTÔME signalé à 04h01 : « image introuvable » sur les raccourcis, puis l'image apparaît
+      // quelques secondes plus tard. Elle n'a jamais manqué : c'est la RÉSOLUTION qui a échoué une
+      // fois, et l'échec était rendu comme une absence définitive.
+      //
+      // Le `return null` d'origine ne distinguait pas trois choses très différentes : le lien est
+      // orphelin (vraie absence), le réseau a hoqueté, ou la route a été refusée un instant. Les
+      // deux dernières se réparent en réessayant ; la première non. Et comme le `null` n'était même
+      // pas mis en cache, chaque tuile refaisait l'appel — donc chaque tuile pouvait échouer.
+      //
+      // Une seule retente suffit, avec une courte pause : au-delà, l'échec est réel et il vaut mieux
+      // le dire que d'insister.
+      // ═══ LA CAUSE DE LA PASTILLE ORANGE QUI COLLE (mesuré le 2026-08-31) ══════════════════════
+      //
+      // Preuve par les données : deux liens voisins, IMG_6083 (vert) et IMG_6084 (orange), ont des
+      // manifestes de lien valides, des registres identiques, et des manifestes canoniques
+      // structurellement identiques — même dépôt CDN, même commit. La donnée est parfaite. L'échec
+      // était purement CLIENT : sous une rafale de tuiles, quelques résolutions échouent (réseau,
+      // limite de connexions du navigateur, quota), et cet échec TRANSITOIRE était rendu `null`.
+      //
+      // Or `useManifest` mettait ce `null` en cache (« x !== undefined »), donc la pastille se figeait
+      // pour toute la session, et rechargeait au même endroit puisque l'ordre de chargement est
+      // stable — d'où la frontière nette qui trompait le diagnostic.
+      //
+      // La règle de Matthieu s'applique ici mot pour mot : STABILITÉ AVANT VITESSE. Un pointeur DOIT
+      // finir par résoudre tant que sa cible existe. On distingue donc trois cas :
+      //   - le serveur répond OK          -> on suit le pointeur,
+      //   - le serveur dit ABSENT (orphelin/invalide) -> absence réelle, on la met en cache,
+      //   - le réseau hoquette            -> TRANSITOIRE, on rend `undefined`, jamais mis en cache,
+      //                                       et `useManifest` réessaie tout seul.
+      const ABSENCE_REELLE = new Set(['orphan-link', 'invalid-resource', 'missing', 'bad-path'])
+      let r = null
+      for (let i = 0; i < 4; i++) {
+        r = await fetch(`/api/page?action=resolve-link&path=${encodeURIComponent(path)}`, { cache: 'no-store' }).then((x) => x.json()).catch(() => null)
+        if (r?.ok && r.path && r.path !== path) break
+        if (r && r.ok === false && ABSENCE_REELLE.has(r.error)) { _cache.set(path, null); return null }
+        r = null
+        await new Promise((res) => setTimeout(res, 300 * (i + 1)))
+      }
+      if (!r) return undefined // transitoire : NON mis en cache, la grille réessaiera
+      m = await readImgManifestCached(r.path)
+      if (m === undefined) return undefined
+    }
+    _cache.set(path, m); return m
+  } catch { return undefined } // échec transitoire : jamais mis en cache, sera réessayé
+}
+
+// BOUNDED manifest read queue: without it, showing N search results fires N SIMULTANEOUS .img.json
+// fetches -> burst -> rate-limit -> slow thumbnails. Cap in-flight reads at MANIFEST_CONC; the rest wait.
+const MANIFEST_CONC = 6
+let _mActive = 0
+const _mQ = []
+const _pumpM = () => { while (_mActive < MANIFEST_CONC && _mQ.length) { const job = _mQ.shift(); _mActive++; job().finally(() => { _mActive--; _pumpM() }) } }
+// resolves to manifest|null (definitive) or undefined (transient failure -> do not cache, retry later).
+// ═══ LA GRILLE PASSE PAR LA VERSION QUI RÉSOUT LES LIENS ════════════════════════════════════════
+//
+// RÉGRESSION du 2026-08-31, corrigée le jour même : `readImgManifest` résolvait les liens Eagle, et
+// j'ai retiré ce code en le croyant redondant avec `readImgManifestCached` juste en dessous. Il
+// l'était pour l'aperçu — pas pour CETTE file, qui est le chemin de la GRILLE.
+//
+// Ce qu'elle rendait alors pour un raccourci : le manifeste du LIEN, cent soixante-douze octets sans
+// vignette, sans `vis`, sans dépôt CDN. Donc une tuile vide et une pastille orange, exactement les
+// deux symptômes signalés à 04h01.
+//
+// `readImgManifestCached` fait les deux choses qu'il faut ici : elle résout le lien vers son
+// manifeste canonique, et elle mémorise le résultat sous le chemin du PLACEMENT — si bien qu'un
+// raccourci déjà vu s'affiche ensuite sans le moindre appel.
+const queuedManifest = (path) => new Promise((resolve) => { _mQ.push(() => readImgManifestCached(path).then((x) => resolve(x), () => resolve(undefined))); _pumpM() })
+
+// Only ACTIVATE loading (manifest + thumbnail) when the tile nears the screen. Searching across 1M
+// images: only the ~few dozen visible tiles fetch; everything else stays a placeholder, zero wasted network.
+function useInView(ref, rootMargin = '700px') {
+  const [inView, setInView] = React.useState(false)
+  React.useEffect(() => {
+    if (inView) return
+    const el = ref.current; if (!el) return
+    if (typeof IntersectionObserver === 'undefined') { setInView(true); return }
+    const io = new IntersectionObserver((ents) => { if (ents.some((e) => e.isIntersecting)) { setInView(true); io.disconnect() } }, { rootMargin })
+    io.observe(el)
+    return () => io.disconnect()
+  }, [ref, inView, rootMargin])
+  return inView
+}
+
+function useManifest(path, enabled = true) {
+  const [m, setM] = React.useState(() => _cache.get(path) || null)
+  React.useEffect(() => {
+    if (_cache.has(path)) { setM(_cache.get(path)); return }
+    if (!enabled) return
+    let live = true
+    let essais = 0
+    // Un résultat DÉFINITIF (manifeste valide, ou `null` = absence confirmée) est mis en cache et
+    // affiché. Un `undefined` est un échec TRANSITOIRE : on ne le met pas en cache et on RÉESSAIE
+    // tout seul, avec une pause croissante, jusqu'à ce que le pointeur résolve. C'est ce qui empêche
+    // la pastille orange de coller. Stabilité avant vitesse : l'image finit toujours par venir.
+    const tenter = () => {
+      queuedManifest(path).then((x) => {
+        if (!live) return
+        if (x !== undefined) { _cache.set(path, x); setM(x); return }
+        if (essais++ < 5) setTimeout(tenter, 600 * essais)
+      })
+    }
+    tenter()
+    return () => { live = false }
+  }, [path, enabled])
+  // T(1) — A copy just wrote manifests. If OUR manifest is not resolved yet (null/absent because
+  // copyNode was still running when we fetched), RE-FETCH. Only re-apply if the manifest is now
+  // VALID (truthy); if it is still missing (copy unfinished), do NOT wrongly re-cache null — wait
+  // for the next event. This is the copy-paste race fix: the thumbnail always shows up eventually.
+  React.useEffect(() => {
+    if (m) return // already resolved, nothing to refresh
+    const onRefresh = (ev) => {
+      const p = ev && ev.detail && ev.detail.path
+      if (p && p !== path) return
+      _cache.delete(path) // bypass a possibly cached null
+      queuedManifest(path).then((x) => { if (x) { _cache.set(path, x); setM(x) } })
+    }
+    window.addEventListener('zr-manifest-refresh', onRefresh)
+    return () => window.removeEventListener('zr-manifest-refresh', onRefresh)
+  }, [path, m])
+  return m
+}
+
+// T(2) — CLIENT-SIDE BACKFILL of a missing thumbnail. When a tile has a VALID manifest but its
+// .webp thumbnail 404s (never generated: old import, copy, interrupted capture), download the FULL
+// image once, shrink it to .webp (canvas) and upload it at the shard's hashed .webp path.
+// Idempotent (same hash = same blob server-side) and bounded (pulling the full binary is heavy).
+const BACKFILL_CONC = 2          // very low: each backfill downloads a full image
+let _bfActive = 0
+const _bfQ = []
+const _bfDone = createLruSet(IMAGE_NODE_CACHE_LIMITS.backfills) // .webp paths already backfilled (avoid repeats)
+const _bfPending = new Set()     // .webp paths in flight
+const _bfQueued = new Set()      // dedupe avant que le job entre dans _bfPending
+const _pumpBf = () => {
+  while (_bfActive < BACKFILL_CONC && _bfQ.length) {
+    const job = _bfQ.shift()
+    _bfQueued.delete(job.key)
+    _bfActive++
+    job.run().finally(() => { _bfActive--; _pumpBf() })
+  }
+}
+
+// Target .webp path (single truth: binary path with .webp extension), public or private.
+function thumbTargetPath(m) {
+  const base = (m.vis === 'public' && m.cdnPath) ? m.cdnPath : m.path
+  return base ? base.replace(/\.[^./]+$/, '.webp') : null
+}
+
+// Generate + upload the missing thumbnail. Returns a local objectURL (instant display, no CDN
+// propagation wait) or null if impossible. Best-effort, idempotent.
+async function backfillThumb(m) {
+  const repo = m.repo || m.cdnRepo
+  const tp = thumbTargetPath(m)
+  if (!repo || !tp) return null            // no usable source/target (e.g. public without a private mirror)
+  if (_bfDone.has(tp) || _bfPending.has(tp)) return null
+  // Quota guard: do not pull full images during a confirmed rate-limit.
+  try { if (window.__zrRateLimited) return null } catch {}
+  _bfPending.add(tp)
+  try {
+    const fullUrl = shardImgUrl(m); if (!fullUrl) return null
+    const blob = await fetch(fullUrl, { cache: 'force-cache' }).then((r) => (r.ok ? r.blob() : null)); if (!blob) return null
+    const webp = await makeThumbWebp(blob); if (!webp) return null
+    const b64 = abToB64(await webp.arrayBuffer())
+    const br = await shardApi({ action: 'blob', repo, b64 }); if (!br || !br.sha) return null
+    const cr = await shardApi({ action: 'commit', repo, files: [{ path: tp, sha: br.sha }], addBytes: webp.size })
+    if (!cr || cr.error || !cr.ok) return null
+    _bfDone.add(tp)
+    return URL.createObjectURL(webp)
+  } catch { return null } finally { _bfPending.delete(tp) }
+}
+const queueBackfill = (m) => {
+  const key = thumbTargetPath(m)
+  if (!key || _bfDone.has(key) || _bfPending.has(key) || _bfQueued.has(key)) return Promise.resolve(null)
+  if (_bfQ.length >= IMAGE_NODE_CACHE_LIMITS.backfillQueue) return Promise.resolve(null)
+  _bfQueued.add(key)
+  return new Promise((resolve) => {
+    _bfQ.push({ key, run: () => backfillThumb(m).then(resolve, () => resolve(null)) })
+    _pumpBf()
+  })
+}
+
+// Resolve the URL an <img> can ACTUALLY display from a manifest.
+//   - encrypted (public + iv): returns the decrypted plaintext objectURL (async, via state). null until ready.
+//   - otherwise: returns the synchronous URL directly (clear public CDN or private proxy), unchanged behavior.
+// `enabled` gates the encrypted resolution (decrypting costs a CDN fetch + an AES-GCM pass) on visibility.
+function useResolvedFull(m, enabled = true) {
+  const plain = isEncrypted(m) ? null : shardImgUrl(m)
+  const [dec, setDec] = React.useState(null)
+  React.useEffect(() => {
+    if (!isEncrypted(m) || !enabled) return
+    let live = true
+    // NEW SCHEMA (cdnChunks): strict jsDelivr reconstruction (see decryptedObjectUrlChunked).
+    // OLD SCHEMA (cdnPath, never migrated): FIX 2026-07-07 (pre-existing bug, spotted while testing
+    // chunking) — this branch used to try ONLY jsDelivr, straight at the whole original. Above
+    // ~20 MB jsDelivr returns 403 (CDN limit) and the image hung forever on "decrypting image…"
+    // (ImageNodeViewer page, called with enabled=true permanently — a single explicitly requested
+    // image, not a grid burst). Same fallback as resolveFullUrl: raw.github first (100 MB limit,
+    // not 20), jsDelivr as backup if raw is unavailable.
+    const p = hasChunks(m) ? decryptedObjectUrlChunked(m, m.iv, fullMimeOf(m)) : resolveFullUrl(m)
+    p.then((u) => { if (live && u) setDec(u) }).catch(() => {})
+    return () => { live = false }
+  }, [m && m.cdnRepo, m && m.cdnCommit, m && m.cdnPath, m && m.cdnChunks, m && m.iv, enabled])
+  return isEncrypted(m) ? dec : plain
+}
+
+// Same logic for the .webp THUMBNAIL (encrypted with its own thumbIv). Never chunked (always small):
+// no cdnChunks branch needed here; only the legacy fallback (m.cdnPath) is kept, defensively.
+function useResolvedThumb(m, enabled = true) {
+  const plain = isEncrypted(m) ? null : shardThumbUrl(m)
+  const [dec, setDec] = React.useState(null)
+  React.useEffect(() => {
+    if (!isEncrypted(m) || !m.thumbIv || !enabled) return
+    let live = true
+    // The THUMBNAIL has its OWN content hash (≠ cdnPath = the original's hash). m.thumb carries the
+    // CORRECT jsDelivr URL -> use it. cdnPath.replace(.webp) yielded original-hash + .webp = 404 ->
+    // decrypting a 404 = grey thumbnail. Fallback (old manifests without thumb): legacy computation,
+    // only when cdnPath exists.
+    const cdn = m.thumb || (m.cdnPath ? buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, m.cdnPath.replace(/\.[^./]+$/, '.webp')) : null)
+    decryptedObjectUrl(cdn, m.thumbIv, 'image/webp').then((u) => { if (live && u) setDec(u) }).catch(() => {})
+    return () => { live = false }
+  }, [m && m.cdnRepo, m && m.cdnCommit, m && m.cdnPath, m && m.thumb, m && m.thumbIv, enabled])
+  // Encrypted without thumbIv (no thumbnail) -> fall back to the decrypted full image via viewer/onMissing.
+  return isEncrypted(m) ? dec : plain
+}
+
+// SEARCH MODE (hasDirect): the thumbnail comes from the v2 index as {u, iv} (u = jsDelivr URL of the
+//   encrypted .webp, iv = thumbIv). No manifest read. With iv -> u points at ciphertext -> fetch +
+//   decrypt into an objectURL (gated on viewport). Without iv -> u is direct plaintext, unchanged (return u).
+// Exportee pour que l'apercu puisse afficher la vignette de l'INDEX sans attendre le manifeste :
+// c'est ce qui fait tomber l'ouverture a froid sous la cible. Voir QuickLookOverlay.
+export function useResolvedDirectThumb(url, iv, enabled = true, onFail) {
+  const [dec, setDec] = React.useState(null)
+  React.useEffect(() => {
+    if (!url || !iv || !enabled) return
+    let live = true
+    // Decrypt failure = the CDN .webp 404s (renamed media: the OLD path's thumbnail is gone, the new
+    // one has not propagated to jsDelivr yet). Signal it -> switch to the live manifest via /api.
+    decryptedObjectUrl(url, iv, 'image/webp').then((u) => { if (live) { if (u) setDec(u); else onFail && onFail() } }).catch(() => { if (live) onFail && onFail() })
+    return () => { live = false }
+  }, [url, iv, enabled])
+  return iv ? dec : url
+}
+
+// Image node thumbnail for the Finder (list/icons/search). LAZY loading gated on the viewport:
+// manifest + light .webp thumbnail only load if the tile is visible (or close). Placeholder otherwise.
+//
+// E (thumbnail from the v2 index): if `thumbUrl` is provided (thumbnail URL precomputed by the
+// search index), use it DIRECTLY as the source -> ZERO .img.json manifest fetch. The FULL image
+// (for QuickLook/hover) is then resolved LAZILY on hover only (manifest read on demand), not on
+// mount. If `thumbUrl` is absent -> current behavior unchanged (lazy manifest read gated on viewport).
+export function ImgNodeThumb({ path, thumbUrl, thumbIv, size = 54, radius = 7, priority = false, onProvenance }) {
+  const ref = React.useRef(null)
+  const hasDirect = !!thumbUrl
+  // The Finder icon grid uses large slots (typically 70px+); its images should look like Finder/Eagle
+  // thumbnails, respecting landscape/portrait geometry. Small list/dock icons intentionally stay square
+  // so their surrounding rows never change shape.
+  const preserveAspect = size >= 56
+  const inView = useInView(ref)
+  // RENAME = "missing" media (grey thumbnail): the v2 index hands a direct URL that points at the
+  //   OLD path (delta.json not propagated yet) -> the CDN .webp 404s. directFailed then switches to
+  //   the live manifest (/api, no-store, authoritative, immediate) = correct thumbnail right away,
+  //   without waiting ~5 min of CDN cache. Reset when the (path, thumbUrl) pair changes.
+  const [directFailed, setDirectFailed] = React.useState(false)
+  React.useEffect(() => { setDirectFailed(false) }, [path, thumbUrl])
+  const useManif = !hasDirect || directFailed
+  // Only read the manifest when there is NO usable direct URL (otherwise zero network for the thumbnail).
+  const m = useManifest(path, useManif && (inView || _cache.has(path) || priority))
+  const [intrinsicSize, setIntrinsicSize] = React.useState(null)
+  React.useEffect(() => { setIntrinsicSize(null) }, [path, thumbUrl])
+  const onIntrinsicSize = React.useCallback(({ width, height }) => {
+    if (!(width > 0 && height > 0)) return
+    setIntrinsicSize((previous) => (previous && previous.width === width && previous.height === height ? previous : { width, height }))
+  }, [])
+  // T(2): locally backfilled thumbnail (objectURL) -> instant display without waiting for CDN propagation.
+  const [localThumb, setLocalThumb] = React.useState(null)
+  React.useEffect(() => () => { if (localThumb) URL.revokeObjectURL(localThumb) }, [localThumb])
+  // ENCRYPTED: thumbnail/image resolve to decrypted plaintext objectURLs (viewport-gated so only the
+  //   visible decrypts). UNENCRYPTED: synchronous URL (clear CDN or private proxy), unchanged.
+  const decThumb = useResolvedThumb(m, useManif && inView)
+  // Direct mode (search): with thumbIv, thumbUrl is ciphertext -> decrypt (null until ready, NEVER
+  //   raw ciphertext). Without thumbIv: thumbUrl is direct plaintext, unchanged. onFail -> manifest.
+  const onDirectFail = React.useCallback(() => setDirectFailed(true), [])
+  const directThumb = useResolvedDirectThumb(hasDirect && !directFailed ? thumbUrl : null, hasDirect ? thumbIv : null, inView, onDirectFail)
+  const encThumb = (hasDirect && !directFailed) ? directThumb : (isEncrypted(m) ? decThumb : shardThumbUrl(m))
+  const thumb = localThumb || encThumb
+  // full: known via the manifest (normal path); in direct mode, resolved lazily on hover.
+  const [lazyFull, setLazyFull] = React.useState(null)
+  const [hover, setHover] = React.useState(false)
+  // PERF/FREEZE: the encrypted FULL image only decrypts on HOVER, never in bulk for every visible
+  //   tile — otherwise opening a folder of 146 encrypted images fires 30+ AVIF decrypts at once =
+  //   frozen page. Thumbnails (decThumb, light) stay viewport-gated. Unencrypted: synchronous URL.
+  const decFull = useResolvedFull(m, !hasDirect && hover)
+  const full = hasDirect ? (lazyFull || null) : (isEncrypted(m) ? decFull : shardImgUrl(m))
+  const onEnter = React.useCallback(() => {
+    setHover(true)
+    if (!hasDirect) { if (full) prefetchOne(full) ; return }
+    if (lazyFull) { prefetchOne(lazyFull); return }
+    // Resolve the full image ONCE on hover: read the manifest on demand, then prefetch.
+    // ENCRYPTED: shardImgUrl would return ciphertext (undisplayable by <img>) -> decrypt to an objectURL.
+    readImgManifestCached(path).then((mm) => {
+      if (isEncrypted(mm)) {
+        const p = hasChunks(mm) ? decryptedObjectUrlChunked(mm, mm.iv, fullMimeOf(mm)) : decryptedObjectUrl(buildJsDelivrUrl(mm.cdnRepo, mm.cdnCommit, mm.cdnPath), mm.iv, fullMimeOf(mm))
+        p.then((u) => { if (u) setLazyFull(u) }).catch(() => {})
+        return
+      }
+      const u = shardImgUrl(mm); if (u) { setLazyFull(u); prefetchOne(u) }
+    })
+  }, [hasDirect, full, lazyFull, path])
+  // T(2): the .webp thumbnail 404'd -> generate it client-side (lazy: only while the tile is in
+  // view; we need manifest `m` for repo+path, so unavailable in direct index mode).
+  // ENCRYPTED: we do NOT backfill. Backfill downloads the full image, re-thumbnails it and PUSHES a
+  //   thumbnail to the repo. On an encrypted public repo that would (a) read ciphertext (broken
+  //   image) and (b) push PLAINTEXT (clear .webp) to a public repo = P0 violation. The encrypted
+  //   thumbnail is guaranteed by the upload; if missing, fall back cleanly to the decrypted full
+  //   image (decFull), never to a push.
+  const onMissing = React.useCallback(() => {
+    // Direct mode (search): the index URL's <img> 404'd (renamed media). Switch to the live manifest.
+    if (hasDirect && !directFailed) { setDirectFailed(true); return }
+    if (!m || !inView || isEncrypted(m)) return
+    queueBackfill(m).then((u) => { if (u) setLocalThumb(u) })
+  }, [m, inView, hasDirect, directFailed])
+  // PROVENANCE DOT (subtle). FIX 2026-06-11: it used to test ENCRYPTION, not the SOURCE — 16k public
+  //   PLAINTEXT images on jsDelivr (e.g. FF VII Rebirth) wrongly showed yellow "Vercel · private".
+  //   Now: green = served by jsDelivr (clear OR encrypted, quota-free CDN); yellow = real /api/shard proxy.
+  const enc = isEncrypted(m) || (hasDirect && !!thumbIv)
+  const onCdn = (m && m.vis === 'public' && m.cdnRepo && m.cdnCommit) || hasDirect
+  const known = !!m || hasDirect
+  // LA PASTILLE NE VIT PLUS ICI (2026-07-31). Elle etait posee en absolu dans le coin de la vignette,
+  // ou elle chevauchait l'image et se lisait mal. Elle appartient desormais a la LIGNE DE TEXTE de la
+  // tuile, a gauche du nom, conformement a la reference macOS mesuree dans src/config/colors.js.
+  //
+  // On la fait donc REMONTER par rappel plutot que de relire le manifeste depuis la tuile : cette
+  // lecture est asynchrone et mise en cache, mais rien ne garantit l'ordre des deux appels, et un
+  // second lecteur declencherait une requete de plus par vignette au premier affichage.
+  //
+  // `onProvenance` est volontairement absent des dependances : l'appelant le recree a chaque rendu,
+  // l'inclure relancerait l'effet en boucle. C'est la valeur qui compte, pas l'identite de la fonction.
+  const provRef = React.useRef(null)
+  provRef.current = onProvenance
+  React.useEffect(() => { provRef.current?.({ known, onCdn, enc }) }, [known, onCdn, enc])
+
+  // Manifests carry the original w/h. Direct index thumbnails deliberately skip a manifest read, so their
+  // intrinsic dimensions provide the same information as soon as the lightweight WebP decodes.
+  const aspectWidth = preserveAspect ? (m?.w || intrinsicSize?.width) : null
+  const aspectHeight = preserveAspect ? (m?.h || intrinsicSize?.height) : null
+  const aspectReady = !preserveAspect || (aspectWidth > 0 && aspectHeight > 0)
+  const geometry = fitAspectWithinSquare(size, aspectWidth, aspectHeight)
+  return (
+    <div ref={ref} onMouseEnter={onEnter} style={{ position: 'relative', width: geometry.width, height: geometry.height, borderRadius: radius, background: thumb ? 'transparent' : 'rgba(128,128,128,0.12)', opacity: aspectReady ? 1 : 0, transition: 'opacity 200ms ease' }}>
+      {thumb && <SmartThumb url={thumb} fullUrl={full} noFullFallback onMissing={onMissing} width="100%" height={geometry.height} radius={radius} priority={priority} onIntrinsicSize={onIntrinsicSize} />}
+
+    </div>
+  )
+}
+
+// Trigger a browser download of a Blob under a given filename.
+function triggerDownload(blob, filename) {
+  const dl = URL.createObjectURL(blob)
+  const a = document.createElement('a'); a.href = dl; a.download = filename || 'fichier'
+  document.body.appendChild(a); a.click(); a.remove()
+  setTimeout(() => URL.revokeObjectURL(dl), 2000)
+}
+
+// OUTPUT (re-download of the original): take the DISPLAYABLE URL (for an encrypted image that is
+//   already the decrypted plaintext objectURL; for an unencrypted one, the CDN/proxy URL), read it
+//   as a Blob and trigger a browser download with the REAL name + extension. One image = one piece,
+//   so "reassembling" = taking the blob as-is. (HLS video has its own download path, outside this component.)
+async function downloadOriginal(displayUrl, m, title) {
+  // DOWNLOAD = the full-quality ORIGINAL. New schema (cdnChunks): resolveOriginalUrl IS already
+  // bit-exact (same reconstruction as display) -> call it systematically (cached, free if already
+  // resolved), no downscaled derivative to dodge. Old schema (cdnPath): unchanged behavior
+  // (re-resolve when the original exceeds 19.5 MB, in case the displayed URL did not point at the
+  // complete original yet).
+  let src = displayUrl
+  try { if (m && (hasChunks(m) || (m.size || 0) > 19.5 * 1024 * 1024)) { const o = await resolveOriginalUrl(m); if (o) src = o } } catch {}
+  if (!src) return
+  const blob = await fetch(src).then((r) => (r.ok ? r.blob() : Promise.reject(new Error('dl ' + r.status))))
+  const nm = (m && m.name) || title || 'image'
+  const fname = /\.[^./]+$/.test(nm) ? nm : nm + (m && m.ext ? '.' + m.ext : '')
+  triggerDownload(blob, fname)
+}
+
+// Read a media node manifest (.media.json) in clear via the read action (raw, outside REST quota).
+async function readMediaManifest(path) {
+  const r = await fetch(`/api/page?action=read&path=${encodeURIComponent(path)}&raw=1`, { cache: 'no-store' }).then((x) => x.json()).catch(() => null)
+  if (!r || r.markdown == null) return null
+  try { return JSON.parse(r.markdown) } catch { return null }
+}
+
+// RECONSTRUCTION of a chunked media (.media.json {type:'chunked-media'}): fetch each piece, decrypt
+//   it (public+encrypted: jsDelivr ciphertext + manifest iv), and REASSEMBLE the original file in
+//   order -> Blob -> download with the real name/MIME. The exact INVERSE of upload-time deconstruction.
+//   Legacy private (no ivs): fall back to the /api/shard proxy, no decryption.
+async function downloadChunkedMedia(path, title) {
+  const m = await readMediaManifest(path)
+  // BUG DOWNLOAD 0 Ko CORRIGÉ (2026-07-22) : le garde exigeait `type==='chunked-media'` et la branche `enc`
+  // exigeait `cdnRepo`+`ivs[]`. Or les manifestes AUDIO V3 (buildAudioManifestV3) portent `type:'raw'`, des
+  // `parts` = OBJETS {url jsDelivr, start, end, size, iv} et AUCUN cdnRepo/ivs/dir -> le garde renvoyait
+  // immédiatement (fichier vide) OU tombait sur `/api/shard?repo=undefined`. Désormais on accepte tout
+  // manifeste à `parts[]` non vide et getChunk est SCHÉMA-AWARE (object-parts V3 / cdnRepo+ivs / privé /api/shard).
+  if (!m) return
+  if (!Array.isArray(m.parts) || !m.parts.length) {
+    const directUrl = m.url || m.streamUrl || `/api/stream?path=${encodeURIComponent(path)}`
+    await streamDownload({ urls: [directUrl], name: m.name || title || 'media', mime: m.mime || 'application/octet-stream' })
+    return
+  }
+  const pad = (i) => String(i).padStart(3, '0')
+  const enc = m.vis === 'public' && Array.isArray(m.ivs) && m.cdnRepo
+  // STREAMED (anti-OOM): decrypt piece by piece and write straight to disk when the API allows it
+  // (never the whole decrypted file in RAM, which crashed the tab on big mobile media).
+  // getChunk(i) -> Uint8Array of the i-th piece in PLAINTEXT. Bounded-Blob fallback without the API.
+  await streamDownloadChunks({
+    count: m.count || m.parts.length,
+    name: m.name || title || 'fichier',
+    mime: m.mime || 'application/octet-stream',
+    getChunk: async (i) => {
+      // SCHÉMA AUDIO V3 : parts = objets {url, iv}. Fetch direct jsDelivr (+ repli raw) puis déchiffrement par-part.
+      const partObj = m.parts[i]
+      if (partObj && typeof partObj === 'object' && partObj.url) {
+        let r = await fetch(partObj.url).catch(() => null)
+        if (!r || !r.ok) {
+          const raw = String(partObj.url)
+            .replace('https://cdn.jsdelivr.net/gh/', 'https://raw.githubusercontent.com/')
+            .replace(/@([^/]+)\//, '/$1/')
+          r = await fetch(raw).catch(() => null)
+        }
+        if (!r || !r.ok) throw new Error('part ' + i + ' inaccessible (CDN et raw)')
+        return new Uint8Array(await decryptBytes(await r.arrayBuffer(), partObj.iv))
+      }
+      const rel = `${m.dir}/${pad(i)}.bin`
+      if (enc) {
+        const url = buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, rel)
+        const cipher = await fetch(url).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error('cdn ' + r.status))))
+        return new Uint8Array(await decryptBytes(cipher, m.ivs[i]))
+      }
+      const url = `/api/shard?repo=${encodeURIComponent(m.repo)}&path=${encodeURIComponent(rel)}`
+      return new Uint8Array(await fetch(url).then((r) => r.arrayBuffer()))
+    },
+  })
+}
+
+// OUTPUT by PATH (right-click "Download original"): image (.img.json) -> single decrypted blob;
+//   chunked media (.media.json) -> multi-piece reconstruction. No UI: usable from the context menu.
+export async function downloadMedia(path, title) {
+  if (/\.media\.json$/.test(path)) return downloadChunkedMedia(path, title)
+  // .file.json (ZenRayShards blob-raw OR chunked archive): BIT-EXACT reconstruction by concatenating
+  //   parts, downloaded under the REAL name (m.name). Otherwise the browser saved one raw part =>
+  //   "<hash>.bin" (wrong name + a single piece). The name forces the right extension (.wav, .pdf…).
+  if (/\.file\.json$/.test(path)) {
+    const m = await readMediaManifest(path)
+    if (!m) return
+    await streamDownload({ urls: fileDownloadUrls(m), name: m.name || title || 'fichier', mime: m.mime || 'application/octet-stream' })
+    return
+  }
+  const m = await readImgManifestCached(path)
+  if (!m) return
+  const url = await resolveFullUrl(m)
+  await downloadOriginal(url, m, title || (m && m.name))
+}
+
+export default function ImageNodeViewer({ t, path, title }) {
+  const [m, setM] = React.useState(null)
+  const [err, setErr] = React.useState(false)
+  React.useEffect(() => { let live = true; setM(null); setErr(false); readImgManifest(path).then((x) => { if (live) (x ? setM(x) : setErr(true)) }); return () => { live = false } }, [path])
+
+  // Full screen: ENCRYPTED -> decrypted plaintext objectURL (always enabled here, the image is
+  //   explicitly requested); UNENCRYPTED -> synchronous URL (clear CDN or private proxy), unchanged.
+  const resolved = useResolvedFull(m, true)
+
+  if (err) return <div style={{ padding: 24, color: t.textSecondary }}>image introuvable</div>
+  // Pas de texte d'attente (2026-07-13, demande Matthieu : AUCUN indicateur de chargement sur les
+  // images — ni flou, ni spinner, ni texte). Les instants avant manifeste/déchiffrement restent
+  // silencieux (zone vide), l'image apparaît seule dès qu'elle est prête.
+  if (!m) return null
+  const url = isEncrypted(m) ? resolved : shardImgUrl(m)
+  if (isEncrypted(m) && !url) return null
+  const orient = m.w && m.h ? (m.w > m.h ? 'paysage' : m.w < m.h ? 'portrait' : 'carré') : ''
+  const kb = m.size ? (m.size < 1048576 ? (m.size / 1024).toFixed(0) + ' Ko' : (m.size / 1048576).toFixed(1) + ' Mo') : ''
+  return (
+    <div style={{ maxWidth: 1100, margin: '0 auto', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16, paddingBottom: 40 }}>
+      <div className="zr-stage" style={{ borderRadius: RADII.lg, padding: 14, maxWidth: '100%', boxShadow: SHADOWS.apple }}>
+        <img src={url} alt={m.name || title} decoding="async" style={{ maxWidth: '100%', maxHeight: '74vh', display: 'block', borderRadius: RADII.md, objectFit: 'contain' }} />
+      </div>
+      <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center', color: t.textSecondary, fontSize: 'var(--zr-ui-sm)' }}>
+        <span style={{ color: t.textPrimary, fontWeight: 600 }}>{m.name || title}</span>
+        {m.w && m.h && <span>{m.w}×{m.h} {orient}</span>}
+        {kb && <span>{kb}</span>}
+        {Array.isArray(m.tags) && m.tags.length > 0 && <span>{m.tags.slice(0, 8).map((x) => '#' + x).join(' ')}</span>}
+        <a href={url} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>ouvrir</a>
+        <button onClick={() => downloadOriginal(url, m, title).catch(() => {})} style={{ color: 'inherit', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 'inherit', fontFamily: 'inherit', padding: 0, textDecoration: 'underline' }}>télécharger</button>
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,661 @@
+// ZenRayMedia — L6 : le compilateur de page.
+// Cut + Theme + Format -> UNE page HTML autonome (styles inclus, aucun appel réseau).
+//
+// RÈGLE (01-PLAN §6.1) : la page produite ici est EXACTEMENT celle que le Stage affiche et que
+// la Forge capturerait. Il n'existe pas de « rendu d'aperçu » séparé — sinon ce qu'on voit
+// n'est pas ce qui sort, et tout le produit ment.
+//
+// RÈGLE (01-PLAN §5.5) : aucun aléa hors `rng(seed)`. Deux compilations du même job donnent la
+// même chaîne, octet pour octet. C'est vérifié par le test `compile.test.js`.
+
+import { rng, ROLE_LABELS } from './contracts.js'
+import { isTemporal, beatDuration, durationOf } from './formats.js'
+import { renderTemplate, escapeHtml } from './htmlTemplate.js'
+import { fontFaceCss, fontStack } from './fonts.js'
+import { paintOrder, filterOf, styleOf, transformOf, isEffectivelyHidden, shapeClipPath, fillOf, safeHref, animationOf, pathD, pathPointsInPixels, effectiveSlideLayers, resolvedTextStyle, textWrapFloat, resolvedObjectStyle, safeCssValue } from './layers.js'
+import { applyOverrides } from './nodes.js'
+
+const WORDS_PER_MINUTE = 220
+
+// Les polices du projet, déclarées DANS la page compilée.
+// Sans ce bloc, l'aperçu (iframe srcDoc, même origine) n'héritait d'aucune @font-face et
+// retombait sur Georgia, alors que l'export, lui, embarque la vraie police en base64 :
+// l'aperçu ne montrait donc PAS ce qui sort. Bug corrigé le 2026-07-25.
+// À l'export, `embedFonts()` ajoute les mêmes familles en base64 APRÈS ce bloc : la version
+// autonome gagne, et la page reste identique hors ligne.
+const FONT_FACES = `
+@font-face{font-family:'AnthropicSerif';src:url('/fonts/AnthropicSerif-Romans.woff2') format('woff2');font-weight:100 900;font-style:normal;font-display:block;}
+@font-face{font-family:'AnthropicSerif';src:url('/fonts/AnthropicSerif-Italics.woff2') format('woff2');font-weight:100 900;font-style:italic;font-display:block;}
+@font-face{font-family:var(--zr-police-sans);src:url('/fonts/AnthropicSans-Romans.woff2') format('woff2');font-weight:100 900;font-style:normal;font-display:block;}
+@font-face{font-family:'AnthropicMono';src:url('/fonts/AnthropicMono.woff2') format('woff2');font-weight:100 900;font-style:normal;font-display:block;}
+`.trim()
+
+export function readingTimeOf(cut) {
+  const words = (cut?.beats || []).reduce((n, b) => n + String(b.text || '').trim().split(/\s+/).filter(Boolean).length, 0)
+  return { words, minutes: Math.max(1, Math.round(words / WORDS_PER_MINUTE)) }
+}
+
+function step(typography, name) {
+  const s = typography.scale
+  const exp = s.steps?.[name] ?? 0
+  return Math.round(s.base * Math.pow(s.ratio, exp) * 100) / 100
+}
+
+// Facteur d'échelle pour les formats à hauteur fixe : plus il y a de texte, plus on réduit.
+// Échelle DISCRÈTE (paliers) et non continue : un palier est reproductible et lisible dans le
+// Critique (« palier 0.82 »), une formule continue produit des tailles impossibles à débattre.
+const SHRINK_LADDER = [1, 0.92, 0.84, 0.76, 0.68, 0.6, 0.54]
+
+export function shrinkFactor(cut, format) {
+  if (!format?.canvas?.h || format.overflow !== 'shrink') return 1
+  const chars = visibleBeats(cut, format).reduce((n, b) => n + String(b.text || '').length, 0)
+  const area = format.canvas.w * format.canvas.h
+  // ~1 signe pour 950 px² tient confortablement à l'échelle 1 sur ces formats.
+  const load = chars / (area / 950)
+  const index = Math.min(SHRINK_LADDER.length - 1, Math.max(0, Math.round((load - 0.6) * 3)))
+  return SHRINK_LADDER[index]
+}
+
+// Palier suivant de l'échelle, utilisé par l'ajustement MESURÉ (voir MediaApp) : on descend d'un
+// cran tant que la page déborde réellement dans le document, au lieu de deviner d'avance.
+// Une estimation qui se trompe produit exactement ce que Matthieu a vu : « dépasse de 886 px ».
+export function nextShrink(current) {
+  const i = SHRINK_LADDER.findIndex((v) => v <= current + 1e-6)
+  const next = SHRINK_LADDER[Math.min(SHRINK_LADDER.length - 1, (i < 0 ? 0 : i) + 1)]
+  return next
+}
+
+export const MIN_SHRINK = SHRINK_LADDER[SHRINK_LADDER.length - 1]
+
+/**
+ * Les blocs qu'un format affiche réellement.
+ * 'full'   -> tout (article, A4)
+ * 'poster' -> les `maxBeats` premiers, choisis par POIDS d'accent décroissant à position égale
+ *             d'ouverture : une image sociale montre l'accroche, pas le troisième paragraphe.
+ */
+export function visibleBeats(cut, format) {
+  const beats = cut?.beats || []
+  const fit = format?.fit || { mode: 'full', maxBeats: Infinity }
+  if (fit.mode === 'full' || !Number.isFinite(fit.maxBeats)) return beats
+  if (fit.maxBeats <= 0) return []
+  return beats.slice(0, fit.maxBeats)
+}
+
+export function omittedCount(cut, format) {
+  return Math.max(0, (cut?.beats || []).length - visibleBeats(cut, format).length)
+}
+
+function themeCss(theme, format, { dark, scale }) {
+  const t = theme.typography
+  const p = theme.palette
+  const g = theme.grid
+  const s = theme.surface
+  // DENSITÉ (correctif 2026-07-25, bug A4 signalé par Matthieu) : un thème décrit des PROPORTIONS
+  // (base 19, ratio 1.333), le format décide de l'échelle PHYSIQUE. Sans ce facteur, le corps de
+  // 19 px atterrissait tel quel sur un canevas A4 de 2480 px : un timbre-poste illisible.
+  const density = format.density || 1
+  const px = (v) => `${Math.round(v * scale * density * 100) / 100}px`
+  const ink = dark ? p.inkDark : p.ink
+  const muted = dark ? p.mutedDark : p.muted
+  const rule = dark ? p.ruleDark : p.rule
+  const accent = dark ? p.accentDark : p.accent
+  const bg = dark ? s.backgroundDark : s.background
+  const fixed = format.canvas.h > 0
+  const safe = format.safe || { top: 0, bottom: 0, sides: 0 }
+  // Une affiche n'est pas un article rétréci : le titre y porte, le corps y est secondaire.
+  const poster = (format.fit?.mode || 'full') === 'poster'
+
+  // Polices du thème : les trois familles Anthropic sont toujours là, plus celles que le thème
+  // déclare (`theme.fonts`), servies depuis /zrm-fonts/ pour l'aperçu et inlinées en base64 à
+  // l'export. Un thème qui ne déclare rien garde exactement le comportement d'avant.
+  const themeFaces = fontFaceCss(theme.fonts || [])
+
+  return `
+${FONT_FACES}
+${themeFaces}
+:root{
+  --zrm-ink:${ink}; --zrm-muted:${muted}; --zrm-rule:${rule}; --zrm-accent:${accent}; --zrm-bg:${bg};
+  --zrm-body:${t.body}; --zrm-display:${t.display}; --zrm-mono:${t.mono};
+  --zrm-rhythm:${px(g.rhythm)}; --zrm-ease:${theme.motion.ease};
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;background:var(--zrm-bg);}
+body{
+  font-family:var(--zrm-body); color:var(--zrm-ink);
+  font-size:${px(step(t, 'body'))}; line-height:${t.lineHeight.body}; font-weight:${t.weights.body};
+  letter-spacing:${t.tracking.body};
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  ${fixed ? `width:${format.canvas.w}px;height:${format.canvas.h}px;overflow:hidden;` : ''}
+}
+${s.grain > 0 ? `body::after{content:'';position:fixed;inset:0;pointer-events:none;opacity:${s.grain};mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");}` : ''}
+${s.vignette > 0 ? `body::before{content:'';position:fixed;inset:0;pointer-events:none;background:radial-gradient(120% 90% at 50% 45%,transparent 55%,rgba(0,0,0,${s.vignette}) 100%);}` : ''}
+/* Deux boîtes, deux rôles distincts (correctif 2026-07-25).
+   .zrm-frame CENTRE le bloc dans le canevas et porte les zones de sécurité.
+   .zrm-page borne la MESURE DE LECTURE et aligne le texte à gauche.
+   Avant, une seule boîte faisait les deux : sur un canevas A4 la ligne courait sur 2244 px,
+   soit ~190 signes — illisible. « Centré » et « aligné à gauche » ne sont pas contradictoires :
+   c'est le BLOC qui est centré, le TEXTE qui est ferré à gauche. */
+.zrm-frame{
+  ${fixed
+    ? `width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:${safe.top}px ${safe.sides}px ${safe.bottom}px;overflow:hidden;`
+    : `display:block;padding:${px(g.margin.top)} ${px(g.margin.sides)} ${px(g.margin.bottom)};`}
+}
+.zrm-page{
+  width:100%;
+  max-width:${fixed ? `${t.measure}ch` : `${Math.round(g.maxWidth * scale)}px`};
+  margin:0 auto;
+  text-align:${g.align};
+}
+.zrm-kicker{font-family:var(--zrm-mono);font-size:${px(step(t, 'small') * 0.82)};letter-spacing:${t.tracking.mono};text-transform:uppercase;color:var(--zrm-muted);margin:0 0 calc(var(--zrm-rhythm) * 2);}
+.zrm-title{font-family:var(--zrm-display);font-size:${px(step(t, 'h1') * (poster ? 1.25 : 1))};line-height:${t.lineHeight.display};font-weight:${t.weights.display};letter-spacing:${t.tracking.display};margin:0 0 calc(var(--zrm-rhythm) * 2);${t.case.display !== 'none' ? `text-transform:${t.case.display};` : ''}}
+.zrm-standfirst{font-size:${px(step(t, 'h3') * (poster ? 1.05 : 0.92))};line-height:1.42;color:var(--zrm-muted);margin:0 0 calc(var(--zrm-rhythm) * 4);}
+.zrm-byline{font-family:var(--zrm-mono);font-size:${px(step(t, 'small') * 0.82)};letter-spacing:${t.tracking.mono};color:var(--zrm-muted);margin:0 0 calc(var(--zrm-rhythm) * 5);${theme.chrome.rules ? 'border-bottom:1px solid var(--zrm-rule);padding-bottom:calc(var(--zrm-rhythm) * 2);' : ''}}
+.zrm-beat{margin:0 0 calc(var(--zrm-rhythm) * 4);}
+.zrm-beat:last-child{margin-bottom:0;}
+.zrm-beat-label{font-family:var(--zrm-mono);font-size:${px(step(t, 'small') * 0.78)};letter-spacing:${t.tracking.mono};text-transform:uppercase;color:var(--zrm-muted);display:block;margin-bottom:calc(var(--zrm-rhythm) * 1);}
+.zrm-beat-text{margin:0;white-space:pre-wrap;}
+.zrm-beat[data-role="hook"] .zrm-beat-text{font-family:var(--zrm-display);font-size:${px(step(t, 'h3'))};line-height:1.34;}
+.zrm-beat[data-role="cta"] .zrm-beat-text{font-weight:${t.weights.emphasis};}
+.zrm-beat[data-role="turn"] .zrm-beat-text{font-style:italic;}
+${theme.chrome.dropCap ? `.zrm-beat[data-index="1"] .zrm-beat-text::first-letter{float:left;font-family:var(--zrm-display);font-size:${px(step(t, 'h1'))};line-height:.86;padding:0 .08em 0 0;}` : ''}
+${theme.chrome.numbering ? '.zrm-beat-label::before{content:attr(data-number) " · ";}' : ''}
+.zrm-slots{display:flex;flex-wrap:wrap;gap:calc(var(--zrm-rhythm) * 1.5);margin-top:calc(var(--zrm-rhythm) * 2);}
+.zrm-slot{flex:1 1 220px;min-height:${px(120)};border:1px dashed var(--zrm-rule);border-radius:${px(10)};display:flex;align-items:center;justify-content:center;color:var(--zrm-muted);font-family:var(--zrm-mono);font-size:${px(step(t, 'small') * 0.8)};letter-spacing:${t.tracking.mono};padding:${px(12)};text-align:center;}
+.zrm-slot img{max-width:100%;max-height:${px(320)};display:block;border-radius:${px(8)};}
+.zrm-footer{margin-top:calc(var(--zrm-rhythm) * 6);color:var(--zrm-muted);font-family:var(--zrm-mono);font-size:${px(step(t, 'small') * 0.78)};letter-spacing:${t.tracking.mono};${theme.chrome.rules ? 'border-top:1px solid var(--zrm-rule);padding-top:calc(var(--zrm-rhythm) * 2);' : ''}}
+${theme.motion.enabled ? `
+@media (prefers-reduced-motion: no-preference){
+  .zrm-beat{animation:zrm-in ${theme.motion.enter}ms var(--zrm-ease) both;}
+  ${Array.from({ length: 24 }, (_, i) => `.zrm-beat[data-index="${i + 1}"]{animation-delay:${i * theme.motion.stagger}ms;}`).join('')}
+  @keyframes zrm-in{from{opacity:0;transform:translateY(${px(10)});}to{opacity:1;transform:none;}}
+}` : ''}
+@media print{ body{background:#fff;} .zrm-page{max-width:none;} }
+`.trim()
+}
+
+function slotHtml(slot) {
+  if (!slot) return ''
+  if (slot.dataUrl) return `<div class="zrm-slot"><img src="${escapeHtml(slot.dataUrl)}" alt="${escapeHtml(slot.label || '')}"></div>`
+  if (slot.url) return `<div class="zrm-slot"><img src="${escapeHtml(slot.url)}" alt="${escapeHtml(slot.label || '')}"></div>`
+  return `<div class="zrm-slot">${escapeHtml(slot.label || slot.kind || 'emplacement média')}</div>`
+}
+
+function beatsHtml(cut, theme, format) {
+  return visibleBeats(cut, format).map((beat, i) => {
+    const slots = (beat.slots || []).map(slotHtml).join('')
+    const label = theme.chrome.kicker || theme.chrome.numbering
+      ? `<span class="zrm-beat-label" data-number="${i + 1}">${escapeHtml(ROLE_LABELS[beat.role] || beat.role)}</span>`
+      : ''
+    const dur = isTemporal(format) ? ` data-duration="${beatDuration(beat)}"` : ''
+    return `      <section class="zrm-beat" data-role="${escapeHtml(beat.role)}" data-index="${i + 1}"${dur}>
+${label ? `        ${label}\n` : ''}        <p class="zrm-beat-text">${escapeHtml(beat.text)}</p>
+${slots ? `        <div class="zrm-slots">${slots}</div>\n` : ''}      </section>`
+  }).join('\n')
+}
+
+function splitPart(html) {
+  const styles = []
+  const body = String(html || '')
+    .replace(/<!--zrm[\s\S]*?-->/g, '')
+    .replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (_, css) => { styles.push(css); return '' })
+    .trim()
+  return { styles: styles.join('\n'), body }
+}
+
+// LA CARTE C1 : UNE PIÈCE POSÉE LIT SES PROPRES VALEURS.
+//
+// Avant le 2026-08-01, `grep -rn "\.props" src/zenraymedia/` hors tests ne rendait QU'UNE ligne,
+// celle de l'image. Aucun composant de texte ne consultait jamais ses valeurs, si bien que poser
+// deux fois un titre donnait deux fois le même texte. C'est le geste fondamental d'un éditeur de
+// widgets, et il n'existait pas.
+//
+// DEUX PIÈGES, tous deux relevés avant d'écrire une ligne, et tous deux dans la spécification
+// d'origine du KANBAN plutôt que dans son ordre.
+//
+// 1. `{ ...data, ...item.props }` EFFACE LE BRIEF AU LIEU DE LE COMPLÉTER. L'étalement d'objet ne
+//    distingue pas une clef absente d'une clef valant la chaîne vide, et `normalizeComposition`
+//    pose `props: {}` par défaut : « jamais renseigné » et « renseigné puis vidé » seraient donc
+//    indiscernables. Un champ touché puis effacé ferait cesser l'affichage du titre du brief au
+//    lieu d'y revenir. On ne retient donc QUE les chaînes non vides.
+//
+// 2. UN DÉFAUT DE GABARIT DOIT ÊTRE RÉSOLU AVANT LA FUSION, en passe séparée. `renderScope` est à
+//    passe unique et délibérément ainsi : une valeur substituée n'est jamais réinterprétée. Poser
+//    `default: "{{title}}"` dans la table et le laisser traverser la fusion le ferait sortir
+//    littéralement, accolades comprises et échappées.
+//
+// Ce qui casse si l'on retire cette fonction : les composants cessent de porter leurs valeurs et
+// l'éditeur redevient une visionneuse.
+export function resolveItemData(data, item, entry) {
+  const out = { ...data }
+  for (const declaration of Array.isArray(entry?.props) ? entry.props : []) {
+    if (!declaration?.key || typeof declaration.default !== 'string' || !declaration.default) continue
+    const resolu = renderTemplate(declaration.default, data)
+    if (resolu !== '') out[declaration.key] = resolu
+  }
+  for (const [clef, valeur] of Object.entries(item?.props || {})) {
+    if (typeof valeur === 'string' && valeur !== '') out[clef] = valeur
+  }
+  return out
+}
+
+// LE PONT DE SÉLECTION, RÉSERVÉ À L'APERÇU (2026-08-01, étape 4 du PLAN-V1).
+//
+// L'aperçu est une `<iframe srcDoc>` recompilée toutes les 220 ms : tout écouteur injecté depuis le
+// parent meurt au rechargement suivant, ce que deux relectures indépendantes avaient signalé. Le
+// pont voyage donc DANS le document, où il renaît à chaque recompilation au lieu d'être détruit.
+//
+// **Il n'existe qu'en mode `interactive`.** Le HTML exporté doit rester sans script : c'est une
+// promesse tenue par un test du projet, et un fichier livré qui embarquerait un écouteur cesserait
+// d'être le document autonome que l'export promet.
+//
+// Il ne remonte QUE l'identifiant, jamais le contenu : le parent décide, le document ne fait que
+// désigner. Une pièce imbriquée dans une autre remonte la plus proche, par `closest`.
+// LE PONT DE SÉLECTION. Il ne remonte que des IDENTIFIANTS et un CHEMIN D'INDICES, jamais du
+// contenu : le document reste une donnée, le parent reste le seul à décider. Il n'entre dans la
+// page qu'en mode aperçu, et jamais dans l'export, qui doit rester une page morte.
+//
+// Depuis le 2026-08-04 il calcule aussi le chemin du sous-composant sous le curseur, en comptant
+// EXACTEMENT comme `nodes.js` : mêmes balises ignorées, même numérotation. Deux comptages qui
+// divergeraient d'un cran désigneraient deux éléments différents.
+const PONT_SELECTION = `<script>(function(){var c=null,I={STYLE:1,SCRIPT:1,DEFS:1,SYMBOL:1,BR:1,HR:1};
+function kids(e){return [].filter.call(e.children,function(x){return !I[x.tagName.toUpperCase()]})}
+function path(e,h){var p=[],n=e;while(n&&n!==h){var q=n.parentElement;if(!q)return null;var i=kids(q).indexOf(n);if(i<0)return null;p.unshift(i);n=q}return n===h?p.join('.'):null}
+document.addEventListener('click',function(e){var n=e.target.closest('[data-zrm-instance]');if(!n)return;e.preventDefault();
+parent.postMessage({zrm:'select',id:n.getAttribute('data-zrm-instance'),path:path(e.target,n)},'*')},true);
+addEventListener('message',function(e){var d=e.data;if(!d||d.zrm!=='selected')return;if(c)c.removeAttribute('data-zrm-on');c=d.id?document.querySelector('[data-zrm-instance="'+d.id+'"]'):null;if(c)c.setAttribute('data-zrm-on','1')});
+parent.postMessage({zrm:'ready'},'*')})()</` + `script>`
+
+
+// LES CALQUES, ÉCRITS EN POSITIONNEMENT ABSOLU (carte L2, 2026-08-04).
+//
+// « Layer HTML comme Photoshop = layer de PNG ou effets. » Chaque calque devient une boîte placée
+// au pixel dans un conteneur aux dimensions du format, et l'ORDRE DU DOM suit le rang : le rang le
+// plus élevé s'écrit en dernier, donc se dessine devant. On pose aussi `z-index`, parce qu'un
+// `mix-blend-mode` crée un contexte d'empilement où l'ordre du DOM seul ne suffirait plus.
+//
+// Aucune de ces valeurs n'est saisie en texte libre : elles viennent du modèle, qui les a déjà
+// bornées. Ce qui vient de l'utilisateur, le texte d'un calque et l'adresse d'une image, passe par
+// `escapeHtml` sans exception.
+function layersHtml(composition, entries, data, interactive) {
+  // FAMILLE PHOTOSHOP 5 · un calque masqué PAR SON GROUPE ne se rend pas davantage qu'un calque
+  // masqué directement : c'est le sens même de « masquer tout un ensemble ».
+  // FAMILLE INDESIGN D1 · les calques HÉRITÉS de la page parente de la diapositive active rejoignent
+  // la peinture EN PREMIER (leur z synthétique reste toujours sous tout calque réel, voir
+  // `effectiveSlideLayers`) : ils sont donc peints derrière le contenu propre de la page, exactement
+  // comme un gabarit InDesign reste sous ce que chaque page ajoute par-dessus.
+  const herites = composition?.activeSlideId ? effectiveSlideLayers(composition, composition.activeSlideId) : []
+  const calques = [...herites, ...paintOrder(composition).filter((l) => !isEffectivelyHidden(composition, l))]
+  if (!calques.length) return { html: '', styles: [] }
+  const styles = []
+  const boites = calques.map((layer) => {
+    const filtre = filterOf(layer)
+    // AUDIT P0-T8 · sanitisé ICI, avant le test de troncature plus bas : une valeur entièrement
+    // refusée (par exemple `url(...)`) ne doit produire aucune déclaration `box-shadow:` vide,
+    // jamais seulement une valeur vidée après coup.
+    const ombre = safeCssValue(typeof layer.effects?.shadow === 'string' ? layer.effects.shadow : '')
+    // FAMILLE MIRO 6 · un connecteur reste un calque `shape` (aucun type de calque neuf), mais ni
+    // sa forme (rectangle/ellipse/…) ni son `data-shape` ne s'appliquent : sa géométrie EST déjà la
+    // ligne, portée par les points relatifs `connectorX1/Y1/X2/Y2`, pas par `shapeType`.
+    const estConnecteur = layer.kind === 'shape' && layer.connectFrom && layer.connectTo
+    // FAMILLE ILLUSTRATOR I2 · même logique pour un tracé Plume : sa silhouette vient de ses
+    // POINTS, pas de `shapeType`/`data-shape`, et son fond se peint DANS le <path> SVG lui-même
+    // (lequel suit le contour réel), jamais via `background-color` sur la boîte rectangulaire —
+    // un fond carré derrière un tracé qui ne l'est pas se verrait dans les coins, hors silhouette.
+    const estTrace = layer.kind === 'shape' && Array.isArray(layer.pathPoints) && layer.pathPoints.length >= 2
+    // FAMILLE INDESIGN D4 · un calque texte RÉSOUT d'abord son style de texte nommé (remplacements
+    // locaux toujours prioritaires, champ par champ). FAMILLE INDESIGN D7 · le style D'OBJET se
+    // résout ENSUITE, par-dessus : les deux listes de champs ne se recouvrent jamais (typographie
+    // contre apparence), les deux résolutions composent donc sans jamais se marcher dessus.
+    // `styleOf` ne voit ensuite qu'UN SEUL style déjà fusionné, jamais plusieurs sources à départager.
+    const styleTexteResolu = layer.kind === 'text' ? resolvedTextStyle(composition, layer) : layer.style
+    const styleResolu = resolvedObjectStyle(composition, { ...layer, style: styleTexteResolu })
+    // AUDIT P1-R10 · un connecteur n'a PAS DE FOND, exactement comme un tracé : sa géométrie EST
+    // la ligne SVG, jamais le rectangle englobant de ses deux extrémités. Sans cette exclusion,
+    // `.zrm-layer-shape` (la classe commune à toute forme) peint un fond plein derrière le trait —
+    // une diagonale entre deux coins opposés peut alors masquer tout le contenu qui se trouve entre
+    // les deux, bien plus grand que le trait de deux pixels réellement visible.
+    const styleSansFond = estTrace || estConnecteur ? { ...layer, style: { ...layer.style, backgroundColor: '' } } : { ...layer, style: styleResolu }
+    const style = [
+      `left:${layer.x}px`, `top:${layer.y}px`, `width:${layer.w}px`, `height:${layer.h}px`,
+      `z-index:${layer.z}`,
+      layer.opacity !== 1 ? `opacity:${layer.opacity}` : '',
+      layer.blend !== 'normal' ? `mix-blend-mode:${layer.blend}` : '',
+      filtre ? `filter:${filtre}` : '',
+      // TRANSFORM-ORIGIN CENTER n'est PAS le défaut CSS (c'est 50% 50% par défaut en réalité, donc
+      // il ne coûte rien de le rappeler) : le pivot au centre est ce que Photoshop et Figma font
+      // tous deux, et c'est le seul qui ne surprenne jamais un utilisateur qui n'a rien réglé.
+      transformOf(layer) ? `transform:${transformOf(layer)};transform-origin:center` : '',
+      // `escapeHtml` reste un second rideau pour tout caractère HTML que `safeCssValue`, plus
+      // haut, n'avait pas vocation à traiter — deux passes, jamais redondantes entre elles.
+      ombre ? `box-shadow:${escapeHtml(ombre)}` : '',
+      // FAMILLE FIGMA 6 · polygone et étoile ne sont pas des rectangles qu'on habille de coins
+      // arrondis : `clip-path` découpe RÉELLEMENT la boîte à la forme demandée.
+      layer.kind === 'shape' && !estConnecteur && !estTrace ? shapeClipPath(layer) && `clip-path:${shapeClipPath(layer)}` : '',
+      styleOf(styleSansFond),
+      // FAMILLE FIGMA 7 · le dégradé s'écrit APRÈS `styleOf`, donc après un éventuel
+      // `background-color` : en CSS la dernière déclaration l'emporte, le dégradé prime bien quand
+      // les deux coexistent dans le style en ligne. Un tracé ou un connecteur n'ont pas de dégradé
+      // de fond non plus : même raison que `backgroundColor` ci-dessus.
+      !estTrace && !estConnecteur ? fillOf(layer) : '',
+    ].filter(Boolean).join(';')
+
+    let dedans = ''
+    if (layer.kind === 'text') {
+      // FAMILLE POWERPOINT 3 · une liste est une ligne par retour à la ligne, jamais des niveaux
+      // imbriqués (portée assumée, écrite au-dessus de LIST_STYLES). Le lien, restreint à des
+      // protocoles sûrs par `safeHref`, enveloppe le contenu SANS changer sa mise en forme.
+      let contenu
+      if (layer.listStyle !== 'none') {
+        const balise = layer.listStyle === 'number' ? 'ol' : 'ul'
+        const items = String(layer.source || layer.name).split('\n').filter((l) => l.trim()).map((l) => `<li>${escapeHtml(l)}</li>`).join('')
+        contenu = `<${balise} class="zrm-layer-list">${items}</${balise}>`
+      } else {
+        contenu = `<span>${escapeHtml(layer.source || layer.name).replace(/\n/g, '<br>')}</span>`
+      }
+      const lien = safeHref(layer.href)
+      // FAMILLE INDESIGN D5 · l'habillage se pose comme TOUT PREMIER enfant, un flottant invisible
+      // qui occupe l'espace de l'obstacle : le paragraphe qui le suit dans le flux l'évite tout seul.
+      const habillage = textWrapFloat(composition, layer)
+      const flottant = habillage ? `<i class="zrm-wrap-float" style="float:${habillage.side};width:${habillage.width}px;height:${habillage.height}px;margin-top:${habillage.marginTop}px"></i>` : ''
+      dedans = `<div class="zrm-layer-text">${flottant}${lien ? `<a href="${escapeHtml(lien)}">${contenu}</a>` : contenu}</div>`
+    } else if (layer.kind === 'image') {
+      // FAMILLE PHOTOSHOP 6 · LE POINT FOCAL, recadrage repositionnable sans outil dédié. La boîte
+      // du calque agit déjà comme le cadre de recadrage via `object-fit:cover` ; ce qui manquait
+      // est de choisir QUELLE partie de l'image reste visible dans ce cadre. `object-position`
+      // fait exactement ça, nativement, sans retailler le fichier source.
+      dedans = layer.source ? `<img src="${escapeHtml(layer.source)}" alt="${escapeHtml(layer.name)}" style="object-position:${layer.focalX}% ${layer.focalY}%">` : ''
+    } else if (layer.kind === 'component') {
+      const entry = entries.get(layer.source)
+      if (entry?.html) {
+        const part = splitPart(entry.html)
+        styles.push(part.styles)
+        dedans = renderTemplate(part.body, { ...data, ...(layer.props || {}) })
+      }
+    } else if (layer.kind === 'table') {
+      // FAMILLE POWERPOINT 5 · une grille À PLAT (`tableCells[ligne*colonnes+col]`) redevient des
+      // lignes `<tr>` au rendu, jamais l'inverse : le modèle ne porte pas de tableau à deux niveaux.
+      const rangees = []
+      for (let r = 0; r < layer.tableRows; r++) {
+        const cellules = []
+        for (let c = 0; c < layer.tableCols; c++) cellules.push(`<td>${escapeHtml(layer.tableCells[r * layer.tableCols + c] || '')}</td>`)
+        rangees.push(`<tr>${cellules.join('')}</tr>`)
+      }
+      dedans = `<table class="zrm-layer-table">${rangees.join('')}</table>`
+    } else if (estConnecteur) {
+      // FAMILLE MIRO 6 · un SVG dimensionné À LA BOÎTE ENGLOBANTE, la ligne dessinée par ses DEUX
+      // POINTS RELATIFS : aucune rotation CSS, donc aucun pivot à sortir de la convention « centre »
+      // déjà posée pour tout le reste (carte S2). `vector-effect` garde le trait à 2px même si le
+      // connecteur est très étiré, un `stroke-width` en unités de viewBox s'étirerait sinon avec lui.
+      dedans = `<svg class="zrm-layer-connector" viewBox="0 0 ${layer.w} ${layer.h}" preserveAspectRatio="none"><line x1="${layer.connectorX1}" y1="${layer.connectorY1}" x2="${layer.connectorX2}" y2="${layer.connectorY2}" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>`
+    } else if (estTrace) {
+      // FAMILLE ILLUSTRATOR I2 · les points, stockés en POURCENTAGE (0-100) de la boîte, sont
+      // convertis en PIXELS réels ici, à l'instant de la compilation — jamais stockés en pixels,
+      // ce qui laisse le tracé s'étirer tout seul quand `w`/`h` changent (aucun recalcul requis
+      // au redimensionnement, contrairement au connecteur qui dépend d'AUTRES calques).
+      const d = pathD(pathPointsInPixels(layer), layer.pathClosed)
+      // Le fond et le contour se peignent SUR LE <path> lui-même (fill/stroke SVG), jamais via
+      // `background-color`/`border` CSS sur la boîte : ceux-ci resteraient rectangulaires et
+      // déborderaient de la silhouette réelle dès qu'elle n'est pas un rectangle.
+      const remplissage = typeof layer.style?.backgroundColor === 'string' && layer.style.backgroundColor.trim() ? layer.style.backgroundColor : 'none'
+      const contour = layer.pathStrokeColor || 'none'
+      dedans = `<svg class="zrm-layer-path" width="100%" height="100%" style="overflow:visible"><path d="${escapeHtml(d)}" fill="${escapeHtml(remplissage)}" stroke="${escapeHtml(contour)}" stroke-width="${layer.pathStrokeWidth}"/></svg>`
+    }
+    // BOGUE RÉEL CORRIGÉ ICI (trouvé en carte PowerPoint P1, en écrivant un test d'interface qui
+    // vérifiait pour de vrai l'ABSENCE de `data-shape`) : l'attribut se posait DANS la valeur de
+    // `class`, avant son propre guillemet fermant — `class="…shape data-shape="rectangle""`. Une
+    // chaîne malformée dont chaque test antérieur ne vérifiait que la PRÉSENCE en sous-chaîne, ce
+    // qui reste vrai même malformé ; mais le sélecteur CSS `[data-shape="ellipse"]` (cartes P4 et
+    // F6) ne pouvait JAMAIS matcher un attribut qui n'existe pas dans le DOM réellement analysé.
+    const attrForme = layer.kind === 'shape' && !estConnecteur && !estTrace ? ` data-shape="${escapeHtml(layer.shapeType || 'rectangle')}"` : ''
+    // FAMILLE POWERPOINT 6 · l'entrée animée se pose sur un WRAPPER INTERNE, jamais sur la boîte
+    // elle-même : cette boîte porte déjà la rotation dans `style` (`transformOf`), et un `to{}` de
+    // keyframe qui écrirait aussi `transform` l'effacerait à la fin de l'animation. Un second
+    // niveau évite la collision par construction, sans recalculer la rotation dans le keyframe.
+    // N'existe qu'en aperçu INTERACTIF : un export figé n'a pas d'« avant l'animation » à montrer.
+    const anim = interactive ? animationOf(layer) : ''
+    if (anim) dedans = `<div style="${anim};width:100%;height:100%">${dedans}</div>`
+    return `<div class="zrm-layer zrm-layer-${escapeHtml(layer.kind)}${layer.kind === 'text' ? ' zrm-layer-text-host' : ''}"${attrForme} data-zrm-layer="${escapeHtml(layer.id)}" data-zrm-instance="${escapeHtml(layer.id)}" style="${style}">${dedans}</div>`
+  })
+  return { html: `<div class="zrm-layers">${boites.join('')}</div>`, styles }
+}
+
+function composedPage({ brief, cut, theme, format, dark, scale, bundle, composition, interactive = false, selectedId = null }) {
+  // LE CADRE DE SORTIE, ABSENT JUSQU'AU 2026-08-01 (étape 1 du PLAN-V1).
+  //
+  // Cette voie ne connaissait du format que `max-width:1180px` ou `none`. Mesuré : SIX des sept
+  // formats déclarés sont bornés (1080 carré, 1080x1350, 1080x1920, A4 2480x3508, et deux
+  // 1920x1080), tous avec des zones de sécurité réelles et des densités de 1,6 à 3,125. Aucun
+  // n'était servi : un carré, un 9:16, un A4 rendaient la même colonne qui coule.
+  //
+  // Le cas le plus coûteux n'était pas le rendu faux mais le REPÈRE faux : `MediaApp.jsx` affiche
+  // par-dessus un calque de zones de sécurité qui promettait une garantie que la page ne tenait pas.
+  //
+  // DÉCISION SUR `density`, que les documents de conception n'abordaient pas. Sur la voie à jetons,
+  // `density` multiplie chaque valeur typographique via `px()`, ce qui est possible parce que cette
+  // voie ÉCRIT elle-même toutes ses valeurs. Ici les composants apportent leur propre feuille, et
+  // rien ne permet de réécrire un `font-size:16px` posé à l'intérieur. La densité est donc portée
+  // par la taille de police RACINE, ce qui met à l'échelle tout ce qui est exprimé en unités
+  // relatives et rien d'autre.
+  // **Limite nommée, pas oubliée :** un composant qui code ses tailles en pixels durs ne suivra pas.
+  // Les 48 parts du thème Spotify étant à écrire, elles doivent l'être en `em` ou `rem` dès le
+  // départ ; c'est le contrat de la voie Lego et il vaut mieux l'établir avant qu'après.
+  const fixed = format.canvas.h > 0
+  const safe = format.safe || { top: 0, bottom: 0, sides: 0 }
+  const density = format.density || 1
+  const entries = new Map((bundle?.components || []).map((entry) => [entry.id, entry]))
+  const data = { ...templateData(brief, cut, theme, format), dark, scale }
+  const styles = []
+  const rows = []
+
+  for (const row of composition.rows || []) {
+    const items = []
+    for (const item of row.items || []) {
+      if (item.hidden) continue
+      if (item.kind === 'image') {
+        items.push(`<figure class="zrm-lego-item zrm-lego-image" data-zrm-instance="${escapeHtml(item.id)}" style="--zrm-image-ratio:${escapeHtml(item.props?.ratio || '16 / 9')};--zrm-image-radius:${Number(item.props?.radius) || 18}px"><img src="${escapeHtml(item.url || '')}" alt="${escapeHtml(item.name || '')}"></figure>`)
+        continue
+      }
+      const entry = entries.get(item.componentId)
+      if (!entry?.html) continue
+      const part = splitPart(entry.html)
+      styles.push(part.styles)
+      let body = renderTemplate(part.body, resolveItemData(data, item, entry))
+      // Il y avait ici une rustine : elle réécrivait le contenu de tout <h1-3> d'un composant de
+      // titre avec `brief.title`. Elle existait parce que les composants portaient un exemple
+      // figé au lieu de lire le brief. Ils lisent maintenant `{{title}}` comme n'importe quel
+      // gabarit — la rustine ne réparait donc plus rien et DÉTRUISAIT le balisage interne du
+      // titre (petites capitales, exposants, marques de coupe). Supprimée le 2026-07-28.
+      items.push(`<section class="zrm-lego-item" data-zrm-instance="${escapeHtml(item.id)}" data-zrm-component="${escapeHtml(item.componentId)}">${body}</section>`)
+    }
+    if (items.length) rows.push(`<div class="zrm-lego-row" data-zrm-row="${escapeHtml(row.id)}">${items.join('')}</div>`)
+  }
+
+  const calques = layersHtml(composition, entries, data, interactive)
+  styles.push(...calques.styles)
+
+  // Les définitions SVG sont une dépendance invisible. La planche reste ajoutable comme composant,
+  // mais tous les autres blocs peuvent déjà employer leurs <use href="#…"> sans ordre imposé.
+  const definitions = splitPart(bundle?.definitionsHtml || '')
+  if (definitions.styles) styles.unshift(definitions.styles)
+
+  const css = `
+${FONT_FACES}
+${fontFaceCss(theme.fonts || [])}
+${bundle?.tokensCss || ''}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--zrm-paper,var(--zrm-bg,#fff));color:var(--zrm-ink,#151515)}
+body{font-family:var(--f-body,var(--zrm-body,var(--zr-police-sans),system-ui,sans-serif));-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;${fixed ? `width:${format.canvas.w}px;height:${format.canvas.h}px;overflow:hidden;` : ''}}
+.zrm-lego-page{position:relative;width:100%;margin:0 auto;display:flex;flex-direction:column;${fixed
+  ? `height:100%;max-width:none;padding:${safe.top}px ${safe.sides}px ${safe.bottom}px;justify-content:flex-start;overflow:hidden;font-size:${Math.round(density * 100)}%;gap:${Math.round(14 * density)}px;`
+  : `max-width:${format.canvas.w || 1180}px;min-height:0;padding:clamp(12px,2.8vw,42px);gap:clamp(10px,1.6vw,24px);`}}
+/* LE TEXTE ÉTAIT ROGNÉ, ET C'ÉTAIT ÉCRIT ICI EN TOUTES LETTRES (2026-08-04).
+
+   « overflow:hidden » sur la pièce, plus « align-items:stretch » sur la rangée : les cellules d'une
+   même rangée prenaient toutes la hauteur de la plus haute, et toute pièce dont le contenu
+   dépassait sa cellule se faisait couper en silence. C'est le « composant au texte cropé » de la
+   capture, et c'est ce qui se produisait sur les formats carrés et portraits, où la place manque.
+
+   La pièce cesse donc de rogner : elle prend la hauteur de son contenu. La rangée s'aligne en haut
+   plutôt que de s'étirer, ce qui évite de gonfler une pièce courte à la taille de sa voisine. Le
+   seul rognage qui subsiste est celui de la PAGE, sur les formats à hauteur fixe, et il est
+   légitime : une image de 1080 par 1080 ne peut pas grandir. Le Critique le mesure et le dit. */
+.zrm-lego-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));align-items:start;gap:clamp(8px,1.25vw,18px);min-width:0}
+.zrm-lego-item{min-width:0;min-height:0}
+/* Ce qui doit encore rogner le fait explicitement, et seulement là où la coupe est voulue. */
+.zrm-lego-item img,.zrm-lego-item svg{max-width:100%}
+.zrm-lego-image{margin:0;aspect-ratio:var(--zrm-image-ratio);border-radius:var(--zrm-image-radius);background:rgba(127,127,127,.12)}
+.zrm-lego-image img{display:block;width:100%;height:100%;object-fit:cover}
+.zrm-layers{position:absolute;inset:0;pointer-events:none}
+.zrm-layer{position:absolute;pointer-events:auto;overflow:hidden}
+.zrm-layer-text-host{font-family:var(--f-display,var(--zrm-display,inherit));font-size:2rem;line-height:1.15}
+.zrm-layer-shape{background:var(--zrm-accent,#0a84ff)}
+/* FAMILLE PHOTOSHOP 4 · TROIS FORMES, une geometrie chacune. L'ellipse reutilise le remplissage et
+   le contour deja poses par LAYER_STYLES (backgroundColor/border) ; la ligne fixe sa hauteur a un
+   trait de 3 px quelle que soit celle du calque, la ligne d'un logiciel de dessin est un TRAIT, pas
+   un rectangle aplati. */
+.zrm-layer-shape[data-shape="ellipse"]{border-radius:50%}
+.zrm-layer-shape[data-shape="line"]{height:3px !important}
+.zrm-layer-image img{display:block;width:100%;height:100%;object-fit:cover}
+.zrm-layer-text{width:100%;height:100%;display:flex;align-items:center;justify-content:inherit;flex-direction:column;font:inherit;color:inherit;text-align:inherit;white-space:pre-wrap}
+.zrm-layer-text>span{width:100%}
+.zrm-layer-text{display:flex;flex-direction:column;justify-content:center}
+/* FAMILLE POWERPOINT 3 : liste et lien. La liste hérite police/couleur/alignement du calque comme
+   le fait déjà le span de texte ; le lien ne change que le soulignement, jamais la couleur. */
+.zrm-layer-list{margin:0;padding-left:1.3em;width:100%;text-align:inherit}
+.zrm-layer-text a{color:inherit;text-decoration:underline;text-decoration-thickness:.06em}
+/* FAMILLE POWERPOINT 5 · le tableau porte son propre quadrillage par défaut (une bordure sur
+   chaque cellule) : un tableau sans trait visible ne se lirait pas comme un tableau. */
+.zrm-layer-table{width:100%;height:100%;border-collapse:collapse;font:inherit;color:inherit}
+.zrm-layer-table td{border:1px solid currentColor;padding:.4em .6em;text-align:inherit}
+/* FAMILLE MIRO 6 : le connecteur remplit sa boîte englobante, la ligne interne porte sa propre
+   géométrie (points relatifs) : rien à positionner ici, seulement à ne pas déborder. */
+.zrm-layer-connector{width:100%;height:100%;display:block;overflow:visible;color:var(--zrm-ink,#151515)}
+/* FAMILLE POWERPOINT 6 : les trois entrées animées. Définies UNE fois ici, jamais par calque,
+   la fonction animationOf ne pose que le nom ; ces règles portent le mouvement réel. */
+@keyframes zrm-anim-fade{from{opacity:0}to{opacity:1}}
+@keyframes zrm-anim-rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+@keyframes zrm-anim-zoom{from{opacity:0;transform:scale(.85)}to{opacity:1;transform:none}}
+${styles.join('\n')}
+${interactive ? '.zrm-lego-item{cursor:pointer}[data-zrm-on]{outline:2px solid var(--zrm-accent,#0a84ff);outline-offset:2px;border-radius:3px}' : ''}
+@media(prefers-reduced-motion:no-preference){
+  .zrm-lego-item{animation:zrm-lego-in .3s cubic-bezier(.2,.75,.2,1) both}
+  .zrm-lego-item:nth-child(2){animation-delay:.035s}.zrm-lego-item:nth-child(3){animation-delay:.07s}
+  @keyframes zrm-lego-in{from{opacity:0;transform:translateY(7px) scale(.995)}to{opacity:1;transform:none}}
+}
+${fixed ? '' : '@media(max-width:620px){.zrm-lego-page{padding:12px}.zrm-lego-row{grid-template-columns:1fr}}'}
+`.trim()
+
+  // LES RÉGLAGES DE SOUS-COMPOSANTS S'APPLIQUENT EN DERNIER, sur la page entière (2026-08-04).
+  //
+  // Ils ne peuvent pas s'appliquer plus tôt, au moment où chaque fragment est rendu, parce qu'un
+  // chemin d'indices se compte dans l'arbre FINAL : le fragment n'est pas encore posé dans son
+  // hôte, ses indices ne sont donc pas encore ceux que l'utilisateur voit. Passer en dernier coûte
+  // une analyse de la page, mais c'est la seule position où les chemins disent vrai.
+  const reglages = {}
+  for (const row of composition.rows || []) {
+    for (const item of row.items || []) {
+      if (item?.props?.__nodes && Object.keys(item.props.__nodes).length) reglages[item.id] = item.props.__nodes
+    }
+  }
+  for (const layer of paintOrder(composition)) {
+    if (layer?.props?.__nodes && Object.keys(layer.props.__nodes).length) reglages[layer.id] = layer.props.__nodes
+  }
+
+  const page = `<!doctype html>
+<html lang="fr" data-zrm-theme="${escapeHtml(theme.id)}" data-zrm-format="${escapeHtml(format.id)}" data-zrm-composed="1"${dark ? ' data-zrm-dark="1"' : ''}>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(brief.title)}</title><style>${css}</style></head>
+<body>${definitions.body ? `<div hidden>${definitions.body}</div>` : ''}<main class="zrm-lego-page">${rows.join('')}${calques.html}</main>${interactive ? PONT_SELECTION : ''}</body>
+</html>`
+  return applyOverrides(page, reglages)
+}
+
+// Données offertes aux gabarits HTML déposés à la main.
+export function templateData(brief, cut, theme, format) {
+  const rt = readingTimeOf(cut)
+  return {
+    title: brief.title,
+    message: brief.message,
+    audience: brief.audience,
+    register: brief.register,
+    intent: brief.intent,
+    themeName: theme.name,
+    formatLabel: format.label,
+    readingMinutes: rt.minutes,
+    words: rt.words,
+    duration: isTemporal(format) ? durationOf(cut, format) : 0,
+    beats: (cut.beats || []).map((b, i) => ({
+      index: i, number: i + 1, role: b.role, roleLabel: ROLE_LABELS[b.role] || b.role,
+      text: b.text, html: escapeHtml(b.text).replace(/\n/g, '<br>'),
+      weight: b.weight ?? 0.5, tempo: b.tempo || 'calm', duration: beatDuration(b),
+    })),
+  }
+}
+
+/**
+ * Compile une page autonome.
+ * @returns {{ html: string, meta: object }}
+ */
+export function compile({ brief, cut, theme, format, dark = false, seed = 1, fitScale = null, composition = null, componentBundle = null, interactive = false, selectedId = null }) {
+  if (!brief || !cut || !theme || !format) throw new Error('compile : brief, cut, theme et format sont tous requis.')
+  const next = rng(seed)              // consommé par les thèmes qui en ont besoin ; jamais Math.random
+  const jitter = Math.round(next() * 1000) / 1000
+  // `fitScale` vient de l'ajustement MESURÉ dans le document réel. Quand il est fourni, il gagne
+  // sur l'estimation : une mesure bat toujours une formule. La valeur retenue part dans `meta`,
+  // donc l'export utilise EXACTEMENT la même que l'aperçu.
+  const scale = Number.isFinite(fitScale) && fitScale > 0 ? fitScale : shrinkFactor(cut, format)
+  const rt = readingTimeOf(cut)
+
+  // Voie Lego : dès qu'un composant est posé, la composition devient la source du Stage.
+  // Un document ancien ou une composition vide conserve exactement son gabarit monolithique.
+  // Un document peut n'avoir QUE des calques et aucune rangee : c'est meme le cas normal du
+  // nouveau modele, ou l'on compose en empilant. La voie composee s'ouvre donc sur l'un OU l'autre.
+  if (composition?.rows?.some((row) => row.items?.length) || composition?.layers?.length) {
+    const html = composedPage({ brief, cut, theme, format, dark, scale, bundle: componentBundle, composition, interactive, selectedId })
+    return { html, meta: { scale, seed, readingMinutes: rt.minutes, words: rt.words, source: 'composition', themeId: theme.id, formatId: format.id, omitted: 0, shown: (composition.rows || []).reduce((n, row) => n + (row.items?.length || 0), 0) } }
+  }
+
+  // Voie 2 : gabarit HTML déposé à la main.
+  if (theme.html) {
+    const data = { ...templateData(brief, cut, theme, format), dark, scale, jitter }
+    const body = renderTemplate(theme.html, data)
+    const html = /<html[\s>]/i.test(body)
+      ? body
+      : `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(brief.title)}</title></head><body>${body}</body></html>`
+    return { html, meta: { scale, seed, readingMinutes: rt.minutes, words: rt.words, source: 'html', themeId: theme.id, formatId: format.id, omitted: omittedCount(cut, format), shown: visibleBeats(cut, format).length } }
+  }
+
+  // Voie 1 : thème à tokens.
+  const css = themeCss(theme, format, { dark, scale })
+  // Surtitre « registre · intention » RETIRÉ de la page le 2026-07-25 (retour Matthieu : « je ne
+  // trouve pas que ça ait vraiment un intérêt »). Ces deux champs pilotent encore le Critique et
+  // la suggestion de thèmes, mais ils n'ont rien à faire sur une page qu'on partage : le lecteur
+  // se moque de savoir dans quel registre on a classé le texte. `chrome.kicker` continue de
+  // gouverner les libellés de rôle DANS les blocs, qui, eux, structurent la lecture.
+  const kicker = ''
+  const standfirst = brief.message ? `      <p class="zrm-standfirst">${escapeHtml(brief.message)}</p>\n` : ''
+  const bylineBits = []
+  if (theme.chrome.byline && brief.audience) bylineBits.push(`Pour ${brief.audience}`)
+  if (theme.chrome.readingTime) bylineBits.push(isTemporal(format) ? `${durationOf(cut, format)} s` : `${rt.minutes} min de lecture`)
+  const byline = theme.chrome.byline && bylineBits.length ? `      <p class="zrm-byline">${escapeHtml(bylineBits.join(' · '))}</p>\n` : ''
+  const footer = theme.chrome.footer ? `      <footer class="zrm-footer">${escapeHtml(theme.name)} · ${escapeHtml(format.label)}</footer>\n` : ''
+
+  const html = `<!doctype html>
+<html lang="fr" data-zrm-theme="${escapeHtml(theme.id)}" data-zrm-format="${escapeHtml(format.id)}" data-zrm-scale="${scale}"${dark ? ' data-zrm-dark="1"' : ''}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${escapeHtml(brief.title)}</title>
+  <style>${css}</style>
+</head>
+<body>
+  <div class="zrm-frame">
+    <article class="zrm-page">
+${kicker}      <h1 class="zrm-title">${escapeHtml(brief.title)}</h1>
+${standfirst}${byline}${beatsHtml(cut, theme, format)}
+${footer}    </article>
+  </div>
+</body>
+</html>`
+
+  return { html, meta: { scale, seed, readingMinutes: rt.minutes, words: rt.words, source: 'tokens', themeId: theme.id, formatId: format.id, omitted: omittedCount(cut, format), shown: visibleBeats(cut, format).length } }
+}

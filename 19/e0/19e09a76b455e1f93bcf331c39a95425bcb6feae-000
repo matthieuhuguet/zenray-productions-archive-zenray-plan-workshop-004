@@ -1,0 +1,255 @@
+// @vitest-environment node
+// 9 October 2026, 10:01 CEST: verify light catalogue writes preserve the historical project registry.
+import { it, expect } from 'vitest'
+import { createAssetsCloudPublisher, compactRegistryProject } from './AssetsCloudPublisher.mjs'
+import { createWorkspaceCatalogue, LEGACY_WORKSPACE_REGISTRY_PATH, WORKSPACE_CATALOGUE_PATH } from '../src/lib/assetsWorkspaceCatalogue.js'
+
+const registryPath = LEGACY_WORKSPACE_REGISTRY_PATH
+const cataloguePath = WORKSPACE_CATALOGUE_PATH
+// 8 October 2026, 09:44 CEST: mock GitHub Contents metadata and its base64 body for the shared registry.
+const registryContents = (url, data, sha = 'current') => {
+  if (!url.includes('/contents/')) return null
+  const path = decodeURIComponent(new URL(url).pathname.split('/contents/')[1] || '')
+  if (!data.has(path)) return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 })
+  const content = data.get(path)
+  return new Response(JSON.stringify({ sha, size: Buffer.byteLength(content), encoding: 'base64', content: Buffer.from(content).toString('base64') }))
+}
+
+// 3 October 2026, 21:57 CEST: every partial write must fail visibly and recover without dropping another project's mapping.
+it.each(['pages/ZenRayAssets/tiles/.workspace.json', cataloguePath, 'pages/ZenRayAssets/tiles/.context.md'])('recovers a failed publication of %s without duplicating or losing project identities', async (failedPath) => {
+  const core = { id: 'core', name: 'Core', folder: 'pages/ZenRayAssets/core', sources: [], files: [] }
+  const data = new Map([['pages/.zr-assets-workspaces.json', JSON.stringify({ projects: [core] })]])
+  let fail = true
+  const fetchImpl = async (url, options) => {
+    const contents = registryContents(url, data)
+    if (contents) return contents
+    if (options.method !== 'POST') {
+      const file = new URL(url).searchParams.get('path')
+      return new Response(JSON.stringify(data.has(file) ? { markdown: data.get(file), sha: 'current' } : { missing: true }), { status: data.has(file) ? 200 : 404 })
+    }
+    const body = JSON.parse(options.body)
+    if (fail && body.path === failedPath) { fail = false; return new Response(JSON.stringify({ error: 'Simulated outage' }), { status: 503 }) }
+    data.set(body.path, body.markdown)
+    return new Response(JSON.stringify({ ok: true }))
+  }
+  const publish = createAssetsCloudPublisher({ baseUrl: 'http://localhost', fetchImpl, token: 'test-only' })
+  const snapshot = { id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', sources: [], files: [] }
+  await expect(publish(snapshot)).rejects.toThrow(failedPath)
+  await publish(snapshot)
+  await publish(snapshot)
+  expect(JSON.parse(data.get(registryPath)).projects.map(project => project.id)).toEqual(['core'])
+  expect(JSON.parse(data.get(cataloguePath)).projects.map(project => project.id)).toEqual(['core', 'tiles'])
+  expect(JSON.parse(data.get('pages/ZenRayAssets/tiles/.workspace.json'))).toEqual(snapshot)
+  expect(data.get('pages/ZenRayAssets/tiles/.context.md')).toContain('Tiles')
+})
+
+it('retries a conflicting global mapping write and publishes a cloud-safe context', async () => {
+  const core = { id: 'core', name: 'Core', folder: 'pages/ZenRayAssets/core', sources: [], files: [] }
+  const data = new Map([['pages/.zr-assets-workspaces.json', JSON.stringify({ projects: [core] })]])
+  let conflicts = 1
+  const fetchImpl = async (url, options) => {
+    const contents = registryContents(url, data, 'previous')
+    if (contents) return contents
+    if (options.method !== 'POST') {
+      const file = new URL(url).searchParams.get('path')
+      return new Response(JSON.stringify(data.has(file) ? { markdown: data.get(file), sha: 'previous' } : { missing: true }), { status: data.has(file) ? 200 : 404 })
+    }
+    const body = JSON.parse(options.body)
+    if (body.path === cataloguePath && conflicts-- > 0) return new Response(JSON.stringify({ conflict: true }), { status: 409 })
+    data.set(body.path, body.markdown)
+    return new Response(JSON.stringify({ ok: true }))
+  }
+  const publish = createAssetsCloudPublisher({ baseUrl: 'http://localhost', fetchImpl, token: 'test-only' })
+  await publish({ id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', sources: [{ id: 'content', namespace: 'unreal', include: ['Content/Tiles'] }], files: [], dependencies: [{ projectId: 'core' }] })
+  const catalogue = JSON.parse(data.get(cataloguePath))
+  expect(catalogue.projects.map((project) => project.id)).toEqual(['core', 'tiles'])
+  expect(catalogue.projects.find((project) => project.id === 'tiles').dependencies).toEqual([{ projectId: 'core' }])
+  expect(data.get(registryPath)).toContain('"core"')
+  expect(data.get('pages/ZenRayAssets/tiles/.context.md')).toContain('pages/ZenRayAssets/core/.workspace.json')
+  expect(data.get('pages/ZenRayAssets/tiles/.context.md')).not.toContain('localPath')
+})
+
+// 9 October 2026, 10:01 CEST: Migrate the full registry once and leave it untouched after the compact index exists.
+it('migrates the legacy registry into a small index once without rewriting its source', async () => {
+  const conversation = { id: 'session-1', provider: 'codex', title: 'Planning', projectId: 'core' }
+  const core = { id: 'core', name: 'Core', folder: 'pages/ZenRayAssets/core', sources: [], files: [{ id: 'source:file.png', name: 'file.png' }], conversations: [conversation] }
+  const snapshot = { id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', sources: [], files: [] }
+  const legacy = JSON.stringify({ projects: [core], padding: 'x'.repeat(1_050_000) })
+  const data = new Map([[registryPath, legacy]])
+  const shas = new Map([[registryPath, 'legacy-sha']])
+  const reads = []
+  const writes = []
+  const gitWriter = {
+    read: async ({ path }) => {
+      reads.push(path)
+      return { ok: true, sha: shas.get(path) || null, markdown: data.get(path) || '' }
+    },
+    save: async ({ path, markdown, expectedSha, message }) => {
+      expect(shas.get(path) || null).toBe(expectedSha || null)
+      writes.push({ path, message })
+      data.set(path, markdown)
+      const sha = `migration-${writes.length}`
+      shas.set(path, sha)
+      return { ok: true, sha }
+    },
+  }
+  const publish = createAssetsCloudPublisher({ baseUrl: 'http://unused', fetchImpl: async () => { throw new Error('Unexpected REST call') }, gitWriter })
+
+  const first = await publish(snapshot)
+  const catalogue = JSON.parse(data.get(cataloguePath))
+  expect(first.migrated).toBe(true)
+  expect(catalogue.projects.map((project) => project.id)).toEqual(['core', 'tiles'])
+  expect(catalogue.projects.find((project) => project.id === 'core')).toMatchObject({ fileCount: 1, conversations: [conversation] })
+  expect(catalogue.projects.find((project) => project.id === 'core')).not.toHaveProperty('files')
+  expect(data.get(registryPath)).toBe(legacy)
+  expect(writes.map((entry) => entry.path)).toEqual([`${snapshot.folder}/.workspace.json`, cataloguePath, `${snapshot.folder}/.context.md`])
+
+  reads.length = 0
+  const second = await publish(snapshot)
+  expect(second.migrated).toBe(false)
+  expect(reads).not.toContain(registryPath)
+  expect(data.get(registryPath)).toBe(legacy)
+})
+
+it('refuses to replace an existing registry whose full body cannot be read', async () => {
+  let writes = 0
+  const fetchImpl = async (url, options) => {
+    if (url.includes('/contents/')) return new Response(JSON.stringify({ sha: 'large-existing', size: 1200000, content: '', encoding: 'none' }))
+    if (url.includes('/git/blobs/')) return new Response(JSON.stringify({ message: 'temporary failure' }), { status: 503 })
+    if (options.method === 'POST') { writes++; return new Response(JSON.stringify({ ok: true })) }
+    const query = new URL(url).searchParams
+    return new Response(JSON.stringify(query.get('path') === 'pages/.zr-assets-workspaces.json' ? { markdown: '', sha: 'large-existing' } : { missing: true }))
+  }
+  await expect(createAssetsCloudPublisher({ baseUrl: 'http://localhost', fetchImpl, token: 'test-only' })({ id: 'tiles', folder: 'pages/ZenRayAssets/tiles', sources: [], files: [] })).rejects.toThrow('refusing to overwrite')
+  expect(writes).toBe(1)
+})
+
+// 9 October 2026, 10:01 CEST: routine publication avoids fetching or rewriting the oversized legacy registry.
+it('publishes summaries through sparse Git without fetching or rewriting the large legacy registry', async () => {
+  const core = { id: 'core', name: 'Core', folder: 'pages/ZenRayAssets/core', sources: [], files: [] }
+  const workspacePath = 'pages/ZenRayAssets/tiles/.workspace.json'
+  const contextPath = 'pages/ZenRayAssets/tiles/.context.md'
+  let registry = JSON.stringify({ projects: [core], padding: 'x'.repeat(1_050_000) })
+  let registrySha = 'large-existing'
+  const metadata = new Map([
+    [workspacePath, { sha: 'workspace-existing', markdown: JSON.stringify({ id: 'tiles', name: 'Old' }) }],
+    [cataloguePath, { sha: 'index-existing', markdown: JSON.stringify(createWorkspaceCatalogue([core])) }],
+  ])
+  let registryPageWrites = 0
+  let gitDataRestWrites = 0
+  let metadataReads = 0
+  const gitWriterWrites = []
+  const gitWriterReads = []
+  let gitBlobBodyReads = 0
+  // 9 October 2026, 10:01 CEST: exercise the writer for project metadata and the small shared index.
+  const currentFile = (filePath) => filePath === registryPath ? { sha: registrySha, markdown: registry } : metadata.get(filePath) || { sha: null, markdown: '' }
+  const gitWriter = {
+    read: async ({ path: filePath = registryPath, expectedSha }) => {
+      gitWriterReads.push(filePath)
+      const current = currentFile(filePath)
+      if (expectedSha !== undefined && current.sha !== (expectedSha || null)) return { ok: false, conflict: true }
+      return { ok: true, ...current }
+    },
+    save: async ({ path: filePath = registryPath, markdown, expectedSha, message }) => {
+      const current = currentFile(filePath)
+      if (current.sha !== (expectedSha || null)) return { ok: false, conflict: true }
+      const sha = filePath === registryPath ? 'large-updated' : `metadata-${gitWriterWrites.length + 1}`
+      gitWriterWrites.push({ path: filePath, message })
+      if (filePath === registryPath) { registry = markdown; registrySha = sha }
+      else metadata.set(filePath, { sha, markdown })
+      return { ok: true, sha }
+    },
+  }
+  const fetchImpl = async (url, options = {}) => {
+    if (url.startsWith('http://localhost')) {
+      if (options.method === 'POST') {
+        const body = JSON.parse(options.body)
+        if (body.path === registryPath) registryPageWrites++
+        return new Response(JSON.stringify({ ok: true }))
+      }
+      return new Response(JSON.stringify({ missing: true }), { status: 404 })
+    }
+    if (url.includes('/contents/')) {
+      metadataReads++
+      return new Response(JSON.stringify({ sha: registrySha, size: Buffer.byteLength(registry), content: '', encoding: 'none' }))
+    }
+    const parsed = new URL(url)
+    const apiPath = parsed.pathname.split('/repos/matthieuhuguet/zenray-data/')[1]
+    const method = options.method || 'GET'
+    if (apiPath === `git/blobs/${registrySha}` && method === 'GET') {
+      gitBlobBodyReads++
+      return new Response(JSON.stringify({ sha: registrySha, encoding: 'base64', content: Buffer.from(registry).toString('base64') }))
+    }
+    if (apiPath.startsWith('contents/')) return new Response(JSON.stringify({ sha: registrySha }))
+    if (method === 'POST') gitDataRestWrites++
+    return new Response(JSON.stringify({ message: `unexpected ${method} ${apiPath}` }), { status: 500 })
+  }
+  const snapshot = { id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', sources: [], files: [] }
+  await createAssetsCloudPublisher({ baseUrl: 'http://localhost', fetchImpl, token: 'test-only', gitWriter })(snapshot)
+  expect(metadataReads).toBe(0)
+  expect(gitWriterReads).toEqual(expect.arrayContaining([workspacePath, cataloguePath, contextPath]))
+  expect(gitWriterReads).not.toContain(registryPath)
+  expect(gitWriterWrites.map((entry) => entry.path)).toEqual([workspacePath, cataloguePath, contextPath])
+  expect(gitBlobBodyReads).toBe(0)
+  expect(gitDataRestWrites).toBe(0)
+  expect(registryPageWrites).toBe(0)
+  expect(JSON.parse(registry).projects.map(project => project.id)).toEqual(['core'])
+  expect(JSON.parse(registry).padding).toBe('x'.repeat(1_050_000))
+  expect(registrySha).toBe('large-existing')
+  expect(JSON.parse(metadata.get(cataloguePath).markdown).projects.map((project) => project.id)).toEqual(['core', 'tiles'])
+  expect(JSON.parse(metadata.get(workspacePath).markdown)).toEqual(snapshot)
+  expect(metadata.get(contextPath).markdown).toContain('Tiles')
+})
+
+// 8 October 2026, 12:58 CEST: verify project metadata avoids the Pages credential path when sparse Git is available.
+it('publishes workspace snapshots and contexts through local Git without Pages writes', async () => {
+  const workspacePath = 'pages/ZenRayAssets/tiles/.workspace.json'
+  const contextPath = 'pages/ZenRayAssets/tiles/.context.md'
+  const data = new Map([[registryPath, JSON.stringify({ projects: [] })], [workspacePath, JSON.stringify({ id: 'tiles', name: 'Old' })]])
+  const shas = new Map([[registryPath, 'registry-before'], [workspacePath, 'workspace-before']])
+  const writes = []
+  let pagesWrites = 0
+  const gitWriter = {
+    read: async ({ path, expectedSha }) => ({ ok: true, sha: shas.get(path) || null, markdown: data.get(path) || '' }),
+    save: async ({ path, markdown, expectedSha, message }) => {
+      expect(shas.get(path) || null).toBe(expectedSha || null)
+      writes.push({ path, message })
+      data.set(path, markdown)
+      const sha = `updated-${writes.length}`
+      shas.set(path, sha)
+      return { ok: true, sha }
+    },
+  }
+  const fetchImpl = async (url, options = {}) => {
+    if (url.startsWith('http://localhost')) {
+      if (options.method === 'POST') { pagesWrites++; return new Response(JSON.stringify({ error: 'github', detail: 'Bad credentials' }), { status: 200 }) }
+      const filePath = new URL(url).searchParams.get('path')
+      return new Response(JSON.stringify(data.has(filePath) ? { markdown: data.get(filePath), sha: shas.get(filePath) } : { missing: true }), { status: data.has(filePath) ? 200 : 404 })
+    }
+    const filePath = decodeURI(new URL(url).pathname.split('/contents/')[1] || '')
+    if (!data.has(filePath)) return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 })
+    const markdown = data.get(filePath)
+    return new Response(JSON.stringify({ sha: shas.get(filePath), size: Buffer.byteLength(markdown), encoding: 'base64', content: Buffer.from(markdown).toString('base64') }))
+  }
+  const snapshot = { id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', sources: [], files: [] }
+  await createAssetsCloudPublisher({ baseUrl: 'http://localhost', fetchImpl, token: 'test-only', gitWriter })(snapshot)
+  expect(pagesWrites).toBe(0)
+  expect(writes.map((entry) => entry.path)).toEqual([workspacePath, cataloguePath, contextPath])
+  expect(JSON.parse(data.get(workspacePath))).toEqual(snapshot)
+  expect(JSON.parse(data.get(registryPath)).projects).toEqual([])
+  expect(JSON.parse(data.get(cataloguePath)).projects.map((project) => project.id)).toEqual(['tiles'])
+  expect(data.get(contextPath)).toContain('Tiles')
+  expect(writes.map((entry) => entry.message)).toEqual(['Assets project metadata save', 'Assets workspace index save', 'Assets project metadata save'])
+})
+
+// 3 October 2026, 10:25 CEST: compaction retains every user file and its cloud proof while removing duplicated transfer paths.
+it('compacts a catalogue idempotently without losing identities, hashes or download metadata', () => {
+  const project = { id: 'tiles', files: [{ id: 'workshop:Scene.hiplc', relativePath: 'Scene.hiplc', sourceId: 'workshop', namespace: 'tmp', size: 42, sha256: 'verified-hash', cloudPath: 'pages/Scene.hiplc.file.json', contentPath: 'pages/Scene.hiplc.file.json', manifestPath: 'pages/Scene.hiplc.file.json', sourceFolder: 'repeated-source', relativeManifest: 'Scene.hiplc.file.json', backedUpAt: 'historical-date', preservedOriginalVersion: { versionId: 'original-version' } }] }
+  const compact = compactRegistryProject(project)
+  expect(compact.files[0]).toMatchObject({ id: project.files[0].id, sha256: 'verified-hash', cloudPath: 'pages/Scene.hiplc.file.json', contentPath: 'pages/Scene.hiplc.file.json', size: 42, preservedOriginalVersion: { versionId: 'original-version' } })
+  expect(compact.files[0].manifestPath).toBeUndefined()
+  expect(compact.files[0].relativeManifest).toBeUndefined()
+  expect(project.files[0].relativeManifest).toBe('Scene.hiplc.file.json')
+  expect(compactRegistryProject(compact)).toEqual(compact)
+  expect(JSON.stringify(compact).length).toBeLessThan(JSON.stringify(project).length)
+})

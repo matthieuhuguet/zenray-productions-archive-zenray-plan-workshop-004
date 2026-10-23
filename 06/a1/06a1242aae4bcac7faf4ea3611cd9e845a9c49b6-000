@@ -1,0 +1,69 @@
+// 12 October 2026: record ONE email received from a studio (a refusal, an answer, an interview invitation) on its exact listing.
+// It reuses the page's own rules (`processIncomingEmail`): an automatic acknowledgment is ignored, a refusal moves the studio
+// to "declined", the whole text is kept as a dated message, and one commit publishes it. Nothing is ever sent from here.
+//
+// FR : enregistre UN mail recu d'un studio (refus, reponse, invitation) sur sa fiche exacte. Memes regles que la page :
+// un accuse de reception est ignore, un refus passe la fiche en « Refuse », le texte entier est garde en message date,
+// un seul commit le publie. Rien n'est jamais envoye d'ici.
+//
+//   node scripts/Freelance/RecordEmail.mjs --studio <id> --from "Voodoo" --date 2026-10-12 --file refus.txt [--subject "..."] [--dry]
+import path from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { createCloudStore } from './CloudStore.mjs'
+import { runtimeDirectory } from './Main.mjs'
+import { processIncomingEmail } from '../../src/lib/freelanceEmailParser.js'
+import { normalizeStudio } from '../../src/lib/freelanceStudios.js'
+
+const FULL_TEXT = 20000
+
+/** `--key value` and `--flag` pairs, nothing else: this tool has no positional argument. */
+export function parseArgs(argv) {
+  const out = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) throw new Error(`Unexpected argument: ${arg}`)
+    const key = arg.slice(2)
+    const next = argv[i + 1]
+    if (next === undefined || next.startsWith('--')) out[key] = true
+    else { out[key] = next; i++ }
+  }
+  return out
+}
+
+/**
+ * Pure: applies one received email to one studio of a parsed store.
+ * Returns { store, result } or throws when the studio is missing or the email was not a real answer.
+ */
+export function applyEmail(store, studioId, email, today) {
+  const list = Array.isArray(store && store.studios) ? store.studios : []
+  const index = list.findIndex((studio) => studio.id === studioId)
+  if (index < 0) throw new Error(`No studio with id ${studioId} in the store`)
+  const outcome = processIncomingEmail(email, list, today, { studio: normalizeStudio(list[index]), snippetLimit: FULL_TEXT })
+  if (outcome.action !== 'updated') throw new Error(`The email was not recorded (${outcome.action}${outcome.reason ? `: ${outcome.reason}` : ''})`)
+  const studios = list.map((studio, i) => (i === index ? outcome.updatedStudio : studio))
+  return { store: { ...store, studios }, result: { studioId, studio: outcome.studioName, intent: outcome.intent, status: outcome.targetStatus, before: list[index].status } }
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2))
+  if (!args.studio || !args.file || !args.date) throw new Error('Usage: RecordEmail.mjs --studio <id> --from <sender> --date <YYYY-MM-DD> --file <body.txt> [--subject <text>] [--dry]')
+  const config = JSON.parse(await readFile(new URL('./FreelanceConfig.json', import.meta.url), 'utf8'))
+  const body = (await readFile(args.file, 'utf8')).trim()
+  if (!body) throw new Error(`The email body is empty: ${args.file}`)
+  const email = { from: args.from === true ? '' : String(args.from || ''), subject: args.subject === true ? '' : String(args.subject || ''), date: String(args.date), body }
+  const cloud = createCloudStore({ config, directory: path.join(runtimeDirectory(), 'DataClone') })
+  const { storePath, maxStoreBytes } = config.cloud
+  const outcome = await cloud.commit(`freelance: record email from ${email.from || 'studio'} on ${args.studio} (${email.date})`, async (tree) => {
+    const text = await tree.read(storePath)
+    if (text === null) throw new Error(`${storePath} does not exist in the data repository`)
+    const { store, result } = applyEmail(JSON.parse(text), args.studio, email, email.date)
+    const next = JSON.stringify(store) + '\n'
+    if (Buffer.byteLength(next) > maxStoreBytes) throw new Error(`The studio store would weigh ${Buffer.byteLength(next)} bytes, above the ${maxStoreBytes} guard; nothing was published`)
+    return { files: next === text ? {} : { [storePath]: next }, report: result }
+  }, { dryRun: Boolean(args.dry) })
+  console.log(JSON.stringify({ dry: Boolean(args.dry), committed: outcome.committed, commit: outcome.commit || '', ...outcome.report }, null, 2))
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => { console.error(`RecordEmail failed: ${error.message}`); process.exitCode = 1 })
+}

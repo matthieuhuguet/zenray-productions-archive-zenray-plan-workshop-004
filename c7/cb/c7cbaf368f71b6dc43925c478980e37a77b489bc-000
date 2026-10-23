@@ -1,0 +1,178 @@
+import { rawFallbackUrl } from './streamFiles.js'
+
+// fetchAsset.js — shared STREAMED download (kills mobile OOM on large archived files).
+//
+// The problem, plainly: to download an archived file, the app used to fetch ALL its chunks and hold
+// them IN MEMORY (one big Blob) before offering the save. On a multi-GB file, especially on iPhone,
+// that blows up RAM (the tab crashes). This module fixes it: when the browser allows it (File
+// System Access API: Chrome/Edge desktop), we WRITE straight to disk chunk by chunk, never holding
+// everything in memory. Otherwise (Safari/iOS, no API) we fall back to a Blob, but BOUNDED (memory
+// cap), as before. Result: a 5 GB download no longer inflates RAM where the API exists.
+//
+// Centralizes the 5 call sites that used to assemble a full-RAM Blob (FileNodeViewer, DownloadsView,
+// MediaViewer, QuickLookOverlay, ImageNodeViewer). Consumes URLs resolved by archiveChunks.js
+// (a single resolver).
+
+// Memory cap for the Blob fallback (no File System Access API). Beyond it we refuse rather than crash.
+// 500 MB = the bound historically used by DownloadsView/QuickLookOverlay.
+export const BLOB_CAP_BYTES = 500 * 1024 * 1024
+
+// 14 October 2026: a piece that jsDelivr refuses (403/404 on a segment it never served) is asked again, every second attempt on GitHub raw
+// (same commit, same bytes). One cold segment no longer kills a whole download. FR : une piece refusee par jsDelivr est redemandee,
+// une tentative sur deux chez GitHub raw.
+export async function fetchResilient(url, { attempts = 8, delayMs = 400, fetchImpl = fetch } = {}) {
+  const raw = rawFallbackUrl(url)
+  let last = ''
+  for (let n = 0; n < attempts; n += 1) {
+    const target = n % 2 === 1 && raw ? raw : url
+    try {
+      const r = await fetchImpl(target)
+      if (r.ok) return r
+      last = `HTTP ${r.status}`
+    } catch (e) { last = String((e && e.message) || e) }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(4000, delayMs * (n + 1))))
+  }
+  throw new Error(last || 'download failed')
+}
+
+const hasFileSystemAccess = () => typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function'
+
+// Trigger the browser "Save as" for a direct URL (raw mode) or an already-built objectURL.
+function clickDownload(href, name, revokeAfter = false) {
+  const a = document.createElement('a')
+  a.href = href; a.download = name || 'fichier'
+  document.body.appendChild(a); a.click(); a.remove()
+  if (revokeAfter) setTimeout(() => { try { URL.revokeObjectURL(href) } catch {} }, 30000)
+}
+
+// Open a disk writable via the File System Access API. Returns:
+//   'aborted'  -> the user cancelled the picker. Do NOT continue to the Blob fallback (that would
+//                 re-download for nothing) — the caller must stop.
+//   writable   -> stream path available, write chunk by chunk then close().
+//   null       -> API missing OR picker/createWritable failed for a non-abort reason -> the caller
+//                 falls through to the bounded-Blob path.
+// PROD BUG (2026-07-02, Matthieu): createWritable() can fail EVEN AFTER the picker succeeded
+// (permission denied by browser/OS — "not allowed by the user agent or the platform"). It must be
+// treated like a picker failure (fallback), not bubbled up raw.
+async function openWritable(name, mime) {
+  if (!hasFileSystemAccess()) return null
+  let handle
+  try {
+    handle = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: 'Fichier', accept: { [mime]: ['.' + (name.split('.').pop() || 'bin')] } }] })
+  } catch (e) {
+    if (e && e.name === 'AbortError') return 'aborted'
+    return null
+  }
+  try { return await handle.createWritable() } catch { return null }
+}
+
+// Throw the explicit "too big for this browser" error used by both Blob fallbacks.
+function throwBlobCap() {
+  throw new Error(`fichier trop volumineux pour ce navigateur (> ${Math.round(BLOB_CAP_BYTES / 1e6)} Mo). Ouvre l'app sur un navigateur de bureau (Chrome/Edge) pour le téléchargement streamé.`)
+}
+
+// streamDownload: download the ORDERED URL list (1 = whole file; N = chunks to re-glue) and save it
+// under `name`. Strategy:
+//   1) File System Access API available -> stream chunk by chunk to disk (writable), NEVER a full Blob.
+//   2) otherwise -> fallback: fetch the pieces and build a BOUNDED Blob (memory cap), then download.
+// onProgress(0..1) is called after each chunk. Throws an explicit error when the fallback cap is hit.
+export async function streamDownload({ urls, name, mime = 'application/octet-stream', onProgress }) {
+  const list = (urls || []).filter(Boolean)
+  if (!list.length) throw new Error('aucune URL à télécharger')
+
+  // Simplest case: a single direct URL (raw mode) -> native link, the browser already streams to disk.
+  if (list.length === 1) { clickDownload(list[0], name); onProgress && onProgress(1); return }
+
+  // 1) STREAM TO DISK (zero full-RAM Blob) when the API is there.
+  const writable = await openWritable(name, mime)
+  if (writable === 'aborted') return
+  if (writable) {
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const r = await fetchResilient(list[i])
+        // Pipe the response body straight into the writable (no memory accumulation).
+        if (r.body && typeof r.body.pipeTo === 'function') {
+          await r.body.pipeTo(writable, { preventClose: true })
+        } else {
+          await writable.write(new Uint8Array(await r.arrayBuffer()))
+        }
+        onProgress && onProgress((i + 1) / list.length)
+      }
+    } finally {
+      await writable.close()
+    }
+    return
+  }
+
+  // 2) BOUNDED Blob fallback (Safari/iOS, or API unavailable). Memory cap so the tab never crashes.
+  const parts = []
+  let total = 0
+  for (let i = 0; i < list.length; i++) {
+    const r = await fetchResilient(list[i])
+    const buf = await r.arrayBuffer()
+    total += buf.byteLength
+    if (total > BLOB_CAP_BYTES) throwBlobCap()
+    parts.push(buf)
+    onProgress && onProgress((i + 1) / list.length)
+  }
+  const url = URL.createObjectURL(new Blob(parts, { type: mime }))
+  clickDownload(url, name, true)
+}
+
+// streamDownloadChunks: GENERIC variant for when each piece must be PRODUCED by a function (e.g.
+// per-chunk decryption of AES-GCM encrypted media, where you cannot just fetch a raw URL). `count`
+// = number of pieces; `getChunk(i)` -> Uint8Array/ArrayBuffer of the i-th piece in PLAINTEXT. Same
+// strategy: stream to disk with the File System Access API, bounded Blob otherwise. Kills the OOM
+// on encrypted-media downloads.
+export async function streamDownloadChunks({ count, getChunk, name, mime = 'application/octet-stream', onProgress }) {
+  if (!count) throw new Error('aucun morceau')
+
+  const writable = await openWritable(name, mime)
+  if (writable === 'aborted') return
+  if (writable) {
+    try {
+      for (let i = 0; i < count; i++) {
+        const part = await getChunk(i)
+        await writable.write(part instanceof Uint8Array ? part : new Uint8Array(part))
+        onProgress && onProgress((i + 1) / count)
+      }
+    } finally { await writable.close() }
+    return
+  }
+
+  // Bounded Blob fallback.
+  const parts = []
+  let total = 0
+  for (let i = 0; i < count; i++) {
+    const part = await getChunk(i)
+    const len = part.byteLength != null ? part.byteLength : part.length
+    total += len
+    if (total > BLOB_CAP_BYTES) throwBlobCap()
+    parts.push(part)
+    onProgress && onProgress((i + 1) / count)
+  }
+  const url = URL.createObjectURL(new Blob(parts, { type: mime }))
+  clickDownload(url, name, true)
+}
+
+// assembleBlobUrl: for an INLINE preview (image/video/audio/pdf) we need an in-memory object URL.
+//   raw -> the direct URL (nothing to assemble). chunked -> BOUNDED Blob (memory cap) of the
+// ordered chunks. Used by QuickLook/Downloads/MediaViewer to PREVIEW (not to download a huge file).
+// Beyond the cap, the caller must show "too big to preview" instead of calling this.
+export async function assembleBlobUrl({ urls, mime = 'application/octet-stream', onProgress }) {
+  const list = (urls || []).filter(Boolean)
+  if (!list.length) throw new Error('aucune URL')
+  if (list.length === 1) return list[0] // raw: direct URL
+  const parts = []
+  let total = 0
+  for (let i = 0; i < list.length; i++) {
+    const r = await fetch(list[i])
+    if (!r.ok) throw new Error(`chunk ${i}`)
+    const buf = await r.arrayBuffer()
+    total += buf.byteLength
+    if (total > BLOB_CAP_BYTES) throw new Error('trop volumineux pour l’aperçu')
+    parts.push(buf)
+    onProgress && onProgress((i + 1) / list.length)
+  }
+  return URL.createObjectURL(new Blob(parts, { type: mime }))
+}

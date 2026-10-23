@@ -1,0 +1,50 @@
+// 4 October 2026: starts the ZenRay Freelance service (scheduler + loopback bridge).
+// FR : demarre le service ZenRay Freelance (planificateur + pont en boucle locale).
+import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
+import { readFile, writeFile, mkdir, rename } from 'node:fs/promises'
+import { createHttp } from './lib/Http.mjs'
+import { createGh } from './lib/Gh.mjs'
+import { createCloudStore } from './CloudStore.mjs'
+import { createEngine } from './Engine.mjs'
+import { createService } from './Service.mjs'
+import { createNotifier } from './Notify.mjs'
+import { createSeenCache } from './lib/SeenCache.mjs'
+import { loadEnvFile } from './Env.mjs'
+
+export const runtimeDirectory = () => process.env.ZENRAY_FREELANCE_HOME || path.join(os.homedir(), 'Library/Application Support/ZenRayFreelance')
+
+async function atomicFile(file) {
+  return {
+    read: async () => { try { return JSON.parse(await readFile(file, 'utf8')) } catch (error) { if (error.code === 'ENOENT') return null; throw error } },
+    write: async (value) => { await mkdir(path.dirname(file), { recursive: true }); const temporary = `${file}.${process.pid}.tmp`; await writeFile(temporary, JSON.stringify(value, null, 2)); await rename(temporary, file) },
+  }
+}
+
+export async function main({ port } = {}) {
+  const config = JSON.parse(await readFile(new URL('./FreelanceConfig.json', import.meta.url), 'utf8'))
+  const runtime = runtimeDirectory()
+  const log = (message) => console.log(`${new Date().toISOString()} ${message}`)
+  const cloud = createCloudStore({ config, directory: path.join(runtime, 'DataClone') })
+  // The settings file is read again before every pass and every letter: creating or changing the token never needs a restart.
+  // FR : le fichier de reglages est relu avant chaque passe et chaque lettre : creer ou changer le jeton ne demande jamais de redemarrage.
+  const env = { ...process.env, ...(await loadEnvFile(runtime, { log })) }
+  const refreshEnv = async () => { Object.assign(env, await loadEnvFile(runtime, { log })) }
+  const engine = createEngine({ config, cloud, gh: createGh(), http: createHttp(config), cvCache: await atomicFile(path.join(runtime, 'Cache/cv.json')), log, env, refreshEnv, seenCache: createSeenCache({ file: path.join(runtime, 'Cache/IndexSeen.json') }) })
+  const service = createService({ config, engine, notifier: createNotifier({ config, directory: runtime, log }), store: await atomicFile(path.join(runtime, 'State.json')), log, secret: env.ZENRAY_API_SECRET || '' })
+  const { startDelayMs } = await service.start()
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1')
+    if (url.pathname === config.service.path) return service.handleHttp(req, res).catch(() => { res.statusCode = 500; res.end('Service failure') })
+    res.statusCode = 404; res.end('Not found')
+  })
+  server.listen(port || config.service.port, '127.0.0.1', () => log(`ZenRay Freelance listening on 127.0.0.1:${server.address().port}`))
+  setTimeout(() => service.tick(), startDelayMs)
+  const timer = setInterval(() => service.tick(), config.service.tickSeconds * 1000)
+  const stop = () => { clearInterval(timer); server.close(() => process.exit(0)) }
+  process.on('SIGTERM', stop); process.on('SIGINT', stop)
+  return { server, service }
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) main().catch((error) => { console.error(`ZenRay Freelance failed to start: ${error.message}`); process.exit(1) })

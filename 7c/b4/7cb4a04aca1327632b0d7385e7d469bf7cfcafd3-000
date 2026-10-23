@@ -1,0 +1,168 @@
+// FOLDER STYLE (2 October 2026). Colour + SVG glyph of a folder, stored in the SAME file as the Finder
+// tags (`pages/.zr-tags.json`), never in a second system.
+// FR : couleur + glyphe SVG d'un dossier, ranges dans le MEME fichier que les tags (.zr-tags.json).
+//
+// File format, backward compatible with the historical `{ path: 'red' }`:
+//   { "Memory/x.md": "red",                                             <- legacy tag, untouched
+//     "Photos/Trips": { "color": "blue", "icon": { "slug": "github", "svg": "<svg ...>" } } }
+// The app keeps two plain maps in memory (colors: path -> key, icons: path -> {slug, svg}) so every
+// existing reader of `tags[path]` keeps working unchanged; this module only splits and joins them.
+//
+// The glyph source is thesvg.org, a STATIC site: it has no search endpoint, the documented way is to
+// fetch /api/registry.json once and filter client side. The SVG text is stored with the folder, so the
+// glyph still renders when thesvg.org is down and costs no request per tile.
+import { FOLDER_ICON_SOURCE } from '../config/colors.js'
+import { sansAccent } from './sansAccent.js'
+
+// ── Persistence shape ─────────────────────────────────────────────────────────────────────────────
+
+const isIconRecord = (v) => !!v && typeof v === 'object' && typeof v.slug === 'string' && typeof v.svg === 'string' && v.svg.includes('<svg')
+
+/** Split the stored file into the two in-memory maps. Unknown shapes are ignored, never thrown on. */
+export function splitStyleFile(parsed) {
+  const colors = {}
+  const icons = {}
+  if (!parsed || typeof parsed !== 'object') return { colors, icons }
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value === 'string') colors[key] = value
+    else if (value && typeof value === 'object') {
+      if (typeof value.color === 'string' && value.color) colors[key] = value.color
+      if (isIconRecord(value.icon)) icons[key] = { slug: value.icon.slug, svg: value.icon.svg }
+    }
+  }
+  return { colors, icons }
+}
+
+/** Join the two maps back. A path with a colour only stays a plain string (old readers keep working). */
+export function joinStyleFile(colors, icons) {
+  const out = {}
+  for (const [key, color] of Object.entries(colors || {})) out[key] = color
+  for (const [key, icon] of Object.entries(icons || {})) {
+    if (!isIconRecord(icon)) continue
+    out[key] = { ...(colors && colors[key] ? { color: colors[key] } : {}), icon: { slug: icon.slug, svg: icon.svg } }
+  }
+  return out
+}
+
+/** The key under which an entry's style is stored: its page path, or its folder path when it has none. */
+export const styleKeyOf = (entry) => (entry ? entry.contentPath || entry.dir || null : null)
+
+/** A folder tile is drawn as a folder: it has children or no page of its own. */
+export const isFolderEntry = (entry) => !!entry && (!!entry.hasKids || !entry.contentPath)
+
+/** Move every key under `fromPath` (the key itself and its descendants) to `toPath`. Pure. */
+export function remapKeys(map, fromPath, toPath, isFolder) {
+  let changed = false
+  const next = { ...map }
+  if (isFolder) {
+    const fp = fromPath.endsWith('/') ? fromPath : fromPath + '/'
+    const tp = toPath.endsWith('/') ? toPath : toPath + '/'
+    for (const key of Object.keys(map)) {
+      if (key.startsWith(fp)) { next[tp + key.slice(fp.length)] = map[key]; delete next[key]; changed = true }
+    }
+    if (map[fromPath] != null && fromPath !== toPath) { next[toPath] = map[fromPath]; delete next[fromPath]; changed = true }
+  } else if (map[fromPath] != null && fromPath !== toPath) {
+    next[toPath] = map[fromPath]; delete next[fromPath]; changed = true
+  }
+  return changed ? next : map
+}
+
+// ── Registry search (thesvg.org) ───────────────────────────────────────────────────────────────────
+
+let registryPromise = null // an in-flight or successful load; reset on failure so a failure is never cached
+let registryIndex = null
+
+/** Error with a message meant to be shown to the person, never swallowed. */
+export class IconSourceError extends Error {
+  constructor(message, cause) { super(message); this.name = 'IconSourceError'; this.cause = cause }
+}
+
+const buildIndex = (icons) => icons.map((icon) => ({
+  icon,
+  slug: sansAccent(String(icon.slug || '')).toLowerCase(),
+  title: sansAccent(String(icon.title || '')).toLowerCase(),
+  aliases: (icon.aliases || []).map((a) => sansAccent(String(a)).toLowerCase()),
+}))
+
+/**
+ * Loads the manifest once per session. Only a SUCCESS is kept: a network failure or a malformed body
+ * rejects with an IconSourceError and leaves nothing behind, so the next call retries.
+ */
+export function loadIconRegistry({ fetchImpl = (typeof fetch === 'function' ? fetch : null) } = {}) {
+  if (registryPromise) return registryPromise
+  const attempt = (async () => {
+    if (!fetchImpl) throw new IconSourceError('Network unavailable')
+    let response
+    try { response = await fetchImpl(FOLDER_ICON_SOURCE.registryUrl) } catch (err) { throw new IconSourceError('thesvg.org is unreachable', err) }
+    if (!response.ok) throw new IconSourceError(`thesvg.org answered ${response.status}`)
+    let body
+    try { body = await response.json() } catch (err) { throw new IconSourceError('thesvg.org returned an unreadable manifest', err) }
+    const icons = body && Array.isArray(body.icons) ? body.icons : null
+    if (!icons || !icons.length) throw new IconSourceError('thesvg.org returned an empty manifest')
+    registryIndex = buildIndex(icons)
+    return registryIndex
+  })()
+  registryPromise = attempt
+  attempt.catch(() => { if (registryPromise === attempt) registryPromise = null })
+  return attempt
+}
+
+/** Test hook: forget the cached manifest. */
+export function resetIconRegistry() { registryPromise = null; registryIndex = null }
+
+/**
+ * Ranked search over the manifest, bounded by `limit`. Pure: takes the index built by loadIconRegistry.
+ * Rank: exact slug/title, then prefix, then word prefix, then substring; shorter titles first on a tie.
+ */
+export function searchIcons(index, query, limit = FOLDER_ICON_SOURCE.maxResults) {
+  const q = sansAccent(String(query || '')).toLowerCase().trim()
+  if (!q || !index) return []
+  const scored = []
+  for (const row of index) {
+    let best = 0
+    // An alias match ranks a little under the same match on the slug or the title.
+    for (const [f, aliasPenalty] of [[row.slug, 0], [row.title, 0], ...row.aliases.map((a) => [a, 5])]) {
+      if (!f) continue
+      let s = 0
+      if (f === q) s = 100
+      else if (f.startsWith(q)) s = 70
+      else if (f.includes(' ' + q) || f.includes('-' + q)) s = 50
+      else if (f.includes(q)) s = 30
+      if (s && s - aliasPenalty > best) best = s - aliasPenalty
+    }
+    if (best) scored.push({ icon: row.icon, score: best - Math.min(row.title.length, 40) / 100 })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  return scored.slice(0, limit).map((s) => s.icon)
+}
+
+/** Variant used for a single-colour glyph. */
+export const glyphVariant = (icon) => ((icon.variants || []).includes(FOLDER_ICON_SOURCE.preferredVariant) ? FOLDER_ICON_SOURCE.preferredVariant : 'default')
+
+/** Download one icon and return the record that gets persisted. Failures are thrown, never cached. */
+export async function fetchIconRecord(icon, { fetchImpl = (typeof fetch === 'function' ? fetch : null) } = {}) {
+  if (!fetchImpl) throw new IconSourceError('Network unavailable')
+  const url = FOLDER_ICON_SOURCE.iconUrl(icon.slug, glyphVariant(icon))
+  let response
+  try { response = await fetchImpl(url) } catch (err) { throw new IconSourceError('thesvg.org is unreachable', err) }
+  if (!response.ok) throw new IconSourceError(`thesvg.org answered ${response.status} for ${icon.slug}`)
+  const svg = await response.text()
+  if (!svg.includes('<svg')) throw new IconSourceError(`${icon.slug} is not an SVG`)
+  if (svg.length > FOLDER_ICON_SOURCE.maxSvgBytes) throw new IconSourceError(`${icon.slug} is too heavy (${Math.round(svg.length / 1024)} KB)`)
+  return { slug: icon.slug, svg }
+}
+
+// ── Rendering helper ──────────────────────────────────────────────────────────────────────────────
+
+const maskCache = new Map()
+
+/** CSS `url(...)` of a stored SVG, usable as mask-image. SVG used as an image never runs scripts. */
+export function svgMaskUrl(svg) {
+  let url = maskCache.get(svg)
+  if (!url) {
+    url = `url("data:image/svg+xml;utf8,${encodeURIComponent(svg)}")`
+    if (maskCache.size > 500) maskCache.clear()
+    maskCache.set(svg, url)
+  }
+  return url
+}

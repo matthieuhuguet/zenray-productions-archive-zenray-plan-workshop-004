@@ -1,0 +1,389 @@
+// video-mse-lib.mjs — REUSABLE core of the MSE transcode (imported by video-mse.mjs AND by
+// scripts/transcode-worker.mjs). No implicit console output: everything goes through the `log` callback.
+//
+// This module does ONE thing: take a local video file and produce the project's MSE format —
+//   1 video-only fMP4 H.264 stream + 1 audio-only fMP4 AAC stereo stream per track + VTT subs,
+// each stream split into 3 MB chunks whose NAME is the chunk's SHA-256 (anonymized), pushed to a
+// PRIVATE shard via the Git Data API, the `mse-av` manifest written separately into the content
+// repo (PUBLIC). The /api/stream server already reads the manifest's `repo` field and fetches
+// chunks from the private shard: NO server change required.
+//
+// Why this split (hashed binaries on a private shard / text manifest on the content repo):
+//   - anonymization: a chunk named <sha256>.bin reveals neither order nor content;
+//   - separation of concerns: the content repo stays light (JSON + VTT only), big binaries live on
+//     the private shards built for that (automatic rollover).
+//
+// Key differences vs the old sequential `media/<id>/<flux>/NNN.bin` path (still supported by
+// video-mse.mjs on the content repo):
+//   - chunks are named by their SHA-256 hash (anonymized), not a sequential index;
+//   - they live on the PRIVATE shard, not the content repo;
+//   - the manifest carries `repo` so /api/stream switches to the shard.
+//
+// The manifest contract (fields read by StreamVideoMSE.jsx) is UNCHANGED:
+//   mse-av { video:{manifest, dir, parts, size, codecs, fragIndex}, audio:[...], subs:[...], probe }
+//   and each child manifest chunked-media { dir, parts, size, chunkSize, count, repo }.
+//
+// IMPORTANT about hashed chunk naming without touching /api/stream:
+//   /api/stream builds the path `m.dir + '/' + m.parts[i] + '.bin'`. To keep HASHED names while
+//   staying served as-is, we set `dir = media/<id>/<flux>` and `parts[i] = <sha256>` (the 64 hex).
+//   The final path `media/<id>/<flux>/<sha256>.bin` is thus anonymized (name = hash, non
+//   sequential) AND 100% compatible with the existing handler. Deep sharding `ab/cd/<hash>.bin` at
+//   the repo root would require an /api/stream change (out of scope, zero regression).
+
+import { readFile, writeFile, mkdir, rm, stat } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { execFileSync, execSync, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
+export const CHUNK = 3145728 // 3 MB, identical to /api/stream, video-transcode.mjs, universalCapture.js
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const SHARD_RE = /^zenray-media-\d{2,}$/
+
+const noop = () => {}
+const sh = (cmd, a, opts = {}) => execFileSync(cmd, a, { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 28, ...opts })
+const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`
+const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
+
+export const LANG_LABEL = { fre: 'Français', fra: 'Français', eng: 'English', jpn: '日本語', und: 'Audio', ger: 'Deutsch', deu: 'Deutsch', spa: 'Español', ita: 'Italiano' }
+export const ISO2 = {
+  fre: 'fr', fra: 'fr', eng: 'en', jpn: 'ja', ger: 'de', deu: 'de', spa: 'es',
+  ita: 'it', por: 'pt', rus: 'ru', chi: 'zh', zho: 'zh', kor: 'ko', dut: 'nl',
+  nld: 'nl', ara: 'ar', pol: 'pl', tur: 'tr', swe: 'sv', nor: 'no', dan: 'da', fin: 'fi',
+}
+
+// --- ffprobe ----------------------------------------------------------------
+export function probe(file) {
+  const j = JSON.parse(sh('ffprobe', ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', file]).toString())
+  const streams = j.streams || []
+  return {
+    duration: parseFloat(j.format?.duration || 0),
+    video: streams.filter((s) => s.codec_type === 'video' && s.codec_name !== 'mjpeg'),
+    audio: streams.filter((s) => s.codec_type === 'audio'),
+    subs: streams.filter((s) => s.codec_type === 'subtitle'),
+  }
+}
+
+// Exact MSE codec read from the OUTPUT stream via mime_codec_string; robust fallback.
+function codecOf(file, type) {
+  try {
+    const j = JSON.parse(sh('ffprobe', ['-v', 'error', '-select_streams', type === 'video' ? 'v:0' : 'a:0', '-show_streams', '-of', 'json', file]).toString())
+    const c = j.streams?.[0]?.mime_codec_string
+    if (c) return c
+  } catch { /* ignore */ }
+  return type === 'video' ? 'avc1.4d401f' : 'mp4a.40.2'
+}
+
+// --- ffmpeg with PROGRESS (parses stderr `time=HH:MM:SS.xx`) ------------------
+// Runs ffmpeg streaming, calls onPct(0..100) as encoding progresses. Rejects on non-zero exit.
+// totalSec = expected OUTPUT duration (for the ratio). onPct is best-effort (never blocking).
+export function ffmpegProgress(args, totalSec, onPct = noop) {
+  return new Promise((resolve, reject) => {
+    const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] })
+    let errTail = ''
+    p.stderr.on('data', (d) => {
+      const s = d.toString()
+      errTail = (errTail + s).slice(-2000)
+      const m = /time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(s)
+      if (m && totalSec > 0) {
+        const sec = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3])
+        onPct(Math.max(0, Math.min(100, (sec / totalSec) * 100)))
+      }
+    })
+    p.on('error', reject)
+    p.on('close', (code) => { code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${errTail.slice(-300)}`)) })
+  })
+}
+
+// --- fMP4 fragment index (moof -> {t, b}) -------------------------------------
+function fragIndexOf(buf) {
+  let timescale = 0; const frags = []
+  const walk = (start, end, cb) => {
+    let p = start
+    while (p + 8 <= end) {
+      let size = buf.readUInt32BE(p); let hdr = 8
+      const type = buf.toString('latin1', p + 4, p + 8)
+      if (size === 1) { size = Number(buf.readBigUInt64BE(p + 8)); hdr = 16 }
+      if (size < 8 || p + size > end) break
+      cb(type, p, p + hdr, p + size); p += size
+    }
+  }
+  walk(0, buf.length, (type, start, cs, ce) => {
+    if (type === 'moov') walk(cs, ce, (t2, s2, c2, e2) => { if (t2 === 'trak') walk(c2, e2, (t3, s3, c3, e3) => { if (t3 === 'mdia') walk(c3, e3, (t4, s4, c4) => { if (t4 === 'mdhd') { const ver = buf[c4]; timescale = ver === 1 ? buf.readUInt32BE(c4 + 4 + 8 + 8) : buf.readUInt32BE(c4 + 4 + 4 + 4) } }) }) })
+    else if (type === 'moof') { let dt = 0; walk(cs, ce, (t2, s2, c2, e2) => { if (t2 === 'traf') walk(c2, e2, (t3, s3, c3) => { if (t3 === 'tfdt') { const ver = buf[c3]; dt = ver === 1 ? Number(buf.readBigUInt64BE(c3 + 4)) : buf.readUInt32BE(c3 + 4) } }) }); frags.push({ b: start, dt }) }
+  })
+  const ts = timescale || 1
+  return frags.map((f) => ({ t: +(f.dt / ts).toFixed(3), b: f.b }))
+}
+
+// --- HASHED chunking of one stream ---------------------------------------------
+// Splits `file` into 3 MB chunks. Each chunk is named by its SHA-256 (anonymized). Chunks live
+// under media/<id>/<flux>/<sha>.bin on the PRIVATE shard. parts[] = the ORDERED hash sequence
+// (read order is carried by parts[], not by file names); /api/stream rebuilds
+// `dir + '/' + parts[i] + '.bin'` unmodified. Returns everything needed for manifest + push.
+export function chunkStreamHashed(buf, dirRel, sub, file, codecType, log = noop) {
+  const fragIndex = fragIndexOf(buf)
+  if (!fragIndex.length) log(`  ATTENTION ${sub}: 0 fragment moof indexé — le lecteur retombera sur l'approximation linéaire (seek/switch moins fiables).`)
+  const count = Math.ceil(buf.length / CHUNK)
+  const subDirRel = `${dirRel}/${sub}`
+  const parts = []        // ordered hash sequence (= file names, extension-less)
+  const blobs = []        // { path, buf } ready to push onto the shard
+  for (let i = 0; i < count; i++) {
+    const slice = buf.subarray(i * CHUNK, Math.min((i + 1) * CHUNK, buf.length))
+    const h = sha256(slice)
+    parts.push(h)
+    blobs.push({ path: `${subDirRel}/${h}.bin`, buf: Buffer.from(slice) })
+  }
+  return { dir: subDirRel, parts, size: buf.length, count, codec: codecOf(file, codecType), fragIndex, blobs }
+}
+
+// Text subtitle -> direct VTT; bitmap PGS/DVD -> pgsrip OCR. Best-effort per track.
+export async function extractSubs(file, p, outDir, log = noop) {
+  const out = []
+  const TEXT = new Set(['subrip', 'ass', 'ssa', 'mov_text', 'webvtt', 'srt'])
+  for (let i = 0; i < p.subs.length; i++) {
+    const s = p.subs[i]
+    const lang = s.tags?.language || 'und'
+    const label = (s.tags?.title) || LANG_LABEL[lang] || lang
+    const vtt = path.join(outDir, `sub${i}_${lang}.vtt`)
+    try {
+      if (TEXT.has(s.codec_name)) {
+        sh('ffmpeg', ['-y', '-i', file, '-map', `0:s:${i}`, '-c:s', 'webvtt', vtt])
+      } else if (s.codec_name.includes('pgs') || s.codec_name === 'dvd_subtitle') {
+        const code = ISO2[lang] || 'en'
+        const sup = path.join(outDir, `sub${i}.${code}.sup`)
+        sh('ffmpeg', ['-y', '-i', file, '-map', `0:s:${i}`, '-c:s', 'copy', sup])
+        execSync(`pgsrip -f -l ${code} "${sup}"`, { stdio: 'pipe' })
+        const srt = sup.replace(/\.sup$/, '.srt')
+        if (existsSync(srt)) { sh('ffmpeg', ['-y', '-i', srt, vtt]); await rm(srt, { force: true }) }
+        await rm(sup, { force: true })
+      } else continue
+      if (existsSync(vtt) && (await stat(vtt)).size > 10) out.push({ file: vtt, lang, label })
+    } catch (e) { log(`  sous-titre ${i} (${s.codec_name}) échec: ${String(e.message || e).slice(0, 100)}`) }
+  }
+  return out
+}
+
+// --- FULL TRANSCODE OF ONE VIDEO ----------------------------------------------
+// Produces all streams + the manifest locally, WITHOUT pushing anything. Returns the `result`
+// object that pushToShard() consumes. Options:
+//   { workDir, crf='21', sampleSec=null, log, onProgress(stage, pct) }
+// onProgress: stage ∈ {'video','audio'}, pct 0..100 (current ffmpeg progress).
+export async function transcodeOne(file, opts = {}) {
+  const log = opts.log || noop
+  const onProgress = opts.onProgress || noop
+  const crf = String(opts.crf || '21')
+  const sampleSec = opts.sampleSec != null ? Number(opts.sampleSec) : null
+  const work = opts.workDir || '/tmp/zr_mse'
+
+  const base = path.basename(file).replace(/\.[^.]+$/, '')
+  const id = newId()
+  const outDir = path.join(work, 'out', id)
+  await mkdir(outDir, { recursive: true })
+
+  const p = probe(file)
+  log(`${base} — ${p.duration.toFixed(0)}s, ${p.audio.length} audio, ${p.subs.length} sous-titres${sampleSec ? ` [échantillon ${sampleSec}s]` : ''}`)
+  if (!p.video.length) throw new Error('aucune piste vidéo')
+
+  const tlim = sampleSec ? ['-t', String(sampleSec)] : []
+  const outDuration = sampleSec ? Math.min(p.duration || sampleSec, sampleSec) : p.duration
+  const dirRel = `media/${id}`
+
+  // 1) video-only fMP4 H.264 stream. -g 48 = a keyframe every ~2 s (densifies fragIndex / reliable seek).
+  log('  transcode vidéo fMP4 H.264 (-g 48)...')
+  const vfile = path.join(outDir, 'video.mp4')
+  await ffmpegProgress(['-y', '-i', file, ...tlim, '-map', '0:v:0', '-dn', '-c:v', 'libx264', '-preset', 'fast',
+    '-crf', crf, '-g', '48', '-pix_fmt', 'yuv420p', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', vfile],
+    outDuration, (pct) => onProgress('video', pct))
+  const vbuf = await readFile(vfile)
+  const video = chunkStreamHashed(vbuf, dirRel, 'video', vfile, 'video', log)
+  log(`  vidéo: ${video.count} chunks (${(video.size / 1048576).toFixed(1)} Mo), codec ${video.codec}, ${video.fragIndex.length} fragments`)
+
+  // 2) one audio-only fMP4 stream per track (stereo)
+  const audios = []
+  for (let i = 0; i < p.audio.length; i++) {
+    const a = p.audio[i]
+    const lang = a.tags?.language || 'und'
+    const label = (a.tags?.title) || LANG_LABEL[lang] || lang
+    const afile = path.join(outDir, `audio_${i}_${lang}.mp4`)
+    log(`  transcode audio ${i} (${lang}) fMP4 AAC stéréo...`)
+    await ffmpegProgress(['-y', '-i', file, ...tlim, '-map', `0:a:${i}`, '-vn', '-c:a', 'aac', '-ac', '2', '-b:a', '160k',
+      '-movflags', '+frag_keyframe+empty_moov+default_base_moof', afile],
+      outDuration, (pct) => onProgress('audio', pct))
+    const abuf = await readFile(afile)
+    const ch = chunkStreamHashed(abuf, dirRel, `audio_${i}_${lang}`, afile, 'audio', log)
+    audios.push({ lang, label, default: i === 0, ...ch })
+    log(`  audio ${i}: ${ch.count} chunks (${(ch.size / 1048576).toFixed(1)} Mo), codec ${ch.codec}`)
+  }
+
+  // 3) subtitles -> VTT
+  const subsRaw = await extractSubs(file, p, outDir, log)
+  log(`  ${subsRaw.length} sous-titre(s) VTT${subsRaw.length ? ': ' + subsRaw.map((s) => s.label).join(', ') : ''}`)
+  // VTT pushed onto the private shard under the same media/<id>/ folder (consistency: all of one
+  // video's binaries in one place). The manifest carries `repo` -> StreamVideoMSE serves the VTT via /api/shard.
+  const subs = subsRaw.map((s) => ({ path: `${dirRel}/${path.basename(s.file)}`, file: s.file, lang: s.lang, label: s.label }))
+
+  return { id, base, outDir, dirRel, video, audios, subs, outDuration, dest: opts.dest || 'pages/Videos' }
+}
+
+// --- manifest builders (StreamVideoMSE.jsx contract UNCHANGED) -----------------
+function buildManifests(result, repo) {
+  const { base, dest, video, audios, subs, outDuration } = result
+  const childManifest = (name, mime, ch) => ({
+    type: 'chunked-media', v: 1, name, mime, size: ch.size, chunkSize: CHUNK, count: ch.count,
+    dir: ch.dir, parts: ch.parts, repo, createdAt: new Date().toISOString(),
+  })
+  const videoManifestRel = `${dest}/${base}.video.media.json`
+  const audioManifestRels = audios.map((a) => `${dest}/${base}.audio.${a.lang}.media.json`)
+  const children = []
+  children.push({ path: videoManifestRel, json: childManifest(`${base}.video.mp4`, 'video/mp4', video) })
+  audios.forEach((a, i) => children.push({ path: audioManifestRels[i], json: childManifest(`${base}.audio.${a.lang}.mp4`, 'audio/mp4', a) }))
+
+  const totalSize = video.size + audios.reduce((s, a) => s + a.size, 0)
+  const totalCount = video.count + audios.reduce((s, a) => s + a.count, 0)
+  const manifest = {
+    type: 'mse-av', v: 1, name: `${base}.mp4`, mime: 'video/mp4', duration: outDuration,
+    size: totalSize, count: totalCount, repo, // <-- /api/stream + StreamVideoMSE switch to the private shard
+    probe: { duration: outDuration },
+    video: { manifest: videoManifestRel, dir: video.dir, parts: video.parts, size: video.size, codecs: video.codec, fragIndex: video.fragIndex },
+    audio: audios.map((a, i) => ({
+      lang: a.lang, label: a.label, default: a.default, manifest: audioManifestRels[i],
+      dir: a.dir, parts: a.parts, size: a.size, codecs: a.codec, fragIndex: a.fragIndex,
+    })),
+    subs: subs.map((s) => ({ path: s.path, lang: s.lang, label: s.label })),
+    createdAt: new Date().toISOString(),
+  }
+  return { manifest, children, manifestPath: `${dest}/${base}.mp4.media.json` }
+}
+
+// --- Git Data API helpers (generic, on any repo of the account) ---------------
+// Exported for reuse by video-hls-lib.mjs (zero duplication of the SAFE Git Data API path).
+export function ghFactory(token, repo) {
+  return async (method, urlPath, body) => {
+    // RETRY on 5xx (GitHub returns transient 500/502/503 on git/trees & git/commits when the tree
+    // is big) and on network errors. Without it, a single 502 threw away the whole push after 752
+    // blobs were uploaded. Git Data POSTs (blobs/trees/commits) are content-idempotent -> retrying
+    // is safe. 5 attempts, backoff.
+    let last
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const res = await fetch(`https://api.github.com/repos/${OWNER}/${repo}/${urlPath}`, {
+          method,
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'zenray-progress' },
+          body: body ? JSON.stringify(body) : undefined,
+        })
+        if (res.ok) return res.json()
+        const txt = (await res.text()).slice(0, 300)
+        if (res.status < 500 && res.status !== 429) throw new Error(`GitHub ${method} ${repo}/${urlPath} -> ${res.status} ${txt}`)
+        last = new Error(`GitHub ${method} ${repo}/${urlPath} -> ${res.status} ${txt}`)
+      } catch (e) { last = e; if (e.message && /-> [1-4]\d\d /.test(e.message)) throw e } // 4xx (except 429) = definitive
+      if (attempt < 4) await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)))
+    }
+    throw last
+  }
+}
+
+// Pushes a blob list to a repo via the SAFE Git Data API (base_tree + commit + ref force:false).
+// blobs = [{ path, content(base64), encoding }]. Retries the ref PATCH when HEAD moved (non-fast-forward).
+// Exported for reuse by video-hls-lib.mjs.
+export async function pushBlobs(token, repo, blobs, message, log = noop) {
+  const gh = ghFactory(token, repo)
+  // 1) create all blobs. BEFORE: sequential + NO log -> on a big video (750+ segments) it took
+  //    silent minutes and LOOKED frozen. NOW: bounded concurrency (6) + per-blob retry
+  //    (transient/5xx/secondary-rate-limit) + progress log. Order preserved via the index.
+  const tree = new Array(blobs.length)
+  const CONC = 6
+  let next = 0, done = 0
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  const worker = async () => {
+    while (next < blobs.length) {
+      const i = next++; const b = blobs[i]
+      let created = null
+      for (let a = 0; a < 4 && !created; a++) {
+        try { created = await gh('POST', 'git/blobs', { content: b.content, encoding: b.encoding }) }
+        catch (e) { if (a === 3) throw e; await sleep(500 * (a + 1)) }
+      }
+      tree[i] = { path: b.path, mode: '100644', type: 'blob', sha: created.sha }
+      done++
+      if (done % 25 === 0 || done === blobs.length) log(`    blobs ${done}/${blobs.length} -> ${repo}…`)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONC, blobs.length) }, worker))
+  // 2) tree + commit + ref IN BATCHES. WHY: one POST git/trees with ~950 entries (long 4K video)
+  //    crashes GitHub's server (502) -> the video fell back to chunk (non-streamable). So the tree
+  //    is built INCREMENTALLY: each batch of TREE_BATCH entries creates a subtree (base = previous
+  //    commit) + a chained commit. The LAST commit contains the WHOLE cumulative tree (git is
+  //    cumulative via base_tree), so jsDelivr pinned on that commit sees ALL segments. Per-batch
+  //    fast-forward retry kept (concurrent pushes from other videos can move the ref between batches).
+  const TREE_BATCH = 150
+  let lastCommitSha = null
+  const nBatches = Math.ceil(tree.length / TREE_BATCH) || 1
+  for (let bi = 0; bi < nBatches; bi++) {
+    const batch = tree.slice(bi * TREE_BATCH, (bi + 1) * TREE_BATCH)
+    let ok = false
+    for (let attempt = 0; attempt < 8 && !ok; attempt++) {
+      const ref = await gh('GET', 'git/refs/heads/main')
+      const headSha = ref.object.sha
+      const headCommit = await gh('GET', `git/commits/${headSha}`)
+      const baseTree = headCommit.tree.sha
+      const newTree = await gh('POST', 'git/trees', { base_tree: baseTree, tree: batch })
+      const commit = await gh('POST', 'git/commits', { message: nBatches > 1 ? `${message} [${bi + 1}/${nBatches}]` : message, tree: newTree.sha, parents: [headSha] })
+      const res = await fetch(`https://api.github.com/repos/${OWNER}/${repo}/git/refs/heads/main`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'zenray-progress' },
+        body: JSON.stringify({ sha: commit.sha, force: false }),
+      })
+      if (res.ok) { ok = true; lastCommitSha = commit.sha; break }
+      const t = await res.text()
+      if (res.status !== 422 && res.status < 500) throw new Error(`ref-update ${repo} -> ${res.status} ${t.slice(0, 200)}`)
+      log(`  ref a bougé (${repo}), nouvelle tentative ${attempt + 1}/8 (lot ${bi + 1}/${nBatches})...`)
+      await new Promise((r) => setTimeout(r, 700 * (attempt + 1) + Math.floor(Math.random() * 400)))
+    }
+    if (!ok) throw new Error(`ref-update ${repo}: épuisé (non fast-forward) au lot ${bi + 1}/${nBatches}`)
+    if (nBatches > 1) log(`    commit ${bi + 1}/${nBatches} (${Math.min((bi + 1) * TREE_BATCH, tree.length)}/${tree.length} entrées)`)
+  }
+  return lastCommitSha
+}
+
+// Asks the server upload-shard API for the active shard (auto rollover). apiBase = e.g. 'http://localhost:3000'.
+// Exported for reuse by video-hls-lib.mjs.
+export async function activeShard(apiBase) {
+  const r = await fetch(`${apiBase}/api/upload-shard`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'active-shard' }),
+  }).then((x) => x.json()).catch(() => null)
+  if (!r || r.error || !r.repo) throw new Error('active-shard: ' + ((r && r.error) || 'fail'))
+  return r.repo
+}
+
+// --- FULL PUSH -----------------------------------------------------------------
+// 1) resolves the active private shard (via the server upload-shard API); 2) pushes ALL hashed
+//    chunks + VTTs onto that shard (Git Data API); 3) writes the mse-av manifest + child manifests
+//    into the content repo. Returns { repo, manifestPath, commitShard, commitContent }.
+// apiBase: local-server base URL (to resolve the active shard). contentRepo: manifest repo.
+export async function pushToShard(token, result, { apiBase = 'http://localhost:3000', contentRepo = 'zenray-data', onProgress = noop, log = noop } = {}) {
+  const repo = await activeShard(apiBase)
+  if (!SHARD_RE.test(repo)) throw new Error(`shard invalide: ${repo}`)
+  log(`  shard privé actif: ${repo}`)
+
+  // 1) binary blobs (hashed chunks of every stream + VTTs) -> private shard
+  const binBlobs = []
+  for (const b of result.video.blobs) binBlobs.push({ path: b.path, content: b.buf.toString('base64'), encoding: 'base64' })
+  for (const a of result.audios) for (const b of a.blobs) binBlobs.push({ path: b.path, content: b.buf.toString('base64'), encoding: 'base64' })
+  for (const s of result.subs) binBlobs.push({ path: s.path, content: (await readFile(s.file)).toString('base64'), encoding: 'base64' })
+
+  onProgress('uploading', 0)
+  const commitShard = await pushBlobs(token, repo, binBlobs, `cdn media update ${new Date().toISOString().slice(0, 10)}`, log)
+  log(`  ${binBlobs.length} blobs poussés sur ${repo} (commit ${commitShard.slice(0, 7)})`)
+  onProgress('uploading', 80)
+
+  // 2) mse-av manifest + children -> content repo (PUBLIC)
+  const { manifest, children, manifestPath } = buildManifests(result, repo)
+  const manifestBlobs = children.map((c) => ({ path: c.path, content: JSON.stringify(c.json, null, 2), encoding: 'utf-8' }))
+  manifestBlobs.push({ path: manifestPath, content: JSON.stringify(manifest, null, 2), encoding: 'utf-8' })
+  const commitContent = await pushBlobs(token, contentRepo, manifestBlobs, `content update ${new Date().toISOString().slice(0, 10)}`, log)
+  log(`  manifest mse-av + ${children.length} enfants poussés sur ${contentRepo} (commit ${commitContent.slice(0, 7)})`)
+  onProgress('uploading', 100)
+
+  return { repo, manifestPath, manifest, commitShard, commitContent }
+}

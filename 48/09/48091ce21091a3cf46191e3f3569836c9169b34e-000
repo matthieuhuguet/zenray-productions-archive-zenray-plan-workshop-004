@@ -1,0 +1,101 @@
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
+import { unzipSync } from 'fflate'
+import { downloadFolderAsZip } from './bulkZip.js'
+
+// 2026-09-03 12:55 : ZIP réel, lecture suspendue et fermeture disque retardée.
+vi.mock('../components/ImageNodeViewer.jsx', () => ({ readImgManifestCached: vi.fn(), resolveOriginalUrl: vi.fn(), downloadMedia: vi.fn() }))
+const entries = [{ name: 'photo.jpg' }, { name: 'photo.jpg' }]
+const bytes = new Uint8Array([1, 2, 3])
+const resolveBytes = async (entry) => ({ name: entry.name, bytes, size: bytes.length })
+const options = { isZippable: () => true, isVideo: () => false, resolveBytes }
+const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r }); return { promise, resolve } }
+let chunks, writable
+beforeEach(() => {
+  chunks = []
+  writable = { write: vi.fn(async (chunk) => { chunks.push(chunk) }), close: vi.fn(async () => {}), abort: vi.fn(async () => {}) }
+  window.showSaveFilePicker = vi.fn(async () => ({ createWritable: async () => writable }))
+})
+afterEach(() => { delete window.showSaveFilePicker; vi.unstubAllGlobals() })
+const archive = () => {
+  const all = new Uint8Array(chunks.reduce((n, b) => n + b.length, 0))
+  let offset = 0
+  for (const chunk of chunks) { all.set(chunk, offset); offset += chunk.length }
+  return unzipSync(all)
+}
+
+describe('progression ZIP', () => {
+  it('preserves project folders without changing bytes or flattening duplicate names', async () => {
+    const scoped = [{ name:'scene.hiplc', archivePath:'houdini/production/scene.hiplc' }, { name:'scene.hiplc', archivePath:'tmp/workshop/scene.hiplc' }]
+    const result = await downloadFolderAsZip(scoped, 'project', vi.fn(), { ...options, preservePaths:true })
+    expect(result.fail).toBe(0)
+    const files = archive()
+    expect(Object.keys(files)).toEqual(['houdini/production/scene.hiplc','tmp/workshop/scene.hiplc'])
+    expect(Array.from(files['houdini/production/scene.hiplc'])).toEqual([1,2,3])
+  })
+  it('rejects a traversal path before publishing an unsafe project ZIP', async () => {
+    await expect(downloadFolderAsZip([{name:'scene',archivePath:'../escape'}], 'project', vi.fn(), {...options,preservePaths:true})).rejects.toThrow('Unsafe ZIP path')
+    expect(writable.abort).toHaveBeenCalledOnce()
+  })
+  it('montre le fichier avant sa lecture et reste sous 100 % jusqu’à la fermeture', async () => {
+    const read = deferred(), close = deferred(), progress = vi.fn()
+    writable.close.mockImplementation(() => close.promise)
+    const download = downloadFolderAsZip(entries, 'photos', progress, { ...options, resolveBytes: async (entry) => { await read.promise; return resolveBytes(entry) } })
+    await vi.waitFor(() => expect(progress).toHaveBeenLastCalledWith(0, 'Lecture 1/2 : photo.jpg'))
+    read.resolve()
+    await vi.waitFor(() => expect(writable.close).toHaveBeenCalledOnce())
+    expect(progress.mock.calls.at(-1)[1]).toBe('Finalisation du ZIP…')
+    expect(progress.mock.calls.every(([ratio]) => ratio < 1)).toBe(true)
+    close.resolve()
+    expect(await download).toEqual({ ok: 2, fail: 0, videosQueued: 0 })
+    expect(progress).toHaveBeenLastCalledWith(1, 'ZIP prêt')
+    const files = archive()
+    expect(Object.keys(files)).toEqual(['photo.jpg', 'photo (2).jpg'])
+    expect(Array.from(files['photo.jpg'])).toEqual([1, 2, 3])
+  })
+
+  it('signale une erreur disque, abandonne le fichier et ne publie pas 100 %', async () => {
+    const progress = vi.fn()
+    writable.write.mockRejectedValue(new Error('Disque plein'))
+    await expect(downloadFolderAsZip(entries, 'photos', progress, options)).rejects.toThrow('Disque plein')
+    expect(writable.abort).toHaveBeenCalledOnce()
+    expect(writable.close).not.toHaveBeenCalled()
+    expect(progress.mock.calls.every(([ratio]) => ratio < 1)).toBe(true)
+  })
+
+  it('signale également un échec de fermeture', async () => {
+    writable.close.mockRejectedValue(new Error('Fermeture refusée'))
+    await expect(downloadFolderAsZip(entries, 'photos', vi.fn(), options)).rejects.toThrow('Fermeture refusée')
+    expect(writable.abort).toHaveBeenCalledOnce()
+  })
+
+  it('conserve le nombre d’échecs de lecture sans bloquer les autres fichiers', async () => {
+    const reader = vi.fn().mockRejectedValueOnce(new Error('Réseau')).mockResolvedValueOnce(await resolveBytes(entries[1]))
+    expect(await downloadFolderAsZip(entries, 'photos', vi.fn(), { ...options, resolveBytes: reader })).toEqual({ ok: 1, fail: 1, videosQueued: 0 })
+    expect(Object.keys(archive())).toEqual(['photo.jpg'])
+  })
+
+  it('respecte l’annulation du choix d’emplacement', async () => {
+    window.showSaveFilePicker.mockRejectedValue(new DOMException('Annulé', 'AbortError'))
+    const reader = vi.fn()
+    const result = await downloadFolderAsZip(entries, 'photos', vi.fn(), { ...options, resolveBytes: reader })
+    expect(result.cancelled).toBe(true)
+    expect(reader).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('repli Blob avec fermeture visible, permission refusée : %s', async (denied) => {
+    if (denied) window.showSaveFilePicker.mockResolvedValue({ createWritable: async () => { throw new Error('Permission refusée') } })
+    else delete window.showSaveFilePicker
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    const createObjectURL = vi.fn(() => 'blob:zip-test')
+    vi.stubGlobal('URL', Object.assign(class extends URL {}, { createObjectURL, revokeObjectURL: vi.fn() }))
+    const progress = vi.fn()
+    const result = await downloadFolderAsZip(entries, 'photos', progress, options)
+    expect(result).toEqual({ ok: 2, fail: 0, videosQueued: 0 })
+    expect(progress.mock.calls.at(-2)[1]).toBe('Finalisation du ZIP…')
+    expect(progress.mock.calls.slice(0, -1).every(([ratio]) => ratio < 1)).toBe(true)
+    expect(click).toHaveBeenCalledOnce()
+    const blob = createObjectURL.mock.calls[0][0]
+    const buffer = await new Promise((resolve) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsArrayBuffer(blob) })
+    expect(Object.keys(unzipSync(new Uint8Array(buffer)))).toEqual(['photo.jpg', 'photo (2).jpg'])
+  })
+})

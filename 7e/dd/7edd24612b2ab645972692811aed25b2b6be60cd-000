@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+// CheckFilmPosters.mjs (12 October 2026): the verifier of the film poster rule. Red when a video manifest has no poster,
+// a /api/raw-proxy poster, or a poster the CDN does not serve as an image. Exit code 1 = red, 0 = green, --json for machines.
+// FR : le verificateur de la regle des posters. Teste dans les deux sens (cf. film-poster.test.js).
+//   node scripts/CheckFilmPosters.mjs --manifests <dir containing pages/> [--json] [--offline]
+import fs from 'node:fs'
+import path from 'node:path'
+import { FILM_POSTER, isProxiedPoster, isPublicPosterUrl, verifyPublicPoster } from './lib/film-poster.mjs'
+
+const CHECK = { parallel: 8, videoTypes: new Set(['video-raw', 'dash', 'hls']) }
+
+const isFilmManifest = (m) => CHECK.videoTypes.has(m.type) || Boolean(m.master || m.mpd) || (String(m.mime || '').startsWith('video/') && Array.isArray(m.parts))
+
+export function classifyPoster(manifest) {
+  if (!manifest.poster) return 'no_poster'
+  if (isProxiedPoster(manifest.poster)) return 'proxied_private_poster'
+  if (!isPublicPosterUrl(manifest.poster)) return 'not_public_jsdelivr'
+  return 'ok_format'
+}
+
+async function main() {
+  const argv = process.argv.slice(2)
+  const value = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : '' }
+  const root = path.resolve(value('--manifests'))
+  if (!value('--manifests') || !fs.existsSync(path.join(root, 'pages'))) throw new Error('--manifests must point to a directory containing pages/')
+  const offline = argv.includes('--offline')
+  const films = []
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) { if (entry.name !== '.git' && entry.name !== '.streams') walk(full) } else if (entry.name.endsWith('.media.json')) {
+        try { const m = JSON.parse(fs.readFileSync(full, 'utf8')); if (isFilmManifest(m)) films.push({ file: path.relative(root, full), manifest: m }) } catch {}
+      }
+    }
+  }
+  walk(path.join(root, 'pages'))
+
+  const problems = []
+  const toFetch = []
+  for (const film of films) {
+    const verdict = classifyPoster(film.manifest)
+    if (verdict !== 'ok_format') problems.push({ file: film.file, verdict, poster: film.manifest.poster || null })
+    else if (!offline) toFetch.push(film)
+  }
+  let next = 0
+  await Promise.all(Array.from({ length: CHECK.parallel }, async () => {
+    while (next < toFetch.length) {
+      const film = toFetch[next]; next += 1
+      const res = await verifyPublicPoster(film.manifest.poster)
+      if (!res.ok) problems.push({ file: film.file, verdict: `cdn_${res.reason}`, poster: film.manifest.poster })
+    }
+  }))
+
+  const report = { ok: problems.length === 0, films: films.length, problems: problems.length, detail: problems.slice(0, 25), posterRepo: FILM_POSTER.repairRepo }
+  if (argv.includes('--json')) console.log(JSON.stringify(report, null, 2))
+  else {
+    console.log(`${report.ok ? 'OK' : 'RED'}: ${report.films} film manifests, ${report.problems} without a working public poster`)
+    for (const p of report.detail) console.log(`  ${p.verdict}  ${p.file}`)
+  }
+  process.exitCode = report.ok ? 0 : 1
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) main().catch((e) => { console.error(e?.message || e); process.exit(2) })

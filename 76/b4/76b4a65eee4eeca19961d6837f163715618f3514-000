@@ -1,0 +1,106 @@
+// 7 October 2026: polite reading of other people's websites. A site's robots.txt is read before its pages, its Disallow rules are
+// obeyed, its Crawl-delay is honoured, and requests to one host never overlap. Nothing here is a way around a refusal.
+// FR : lecture polie des sites des autres. Le robots.txt est lu avant les pages, ses Disallow sont respectes, son Crawl-delay aussi,
+// et deux requetes vers un meme hote ne se chevauchent jamais. Rien ici ne contourne un refus.
+
+/** Parses the group that applies to `agent` (a named group wins over `*`). Returns { rules: [{ allow, path }], delaySeconds }. */
+export function parseRobots(text, agent = 'zenray') {
+  const groups = []
+  let current = null
+  let lastWasAgent = false
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '').trim()
+    if (!line) continue
+    const separator = line.indexOf(':')
+    if (separator < 0) continue
+    const field = line.slice(0, separator).trim().toLowerCase()
+    const value = line.slice(separator + 1).trim()
+    if (field === 'user-agent') {
+      if (!current || !lastWasAgent) { current = { agents: [], rules: [], delaySeconds: null }; groups.push(current) }
+      current.agents.push(value.toLowerCase()); lastWasAgent = true
+      continue
+    }
+    lastWasAgent = false
+    if (!current) continue
+    if (field === 'disallow') current.rules.push({ allow: false, path: value })
+    else if (field === 'allow') current.rules.push({ allow: true, path: value })
+    else if (field === 'crawl-delay' && Number.isFinite(Number(value))) current.delaySeconds = Number(value)
+  }
+  const named = groups.find((group) => group.agents.some((name) => name !== '*' && agent.toLowerCase().includes(name)))
+  const star = groups.find((group) => group.agents.includes('*'))
+  const group = named || star
+  return group ? { rules: group.rules, delaySeconds: group.delaySeconds } : { rules: [], delaySeconds: null }
+}
+
+const toRegex = (path) => new RegExp('^' + path.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\\\$$/, '$'))
+
+/** The longest matching rule wins; Allow beats Disallow on a tie; an empty Disallow allows everything. */
+export function isAllowed(parsed, pathAndQuery) {
+  let best = null
+  for (const rule of parsed.rules) {
+    if (!rule.path) continue
+    if (toRegex(rule.path).test(pathAndQuery) && (!best || rule.path.length > best.path.length || (rule.path.length === best.path.length && rule.allow))) best = rule
+  }
+  return best ? best.allow : true
+}
+
+/**
+ * One fetcher for every index site: robots.txt first (cached for the run), a minimum gap between two requests to the same host
+ * (the larger of `minGapMs` and the site's Crawl-delay), and a hard cap on the delay it will ever accept so a hostile value
+ * cannot freeze a pass. Refused URLs throw an error with `code: 'robots'`.
+ */
+export function createPoliteFetcher({ http, userAgentToken = 'zenray', minGapMs = 1000, maxDelayMs = 10000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), now = () => Date.now() }) {
+  const robots = new Map()
+  const lastRequest = new Map()
+  const chains = new Map()
+
+  async function rulesFor(url) {
+    const { origin, host } = new URL(url)
+    if (!robots.has(host)) {
+      robots.set(host, (async () => {
+        // robots.txt is plain text: some servers answer 406 to a browser-style Accept header. A 4xx means "no rules"; a server error or a
+        // network failure means "unknown", so the pass slows to a conservative five seconds instead of assuming it may hurry.
+        // FR : robots.txt est du texte brut : certains serveurs repondent 406 a un en-tete Accept de navigateur. Un 4xx veut dire « pas de regles » ;
+        // une erreur serveur ou reseau veut dire « inconnu » : la passe ralentit a cinq secondes plutot que de supposer qu'elle peut se presser.
+        try { return parseRobots(await http.text(`${origin}/robots.txt`, { headers: { accept: 'text/plain,*/*;q=0.8' } }), userAgentToken) } catch (error) {
+          return { rules: [], delaySeconds: error.status >= 400 && error.status < 500 ? null : 5 }
+        }
+      })())
+    }
+    return robots.get(host)
+  }
+
+  // Requests to one host go through one promise chain, so the gap holds even when callers run in parallel.
+  // FR : les requetes vers un hote passent par une seule chaine, l'ecart tient meme quand les appelants sont paralleles.
+  function turn(host, task) {
+    const previous = chains.get(host) || Promise.resolve()
+    const next = previous.then(task, task)
+    chains.set(host, next.catch(() => {}))
+    return next
+  }
+
+  async function guarded(url, reader) {
+    const parsed = new URL(url)
+    const rules = await rulesFor(url)
+    if (!isAllowed(rules, parsed.pathname + parsed.search)) { const error = new Error(`robots.txt of ${parsed.host} refuses ${parsed.pathname}`); error.code = 'robots'; throw error }
+    const gap = Math.min(maxDelayMs, Math.max(minGapMs, (rules.delaySeconds || 0) * 1000))
+    return turn(parsed.host, async () => {
+      const wait = (lastRequest.get(parsed.host) || 0) + gap - now()
+      if (wait > 0) await sleep(wait)
+      try { return await reader(url) } finally { lastRequest.set(parsed.host, now()) }
+    })
+  }
+
+  return { text: (url) => guarded(url, (target) => http.text(target)), json: (url) => guarded(url, (target) => http.json(target)), allowed: async (url) => { const parsed = new URL(url); return isAllowed(await rulesFor(url), parsed.pathname + parsed.search) } }
+}
+
+/** A user-supplied address is read only if it is public https: no loopback, private ranges, link-local, IP literals or internal names. */
+export function isPublicHttpsUrl(value) {
+  let url
+  try { url = new URL(String(value)) } catch { return false }
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return false
+  const host = url.hostname.toLowerCase()
+  if (!host.includes('.') || /^\d+(\.\d+){3}$/.test(host) || host.includes(':') || /^\[/.test(host)) return false
+  if (/(^|\.)(localhost|local|internal|lan|home|corp|test|invalid|example)$/.test(host)) return false
+  return true
+}

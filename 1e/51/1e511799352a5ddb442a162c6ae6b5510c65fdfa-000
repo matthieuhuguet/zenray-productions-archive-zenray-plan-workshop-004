@@ -1,0 +1,94 @@
+// 2026-09-23 19:05 : /api/journal, the remote side of the Progress view.
+//
+// The only truth is the local ~/.claude/PROGRESS.md. The journal relay (relay/journal-relay.mjs)
+// pushes it byte for byte to a private repo, with status.json (size + sha256 of the local file)
+// in the SAME commit. This handler never stores anything: every request asks GitHub for the head
+// commit with a conditional request (a 304 is free and does not count against the REST quota),
+// then reads the two files PINNED to that commit, so the pair is always consistent.
+// A commit is immutable, so keeping its bytes in memory is not a second truth: the key is the
+// commit sha, revalidated on every call.
+//
+// FR : aucune copie tenue a la main. Chaque appel revalide le commit de tete (304 gratuit), puis
+// lit le journal et son empreinte epingles sur CE commit ; un commit ne change jamais.
+
+export const JOURNAL = Object.freeze({
+  repo: process.env.JOURNAL_REPO || 'matthieuhuguet/zenray-journal',
+  branch: process.env.JOURNAL_BRANCH || 'main',
+  file: 'PROGRESS.md',
+  status: 'status.json',
+  api: 'https://api.github.com',
+})
+
+// Bytes after `since` (append-only file). Whole file when `since` is absent or incoherent.
+// FR : les octets apres `since` ; tout le fichier si `since` est absent ou incoherent.
+export function sliceSince(bytes, since) {
+  const n = Number(since)
+  if (since == null || since === '' || !Number.isInteger(n) || n < 0 || n > bytes.length) return { body: bytes, from: 0 }
+  return { body: bytes.subarray(n), from: n }
+}
+
+export function createJournalReader({ fetchImpl = fetch, token, config = JOURNAL } = {}) {
+  let head = { etag: '', commit: '' }
+  let snapshot = null // { commit, status, bytes }
+
+  const gh = (url, extra = {}) => fetchImpl(url, {
+    headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'zenray-progress', 'X-GitHub-Api-Version': '2022-11-28', ...extra },
+  })
+
+  async function headCommit() {
+    const extra = { Accept: 'application/vnd.github.sha' }
+    if (head.etag) extra['If-None-Match'] = head.etag
+    const r = await gh(`${config.api}/repos/${config.repo}/commits/${config.branch}`, extra)
+    if (r.status === 304 && head.commit) return head.commit
+    if (!r.ok) throw Object.assign(new Error(`github-head-${r.status}`), { status: r.status })
+    head = { etag: r.headers.get('etag') || '', commit: (await r.text()).trim() }
+    return head.commit
+  }
+
+  async function fileAt(commit, file) {
+    const r = await gh(`${config.api}/repos/${config.repo}/contents/${file}?ref=${commit}`, { Accept: 'application/vnd.github.raw' })
+    if (!r.ok) throw Object.assign(new Error(`github-file-${r.status}`), { status: r.status })
+    return new Uint8Array(await r.arrayBuffer())
+  }
+
+  return async function read() {
+    const commit = await headCommit()
+    if (snapshot && snapshot.commit === commit) return snapshot
+    const [statusBytes, bytes] = await Promise.all([fileAt(commit, config.status), fileAt(commit, config.file)])
+    const status = JSON.parse(new TextDecoder().decode(statusBytes))
+    // Only a definitive, consistent pair enters memory. / FR : seule une paire coherente est gardee.
+    if (status.size !== bytes.length) throw Object.assign(new Error('journal-inconsistent'), { status: 502 })
+    snapshot = { commit, status, bytes }
+    return snapshot
+  }
+}
+
+let reader = null
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') { res.setHeader('Allow', 'GET'); return res.status(405).end() }
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(503).json({ error: 'no-token' })
+  reader = reader || createJournalReader({ token })
+  try {
+    const snap = await reader()
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('ETag', `"${snap.commit}"`)
+    res.setHeader('X-Journal-Source', 'remote')
+    res.setHeader('X-Journal-Commit', snap.commit)
+    res.setHeader('X-Journal-Size', String(snap.status.size))
+    res.setHeader('X-Journal-Sha256', snap.status.sha256)
+    res.setHeader('X-Journal-Mtime', snap.status.sourceMtime || '')
+    res.setHeader('X-Journal-Pushed-At', snap.status.pushedAt || '')
+    if ((req.headers && req.headers['if-none-match']) === `"${snap.commit}"`) return res.status(304).end()
+    if (req.query.meta) {
+      return res.status(200).json({ commit: snap.commit, ...snap.status })
+    }
+    const { body, from } = sliceSince(snap.bytes, req.query.since)
+    res.setHeader('X-Journal-From', String(from))
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    return res.status(200).send(Buffer.from(body.buffer, body.byteOffset, body.byteLength))
+  } catch (e) {
+    return res.status(e.status === 404 ? 404 : 502).json({ error: e.message || 'journal' })
+  }
+}

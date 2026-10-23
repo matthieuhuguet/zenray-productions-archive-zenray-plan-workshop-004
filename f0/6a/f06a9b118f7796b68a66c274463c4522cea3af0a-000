@@ -1,0 +1,117 @@
+#!/usr/bin/env node
+// Build the 2x2 preview mosaic of shared folders WITHOUT a browser (2 October 2026).
+//
+// WHY THIS EXISTS. The preview image of a shared gallery should show four photos. Composing it needs real CPU (decode four
+// 1080x1440 thumbnails, encode a JPEG): the Cloudflare Worker cannot do it reliably on this account (measured: error 1102 on
+// 10 to 60 % of requests), so the Worker only SERVES the cover stored next to the folder (`.zr-share-cover.json`), falling
+// back to the first real photo. This script (ImageMagick, local) and the in-app builder (link creation) write that file.
+// It follows Eagle links to their targets, which the first in-app builder could not do.
+//
+// Usage:
+//   ZENRAY_API_SECRET=<drive code> node scripts/build-share-cover.mjs "pages/Photos/.../gallery"      # one folder
+//   ZENRAY_API_SECRET=<drive code> node scripts/build-share-cover.mjs --all                           # every active folder share
+//   options: --site https://zenray-progress.pages.dev   --force (rebuild even if the four photos did not change)
+// Needs ImageMagick (`magick`), the local media key (.zenray-media-key or ZENRAY_MEDIA_KEY), and `gh` for --all.
+import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs'
+import { createDecipheriv, createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pickCandidates } from '../src/lib/coverPick.js'
+
+const args = process.argv.slice(2)
+const flag = (n) => args.includes(n)
+const opt = (n, d) => (args.includes(n) ? args[args.indexOf(n) + 1] : d)
+const site = opt('--site', 'https://zenray-progress.pages.dev').replace(/\/$/, '')
+const secret = process.env.ZENRAY_API_SECRET
+const COVER_FILE = '.zr-share-cover.json'
+const COTE = 600, LISERE = 4, CASE = (COTE - LISERE) / 2
+const here = path.dirname(fileURLToPath(import.meta.url))
+
+const api = async (query) => (await fetch(`${site}/api/page?${new URLSearchParams(query)}`, { headers: { 'x-zr-auth': secret }, cache: 'no-store' })).json()
+const keyB64 = () => process.env.ZENRAY_MEDIA_KEY || readFileSync(path.resolve(here, '..', '.zenray-media-key'), 'utf8').trim()
+const decrypt = (buf, ivB64) => {
+  const d = createDecipheriv('aes-256-gcm', Buffer.from(keyB64(), 'base64'), Buffer.from(ivB64, 'base64'))
+  d.setAuthTag(buf.subarray(buf.length - 16))
+  return Buffer.concat([d.update(buf.subarray(0, buf.length - 16)), d.final()])
+}
+const manifestOf = async (p) => { const r = await api({ action: 'read', raw: '1', path: p }); try { return JSON.parse(r.markdown) } catch { return null } }
+
+// the thumbnail of one gallery entry, following an Eagle link to its target; { bytes, source } or null
+async function thumbOf(p) {
+  let m = await manifestOf(p)
+  let source = p
+  if (m && m.type === 'zenray-eagle-link/v1') {
+    const r = await api({ action: 'resolve-link', path: p })
+    if (!r.ok || !r.path) return null
+    source = r.path
+    m = await manifestOf(r.path)
+  }
+  if (!m || !m.thumb) return null
+  const res = await fetch(m.thumb)
+  if (!res.ok) return null
+  const buf = Buffer.from(await res.arrayBuffer())
+  return { bytes: m.thumbIv ? decrypt(buf, m.thumbIv) : buf, source }
+}
+
+export async function buildCover(dir, { force = false } = {}) {
+  const kids = (await api({ action: 'children', dir })).entries || []
+  const images = kids.map((e) => e.path).filter((p) => p.endsWith('.img.json') && !p.slice(dir.length + 1).includes('/')).sort()
+  if (images.length < 4) return { dir, status: `skipped (${images.length} images: four or nothing)` }
+  const picks = pickCandidates(images, 8)
+  const chosen = []
+  for (const p of [...picks, ...images.filter((x) => !picks.includes(x))].slice(0, 16)) {
+    if (chosen.length === 4) break
+    const t = await thumbOf(p).catch(() => null)
+    if (t) chosen.push({ p, ...t })
+  }
+  if (chosen.length < 4) return { dir, status: 'skipped (fewer than four usable thumbnails)' }
+  const sig = createHash('sha1').update(chosen.map((c) => c.source).join('|')).digest('hex').slice(0, 16)
+  const target = `${dir}/${COVER_FILE}`
+  const prev = await api({ action: 'read', path: target })
+  let prevSig = null; try { prevSig = JSON.parse(prev.markdown).sig } catch {}
+  if (!force && prevSig === sig) return { dir, status: 'up to date' }
+  const work = mkdtempSync(path.join(tmpdir(), 'zr-cover-'))
+  const files = chosen.map((c, i) => { const f = path.join(work, `t${i}.webp`); writeFileSync(f, c.bytes); return f })
+  const out = path.join(work, 'cover.webp')
+  const tile = (f) => ['(', f, '-resize', `${CASE}x${CASE}^`, '-gravity', 'center', '-extent', `${CASE}x${CASE}`, ')']
+  execFileSync('magick', [
+    '-size', `${COTE}x${COTE}`, 'xc:#17181b',
+    ...files.flatMap((f, i) => [...tile(f), '-gravity', 'northwest', '-geometry', `+${(i % 2) * (CASE + LISERE)}+${Math.floor(i / 2) * (CASE + LISERE)}`, '-composite']),
+    '-quality', '86', out,
+  ])
+  const b64 = readFileSync(out).toString('base64')
+  const res = await fetch(`${site}/api/page`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-zr-auth': secret },
+    body: JSON.stringify({ action: 'save', path: target, markdown: JSON.stringify({ b64, mime: 'image/webp', sig, at: new Date().toISOString() }), ...(prev.sha ? { sha: prev.sha } : {}) }),
+  }).then((r) => r.json())
+  return { dir, status: res.ok ? `written (${Math.round(b64.length * 0.75 / 1024)} KB, ${chosen.map((c) => c.p.split('/').pop().replace('.img.json', '')).join(', ')})` : `FAILED ${JSON.stringify(res)}` }
+}
+
+// every active FOLDER share (not revoked, not expired), read from the private drive repo with the local `gh`
+function activeFolderShares() {
+  const gh = (a) => execFileSync('gh', a, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  const tree = JSON.parse(gh(['api', 'repos/matthieuhuguet/zenray-data/git/trees/main:_shares%2Fv1?recursive=1'])).tree.filter((x) => x.type === 'blob')
+  const dirs = new Set()
+  for (const f of tree) {
+    try {
+      const rec = JSON.parse(Buffer.from(JSON.parse(gh(['api', `repos/matthieuhuguet/zenray-data/git/blobs/${f.sha}`])).content, 'base64').toString('utf8'))
+      if (rec.kind === 'folder' && !rec.revokedAt && Date.parse(rec.expiresAt) > Date.now()) dirs.add(rec.path)
+    } catch { /* unreadable record: skip */ }
+  }
+  return [...dirs]
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (!secret) { console.error('ZENRAY_API_SECRET is required'); process.exit(2) }
+  const targets = flag('--all') ? activeFolderShares() : [args.find((a) => !a.startsWith('--') && a !== opt('--site'))].filter(Boolean)
+  if (!targets.length) { console.error('usage: build-share-cover.mjs <folder path> | --all'); process.exit(2) }
+  let failed = 0
+  for (const dir of targets) {
+    const r = await buildCover(dir, { force: flag('--force') }).catch((e) => ({ dir, status: `FAILED ${e.message}` }))
+    console.log(`${r.status.startsWith('FAILED') ? '✗' : '✓'} ${dir.split('/').slice(-2).join('/')} : ${r.status}`)
+    if (r.status.startsWith('FAILED')) failed++
+  }
+  process.exit(failed ? 1 : 0)
+}

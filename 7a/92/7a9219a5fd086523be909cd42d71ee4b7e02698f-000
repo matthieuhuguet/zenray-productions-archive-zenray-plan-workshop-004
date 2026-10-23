@@ -1,0 +1,124 @@
+// ═══ CE QUE CE TEST PROTÈGE, ET QUI N'ÉTAIT PROTÉGÉ PAR RIEN ══════════════════════════════════════
+//
+// Le bug du 2026-08-27 ne se voyait pas dans le minuteur : il se voyait AILLEURS, en changeant de nav.
+// Aucun test n'aurait pu le rattraper, parce qu'aucun test ne démontait la vue en laissant le temps
+// courir. Le premier cas ci-dessous fait exactement cela, et c'est le seul qui compte vraiment : il
+// échouerait à la seconde où quelqu'un remonterait l'état dans le composant de page.
+//
+// Le second cas vérifie la fin, que l'œil ne peut pas vérifier sans attendre un quart d'heure ni sans
+// écrire une vraie tâche dans le vrai plan de Matthieu. Un minuteur dont on ne peut observer la fin
+// qu'en la vivant n'est pas vérifiable, et la bannière du dépôt Memory demande précisément l'inverse.
+import React, { useState } from 'react'
+import { act, cleanup, render } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const journal = vi.hoisted(() => ({ ecritures: [], avertis: [] }))
+
+vi.mock('../lib/saveJson.js', () => ({
+  saveJsonWithRetry: vi.fn(async (chemin, muter) => {
+    journal.ecritures.push({ chemin, resultat: muter({ tasks: [] }) })
+    return { ok: true }
+  }),
+}))
+vi.mock('../components/Notifications.jsx', () => ({ notify: vi.fn((n) => journal.avertis.push(n)) }))
+vi.mock('../search/searchIndexClient.js', () => ({
+  loadSearchIndex: vi.fn(async () => {}),
+  getIndexPaths: vi.fn(() => ['pages/Calendar/jour.plan.json']),
+}))
+
+import { TimerProvider, useTimer } from './TimerContext.jsx'
+
+let api = null
+
+// 20 October 2026, 18:48 CEST: exercise an explicit 15-minute session independently of the Plan's shared default.
+const TIMER_SCENARIO = { minutes: 15 }
+async function startFixtureTimer() {
+  await act(async () => { api.choisir(TIMER_SCENARIO.minutes) })
+  await act(async () => { api.demarrer() })
+}
+
+// Deux sondes DIFFÉRENTES, pour que remplacer l'une par l'autre démonte réellement la première. Réutiliser
+// le même composant laisserait React réconcilier au lieu de démonter, et le test passerait sans rien
+// prouver : c'est le piège de ce genre de vérification.
+//
+// CE PIÈGE A ÉTÉ PAYÉ EN VÉRIFIANT CE TEST LUI-MÊME (2026-08-27). Pour s'assurer qu'il attrapait bien le
+// bug, on a écrit une variante volontairement cassée où le fournisseur vit DANS la vue, comme avant le
+// correctif. Elle est passée au vert, ce qui aurait dû clore l'affaire et aurait été un mensonge : React
+// réconciliait les deux `<TimerProvider>` de même type à la même position au lieu de les démonter, si
+// bien que la variante « cassée » ne l'était pas. Il a fallu une `key` distincte pour la casser
+// vraiment, et le test est alors devenu rouge sur « expected 900 to be 840 », c'est-à-dire exactement le
+// symptôme décrit par Matthieu : le minuteur revient à quinze minutes.
+// La leçon générale dépasse ce fichier : un vérificateur qu'on n'a jamais vu virer au rouge n'a rien
+// prouvé, il n'a peut-être même pas regardé.
+function SondeA() { api = useTimer(); return <output data-testid="a">{`${api.reste}|${api.enCours}`}</output> }
+function SondeB() { api = useTimer(); return <output data-testid="b">{`${api.reste}|${api.enCours}`}</output> }
+
+function Commutateur({ depart = 'a' }) {
+  const [vue, setVue] = useState(depart)
+  return (
+    <TimerProvider>
+      <button type="button" onClick={() => setVue((v) => (v === 'a' ? 'b' : 'a'))}>changer</button>
+      {vue === 'a' ? <SondeA /> : <SondeB />}
+    </TimerProvider>
+  )
+}
+
+describe('TimerProvider', () => {
+  beforeEach(() => {
+    api = null
+    journal.ecritures = []
+    journal.avertis = []
+    vi.useFakeTimers()
+    // L'heure de fin est calculée sur `Date.now()`, jamais sur un compteur de battements : le temps
+    // simulé doit donc avancer lui aussi, sinon le minuteur constate à raison qu'aucune seconde ne s'est
+    // écoulée et le test mesure le vide.
+    vi.setSystemTime(new Date('2026-08-27T10:00:00Z'))
+  })
+  afterEach(() => { vi.useRealTimers(); cleanup(); vi.clearAllMocks() })
+
+  it('continue de décompter quand la vue qui l\'affichait est démontée', async () => {
+    const { getByText, queryByTestId } = render(<Commutateur />)
+    await startFixtureTimer()
+    expect(api.enCours).toBe(true)
+
+    // On quitte la nav : la sonde A disparaît pour de bon, exactement comme `ZenRayTimer` disparaissait.
+    await act(async () => { getByText('changer').click() })
+    expect(queryByTestId('a')).toBeNull()
+
+    await act(async () => { vi.advanceTimersByTime(60_000) })
+
+    // 15 minutes moins 1 = 14 minutes restantes. Avant le correctif, on serait revenu à 900.
+    expect(api.reste).toBe(14 * 60)
+    expect(api.enCours).toBe(true)
+  })
+
+  it('termine, inscrit la tâche dans le plan et horodate la fin pour la pastille', async () => {
+    render(<Commutateur />)
+    await act(async () => { api.setTitre('Japonais - 15 min - grammaire nara') })
+    await startFixtureTimer()
+    await act(async () => { vi.advanceTimersByTime(15 * 60_000 + 400) })
+    await act(async () => {})   // laisse l'écriture asynchrone se résoudre
+
+    expect(api.fini).toBe(true)
+    expect(api.reste).toBe(0)
+    expect(api.finiA).toBeGreaterThan(0)   // c'est ce nombre qui fait disparaître la pastille ensuite
+
+    expect(journal.ecritures).toHaveLength(1)
+    const tache = journal.ecritures[0].resultat.tasks.at(-1)
+    expect(tache.title).toBe('Japonais - 15 min - grammaire nara')
+    expect(tache.durationMin).toBe(15)
+    expect(tache.status).toBe('done')
+    expect(journal.avertis[0]).toMatchObject({ label: 'ZenRayTimer' })
+  })
+
+  it('rend la main sans rien inscrire quand on réinitialise', async () => {
+    render(<Commutateur />)
+    await startFixtureTimer()
+    await act(async () => { vi.advanceTimersByTime(30_000) })
+    await act(async () => { api.annuler() })
+    expect(api.enCours).toBe(false)
+    expect(api.reste).toBe(15 * 60)
+    expect(api.finiA).toBe(0)
+    expect(journal.ecritures).toHaveLength(0)
+  })
+})

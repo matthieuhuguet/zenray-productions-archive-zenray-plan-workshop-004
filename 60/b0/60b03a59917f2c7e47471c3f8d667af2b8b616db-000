@@ -1,0 +1,240 @@
+// Jetons de partage publics v1.
+//
+// Le jeton est opaque (aucun chemin dedans), signé HMAC et relié à un enregistrement persistant dans
+// zenray-data/_shares. L'enregistrement porte la cible, l'expiration et l'état de révocation. Seule la
+// résolution GET est publique ; émission/révocation restent derrière x-zr-auth dans api/[...route].js.
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { memeChemin, sousLaRacine } from './sansAccent.js'
+import { readFreshText } from './githubGraphql.js'
+
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const VERSION = 1
+const PREFIX = 'zrs1'
+const DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60
+const MIN_TTL_SECONDS = 5 * 60
+const MAX_TTL_SECONDS = 365 * 24 * 60 * 60
+const RECORD_CACHE_MS = 15_000
+const RECORD_CACHE_MAX = 512
+const recordCache = new Map()
+
+const b64url = (value) => Buffer.from(value).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+const sha256 = (value) => createHash('sha256').update(String(value)).digest('hex')
+const signatureFor = (secret, id) => b64url(createHmac('sha256', secret).update(`${PREFIX}.${id}`).digest())
+const secretFromEnv = () => process.env.ZENRAY_SHARE_SECRET || process.env.ZENRAY_API_SECRET || process.env.GITHUB_TOKEN || ''
+
+// Un chemin de partage est une clé de contenu, jamais une URL. Le valider une seule fois
+// supprime les ambiguïtés `?`, `#`, encodage % et doubles slash entre le routeur et GitHub.
+export const isCanonicalPagePath = (path) => {
+  if (typeof path !== 'string' || path !== path.trim() || !path.startsWith('pages/')) return false
+  if (/[\\?#%\u0000-\u001f\u007f]/.test(path)) return false
+  const segments = path.split('/')
+  return segments.length > 1 && segments.every((segment) => segment && segment !== '.' && segment !== '..')
+}
+
+export const isShareTarget = (kind, path) => {
+  if (!isCanonicalPagePath(path)) return false
+  if (kind === 'file') return path.endsWith('.media.json')
+  if (kind === 'video') return path.endsWith('.media.json')
+  if (kind === 'image') return path.endsWith('.img.json')
+  return kind === 'folder' && path !== 'pages' && !/\.(?:media|img)\.json$/i.test(path)
+}
+
+export const inferShareKind = (path) => path.endsWith('.media.json') ? 'video' : path.endsWith('.img.json') ? 'image' : 'folder'
+
+export function decodeLegacyShare(token, allowLegacy = process.env.ZENRAY_ALLOW_LEGACY_SHARES === '1') {
+  // Les anciens jetons base64 n'étaient ni signés ni révocables. Les accepter doit être un
+  // choix de migration temporaire et explicite, jamais le comportement sécurisé par défaut.
+  if (!allowLegacy) return ''
+  try {
+    const value = Buffer.from(String(token || '').replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
+    return isShareTarget(inferShareKind(value), value) ? value : ''
+  } catch { return '' }
+}
+
+export function createSignedShareToken(secret = secretFromEnv(), entropy = randomBytes(24)) {
+  if (!secret) throw new Error('missing-share-secret')
+  const id = b64url(entropy)
+  return `${PREFIX}.${id}.${signatureFor(secret, id)}`
+}
+
+export function verifySignedShareToken(token, secret = secretFromEnv()) {
+  if (!secret) return false
+  const parts = String(token || '').split('.')
+  if (parts.length !== 3 || parts[0] !== PREFIX || !/^[A-Za-z0-9_-]{24,64}$/.test(parts[1]) || !/^[A-Za-z0-9_-]{40,64}$/.test(parts[2])) return false
+  const expected = signatureFor(secret, parts[1])
+  const actual = parts[2]
+  if (actual.length !== expected.length) return false
+  try { return timingSafeEqual(Buffer.from(actual), Buffer.from(expected)) } catch { return false }
+}
+
+export const shareRecordPath = (token) => {
+  const hash = sha256(token)
+  return `_shares/v1/${hash.slice(0, 2)}/${hash}.json`
+}
+
+const RECORD_READ_TRIES = 3
+const RECORD_RETRY_MS = 350
+async function githubReadRecord(token, githubToken = process.env.GITHUB_TOKEN, fetchImpl = fetch, { needSha = false } = {}) {
+  if (!githubToken) return null
+  const cached = recordCache.get(token)
+  if (cached && cached.until > Date.now() && (!needSha || cached.value.sha)) return cached.value
+  if (cached) recordCache.delete(token)
+  const recordPath = shareRecordPath(token)
+  // GraphQL FIRST (2 October 2026): every shared thumbnail, listing and download checks its token, i.e. reads this record. Through the
+  // Contents API each check spent one of the owner's 5000 REST calls per hour; GraphQL has its own, untouched bucket. The REST read
+  // stays as the fallback (and carries the file `sha` that revocation needs: only the issuing/revoking routes use it).
+  // A hiccup of GitHub is NOT "the link does not exist": only a 404 from the Contents API proves absence (2 October 2026, a visitor saw
+  // "Content not found" on a valid link). Anything else is retried, a little later each time, before the link is called unreadable.
+  // FR : un hoquet de GitHub n'est pas « le lien n'existe pas » ; seul un 404 prouve l'absence, le reste est réessayé.
+  for (let attempt = 0; attempt < RECORD_READ_TRIES; attempt++) {
+    if (fetchImpl === fetch && !needSha) {
+      const text = await readFreshText(githubToken, recordPath)
+      if (text) {
+        try {
+          const record = JSON.parse(text)
+          const value = { record, sha: null, recordPath }
+          recordCache.delete(token); recordCache.set(token, { value, until: Date.now() + RECORD_CACHE_MS })
+          while (recordCache.size > RECORD_CACHE_MAX) recordCache.delete(recordCache.keys().next().value)
+          return value
+        } catch { /* unreadable: fall through to REST */ }
+      }
+    }
+    let response = null
+    try {
+      response = await fetchImpl(`https://api.github.com/repos/${REPO}/contents/${recordPath}?ref=${encodeURIComponent(BRANCH)}`, {
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${githubToken}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress' },
+      })
+    } catch { response = null }
+    if (response && response.ok) {
+      try {
+        const payload = await response.json()
+        const record = JSON.parse(Buffer.from(String(payload.content || '').replace(/\n/g, ''), 'base64').toString('utf8'))
+        const value = { record, sha: payload.sha, recordPath }
+        recordCache.delete(token); recordCache.set(token, { value, until: Date.now() + RECORD_CACHE_MS })
+        while (recordCache.size > RECORD_CACHE_MAX) recordCache.delete(recordCache.keys().next().value)
+        return value
+      } catch { return null }
+    }
+    if (response && response.status === 404) return null // absence confirmed by GitHub itself
+    if (attempt < RECORD_READ_TRIES - 1) await new Promise((r) => setTimeout(r, RECORD_RETRY_MS * (attempt + 1)))
+  }
+  return null
+}
+
+async function githubWriteRecord(token, record, sha = '', githubToken = process.env.GITHUB_TOKEN, fetchImpl = fetch) {
+  if (!githubToken) throw new Error('missing-github-token')
+  const recordPath = shareRecordPath(token)
+  const response = await fetchImpl(`https://api.github.com/repos/${REPO}/contents/${recordPath}`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${githubToken}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'zenray-progress' },
+    body: JSON.stringify({
+      message: `share: ${record.revokedAt ? 'revoke' : 'issue'} ${record.kind}`,
+      branch: BRANCH,
+      content: Buffer.from(JSON.stringify(record, null, 2), 'utf8').toString('base64'),
+      ...(sha ? { sha } : {}),
+    }),
+  })
+  if (!response.ok) throw new Error(`github-write-${response.status}`)
+  const payload = await response.json()
+  const nextSha = (payload.content && payload.content.sha) || sha
+  const value = { record, sha: nextSha, recordPath }
+  recordCache.delete(token); recordCache.set(token, { value, until: Date.now() + RECORD_CACHE_MS })
+  while (recordCache.size > RECORD_CACHE_MAX) recordCache.delete(recordCache.keys().next().value)
+  return payload
+}
+
+const shareFailure = (code, status = 404) => Object.assign(new Error(code), { code, status })
+
+export async function resolveShareToken(token, {
+  expectedKind = '',
+  now = Date.now(),
+  secret = secretFromEnv(),
+  loadRecord = (value) => githubReadRecord(value),
+  allowLegacy = process.env.ZENRAY_ALLOW_LEGACY_SHARES === '1',
+} = {}) {
+  const legacyPath = decodeLegacyShare(token, allowLegacy)
+  if (legacyPath) {
+    const kind = inferShareKind(legacyPath)
+    if (expectedKind && expectedKind !== kind) throw shareFailure('share-kind-mismatch')
+    return { v: 0, legacy: true, token, kind, path: legacyPath, expiresAt: null }
+  }
+  if (!verifySignedShareToken(token, secret)) throw shareFailure('invalid-share')
+  const loaded = await loadRecord(token)
+  const record = loaded && (loaded.record || loaded)
+  if (!record || record.v !== VERSION || record.tokenHash !== sha256(token) || !isShareTarget(record.kind, record.path)) throw shareFailure('invalid-share')
+  if (expectedKind && record.kind !== expectedKind) throw shareFailure('share-kind-mismatch')
+  if (record.revokedAt) throw shareFailure('share-revoked', 410)
+  const expires = Date.parse(record.expiresAt || '')
+  if (!((record.kind === 'file' || record.permanent === true) && record.expiresAt === null) && (!Number.isFinite(expires) || expires <= now)) throw shareFailure('share-expired', 410)
+  return { ...record, token, legacy: false }
+}
+
+export async function authorizeShareAccess(token, requestedPath, options = {}) {
+  if (!token || !isCanonicalPagePath(requestedPath)) return false
+  try {
+    const share = await resolveShareToken(token, options)
+    // COMPARAISON TOLERANTE A L ACCENT ET A LA FORME UNICODE. Le chemin est FIGE dans le jeton signe
+    // au moment ou le lien est cree : un renommage ulterieur (les accents retires de pages/Photos le
+    // 2026-08-31) rendait « Empty folder » a tous les liens deja envoyes, sans une erreur. Voir
+    // server/sansAccent.js pour le raisonnement complet. `sousLaRacine` reste STRICT sur le bornage :
+    // un dossier voisin est toujours refuse, seul l accent est ignore.
+    return share.kind === 'folder'
+      ? sousLaRacine(requestedPath, share.path)
+      : memeChemin(requestedPath, share.path)
+  } catch { return false }
+}
+
+const bodyOf = (req) => {
+  if (req.body && typeof req.body === 'object') return req.body
+  try { return JSON.parse(req.body || '{}') } catch { return {} }
+}
+
+export default async function handler(req, res) {
+  res.setHeader('Cache-Control', 'no-store')
+  const method = String(req.method || 'GET').toUpperCase()
+  const githubToken = process.env.GITHUB_TOKEN
+  const secret = secretFromEnv()
+  if (!githubToken || !secret) return res.status(503).json({ error: 'share-service-unavailable' })
+
+  try {
+    if (method === 'GET') {
+      const token = String((req.query && req.query.token) || '')
+      const expectedKind = String((req.query && req.query.kind) || '')
+      const share = await resolveShareToken(token, { expectedKind, secret })
+      return res.status(200).json({ kind: share.kind, path: share.path, expiresAt: share.expiresAt, legacy: share.legacy })
+    }
+    if (method !== 'POST') { res.setHeader('Allow', 'GET, POST'); return res.status(405).json({ error: 'method-not-allowed' }) }
+
+    const body = bodyOf(req)
+    if (body.action === 'revoke') {
+      const token = String(body.token || '')
+      if (!verifySignedShareToken(token, secret)) return res.status(400).json({ error: 'invalid-share' })
+      const loaded = await githubReadRecord(token, githubToken, fetch, { needSha: true })   // revocation rewrites the file: it needs its sha
+      if (!loaded || !loaded.record) return res.status(404).json({ error: 'invalid-share' })
+      const revokedAt = new Date().toISOString()
+      await githubWriteRecord(token, { ...loaded.record, revokedAt }, loaded.sha, githubToken)
+      return res.status(200).json({ ok: true, revokedAt })
+    }
+
+    const kind = String(body.kind || '')
+    const path = String(body.path || '')
+    if (!isShareTarget(kind, path)) return res.status(400).json({ error: 'invalid-target' })
+    const requestedTtl = Number(body.expiresInSeconds)
+    const ttl = Number.isFinite(requestedTtl)
+      ? Math.min(MAX_TTL_SECONDS, Math.max(MIN_TTL_SECONDS, Math.round(requestedTtl)))
+      : DEFAULT_TTL_SECONDS
+    const token = createSignedShareToken(secret)
+    const createdAt = new Date().toISOString()
+    // Calendar viewer links opt into permanence and remain revocable. (19 October 2026, 01:14 Paris)
+    const permanent = kind === 'file' || body.permanent === true
+    const expiresAt = permanent ? null : new Date(Date.now() + ttl * 1000).toISOString()
+    const record = { v: VERSION, tokenHash: sha256(token), kind, path, createdAt, expiresAt, ...(permanent ? { permanent: true } : {}), revokedAt: null }
+    await githubWriteRecord(token, record, '', githubToken)
+    return res.status(201).json({ token, kind, expiresAt })
+  } catch (error) {
+    const status = Number(error && error.status) || 500
+    return res.status(status).json({ error: (error && error.code) || 'share-service-error' })
+  }
+}

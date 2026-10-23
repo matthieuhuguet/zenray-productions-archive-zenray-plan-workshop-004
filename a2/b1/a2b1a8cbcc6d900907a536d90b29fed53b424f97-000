@@ -1,0 +1,767 @@
+// video-raw-lib.mjs — VIDÉO SANS RÉENCODAGE (« chunks bruts »).
+//
+// PRINCIPE (validé 2026-06-30, remplace le DASH+HEVC trop lent) : le fichier vidéo ORIGINAL est découpé par
+// TAILLE en parts de 95 Mo (sûr sous la limite 100 Mo de raw.githubusercontent.com), poussées telles quelles
+// sur un repo public, et servies par raw.github. AUCUN ffmpeg de transcodage : juste un ffprobe (métadonnées)
+// + 1 frame poster. Qualité = source, débit = source. Upload = temps réseau seul, zéro CPU. Coût = 0.
+//
+// LECTURE côté site : Service Worker « range-shim » (P2) — le <video> natif lit une URL virtuelle, le SW
+// traduit les requêtes Range en fetch des bonnes parts. HEVC décodé par l'OS (pas les limites MSE de Chrome).
+//
+// POURQUOI raw.github et pas jsDelivr pour la vidéo : raw.github accepte 100 Mo/fichier (jsDelivr 20). On est
+// peu de requêtes (1 spectateur) donc pas de throttle. Les IMAGES, elles, restent sur jsDelivr (CDN, gère les
+// galeries 10k requêtes ; raw.github throttle les bursts).
+
+import { open, mkdir, writeFile, readFile, rm, stat } from 'node:fs/promises'
+import { acquirePushToken } from './lib/push-token.mjs'
+import { canReuse, claimRepoPoolSlot, createRepoGate, loadRepoCreatePolicy } from './lib/repo-create-policy.mjs'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { execFile, spawnSync, spawn } from 'node:child_process'
+import { createHash, createHmac, createCipheriv, randomBytes } from 'node:crypto'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+import { mimeForName } from '../src/lib/fileKinds.js'
+import { loadMasterKey } from './lib/img-pipeline.mjs'
+import { RAW_CHUNK } from '../src/config/chunkPolicy.js' // 95 Mo/part (source unique chunkPolicy.js)
+import { requireCommitSha } from './lib/git-result.mjs'
+import {
+  loadPushPolicyConfig, repoCapBytes, partsPerRepo, sharedPushController, runPushBatch, parsePushPackBytes, remoteTipIs,
+  PushPermanentRejection, PushExhausted,
+} from './lib/push-batch-policy.mjs'
+const execFileP = promisify(execFile)
+
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const PART = RAW_CHUNK                    // 95 Mo : marge sûre sous la limite 100 Mo de GitHub/raw.github (source unique)
+// 12 October 2026: every push number (batch, ramp, fallback, repository cap) lives in ONE object, lib/push-batch-policy.mjs.
+// The repository cap is 4 096 MiB (D2): 43 parts per repository for NEW films instead of 21. A manifest stores the repository in
+// every part url, so films already online resolve exactly as before; this number only picks the repository of a part being WRITTEN.
+// FR : tous les nombres de poussee vivent dans lib/push-batch-policy.mjs ; le plafond de depot passe a 4 096 Mio (43 parts)
+// pour les films NEUFS ; un manifeste porte le depot dans l'url de chaque part, les films deja en ligne sont inchanges.
+const PUSH_POLICY = loadPushPolicyConfig()
+const SHARD_CAP = repoCapBytes(PUSH_POLICY, 'film')
+const REPO_CREATE_TIMEOUT_MS = Number(process.env.ZR_REPO_CREATE_TIMEOUT_MS) || 30000
+const PARTS_PAR_DEPOT = partsPerRepo(PUSH_POLICY, 'film')
+const LEGACY_PARTS_PAR_DEPOT = partsPerRepo(PUSH_POLICY, 'legacy')
+const noop = () => {}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// 12 October 2026: the answer to a repository creation, kept whole (headers and body) so that a GitHub refusal names its cause.
+// The curl call used to discard both (-o /dev/null), which left three 30 minute waves of HTTP 403 unexplained. Only RESPONSE headers
+// are printed (-i); the request, with its credentials, never is.
+// FR : la reponse a une creation de depot est gardee en entier ; un refus de GitHub nomme alors sa cause.
+export function repoCreateFailure(stdout) {
+  const out = String(stdout || '')
+  const code = out.trim().split('\n').pop().trim()
+  const header = (name) => new RegExp(`^${name}:\\s*(.+)$`, 'im').exec(out)?.[1]?.trim()
+  const message = /"message"\s*:\s*"([^"]*)"/.exec(out)?.[1] || ''
+  const detail = [
+    header('retry-after') ? `retry-after=${header('retry-after')}s` : '',
+    header('x-ratelimit-remaining') ? `ratelimit-remaining=${header('x-ratelimit-remaining')}` : '',
+    message ? `message="${message.slice(0, 160)}"` : '',
+  ].filter(Boolean).join(' ')
+  return { code, detail }
+}
+
+// 10 October 2026, 14:49 CEST: Tune push batches to measured network speed without changing shard capacity.
+// 12 October 2026: without ZR_SHARD_PUSH_BATCH_MB the answer is the top of the push policy (20 parts, 1 900 MiB); with it the
+// batch is fixed and the adaptive policy is disabled (backward compatible). FR : sans variable, le haut de la politique.
+export function videoRawPushBatchBytes(env = process.env, partBytes = PART) {
+  const config = loadPushPolicyConfig(env)
+  const configuredMegabytes = Number(env.ZR_SHARD_PUSH_BATCH_MB)
+  if (Number.isFinite(configuredMegabytes) && configuredMegabytes > 0) {
+    return Math.max(partBytes + 16, Math.floor(configuredMegabytes * 1024 * 1024))
+  }
+  return config.ladder[config.ladder.length - 1] * config.partBytes
+}
+
+/** Parts a repository holds for a NEW film (D2) and its cap, for the panels and the tests. */
+export const videoRepoCapBytes = () => SHARD_CAP
+
+export function videoGitAuthEnvironment(baseEnv, token) {
+  if (!token) throw new Error('GitHub token is required for private video shards')
+  const currentCount = Number.parseInt(baseEnv.GIT_CONFIG_COUNT || '0', 10)
+  const authIndex = Number.isInteger(currentCount) && currentCount >= 0 ? currentCount : 0
+  return {
+    ...baseEnv,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: String(authIndex + 1),
+    [`GIT_CONFIG_KEY_${authIndex}`]: 'http.https://github.com/.extraheader',
+    [`GIT_CONFIG_VALUE_${authIndex}`]: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`,
+  }
+}
+
+const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
+// chemin d'adresse de contenu : ab/cd/<hash>.bin (dédup + arbo équilibrée)
+const partPathFor = (h) => `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.bin`
+const rawUrl = (repo, sha, p) => `https://raw.githubusercontent.com/${OWNER}/${repo}/${sha}/${p}`
+// mimeOf : SOURCE UNIQUE partagée avec le viewer (src/lib/fileKinds.js). Garantit que tout futur upload stocke
+// le MÊME mime que celui attendu par l'aperçu -> aucune divergence possible. Défaut application/octet-stream.
+const mimeOf = (f) => mimeForName(path.basename(f))
+
+// ── CHIFFREMENT DES PARTS (2026-07-05) ────────────────────────────────────────────────────────────────
+// AES-256-GCM, IV 12o PAR part, MÊME clé maître que le reste de l'app (chunked-media audio/PDF,
+// images privées — server/media-key.js, src/media/crypto.js) : un seul modèle de sécurité, une seule clé.
+// Le repo reste PUBLIC (raw.github), mais son contenu est illisible sans la clé -> "public + chiffré".
+// Pour une source dont le SHA-256 est connu, l'IV est dérivé par HMAC de la source, de l'index et du contenu :
+// une reprise fabrique donc le même ciphertext et retrouve le même chemin sans réenvoyer la part. Hors de ce
+// chemin prouvé, l'IV reste aléatoire. Le nom sur disque demeure le hash du CIPHERTEXT, jamais celui du clair.
+// Coût : perte du dédup inter-vidéos par contenu identique (négligeable, deux vidéos distinctes ne
+// partagent jamais de chunk 95 Mo aligné identique en pratique). Le POSTER reste EN CLAIR (affiché en
+// <img src> direct dans le Finder, un décodage async pour une simple miniature serait disproportionné).
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+let _mediaKey = null
+function mediaKey() { if (!_mediaKey) _mediaKey = loadMasterKey(REPO_ROOT, { readFileSync }); return _mediaKey }
+function encryptPart(buf, sourceSha256 = null, index = 0) {
+  // Une reprise doit produire le MÊME ciphertext et donc le MÊME chemin. L'IV reste imprévisible sans la clé,
+  // mais devient déterministe pour une part précise d'une source précise. Réutiliser cet IV ne chiffre ainsi
+  // que le même message ; deux fichiers distincts, deux positions ou deux contenus donnent un IV différent.
+  const iv = /^[0-9a-f]{64}$/i.test(sourceSha256 || '')
+    ? createHmac('sha256', mediaKey()).update('zenray-video-raw-v2\0').update(sourceSha256.toLowerCase())
+      .update(`\0${index}\0${sha256(buf)}`).digest().subarray(0, 12)
+    : randomBytes(12)
+  const c = createCipheriv('aes-256-gcm', mediaKey(), iv)
+  const cipher = Buffer.concat([c.update(buf), c.final(), c.getAuthTag()])
+  return { cipher, iv: iv.toString('base64') }
+}
+
+async function probe(file) {
+  try {
+    const { stdout } = await execFileP('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,codec_name', '-show_entries', 'format=duration', '-of', 'json', file], { timeout: 30000 })
+    const j = JSON.parse(stdout); const s = (j.streams && j.streams[0]) || {}
+    return { width: +s.width || 0, height: +s.height || 0, codec: s.codec_name || '', duration: +((j.format && j.format.duration) || 0) || 0 }
+  } catch { return { width: 0, height: 0, codec: '', duration: 0 } }
+}
+// poster : 1 frame (au milieu si durée connue), JPEG (ce ffmpeg n'a pas d'encodeur webp). Best-effort.
+async function makePoster(file, outDir, atSec) {
+  const p = path.join(outDir, 'poster.jpg')
+  try { await execFileP('ffmpeg', ['-y', '-ss', String(Math.max(0, atSec || 1)), '-i', file, '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '3', p], { timeout: 60000 }); return existsSync(p) ? p : null } catch { return null }
+}
+
+// ── CONTEXTE SHARD VIDÉO BRUTE (arbre Git léger, push incrémental, reprise par empreinte) ─────────────────
+// Patron jumeau de makeImgShardCtx, mais privé et chiffré pour la famille vidéo. Le bulk crée UN ctx, le
+// réutilise pour chaque vidéo et le vide à la fin de chacune.
+// startShard (1-based) : index du PREMIER shard à ouvrir. >1 -> on saute les shards pleins existants et on
+// démarre sur un shard NEUF VIDE (création instantanée, ZÉRO clone de 4 Go). base : famille de repos (vidéo
+// brute par défaut ; réutilisable pour des blobs génériques 'zenray-blob-public').
+// ── MODÈLE REPRENABLE : UN FICHIER, DES DÉPÔTS DÉTERMINISTES, AUCUN BINAIRE RETÉLÉCHARGÉ ────────────────
+// Un nom aléatoire par passage rendait chaque push intermédiaire inutilisable après un crash : la vidéo
+// repartait de zéro et les gigaoctets déjà distants devenaient orphelins. Le contrat est désormais :
+//   1. Une vidéo dont l'empreinte est connue reçoit des dépôts stables `vid-file-<sha>-NN`. Une reprise retrouve
+//      donc exactement les mêmes dépôts et les mêmes parts chiffrées.
+//   2. Seuls le commit et l'arbre Git sont clonés avec `--filter=blob:none --no-checkout` ; aucune ancienne part
+//      de 95 Mo ne revient sur le Mac. Les chemins déjà présents sont sautés avant toute écriture.
+//   3. La tranche `NN` vient de l'index de la part et du plafond central SHARD_CAP : aucun calcul de taille
+//      distante ni téléchargement du dépôt n'est nécessaire.
+//   4. Les blobs sans empreinte source gardent le modèle aléatoire historique et son roulement local.
+//   5. Visibilité ENCODÉE DANS LE NOM (convention dure, utilisée par le lecteur/le SW/le téléchargement) :
+//      zenrayshards-img-* = PUBLIC (jsDelivr exige public) ; tout autre type (vid/blob/pdf/doc/...) = PRIVÉ,
+//      lu via api.github.com (Accept: raw, token) — CORS vérifié OK le 2026-07-05 (authorization autorisé).
+//   6. Ne JAMAIS recréer un repo avec un ANCIEN nom : les vieux manifestes reposent sur la redirection
+//      GitHub ancien-nom -> nouveau-nom (vérifiée OK raw.github ET jsDelivr le 2026-07-05) ; recréer l'ancien
+//      nom tuerait cette redirection.
+const SHARD_PREFIX = 'zenrayshards'
+const newShardName = (type) => `${SHARD_PREFIX}-${type}-${randomBytes(6).toString('hex')}`
+export const resumableVideoShardName = (sourceSha256, index) => {
+  if (!/^[0-9a-f]{64}$/i.test(sourceSha256 || '')) throw new Error('empreinte vidéo invalide')
+  if (!Number.isInteger(index) || index < 0) throw new Error('index de dépôt vidéo invalide')
+  return `${SHARD_PREFIX}-vid-file-${sourceSha256.slice(0, 16).toLowerCase()}-${String(index + 1).padStart(2, '0')}`
+}
+export const videoPartsPerShard = () => PARTS_PAR_DEPOT
+export const isPrivateShardName = (repo) => repo.startsWith(SHARD_PREFIX + '-') && !repo.startsWith(SHARD_PREFIX + '-img-')
+
+export function commitForRepo(commitOf, repo) {
+  const sha = commitOf && commitOf[repo]
+  if (!/^[0-9a-f]{40}$/i.test(sha || '')) throw new Error('commit vidéo manquant pour ' + repo)
+  return sha
+}
+
+export async function releaseUploadedShardScratch({ work, dir, pendingBytes, pendingPaths, commit }) {
+  // 10 October 2026, 13:43 CEST: Release only a completed transport clone, never a media source.
+  const relative = path.relative(path.resolve(work), path.resolve(dir))
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || relative.includes(path.sep)
+    || !/^zenrayshards-vid-[a-z0-9-]+$/.test(relative)) throw new Error('unsafe shard scratch path')
+  if (pendingBytes || pendingPaths.length || !/^[0-9a-f]{40}$/i.test(commit || '')) {
+    throw new Error('shard scratch upload not confirmed')
+  }
+  await rm(dir, { recursive: true, force: true })
+}
+
+export function makeVidRawShardCtx({ token, owner = OWNER, work, log = console.log, type = 'vid', vis = 'private', onPushed = noop,
+  cleanupClosedShards = false, pushController = null, hooks = {} }) {
+  // 12 October 2026: `pushController` is the push batch policy (lib/push-batch-policy.mjs), shared by the whole process unless a
+  // test supplies its own. `hooks` replaces the four GitHub touching calls (remote url, existence probe, creation, pause) so the
+  // whole send path can be proven against a local bare repository without any network write.
+  // FR : `pushController` = la politique de lots ; `hooks` remplace les quatre appels qui touchent GitHub (tests locaux).
+  const policy = pushController || sharedPushController({ log })
+  const overlapPrepare = policy.config.overlapPrepare
+  const pause = hooks.sleep || sleep
+  const GENV = videoGitAuthEnvironment(process.env, token)
+  const cloneUrl = hooks.remoteUrl || ((repo) => `https://github.com/${owner}/${repo}.git`)
+  // 14 October 2026: repository reuse (one open repository per lane) and a shared creation gate; see lib/repo-create-policy.mjs.
+  // Tests that replace the GitHub calls (hooks) stay off unless they opt in with hooks.repoPool = { policy }.
+  // FR : reutilisation d'un depot par voie et porte de creation partagee ; hors tests, active par defaut (ZR_REPO_POOL=0 la coupe).
+  const poolConfig = hooks.repoPool || (!hooks.createRepo && !hooks.repoExists && process.env.ZR_REPO_POOL !== '0' ? { policy: loadRepoCreatePolicy() } : null)
+  const creationGate = poolConfig ? createRepoGate({ policy: poolConfig.policy, sleep: hooks.sleep, log }) : null
+  let poolLane
+  let poolForceNew = false
+  let poolReusing = false
+  const lane = () => { if (poolLane === undefined) poolLane = poolConfig ? claimRepoPoolSlot({ type, vis, policy: poolConfig.policy }) : null; return poolLane }
+  const gitRun = (a, timeout = 600000) => spawnSync('git', a, { encoding: 'utf8', env: GENV, timeout, killSignal: 'SIGKILL' })
+  const git = (dir, a, timeout = 600000) => gitRun(['-C', dir, ...a], timeout)
+  const head = (dir, label) => requireCommitSha(git(dir, ['rev-parse', 'HEAD']), label)
+  const githubApi = (args, timeout = REPO_CREATE_TIMEOUT_MS) => spawnSync('curl', ['--config', '-', ...args], {
+    encoding: 'utf8', env: process.env, timeout, killSignal: 'SIGKILL',
+    input: `header = "Authorization: Bearer ${token}"\n`,
+  })
+  const lireArbre = (dir, arbre) => {
+    if (!arbre) return []
+    const r = git(dir, ['ls-tree', arbre])
+    if (r.status !== 0) throw new Error(`lecture arbre Git: ${(r.stderr || '').slice(-200)}`)
+    return (r.stdout || '').split('\n').filter(Boolean).map((ligne) => {
+      const m = /^(\d+)\s+(blob|tree)\s+([0-9a-f]{40})\t(.+)$/.exec(ligne)
+      if (!m) throw new Error(`entrée d'arbre Git illisible: ${ligne.slice(0, 120)}`)
+      return { mode: m[1], type: m[2], sha: m[3], name: m[4] }
+    })
+  }
+  const ecrireArbre = (dir, entrees) => {
+    const input = entrees.sort((a, b) => Buffer.from(a.name).compare(Buffer.from(b.name)))
+      .map((e) => `${e.mode} ${e.type} ${e.sha}\t${e.name}\n`).join('')
+    const r = spawnSync('git', ['-C', dir, 'mktree', '--missing'], {
+      encoding: 'utf8', env: GENV, timeout: 600000, killSignal: 'SIGKILL', input,
+    })
+    const sha = (r.stdout || '').trim()
+    if (r.status !== 0 || !/^[0-9a-f]{40}$/i.test(sha)) throw new Error(`écriture arbre Git: ${(r.stderr || '').slice(-200)}`)
+    return sha
+  }
+  const poserBlob = (dir, arbre, segments, blobSha) => {
+    const [nom, ...suite] = segments
+    const originales = lireArbre(dir, arbre)
+    const entrees = originales.filter((e) => e.name !== nom)
+    if (!suite.length) entrees.push({ mode: '100644', type: 'blob', sha: blobSha, name: nom })
+    else {
+      const ancien = originales.find((e) => e.name === nom && e.type === 'tree')
+      const enfant = poserBlob(dir, ancien?.sha || null, suite, blobSha)
+      entrees.push({ mode: '040000', type: 'tree', sha: enfant, name: nom })
+    }
+    return ecrireArbre(dir, entrees)
+  }
+  // 12 October 2026: the blob of a part is written to the object database as soon as the part is on disk (hashObject), while the
+  // previous batch still transfers; the commit of a batch then only rebuilds a few small tree objects (knownBlobs).
+  // FR : le blob d'une part est ecrit des que la part est sur disque, pendant le transfert du lot precedent.
+  const hashObject = (dir, chemin, label) => {
+    const blob = git(dir, ['hash-object', '-w', '--', chemin])
+    const sha = (blob.stdout || '').trim()
+    if (blob.status !== 0 || !/^[0-9a-f]{40}$/i.test(sha)) throw new Error(`git hash ${label}: ` + (blob.stderr || '').slice(-200))
+    return sha
+  }
+  const commitStaged = (dir, chemins, message, label, knownBlobs = null) => {
+    if (!chemins.length) return 'unchanged'
+    const ancien = git(dir, ['rev-parse', '--verify', 'HEAD'])
+    const ancienSha = ancien.status === 0 ? (ancien.stdout || '').trim() : null
+    const ancienArbre = ancienSha ? git(dir, ['rev-parse', 'HEAD^{tree}']) : null
+    let treeSha = ancienArbre ? (ancienArbre.stdout || '').trim() : null
+    // `git add` et `write-tree` peuvent réclamer les blobs promis d'un clone partiel. `mktree --missing`
+    // reconstruit seulement les petits objets ARBRE au-dessus du précédent et accepte que les anciens blobs
+    // restent exclusivement distants ; seul le nouveau fichier local devient un objet Git.
+    for (const chemin of chemins) {
+      const sha = knownBlobs?.get(chemin) || hashObject(dir, chemin, label)
+      treeSha = poserBlob(dir, treeSha, chemin.split('/'), sha)
+    }
+    if (!treeSha || !/^[0-9a-f]{40}$/i.test(treeSha)) throw new Error(`git arbre ${label} absent`)
+    if (ancienArbre && (ancienArbre.stdout || '').trim() === treeSha) return 'unchanged'
+    const args = ['commit-tree', treeSha, ...(ancienSha ? ['-p', ancienSha] : []), '-m', message]
+    const commit = git(dir, args)
+    const commitSha = (commit.stdout || '').trim()
+    if (commit.status !== 0 || !/^[0-9a-f]{40}$/i.test(commitSha)) {
+      throw new Error(`git commit ${label}: ` + (commit.stderr || commit.stdout || 'sans message').slice(-200))
+    }
+    const maj = git(dir, ['update-ref', 'HEAD', commitSha, ...(ancienSha ? [ancienSha] : [])])
+    if (maj.status !== 0) throw new Error(`git ref ${label}: ` + (maj.stderr || '').slice(-200))
+    return 'committed'
+  }
+  const ctx = { type, vis, repo: null, dir: null, bytes: 0, pendingBytes: 0, pendingPaths: [],
+    remotePaths: new Set(), commitOf: {}, sourceSha256: null, pushPolicy: policy }
+  // pendingBytes / pendingPaths = every part not yet CONFIRMED online (queued and in flight). sizeOf and blobOf are the side tables.
+  const sizeOf = new Map()
+  const blobOf = new Map()
+  let prepared = { key: '', commit: null }   // the commit built for the batch last attempted (an unchanged retry reuses it)
+  let sender = null                          // promise of the send loop; at most ONE push is in flight per context
+  let senderActive = false                   // true from startSender until the loop ends (cleared synchronously, never stale)
+  let senderError = null
+  let draining = false
+  let sendingBytes = 0                       // bytes of the batch in flight
+  let batchSignal = null
+  const newSignal = () => { let resolve; const promise = new Promise((r) => { resolve = r }); return { promise, resolve } }
+  batchSignal = newSignal()
+  const notifyBatch = () => { const signal = batchSignal; batchSignal = newSignal(); signal.resolve() }
+  const takeSenderError = () => { if (!senderError) return; const error = senderError; senderError = null; throw error }
+
+  const configurerDepot = () => {
+    git(ctx.dir, ['config', 'user.email', 'bot@zenray']); git(ctx.dir, ['config', 'user.name', 'zenray-bot'])
+    git(ctx.dir, ['config', 'http.version', 'HTTP/1.1']); git(ctx.dir, ['config', 'http.postBuffer', '524288000'])
+    // 12 October 2026 (profiling): AES-GCM output is incompressible and two random blobs share nothing, so zlib and the delta
+    // search only keep the uplink idle (7.6 s per 190 MiB batch, 1.4 s with these four lines, about 49 s per film). The
+    // objects are byte-identical in content; only the pack encoding changes.
+    // FR : le chiffre est incompressible ; zlib et la recherche de deltas ne font que laisser la montee vide entre deux lots.
+    git(ctx.dir, ['config', 'core.compression', '0']); git(ctx.dir, ['config', 'core.looseCompression', '0'])
+    git(ctx.dir, ['config', 'pack.window', '0']); git(ctx.dir, ['config', 'pack.depth', '0'])
+  }
+
+  async function depotExiste(repo) {
+    if (hooks.repoExists) return hooks.repoExists(repo)
+    const r = githubApi(['-sS', '--max-time', String(Math.ceil(REPO_CREATE_TIMEOUT_MS / 1000)),
+      '-o', '/dev/null', '-w', '%{http_code}', `https://api.github.com/repos/${owner}/${repo}`])
+    if (r.status !== 0) throw new Error(`sonde repo ${repo}: ${(r.stderr || 'échec réseau').slice(-160)}`)
+    const code = (r.stdout || '').trim()
+    if (code === '200') return true
+    if (code === '404') return false
+    throw new Error(`sonde repo ${repo}: HTTP ${code || '?'}`)
+  }
+
+  async function creerDepot(repo) {
+    if (hooks.createRepo) { await hooks.createRepo(repo); return }
+    // 12 October 2026: a secondary rate limit on repository creation lasts 15 to 30 minutes and the archive is not resumable:
+    // failing here threw away an upload of 1 h 40 (The Revenant, 11:31). The creation now WAITS for the block to lift, up to
+    // ZR_REPO_CREATE_WAIT_MIN minutes, with the process and its local state intact. FR : on attend la fin du blocage au lieu d'echouer.
+    const waitBudgetMs = (Number(process.env.ZR_REPO_CREATE_WAIT_MIN) || 120) * 60000
+    const waitStarted = Date.now()
+    for (let attempt = 0; ; attempt += 1) {
+      if (creationGate) await creationGate.wait({ throughputBps: policy.state?.().throughputBps || 0, capBytes: SHARD_CAP })
+      const cr = githubApi(['-sS', '-i', '--max-time', String(Math.ceil(REPO_CREATE_TIMEOUT_MS / 1000)),
+        '-w', '\n%{http_code}', '-X', 'POST', 'https://api.github.com/user/repos',
+        '-d', JSON.stringify({ name: repo, private: ctx.vis === 'private' })])
+      const failure = repoCreateFailure(cr.stdout)
+      if (failure.code === '201') { if (creationGate) await creationGate.created(); return }
+      const blocked = failure.code === '403' && /secondary rate limit|temporarily blocked/i.test(cr.stdout || '')
+      if (!blocked || Date.now() - waitStarted > waitBudgetMs) {
+        throw new Error(`création repo ${repo}: HTTP ${failure.code || '?'}${failure.detail ? ` (${failure.detail})` : ''}`)
+      }
+      if (creationGate) {
+        // the block is shared: every process waits on blockedUntil (5, 10, 20, 30 minutes) instead of probing GitHub again
+        await creationGate.blocked()
+        log(`  creation blocked by GitHub (secondary rate limit), the gate holds every creation of this machine before retrying ${repo}`)
+        continue
+      }
+      const pauseMs = Math.min(300, 60 * 2 ** Math.min(attempt, 3)) * 1000
+      log(`  creation blocked by GitHub (secondary rate limit), waiting ${pauseMs / 1000} s before retrying ${repo}`)
+      await pause(pauseMs)
+    }
+  }
+
+  async function openShard(nomImpose = null) {
+    if (cleanupClosedShards && ctx.dir) {
+      await releaseUploadedShardScratch({ work, dir: ctx.dir, pendingBytes: ctx.pendingBytes,
+        pendingPaths: ctx.pendingPaths, commit: commitForRepo(ctx.commitOf, ctx.repo) })
+    }
+    sizeOf.clear(); blobOf.clear(); prepared = { key: '', commit: null }
+    // 14 October 2026: reuse the lane's open repository while it has room (15 small episodes = 1 repository, not 15 creations).
+    // FR : on reprend le depot ouvert de la voie tant qu'il a de la place.
+    if (!nomImpose && !poolForceNew && lane()) {
+      const remembered = lane().read()
+      if (canReuse(remembered, ctx.incomingBytes || 0, SHARD_CAP) && await depotExiste(remembered.repo)) {
+        log(`  >>> reusing repository ${remembered.repo} (${Math.round(remembered.bytes / 1048576)} MiB used of ${Math.round(SHARD_CAP / 1048576)})`)
+        poolReusing = true
+        return openShard(remembered.repo)
+      }
+    }
+    poolForceNew = false
+    ctx.repo = nomImpose || newShardName(ctx.type)
+    ctx.dir = path.join(work, ctx.repo)
+    await rm(ctx.dir, { recursive: true, force: true })
+    await mkdir(work, { recursive: true })
+    const existe = nomImpose ? await depotExiste(ctx.repo) : false
+    if (existe) {
+      const refs = gitRun(['ls-remote', '-q', cloneUrl(ctx.repo), 'refs/heads/main'], REPO_CREATE_TIMEOUT_MS)
+      if (refs.status !== 0) throw new Error(`lecture repo ${ctx.repo}: ${(refs.stderr || '').slice(-200)}`)
+      if (/^[0-9a-f]{40}\s/m.test(refs.stdout || '')) {
+        const cl = gitRun(['clone', '-q', '--filter=blob:none', '--no-checkout', '--depth', '1',
+          '--single-branch', '--branch', 'main', cloneUrl(ctx.repo), ctx.dir], 120000)
+        if (cl.status !== 0) throw new Error(`reprise repo ${ctx.repo}: ${(cl.stderr || '').slice(-200)}`)
+        configurerDepot()
+        const arbre = git(ctx.dir, ['ls-tree', '-r', '--name-only', 'HEAD'])
+        if (arbre.status !== 0) throw new Error(`inventaire repo ${ctx.repo}: ${(arbre.stderr || '').slice(-200)}`)
+        ctx.remotePaths = new Set((arbre.stdout || '').split('\n').filter(Boolean))
+        ctx.commitOf[ctx.repo] = head(ctx.dir, ctx.repo)
+        ctx.bytes = [...ctx.remotePaths].filter((p) => p.endsWith('.bin')).length * (PART + 16)
+        ctx.pendingBytes = 0; ctx.pendingPaths = []
+        log(`  >>> repo ${ctx.repo} repris sans ses binaires (${ctx.remotePaths.size} chemin(s) distant(s))`)
+        if (poolReusing && lane()) lane().write({ repo: ctx.repo, bytes: ctx.bytes, full: false })
+        poolReusing = false
+        return
+      }
+    }
+    await mkdir(ctx.dir, { recursive: true })
+    git(ctx.dir, ['init', '-q']); git(ctx.dir, ['branch', '-M', 'main'])
+    await writeFile(path.join(ctx.dir, 'README.md'), `# zenrayshards (${ctx.type}, ${ctx.vis})\n\nParts de 95 Mo, chiffrees AES-256-GCM, nommees par empreinte. Manifeste sur zenray-data.\n`)
+    if (!existe) await creerDepot(ctx.repo)
+    configurerDepot()
+    commitStaged(ctx.dir, ['README.md'], 'init', 'initial vidéo')
+    git(ctx.dir, ['remote', 'add', 'origin', cloneUrl(ctx.repo)])
+    const ps = git(ctx.dir, ['push', '-q', 'origin', 'HEAD:main'], 120000)
+    if (ps.status !== 0) throw new Error('push-init shard: ' + (ps.stderr || '').slice(-200))
+    ctx.commitOf[ctx.repo] = head(ctx.dir, ctx.repo)
+    ctx.remotePaths = new Set(['README.md'])
+    log(`  >>> repo neuf ${ctx.repo} (${ctx.vis}) créé`)
+    ctx.bytes = 0; ctx.pendingBytes = 0; ctx.pendingPaths = []
+    if (lane()) lane().write({ repo: ctx.repo, bytes: 0, full: false })
+  }
+
+  // 12 October 2026: one push sends its data at a time on the machine (see lib/push-token.mjs); the token goes back as soon
+  // as "Writing objects: 100%" is printed, so the next upload sends while this one waits for the server.
+  // The commit is pushed by its id (<sha>:refs/heads/main), never HEAD, so preparing the next batch cannot change what is sent.
+  // FR : une poussee a la fois pour les donnees ; le jeton est rendu des que les donnees sont parties ; on pousse le commit par
+  // son identifiant, jamais HEAD, donc preparer le lot suivant ne change rien a ce qui part.
+  async function pushWithToken(dir, commit, repo, timeout) {
+    const token = await acquirePushToken(`archive push ${repo}`)
+    const startedAt = Date.now()
+    try {
+      const outcome = await new Promise((resolve) => {
+        const child = spawn('git', ['-C', dir, 'push', '--progress', 'origin', `${commit}:refs/heads/main`], { env: GENV, stdio: ['ignore', 'pipe', 'pipe'] })
+        let stdout = ''
+        let stderr = ''
+        let packBytes = null
+        let timedOut = false
+        const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, timeout)
+        child.stdout.on('data', (c) => { stdout = (stdout + c).slice(-4000) })
+        child.stderr.on('data', (c) => {
+          const text = c.toString()
+          stderr = (stderr + text).slice(-8000)
+          const pack = parsePushPackBytes(text)
+          if (pack) packBytes = pack.bytes
+          if (/Writing objects:\s*100%/.test(text)) token.release().catch(() => {})
+        })
+        child.on('close', (code) => {
+          clearTimeout(timer)
+          // a push killed by our own timeout is named, so the policy reduces the batch instead of repeating the same wait
+          // FR : un push tue par notre delai est nomme pour que la politique reduise le lot
+          resolve({ status: timedOut ? 1 : code, stdout, stderr: timedOut ? `${stderr}\nVideo push timed out` : stderr, packBytes })
+        })
+        child.on('error', (error) => { clearTimeout(timer); resolve({ status: 1, stdout, stderr: String(error), packBytes }) })
+      })
+      return { ...outcome, packBytes: outcome.packBytes ?? parsePushPackBytes(outcome.stderr)?.bytes ?? null,
+        durationMs: Date.now() - startedAt, waitMs: token.waitedMs || 0 }
+    } finally {
+      await token.release()
+    }
+  }
+
+  // Sends ONE batch of the queue head through the push policy: plan by bytes, stage the commit, push it; a failure is counted for
+  // this batch, retried unchanged twice, then falls back to 2 parts; a size refusal shrinks the batch. Nothing is dropped: the part
+  // files stay in the clone until a push is confirmed.
+  // FR : envoie UN lot de la tete de file selon la politique ; rien n'est jete tant qu'une poussee n'est pas confirmee.
+  async function sendOneBatch() {
+    const repo = ctx.repo
+    const dir = ctx.dir
+    const paths = ctx.pendingPaths.slice()
+    const sizes = paths.map((p) => sizeOf.get(p))
+    try {
+      const outcome = await runPushBatch({
+        controller: policy, sizes, headId: `${repo}:${paths[0]}`, label: repo, log, sleep: pause,
+        attempt: async (plan) => {
+          const batch = paths.slice(0, plan.count)
+          sendingBytes = plan.bytes
+          const key = batch.join('\0')
+          if (prepared.key !== key || !prepared.commit) {
+            // A different batch (smaller after a fallback, or after a size refusal): start again from the last CONFIRMED commit so
+            // the push carries nothing of the batch that failed. EXCEPTION (F2): when the remote branch already holds the previous
+            // attempt (it landed late after a kill or a cut connection), build on top of THAT commit: a sibling of it would be
+            // rejected "fetch first" on every retry while the data is already online. Its blobs are identical, so nothing is resent.
+            // FR : si le sommet distant est deja la tentative precedente, on construit dessus ; un commit frere serait rejete.
+            const landed = await remoteTipIs(async () => {
+              const tip = gitRun(['ls-remote', '-q', cloneUrl(repo), 'refs/heads/main'], REPO_CREATE_TIMEOUT_MS)
+              if (tip.status !== 0) return null
+              return /^([0-9a-f]{40})\s/m.exec(tip.stdout || '')?.[1] || null
+            }, prepared.commit)
+            const confirmed = landed ? prepared.commit : ctx.commitOf[repo]
+            if (confirmed) {
+              const back = git(dir, ['update-ref', 'HEAD', confirmed])
+              if (back.status !== 0) throw new Error('git ref retour vidéo: ' + (back.stderr || '').slice(-200))
+            }
+            commitStaged(dir, batch, '+vidraw', 'vidéo', blobOf)
+            prepared = { key, commit: head(dir, repo) }
+          }
+          return pushWithToken(dir, prepared.commit, repo, plan.timeoutMs)
+        },
+      })
+      const confirmedPaths = paths.slice(0, outcome.count)
+      ctx.commitOf[repo] = prepared.commit
+      for (const p of confirmedPaths) { ctx.remotePaths.add(p); sizeOf.delete(p); blobOf.delete(p) }
+      ctx.pendingPaths.splice(0, outcome.count)
+      ctx.pendingBytes -= outcome.bytes
+      prepared = { key: '', commit: null }
+      if (lane() && lane().read()?.repo === repo) lane().write({ repo, bytes: ctx.bytes - ctx.pendingBytes, full: false })
+      onPushed(outcome.bytes)
+    } catch (error) {
+      if (error instanceof PushPermanentRejection) {
+        // 12 October 2026: the whole refusal is printed (120 characters hid the cause of a "(failure)" rejection).
+        console.error(`  push refused by GitHub for ${repo}:\n${error.detail.slice(-1500)}`)
+        throw new Error(`push-refus-definitif ${repo}: ${error.detail.slice(-400)}`)
+      }
+      if (error instanceof PushExhausted) throw new Error(draining ? `push-final vidraw ${repo}` : 'push-incr vidraw')
+      throw error
+    } finally {
+      sendingBytes = 0
+    }
+  }
+
+  const shouldSend = () => ctx.pendingPaths.length > 0 && (draining || ctx.pendingBytes >= policy.budgetBytes())
+
+  async function sendLoop() {
+    try {
+      while (!senderError && shouldSend()) {
+        await sendOneBatch()
+        notifyBatch()
+      }
+    } catch (error) {
+      senderError = error
+    } finally {
+      senderActive = false
+      notifyBatch()
+    }
+  }
+
+  function startSender() {
+    if (senderActive) return
+    senderActive = true
+    sender = sendLoop()
+  }
+
+  // Waits until every queued part is confirmed online (or throws the error of the send loop).
+  async function drain() {
+    draining = true
+    try {
+      for (;;) {
+        takeSenderError()
+        if (!senderActive) {
+          if (!ctx.pendingPaths.length) return
+          startSender()
+        }
+        await sender
+      }
+    } finally { draining = false }
+  }
+
+  // Écrit une part (déjà hachée) dans le clone. Rollover AVANT écriture si le shard atteint le cap. Push
+  // incrémental dès que la file atteint le budget de la politique (anti-RAM, anti-packfile géant). Renvoie le repo où elle a atterri.
+  //
+  // 12 October 2026: the budget is no longer a constant. It comes from the push policy (20 parts, 1 900 MiB at the top of the
+  // ladder, 8 parts at the start) and the push runs in the background: while a batch transfers the next parts are read, encrypted
+  // and hashed, and the queue is bounded to ONE batch behind the one in flight (disk and memory stay bounded).
+  // Historic note (11 July 2026): a single push of several GB used to hang, which is why batches stay below 2 GiB (GitHub enforces
+  // 2 GiB per push; the policy keeps 7.2 % below it).
+  // FR : le budget vient de la politique ; la poussee tourne en arriere-plan, la file est bornee a UN lot derriere celui en vol.
+  async function writePart(hashedPath, buf, partIndex = null) {
+    takeSenderError()
+    if (ctx.sourceSha256 && Number.isInteger(partIndex) && partIndex >= 0) {
+      const voulu = resumableVideoShardName(ctx.sourceSha256, Math.floor(partIndex / (ctx.partsPerRepo || PARTS_PAR_DEPOT)))
+      if (ctx.repo !== voulu) {
+        if (ctx.repo) await flush()
+        await openShard(voulu)
+      }
+    } else if (!ctx.repo) await openShard()
+    // Découpage ANTICIPÉ (avant le push de la part, jamais de question à GitHub) : si cette part ferait
+    // dépasser le plafond au repo courant, on pousse ce qui est en attente et on ouvre un AUTRE repo neuf.
+    if (!ctx.sourceSha256 && ctx.bytes > 0 && ctx.bytes + buf.length > SHARD_CAP) {
+      await drain()
+      ctx.commitOf[ctx.repo] = ctx.commitOf[ctx.repo] || head(ctx.dir, ctx.repo)
+      if (lane()) lane().write({ repo: ctx.repo, bytes: ctx.bytes, full: true })
+      poolForceNew = true
+      await openShard()
+    }
+    if (ctx.remotePaths.has(hashedPath)) return ctx.repo
+    const dst = path.join(ctx.dir, hashedPath)
+    await mkdir(path.dirname(dst), { recursive: true })
+    await writeFile(dst, buf)
+    ctx.bytes += buf.length; ctx.pendingBytes += buf.length; ctx.pendingPaths.push(hashedPath)
+    sizeOf.set(hashedPath, buf.length)
+    if (overlapPrepare) {
+      // The blob is in the object database now; a commit is built from blob ids, so the working tree copy is not needed any more.
+      // Deleting it keeps the disk footprint of a film at the blobs of ONE batch in flight plus ONE batch queued (about 3.8 GiB at
+      // the top of the ladder) instead of twice that.
+      // FR : le blob est dans la base d'objets ; la copie de l'arbre de travail ne sert plus, la supprimer divise l'empreinte disque par deux.
+      blobOf.set(hashedPath, hashObject(ctx.dir, hashedPath, 'vidéo'))
+      await rm(dst, { force: true })
+    }
+    takeSenderError()
+    const budget = policy.budgetBytes()
+    if (ctx.pendingBytes >= budget) {
+      startSender()
+      if (!overlapPrepare) {
+        // no overlap: the producer waits for the queue to be sent, like the code before the policy
+        while (senderActive && ctx.pendingBytes >= budget) { await sender; takeSenderError() }
+      } else {
+        // overlap: keep preparing, but never more than ONE batch queued behind the one in flight
+        while (senderActive && ctx.pendingBytes - sendingBytes >= budget) { await batchSignal.promise; takeSenderError() }
+      }
+    }
+    return ctx.repo
+  }
+
+  async function beginFile(sourceSha256 = null) {
+    if (ctx.repo) await flush()
+    ctx.repo = null; ctx.dir = null; ctx.bytes = 0; ctx.pendingBytes = 0; ctx.pendingPaths = []
+    ctx.remotePaths = new Set()
+    sizeOf.clear(); blobOf.clear(); prepared = { key: '', commit: null }
+    ctx.sourceSha256 = /^[0-9a-f]{64}$/i.test(sourceSha256 || '') ? sourceSha256.toLowerCase() : null
+    ctx.partsPerRepo = ctx.sourceSha256 ? await layoutPartsPerRepo(ctx.sourceSha256) : PARTS_PAR_DEPOT
+  }
+
+  // F1 (12 October 2026): the part to repository layout of a film must not change between two runs. A film laid out before D2 has
+  // 21 parts in repository 01 and the next ones in 02; under 43 per repository a resume would rewrite parts 21..42 into 01 and send
+  // parts 43.. to a 02 that already holds old parts (past 4 GiB). So a film whose repository 02 exists and whose repository 01 holds
+  // no more than the legacy count keeps the legacy layout. A film with no repository 02 yet, or with a fuller 01, uses the new one.
+  // FR : la repartition parts -> depots d'un film ne change pas entre deux passages ; un film deja pose en 21 parts/depot reste en 21.
+  async function layoutPartsPerRepo(sourceSha256) {
+    if (LEGACY_PARTS_PAR_DEPOT === PARTS_PAR_DEPOT) return PARTS_PAR_DEPOT
+    const second = resumableVideoShardName(sourceSha256, 1)
+    if (!(await depotExiste(second))) return PARTS_PAR_DEPOT
+    const first = resumableVideoShardName(sourceSha256, 0)
+    const count = hooks.countRemoteParts
+      ? await hooks.countRemoteParts(first)
+      : (() => {
+        const scratch = path.join(work, `layout-${first}`)
+        try {
+          const clone = gitRun(['clone', '-q', '--filter=blob:none', '--no-checkout', '--depth', '1', '--single-branch', '--branch', 'main', cloneUrl(first), scratch], 120000)
+          if (clone.status !== 0) throw new Error(`layout probe ${first}: ${(clone.stderr || '').slice(-160)}`)
+          const tree = git(scratch, ['ls-tree', '-r', '--name-only', 'HEAD'])
+          if (tree.status !== 0) throw new Error(`layout probe ${first}: ${(tree.stderr || '').slice(-160)}`)
+          return (tree.stdout || '').split('\n').filter((name) => name.endsWith('.bin')).length
+        } finally { rmSync(scratch, { recursive: true, force: true }) }
+      })()
+    return count <= LEGACY_PARTS_PAR_DEPOT ? LEGACY_PARTS_PAR_DEPOT : PARTS_PAR_DEPOT
+  }
+
+  async function flush() {
+    if (ctx.dir && existsSync(ctx.dir)) {
+      const avaitAttente = ctx.pendingPaths.length > 0
+      await drain()
+      ctx.commitOf[ctx.repo] = ctx.commitOf[ctx.repo] || head(ctx.dir, ctx.repo)
+      if (avaitAttente) log(`  ✓ ${ctx.repo} poussé (commit ${(ctx.commitOf[ctx.repo] || '').slice(0, 7)})`)
+    }
+  }
+  ctx.openShard = openShard; ctx.beginFile = beginFile; ctx.writePart = writePart
+  // 14 October 2026: gives the lane back (a process also gives it back when it exits). FR : rend la voie.
+  ctx.releasePool = () => { if (poolLane) poolLane.release(); poolLane = undefined }
+  ctx.flush = flush
+  ctx.pushSummary = () => policy.metrics.summary()
+  return ctx
+}
+
+// ── INGESTION D'UNE VIDÉO BRUTE ───────────────────────────────────────────────────────────────────────
+// Découpe le fichier ORIGINAL en parts de 95 Mo (lecture streamée, anti-OOM), les pousse via le ctx shard,
+// pousse le poster, et renvoie le manifeste .media.json (type 'video-raw') prêt à committer sur zenray-data.
+// CONFIRMÉ EN LIGNE = ce manifeste committé (le bulk le fait), pas avant. URLs raw.github pinnées sur le commit.
+export async function ingestVideoRaw(file, { dest, base, vctx, posterCtx = null, workDir = '/tmp/zr_vidraw',
+  sourceSha256 = null, log = noop }) {
+  await vctx.beginFile?.(sourceSha256)
+  const p = await probe(file)
+  const outDir = path.join(workDir, base.replace(/[^\w.-]/g, '_') + '-' + Date.now().toString(36))
+  await mkdir(outDir, { recursive: true })
+
+  // Le fichier du Mac reste l'unique source. Aucun remux ne déplace son index et aucune piste n'est retirée :
+  // la concaténation des parts déchiffrées rend exactement les octets confiés à ZenRayCloud.
+  const srcFile = file
+  const total = (await stat(srcFile)).size
+  vctx.incomingBytes = total // lets the repository pool judge whether the open repository has room (14 October 2026)
+  const nParts = Math.ceil(total / PART)
+  log(`${base} — ${(total / 1073741824).toFixed(2)} Go, ${p.width}x${p.height} ${p.codec}, ${nParts} parts de 95 Mo (AUCUN réencodage)`)
+
+  // 1) poster (1 frame, best-effort) depuis l'original
+  const posterFile = await makePoster(file, outDir, p.duration ? p.duration / 2 : 1)
+
+  // 2) split streamé du fichier (faststart) + push part par part (jamais le fichier entier en RAM)
+  const parts = []           // { idx, repo, path, hash, size, iv }
+  const fd = await open(srcFile, 'r')
+  const b = Buffer.alloc(PART)
+  try {
+    let off = 0, idx = 0
+    while (off < total) {
+      const { bytesRead } = await fd.read(b, 0, PART, off)
+      if (!bytesRead) break
+      const slice = Buffer.from(b.subarray(0, bytesRead)) // copie : writePart est async, on réutilise b
+      const { cipher, iv } = encryptPart(slice, sourceSha256, idx)
+      const h = sha256(cipher); const hp = partPathFor(h) // adressé par hash du CIPHERTEXT (jamais du clair)
+      const repo = await vctx.writePart(hp, cipher, idx)
+      parts.push({ idx, repo, path: hp, hash: h, size: bytesRead, iv })
+      off += bytesRead; idx++
+      if (idx % 5 === 0 || off >= total) log(`  part ${idx}/${nParts} (${(off / 1073741824).toFixed(2)}/${(total / 1073741824).toFixed(2)} Go)`)
+    }
+  } finally { await fd.close() }
+
+  // poster en part raw (simple, toujours dispo) — petit, va dans le shard courant
+  let posterPart = null
+  if (posterFile) {
+    try {
+      const pb = await readFile(posterFile)
+      const h = sha256(pb); const hp = `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.jpg`
+      const repo = await vctx.writePart(hp, pb)
+      posterPart = { repo, path: hp }
+    } catch (e) { log(`  ⚠ poster: ${(e.message || e).toString().slice(0, 80)}`) }
+  }
+
+  // 3) flush du shard -> commit SHA connu -> URLs raw.github pinnées
+  await vctx.flush()
+  const shaOf = (repo) => commitForRepo(vctx.commitOf, repo)
+  const isPriv = vctx.vis === 'private'
+  const partUrls = parts.map((pt) => rawUrl(pt.repo, shaOf(pt.repo), pt.path))
+  // POSTER sur repo PRIVÉ : un <img src> ne peut pas porter de header d'authentification -> l'URL stockée
+  // dans le manifeste passe par /api/raw-proxy (le serveur, qui a le token, va chercher l'image et la sert
+  // même-origine). Petit fichier (~50 Ko), zéro impact bande passante notable. Repo public : URL raw directe.
+  const posterRaw = posterPart ? rawUrl(posterPart.repo, shaOf(posterPart.repo), posterPart.path) : null
+  const posterUrl = posterRaw ? (isPriv ? `/api/raw-proxy?u=${encodeURIComponent(posterRaw)}` : posterRaw) : null
+
+  // 4) manifeste .media.json (type 'video-raw'). offsets cumulés (EN CLAIR) -> le Service Worker mappe un
+  // Range -> part(s), déchiffre chaque part avec son iv, PUIS applique ces offsets sur le clair obtenu.
+  // private:true -> le lecteur (SW) et le téléchargement convertissent chaque URL raw en appel
+  // api.github.com (Accept: raw + token via /api/raw-token) — le repo est invisible/illisible publiquement.
+  let acc = 0
+  const partsMeta = parts.map((pt) => { const start = acc; acc += pt.size; return { url: partUrls[pt.idx], start, end: acc - 1, size: pt.size, iv: pt.iv } })
+  const manifest = {
+    type: 'video-raw', v: 1, name: path.basename(file), mime: mimeOf(file),
+    size: total, codec: p.codec, width: p.width, height: p.height, duration: p.duration,
+    parts: partsMeta, poster: posterUrl,
+    enc: true, alg: 'AES-GCM', // chaque part est chiffrée (iv par part ci-dessus) ; poster = clair (voir plus haut)
+    ...(isPriv ? { private: true } : {}),
+  }
+  const manifestPath = `${dest}/${base}.${path.basename(file).split('.').pop().toLowerCase()}.media.json`
+  await rm(outDir, { recursive: true, force: true }).catch(() => {})
+  return { manifestPath, manifest, posterUrl }
+}
+
+// ── INGESTION D'UN FICHIER QUELCONQUE (blob brut) ──────────────────────────────────────────────────────
+// Pour les fichiers NON ouvrables directement sur le site (wav, py, cube, zip, …) : on découpe le fichier
+// ORIGINAL en parts de 95 Mo (aucune transformation), on les pousse via le ctx shard, et on renvoie un
+// manifeste .file.json (type 'blob-raw'). Le téléchargement recolle les parts dans l'ordre = fichier BIT À BIT
+// identique (offsets cumulés + tailles + empreinte par part). Aucune perte. URLs raw.github pinnées sur commit.
+export async function ingestBlobRaw(file, { dest, base, vctx, log = noop }) {
+  const total = (await stat(file)).size
+  const nParts = Math.ceil(total / PART) || 1
+  log(`${base} — ${(total / 1048576).toFixed(1)} Mo, ${nParts} part(s) de 95 Mo (fichier brut, aucune transformation)`)
+  const parts = []
+  const fd = await open(file, 'r')
+  const b = Buffer.alloc(PART)
+  try {
+    let off = 0, idx = 0
+    while (off < total) {
+      const { bytesRead } = await fd.read(b, 0, PART, off)
+      if (!bytesRead) break
+      const slice = Buffer.from(b.subarray(0, bytesRead))
+      const h = sha256(slice); const hp = partPathFor(h)
+      const repo = await vctx.writePart(hp, slice)
+      parts.push({ idx, repo, path: hp, hash: h, size: bytesRead })
+      off += bytesRead; idx++
+    }
+  } finally { await fd.close() }
+  if (!total) { // fichier vide : une part vide pour cohérence
+    const h = sha256(Buffer.alloc(0)); const hp = partPathFor(h)
+    const repo = await vctx.writePart(hp, Buffer.alloc(0)); parts.push({ idx: 0, repo, path: hp, hash: h, size: 0 })
+  }
+  await vctx.flush()
+  const shaOf = (repo) => commitForRepo(vctx.commitOf, repo)
+  let acc = 0
+  const partsMeta = parts.map((pt) => { const start = acc; acc += pt.size; return { url: rawUrl(pt.repo, shaOf(pt.repo), pt.path), start, end: acc - 1, size: pt.size, sha256: pt.hash } })
+  const manifest = { type: 'blob-raw', v: 1, name: path.basename(file), mime: mimeOf(file), size: total, parts: partsMeta, ...(vctx.vis === 'private' ? { private: true } : {}) }
+  const manifestPath = `${dest}/${path.basename(file)}.file.json`
+  return { manifestPath, manifest }
+}

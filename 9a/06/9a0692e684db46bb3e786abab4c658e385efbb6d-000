@@ -1,0 +1,86 @@
+// archive-identity-proof.mjs (12 October 2026): the identity proof for ARCHIVED FILES (manifests .file.json, plain chunks), used by the
+// ZenRay Assets service before it releases a managed LOAD copy. Same decision as the films (D3): the full restore probe (download
+// every chunk, hash the whole file) is no longer the authority for all but 1 file in `fullReadBackEvery`.
+// FR : preuve par identite pour les fichiers ARCHIVES (chunks en clair) ; le service Assets s'en sert avant de liberer une copie LOAD.
+//
+// An archived file is its bytes cut into chunks of `chunkSize` (storageChunkFor: 19 MiB, 95 MiB above 95 MiB), pushed as they are.
+// The chunk k of a file of `size` bytes is therefore the slice [k * chunkSize, min(size, (k + 1) * chunkSize)) of the SOURCE: it is
+// re-derived locally, its Git blob id is compared with the id GitHub computed (tree of the pinned commit), the manifest online must name
+// that version (sha256) with the same chunks, and the tail chunk is downloaded in full and compared byte for byte.
+// What this does not cover is stated in video-identity-proof.mjs and the report: formats it cannot plan (streamable media, whole-file
+// GCM) return `supported: false` and the caller keeps its full restore probe, so the proof can only REPLACE a probe by positive evidence.
+import { chunkRefs, manifestByFingerprint } from '../../src/lib/archiveChunks.js'
+import { ProofFailure, createGitRemote, proveObjectIdentity, readRemoteManifestBytes, resolveIdentityProofConfig } from './video-identity-proof.mjs'
+
+const refuse = (code, message, failureClass = 'local') => { throw new ProofFailure(failureClass, code, message) }
+
+/** Objects of a chunked archive version (the effective manifest of one version). Plain slices: no IV, no name hash. */
+export function planArchiveObjects(effective) {
+  const refs = chunkRefs(effective)
+  const { chunkSize, size } = effective
+  if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0 || !Number.isSafeInteger(size) || size <= 0) refuse('manifest-unsupported', 'Archive version without a usable chunk size or size')
+  if (refs.length !== Math.ceil(size / chunkSize)) refuse('manifest-unsupported', `Archive lists ${refs.length} chunks, ${Math.ceil(size / chunkSize)} expected`)
+  return refs.map((reference, index) => {
+    const start = index * chunkSize
+    const length = Math.min(chunkSize, size - start)
+    if (!reference.repo || !/^[a-f0-9]{40}$/.test(reference.commit || '') || !reference.path) refuse('manifest-unsupported', `Chunk ${index} has no pinned reference`)
+    return { repo: reference.repo, commit: reference.commit, blobPath: reference.path, nameHash: null, iv: null, start, end: start + length - 1, size: length }
+  })
+}
+
+const isChunkedArchive = (effective) => !effective?.type && (Array.isArray(effective?.parts) || Array.isArray(effective?.chunks))
+
+/** Returns { supported: false, reason } when the format is not planned, else { supported: true, ok, ... } (never throws for a proof failure). */
+export async function proveArchiveIdentity({ manifest, sha256, size, localPath, remote, config, key = null }) {
+  let effective
+  try { effective = manifestByFingerprint(manifest, sha256) }
+  catch { return { supported: true, ok: false, failure: { class: 'manifest', code: 'version-missing', partIndex: null, message: 'The manifest online has no version with this SHA-256' } } }
+  if (!isChunkedArchive(effective)) return { supported: false, reason: 'format' }
+  try {
+    if (effective.size !== size) refuse('source-size-mismatch', `Archive version is ${effective.size} bytes, the loaded copy has ${size}`)
+    const proof = await proveObjectIdentity({ objects: planArchiveObjects(effective), source: localPath, expectedSize: size, key, remote, config })
+    // the hash of the bytes whose chunks were matched must be the SHA-256 the archive promises
+    if (proof.sha256 !== sha256) refuse('sha256-mismatch', 'The local bytes do not hash to the SHA-256 recorded for the archive version')
+    return { supported: true, ...proof }
+  } catch (error) {
+    if (error instanceof ProofFailure) return { supported: true, ok: false, failure: { class: error.failureClass, code: error.code, partIndex: error.partIndex, message: error.message } }
+    throw error
+  }
+}
+
+/** A prover for the Assets service: `session()` shares the Git trees between the files of ONE unload job. `prove` takes the cloud path
+ *  of the manifest (pages/.../x.file.json) and the loaded copy to release. */
+export function createArchiveIdentityProver({ config: overrides = {}, env = process.env, getToken, scratchParent, createRemote = null,
+  readManifestBytes = null }) {
+  const settings = resolveIdentityProofConfig(overrides, env)
+  if (typeof getToken !== 'function') throw new Error('Missing identity prover parameter: getToken')
+  if (!scratchParent) throw new Error('Missing identity prover parameter: scratchParent')
+  return {
+    settings,
+    session() {
+      let remote = null
+      let token = null
+      const ensure = async () => {
+        token ||= await getToken()
+        remote ||= createRemote ? createRemote({ token, config: settings }) : createGitRemote({ token, config: settings, scratchParent })
+        return { token, remote }
+      }
+      return {
+        async prove({ manifestPath, sha256, size, localPath }) {
+          const { token: githubToken, remote: sharedRemote } = await ensure()
+          let bytes
+          try {
+            bytes = readManifestBytes ? await readManifestBytes(manifestPath) : await readRemoteManifestBytes({ token: githubToken, config: settings, repoPath: manifestPath })
+          } catch (error) {
+            return { supported: true, ok: false, failure: { class: 'manifest', code: 'manifest-offline', partIndex: null, message: String(error.message || error).slice(0, 200) } }
+          }
+          let manifest
+          try { manifest = JSON.parse(Buffer.from(bytes).toString('utf8')) }
+          catch { return { supported: true, ok: false, failure: { class: 'manifest', code: 'manifest-offline', partIndex: null, message: 'Remote manifest is not valid JSON' } } }
+          return proveArchiveIdentity({ manifest, sha256, size, localPath, remote: sharedRemote, config: settings })
+        },
+        async close() { await remote?.close?.() },
+      }
+    },
+  }
+}

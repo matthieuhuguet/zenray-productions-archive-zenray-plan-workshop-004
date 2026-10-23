@@ -1,0 +1,296 @@
+// 2026-09-23 20:10 : ZenRay Progress, the live chronology of the work journal.
+// Reads the REAL ~/.claude/PROGRESS.md through journalSource (local relay on the Mac, pushed commit
+// elsewhere), parses it at read time, and links every day to Plan and every project to Assets.
+// FR : la chronologie vivante du journal, lue en direct, reliee a Plan et Assets.
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { createJournalSource } from './journalSource.js'
+import { activityPercent, createActivitySource, isActivityFresh, readableFileName, readableThroughput } from './activitySource.js'
+import { buildTimeline, daySummary, localDay, normalize } from './journal.js'
+import { PROGRESS_DOMAINS, PROGRESS_LINKS } from '../config/progressDomains.js'
+import { UI } from '../config/colors.js'
+import './ProgressView.css'
+
+const WEEKDAYS = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi']
+const MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre']
+const DETAIL_KEYS = ['Décision', 'Vérifié', 'Mesuré', 'Échoué', 'Écarté', 'Apprentissage', 'Blocage', 'Prochain', 'Source durable']
+
+const pad = (n) => String(n).padStart(2, '0')
+const hhmm = (ms) => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}` }
+const dayTitle = (day) => { const d = new Date(`${day}T12:00:00`); return `${WEEKDAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]}` }
+const duration = (min) => { const h = Math.floor(min / 60), m = Math.round(min % 60); return h ? `${h} h${m ? ` ${pad(m)}` : ''}` : `${m} min` }
+const ago = (iso, now) => {
+  if (!iso) return ''
+  const s = Math.max(0, Math.round((now - Date.parse(iso)) / 1000))
+  return s < 60 ? `il y a ${s} s` : s < 3600 ? `il y a ${Math.round(s / 60)} min` : `il y a ${Math.round(s / 3600)} h`
+}
+
+function useJournal() {
+  const [snap, setSnap] = useState({ state: { mode: 'connecting' }, text: '' })
+  useEffect(() => {
+    const dec = new TextDecoder()
+    const src = createJournalSource({ onChange: ({ state, bytes }) => setSnap({ state, text: dec.decode(bytes) }) })
+    src.start()
+    return () => src.stop()
+  }, [])
+  return snap
+}
+
+// 10 October 2026, 14:34 UTC: Show current local uploads and pushes without reading cloud storage.
+function useActivity() {
+  const [activity, setActivity] = useState({ mode: 'connecting', active: [], recentFiles: [] })
+  useEffect(() => {
+    const source = createActivitySource({ onChange: setActivity })
+    source.start()
+    return () => source.stop()
+  }, [])
+  return activity
+}
+
+const ACTIVITY_PHASES = {
+  queued: 'En attente',
+  uploading: 'Envoi en cours',
+  pushing: 'Envoi vers le cloud',
+  verifying: 'Vérification',
+  transcode: 'Conversion',
+  transcoding: 'Conversion',
+  preparing: 'Préparation',
+}
+
+function phaseLabel(phase) {
+  if (typeof phase !== 'string' || !phase.trim()) return 'En cours'
+  const clean = phase.trim().replace(/[-_]+/g, ' ')
+  return ACTIVITY_PHASES[clean.toLowerCase()] || clean.charAt(0).toLocaleUpperCase('fr-FR') + clean.slice(1)
+}
+
+function TransferProgress({ item }) {
+  const percent = activityPercent(item)
+  const title = typeof item.title === 'string' && item.title.trim() ? item.title.trim() : 'Opération en cours'
+  const currentFile = readableFileName(item.currentItem)
+  const throughput = readableThroughput(item.bytesPerSecond)
+  const unitProgress = Number.isInteger(item.completedUnits) && Number.isInteger(item.totalUnits) && item.totalUnits > 0
+    ? `${item.completedUnits} / ${item.totalUnits} fichiers`
+    : null
+  const freedInfo = typeof item.freedGiB === 'number' && item.freedGiB > 0
+    ? `${String(item.freedGiB).replace('.', ',')} Gio libérés`
+    : null
+  return (
+    <li className="zr-pg-transfer">
+      <div className="zr-pg-transfer-head">
+        <span className="zr-pg-transfer-title">{title}</span>
+        <span className="zr-pg-transfer-status">{throughput ? `${phaseLabel(item.phase)} · ${throughput}` : phaseLabel(item.phase)}</span>
+      </div>
+      {currentFile && <div className="zr-pg-transfer-file" title={currentFile}>{currentFile}</div>}
+      {item.currentStep && <div className="zr-pg-transfer-step">{item.currentStep}</div>}
+      <div className={`zr-pg-transfer-track${percent === null ? ' is-indeterminate' : ''}`}
+        role="progressbar" aria-label={`Progression : ${title}`} aria-valuemin="0" aria-valuemax="100"
+        {...(percent === null ? { 'aria-valuetext': 'Progression en cours, pourcentage indisponible' } : { 'aria-valuenow': percent, 'aria-valuetext': `${percent} %` })}>
+        {percent !== null && <span className="zr-pg-transfer-fill" style={{ width: `${percent}%` }} />}
+        {percent === null && <span className="zr-pg-transfer-indicator" />}
+      </div>
+      <div className="zr-pg-transfer-foot">
+        <span>{[unitProgress, freedInfo].filter(Boolean).join(' · ') || (currentFile ? 'Fichier actuel' : 'Transfert actif')}</span>
+        <span className="zr-pg-transfer-percent">{percent === null ? 'En cours' : `${percent} %`}</span>
+      </div>
+    </li>
+  )
+}
+
+function ActivityPanel({ activity, now }) {
+  const active = activity.active.filter((item) => isActivityFresh(item, now))
+  const recentFiles = activity.recentFiles
+    .filter((file) => isActivityFresh(file, now) && readableFileName(file.name))
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+  const visibleFiles = recentFiles.slice(0, 8)
+  return (
+    <section className="zr-pg-activity" aria-labelledby="zr-pg-activity-title" aria-live="polite">
+      <div className="zr-pg-activity-head">
+        <h2 id="zr-pg-activity-title">Envois en cours</h2>
+        {active.length > 0 && <span className="zr-pg-activity-count">{active.length}</span>}
+      </div>
+      {activity.mode === 'connecting' ? <p className="zr-pg-activity-empty">Connexion au suivi des envois…</p>
+        : activity.mode === 'offline' ? <p className="zr-pg-activity-empty">Suivi des envois indisponible sur ce Mac.</p>
+          : active.length ? <ul className="zr-pg-transfer-list">{active.map((item, index) => <TransferProgress key={item.id || `${item.title}-${index}`} item={item} />)}</ul>
+            : <p className="zr-pg-activity-empty">Aucun envoi en cours.</p>}
+      {visibleFiles.length > 0 && (
+        <div className="zr-pg-recent-files">
+          <span className="zr-pg-recent-label">Fichiers des dernières 24 h</span>
+          <ul>{visibleFiles.map((file, index) => <li key={`${file.name}-${file.updatedAt}-${index}`} title={file.name}>{readableFileName(file.name)}</li>)}</ul>
+          {recentFiles.length > visibleFiles.length && <span className="zr-pg-recent-more">+ {recentFiles.length - visibleFiles.length}</span>}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function SyncBadge({ state, now }) {
+  const live = state.mode === 'local'
+  const ok = state.verified === true
+  const color = state.mode === 'offline' || state.verified === false ? 'var(--zr-pg-bad)' : live ? 'var(--zr-pg-live)' : 'var(--zr-pg-remote)'
+  const label = state.mode === 'connecting' ? 'Connexion au journal…'
+    : state.mode === 'offline' ? 'Journal injoignable'
+      : live ? 'Fichier local lu en direct' : `Relais · poussé ${ago(state.pushedAt, now)}`
+  const title = [
+    `Empreinte SHA-256 : ${state.declaredSha || 'inconnue'}`,
+    ok ? 'Recalculée dans le navigateur : identique au fichier local.' : state.verified === false ? 'ÉCART : les octets reçus ne correspondent pas au fichier local.' : '',
+    state.commit ? `Commit ${state.commit.slice(0, 10)}` : '',
+    live && state.inSync != null ? (state.inSync ? 'Dépôt distant à jour.' : 'Dépôt distant en retard, envoi en cours.') : '',
+    state.error || '',
+  ].filter(Boolean).join('\n')
+  return (
+    <span className="zr-pg-badge" title={title}>
+      <span className={`zr-pg-dot${live ? ' is-live' : ''}`} style={{ background: color }} />
+      {label}
+      {state.declaredSha && <span className="zr-pg-hash">{ok ? '✓ ' : state.verified === false ? '✗ ' : ''}{state.declaredSha.slice(0, 8)}</span>}
+    </span>
+  )
+}
+
+function DayStrip({ days, selected, onSelect, today }) {
+  const cells = useMemo(() => {
+    const out = []
+    const base = new Date(`${today}T12:00:00`)
+    for (let i = PROGRESS_LINKS.stripDays - 1; i >= 0; i--) {
+      const d = new Date(base); d.setDate(base.getDate() - i)
+      const key = localDay(d.getTime())
+      const summary = days.has(key) ? daySummary(days.get(key)) : []
+      out.push({ key, d, summary, total: summary.reduce((n, s) => n + s.minutes, 0) })
+    }
+    return out
+  }, [days, today])
+  const max = Math.max(60, ...cells.map((c) => c.total))
+  return (
+    <div className="zr-pg-strip" role="tablist" aria-label="Jours">
+      {cells.map((c) => (
+        <button key={c.key} role="tab" aria-selected={c.key === selected}
+          className={`zr-pg-cell${c.key === selected ? ' is-on' : ''}${c.key === today ? ' is-today' : ''}`}
+          onClick={() => onSelect(c.key)} title={`${dayTitle(c.key)} · ${c.total ? duration(c.total) + ' estimées' : 'rien'}`}>
+          <span className="zr-pg-bar">
+            {c.summary.map((s) => (
+              <span key={s.domain.id} style={{ height: `${(s.minutes / max) * 100}%`, background: s.domain.color }} />
+            ))}
+          </span>
+          <span className="zr-pg-num">{c.d.getDate()}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function openPlan(day) {
+  try { sessionStorage.setItem(PROGRESS_LINKS.planFocusKey, day) } catch {}
+  window.dispatchEvent(new CustomEvent('zr:open-page', { detail: { path: PROGRESS_LINKS.planPath } }))
+}
+const openAssets = () => window.dispatchEvent(new CustomEvent('zr:navigate', { detail: 'assets' }))
+
+function EntryCard({ e, i, fresh }) {
+  const [open, setOpen] = useState(false)
+  const details = DETAIL_KEYS.filter((k) => e.fields[k])
+  const delay = Math.min(i * PROGRESS_LINKS.staggerMs, PROGRESS_LINKS.staggerCapMs)
+  return (
+    <li className={`zr-pg-entry${fresh ? ' is-fresh' : ''}`} style={{ animationDelay: `${delay}ms`, '--zr-pg-c': e.domain.color }}>
+      <time className="zr-pg-time" dateTime={new Date(e.at).toISOString()}>{hhmm(e.at)}</time>
+      <span className="zr-pg-node" />
+      <article className="zr-pg-card">
+        <header className="zr-pg-meta">
+          <span className="zr-pg-domain">{e.domain.label}</span>
+          {e.project && <span>{e.project}</span>}
+          {e.agent && <span className="zr-pg-agent">{e.agent}</span>}
+          {!e.explicitOffset && !e.legacy && <span className="zr-pg-tz" title="Horodaté en heure de Tokyo par l'ancien skill, converti en heure locale">JST</span>}
+        </header>
+        <p className="zr-pg-fait">{e.fait || e.fields[Object.keys(e.fields)[0]] || ''}</p>
+        {(details.length > 0) && (
+          <button className="zr-pg-more" onClick={() => setOpen((v) => !v)}>{open ? 'Masquer' : `Détails · ${details.length}`}</button>
+        )}
+        {open && (
+          <dl className="zr-pg-details">
+            {details.map((k) => (<React.Fragment key={k}><dt>{k}</dt><dd>{e.fields[k]}</dd></React.Fragment>))}
+          </dl>
+        )}
+      </article>
+    </li>
+  )
+}
+
+export default function ProgressView({ t }) {
+  const { state, text } = useJournal()
+  const activity = useActivity()
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => { const id = setInterval(() => setNow(Date.now()), 5000); return () => clearInterval(id) }, [])
+  const timeline = useMemo(() => buildTimeline(text), [text])
+  const today = localDay(now)
+  const [selected, setSelected] = useState(today)
+  const [query, setQuery] = useState('')
+  const [domain, setDomain] = useState('')
+  const seen = useRef(new Set())
+
+  const lastDay = timeline.entries.length ? timeline.entries.at(-1).day : today
+  useEffect(() => { if (!timeline.days.has(selected) && timeline.entries.length) setSelected(lastDay) }, [timeline]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const q = normalize(query.trim())
+  const list = useMemo(() => {
+    const base = q ? timeline.entries : (timeline.days.get(selected) || [])
+    return base.filter((e) => (!domain || e.domain.id === domain) && (!q || normalize(`${e.project} ${e.fait} ${e.agent}`).includes(q))).slice().sort((a, b) => b.at - a.at).slice(0, q ? 300 : undefined)
+  }, [timeline, selected, q, domain])
+  const summary = useMemo(() => daySummary(timeline.days.get(selected) || []), [timeline, selected])
+  const total = summary.reduce((n, s) => n + s.minutes, 0)
+
+  const fresh = new Set()
+  for (const e of list) { const k = `${e.at}|${e.line}`; if (seen.current.size && !seen.current.has(k)) fresh.add(k) }
+  useEffect(() => { for (const e of timeline.entries) seen.current.add(`${e.at}|${e.line}`) }, [timeline])
+
+  return (
+    <div className="zr-pg" style={{ color: t?.textPrimary, '--zr-pg-live': UI.green, '--zr-pg-remote': UI.blue, '--zr-pg-bad': UI.red, '--zr-pg-anim': `${PROGRESS_LINKS.entryAnimMs}ms` }}>
+      <header className="zr-pg-head">
+        <div>
+          <h1 className="zr-pg-title">Progress</h1>
+          <p className="zr-pg-sub">{timeline.entries.length} entrées · {timeline.days.size} jours de travail</p>
+        </div>
+        <SyncBadge state={state} now={now} />
+      </header>
+
+      <ActivityPanel activity={activity} now={now} />
+
+      <DayStrip days={timeline.days} selected={selected} onSelect={(d) => { setSelected(d); setQuery('') }} today={today} />
+
+      <section className="zr-pg-day">
+        <div className="zr-pg-dayhead">
+          <h2 className="zr-pg-daytitle">{q ? `Recherche « ${query.trim()} »` : dayTitle(selected)}</h2>
+          {!q && <span className="zr-pg-total">{total ? `${duration(total)} estimées` : 'Aucune entrée ce jour'}</span>}
+          <span className="zr-pg-actions">
+            <button onClick={() => openPlan(selected)}>Ouvrir dans Plan</button>
+            <button onClick={openAssets}>Assets</button>
+          </span>
+        </div>
+        {!q && summary.length > 0 && (
+          <div className="zr-pg-domains">
+            {summary.map((s) => (
+              <button key={s.domain.id} className={`zr-pg-chip${domain === s.domain.id ? ' is-on' : ''}`} style={{ '--zr-pg-c': s.domain.color }}
+                onClick={() => setDomain(domain === s.domain.id ? '' : s.domain.id)}>
+                <span className="zr-pg-chipdot" />{s.domain.label}<span className="zr-pg-chipnum">{duration(s.minutes)}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="zr-pg-tools">
+          <input className="zr-pg-search" value={query} onChange={(ev) => setQuery(ev.target.value)} placeholder="Chercher dans tout le journal" />
+          <select className="zr-pg-filter" value={domain} onChange={(ev) => setDomain(ev.target.value)}>
+            <option value="">Tous les domaines</option>
+            {PROGRESS_DOMAINS.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}
+          </select>
+        </div>
+      </section>
+
+      <ol className="zr-pg-rail" key={`${selected}|${domain}|${q}`}>
+        {list.map((e, i) => {
+          const showDay = q && (i === 0 || list[i - 1].day !== e.day)
+          return (
+            <React.Fragment key={`${e.at}|${e.line}`}>
+              {showDay && <li className="zr-pg-sep">{dayTitle(e.day)}</li>}
+              <EntryCard e={e} i={i} fresh={fresh.has(`${e.at}|${e.line}`)} />
+            </React.Fragment>
+          )
+        })}
+      </ol>
+    </div>
+  )
+}

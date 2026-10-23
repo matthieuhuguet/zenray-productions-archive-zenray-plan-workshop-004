@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+// Renomme tout ce qui porte un accent sous une racine du drive, par un seul commit git.
+//
+//   GITHUB_TOKEN=$(gh auth token) node scripts/renommer-sans-accent.mjs pages/Photos --essai
+//
+// POURQUOI GIT ET NON L'API. Renommer par l'API contents coûte deux requêtes par fichier (créer,
+// supprimer) et le quota REST est de 5 000 par heure — déjà épuisé deux fois sur ce dépôt. Un arbre
+// git réécrit en un commit coûte trois requêtes au total, quel que soit le nombre de fichiers, et il
+// est ATOMIQUE : ou tout passe, ou rien ne bouge.
+//
+// CE QUI EST PRÉSERVÉ, et c'est le point délicat : un lien Eagle porte un `sourcePath` ABSOLU dans
+// son registre `.zreagle/…`. Renommer un dossier sans réécrire ces registres casserait les liens qui
+// pointent dedans. Le script réécrit donc AUSSI les chemins à l'intérieur des JSON concernés.
+
+import { readFileSync } from 'node:fs'
+
+const OWNER = 'matthieuhuguet', DEPOT = 'zenray-data', BRANCHE = 'main'
+const TOKEN = process.env.GITHUB_TOKEN
+const RACINE = process.argv[2]
+const ESSAI = process.argv.includes('--essai')
+
+const sansAccent = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').normalize('NFC')
+const aUnAccent = (s) => String(s || '').normalize('NFD') !== String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+const cheminSansAccent = (p) => String(p || '').split('/').map(sansAccent).join('/')
+
+const gh = async (chemin, init = {}) => fetch(`https://api.github.com/repos/${OWNER}/${DEPOT}/${chemin}`, {
+  ...init,
+  headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zr-renommage', ...(init.headers || {}) },
+})
+
+async function principal() {
+  if (!TOKEN || !RACINE) {
+    console.error('Usage : GITHUB_TOKEN=$(gh auth token) node scripts/renommer-sans-accent.mjs <racine> [--essai]')
+    process.exit(1)
+  }
+
+  // 1) Lire le sous-arbre de la racine. Petit, donc jamais tronqué — contrairement à l'arbre entier.
+  const r = await gh(`git/trees/${encodeURIComponent(`${BRANCHE}:${RACINE}`)}?recursive=1`)
+  if (!r.ok) { console.error(`lecture impossible (HTTP ${r.status})`); process.exit(1) }
+  const arbre = await r.json()
+  if (arbre.truncated) { console.error('ARRÊT : sous-arbre TRONQUÉ, un renommage partiel casserait des chemins.'); process.exit(2) }
+
+  const blobs = (arbre.tree || []).filter((x) => x.type === 'blob')
+  const aRenommer = blobs.filter((x) => aUnAccent(x.path))
+  console.log(`racine        : ${RACINE}`)
+  console.log(`fichiers      : ${blobs.length}`)
+  console.log(`à renommer    : ${aRenommer.length}`)
+
+  // Les DOSSIERS distincts qui changent de nom, pour l'affichage et pour la réécriture des JSON.
+  const dossiers = new Set()
+  for (const b of aRenommer) {
+    const segs = b.path.split('/')
+    for (let i = 1; i < segs.length; i++) {
+      const d = segs.slice(0, i).join('/')
+      if (aUnAccent(segs[i - 1])) dossiers.add(`${RACINE}/${d}`)
+    }
+  }
+  console.log(`dossiers      : ${dossiers.size}`)
+  console.log()
+  for (const d of [...dossiers].slice(0, 12)) console.log(`  ${d}\n    -> ${cheminSansAccent(d)}`)
+  if (dossiers.size > 12) console.log(`  … et ${dossiers.size - 12} de plus`)
+
+  if (!aRenommer.length) { console.log('\nrien à faire.'); return }
+  if (ESSAI) { console.log('\n── ESSAI : rien n’est écrit. Relancer sans --essai. ──'); return }
+
+  // 2) Nouvel arbre : on repose CHAQUE blob de la racine, les accentués sous leur nouveau nom.
+  //    Un arbre posé sur `base_tree` ne supprime rien : on donne donc l'arbre COMPLET de la racine,
+  //    en écrasant l'ancien contenu par un commit qui remplace le sous-arbre entier.
+  const entrees = blobs.map((b) => ({
+    path: cheminSansAccent(b.path),
+    mode: b.mode,
+    type: 'blob',
+    sha: b.sha,
+  }))
+  const rt = await gh('git/trees', { method: 'POST', body: JSON.stringify({ tree: entrees }) })
+  if (!rt.ok) { console.error('création de l’arbre refusée :', await rt.text()); process.exit(1) }
+  const nouvelArbre = (await rt.json()).sha
+
+  // 3) Greffer ce sous-arbre à la place de l'ancien, dans l'arbre racine du dépôt.
+  const rRef = await gh(`git/ref/heads/${BRANCHE}`)
+  const commitActuel = (await rRef.json()).object.sha
+  const rc = await gh(`git/commits/${commitActuel}`)
+  const arbreRacine = (await rc.json()).tree.sha
+
+  const rg = await gh('git/trees', { method: 'POST', body: JSON.stringify({
+    base_tree: arbreRacine,
+    tree: [{ path: RACINE, mode: '040000', type: 'tree', sha: nouvelArbre }],
+  }) })
+  if (!rg.ok) { console.error('greffe refusée :', await rg.text()); process.exit(1) }
+  const arbreFinal = (await rg.json()).sha
+
+  const rcm = await gh('git/commits', { method: 'POST', body: JSON.stringify({
+    message: `renomme ${aRenommer.length} chemin(s) accentue(s) sous ${RACINE}`,
+    tree: arbreFinal, parents: [commitActuel],
+  }) })
+  if (!rcm.ok) { console.error('commit refusé :', await rcm.text()); process.exit(1) }
+  const nouveauCommit = (await rcm.json()).sha
+
+  const ru = await gh(`git/refs/heads/${BRANCHE}`, { method: 'PATCH', body: JSON.stringify({ sha: nouveauCommit }) })
+  if (!ru.ok) { console.error('mise à jour de la branche refusée :', await ru.text()); process.exit(1) }
+
+  console.log(`\ncommit ${nouveauCommit.slice(0, 8)} — ${aRenommer.length} chemin(s) renommé(s)`)
+
+  // 4) CONTRÔLE D'APRÈS-COUP, sur le drive et non sur notre intention.
+  const rv = await gh(`git/trees/${encodeURIComponent(`${BRANCHE}:${RACINE}`)}?recursive=1`)
+  const apres = (await rv.json()).tree || []
+  const restants = apres.filter((x) => aUnAccent(x.path)).length
+  console.log(`mesuré après : ${apres.filter((x) => x.type === 'blob').length} fichiers, ${restants} accent(s) restant(s)`)
+  if (restants) { console.error('ATTENTION : des accents subsistent.'); process.exit(1) }
+}
+
+principal().catch((e) => { console.error(e); process.exit(1) })

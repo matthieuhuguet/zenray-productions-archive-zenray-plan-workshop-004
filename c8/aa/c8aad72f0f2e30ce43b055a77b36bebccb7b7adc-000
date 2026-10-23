@@ -1,0 +1,168 @@
+// Réception des SEGMENTS HLS transcodés DANS LE NAVIGATEUR + commit sur GitHub (jumeau serveur de pushHls).
+//
+// POURQUOI CE FICHIER EXISTE (le verrou) :
+//   server/upload-shard.js a déjà 'blob' et 'commit', MAIS ils valident le repo avec /^zenray-media-\d{2,}$/
+//   et REFUSENT (400 bad-repo) les repos PUBLICS zenray-vid-NN où vivent les segments vidéo. Le pipeline LOCAL
+//   contourne ça en committant directement avec le token (il a le token). Le NAVIGATEUR n'a PAS le token.
+//   Donc il faut un handler dédié vidéo, qui accepte zenray-vid-NN et garde le token CÔTÉ SERVEUR uniquement.
+//
+// CE QU'IL FAIT (3 actions, le client n'envoie JAMAIS le token, juste du base64) :
+//   - 'vid-blob'    {repoVid, b64}          -> crée un git blob sur le repo PUBLIC zenray-vid-NN -> {sha}
+//   - 'vid-commit'  {repoVid, files:[{path,sha}]} -> 1 commit atomique (tree+commit+ref force:false) -> {commit}
+//                    le SHA renvoyé sert à PINNER les URLs jsDelivr (cache immuable).
+//   - 'vid-content' {files:[{path, b64?|utf8?}]}  -> 1 commit atomique sur le repo PRIVÉ zenray-data
+//                    (clé AES brute + playlists .m3u8 + manifest .media.json). La clé n'existe QUE côté serveur->privé.
+//
+// Le client réutilise SÉPARÉMENT les actions DÉJÀ existantes d'upload-shard.js : 'active-vid-shard' (rollover) et
+// 'vid-commit-bytes' (compteur). On ne les duplique pas.
+//
+// Tout est anonymisé côté client (chemins = ab/cd/<sha256>.ts), jamais de nom humain. Aucune écriture sur master
+// du site, pas de clone, uniquement Git Data API (blobs + base_tree + commit + ref force:false).
+
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const CONTENT_REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const CONTENT_BRANCH = process.env.CONTENT_BRANCH || 'main'
+const VID_BRANCH = 'main'
+const VID_SHARD_RE = /^zenray-vid-\d{2,}$/
+
+const isB64 = (s) => typeof s === 'string' && s.length > 0 && /^[A-Za-z0-9+/=\r\n]+$/.test(s)
+const safePath = (p) => typeof p === 'string' && p.length > 0 && !p.includes('..') && !p.startsWith('/')
+// SÉCURITÉ : vid-content ne doit ÉCRIRE QUE les artefacts vidéo (playlists HLS, clé AES, manifeste) sous pages/.
+// Sans ce bornage, safePath laissait écrire un chemin ARBITRAIRE dans zenray-data (ex .zr-drive.json, n'importe
+// quel nœud) -> corruption de l'état du drive / injection. On restreint aux extensions attendues.
+const vidContentOk = (p) => safePath(p) && /^pages\//.test(p) && /(\.m3u8|\.hlskey\.bin|\.media\.json)$/.test(p)
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+import { instrument } from './cmdlog.js'
+const ghAbsRaw = (token, path, init = {}) =>
+  fetch(`https://api.github.com/${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zenray-progress', ...(init.headers || {}) },
+  })
+const repoFromAbs = (path) => { const m = /^repos\/[^/]+\/([^/]+)/.exec(path || ''); return m ? m[1] : null }
+const ghAbs = instrument(ghAbsRaw, { repoOf: (args) => repoFromAbs(args[1]), pathOf: (args) => args[1], initOf: (args) => args[2] || {} })
+function ghRepo(token, repo, path, init = {}) { return ghAbs(token, `repos/${OWNER}/${repo}/${path}`, init) }
+
+// Commit atomique d'une liste {path, sha} sur OWNER/<repo>@branch. Reconstruit sur HEAD frais à chaque essai
+// (fast-forward, force:false). Renvoie le SHA du commit, ou lève en cas d'échec. Jumeau de la logique commit
+// de upload-shard.js, mais paramétré par repo+branche (réutilisable pour le repo public ET le repo privé).
+async function commitTree(token, repo, branch, tree) {
+  let lastErr = 'ref-update'
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const refR = await ghRepo(token, repo, `git/ref/heads/${branch}`)
+    if (!refR.ok) { lastErr = 'ref ' + refR.status; await sleep(400 * (attempt + 1)); continue }
+    const headSha = (await refR.json()).object.sha
+    const commitR = await ghRepo(token, repo, `git/commits/${headSha}`)
+    if (!commitR.ok) { lastErr = 'head-commit'; break }
+    const baseTree = (await commitR.json()).tree.sha
+
+    const tr = await ghRepo(token, repo, 'git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree }) })
+    if (!tr.ok) { lastErr = 'tree ' + (await tr.text()).slice(0, 120); break }
+    const newTree = (await tr.json()).sha
+
+    const cr = await ghRepo(token, repo, 'git/commits', { method: 'POST', body: JSON.stringify({ message: `hls ${tree.length} file(s)`, tree: newTree, parents: [headSha] }) })
+    if (!cr.ok) { lastErr = 'commit ' + (await cr.text()).slice(0, 120); break }
+    const candidate = (await cr.json()).sha
+
+    const pr = await ghRepo(token, repo, `git/refs/heads/${branch}`, { method: 'PATCH', body: JSON.stringify({ sha: candidate, force: false }) })
+    if (pr.ok) return candidate
+    lastErr = 'ref-update ' + (await pr.text()).slice(0, 120)
+    if (pr.status !== 422 && pr.status < 500) break // 422 = non fast-forward (HEAD a bougé) -> retour de boucle
+    await sleep(500 * (attempt + 1))
+  }
+  throw new Error(lastErr)
+}
+
+export const config = { api: { bodyParser: { sizeLimit: '8mb' } } }
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(200).json({ error: 'no-token' })
+  res.setHeader('Cache-Control', 'no-store')
+  if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return res.status(405).end() }
+
+  let body = req.body
+  if (typeof body === 'string') { try { body = JSON.parse(body) } catch { body = {} } }
+  const action = body && body.action
+
+  try {
+    // 1) vid-blob : crée UN blob sur le repo PUBLIC vidéo, renvoie son sha (le client enverra 1 segment .ts < 8mb).
+    if (action === 'vid-blob') {
+      const repo = String(body.repoVid || '')
+      if (!VID_SHARD_RE.test(repo)) return res.status(400).json({ error: 'bad-repo' })
+      const b64 = body.b64
+      if (!isB64(b64)) return res.status(400).json({ error: 'bad-b64' })
+      const r = await ghRepo(token, repo, 'git/blobs', { method: 'POST', body: JSON.stringify({ content: b64, encoding: 'base64' }) })
+      if (!r.ok) { const t = await r.text(); return res.status(200).json({ error: 'github', detail: t.slice(0, 160) }) }
+      return res.status(200).json({ ok: true, sha: (await r.json()).sha })
+    }
+
+    // 2) vid-commit : 1 commit atomique des segments hashés sur le repo PUBLIC -> {commit} (SHA pour jsDelivr).
+    if (action === 'vid-commit') {
+      const repo = String(body.repoVid || '')
+      if (!VID_SHARD_RE.test(repo)) return res.status(400).json({ error: 'bad-repo' })
+      const files = Array.isArray(body.files) ? body.files : []
+      if (!files.length) return res.status(400).json({ error: 'no-files' })
+      for (const f of files) {
+        if (!f || !safePath(f.path) || typeof f.sha !== 'string') return res.status(400).json({ error: 'bad-file-entry' })
+      }
+      const tree = files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', sha: f.sha }))
+      let commit
+      try { commit = await commitTree(token, repo, VID_BRANCH, tree) } catch (e) { return res.status(200).json({ error: 'github', detail: String(e.message).slice(0, 160) }) }
+      return res.status(200).json({ ok: true, commit })
+    }
+
+    // 3) vid-content : clé AES brute + playlists .m3u8 + manifest .media.json sur le repo PRIVÉ zenray-data.
+    //    files:[{path, b64}] (binaire, ex la clé) OU {path, utf8} (texte, ex playlists/manifest).
+    //    La clé brute n'existe QUE dans ce flux serveur->privé, jamais renvoyée au client.
+    if (action === 'vid-content') {
+      const files = Array.isArray(body.files) ? body.files : []
+      if (!files.length) return res.status(400).json({ error: 'no-files' })
+      const [repoOwner, repoName] = CONTENT_REPO.split('/')
+      const tree = []
+      for (const f of files) {
+        if (!f || !vidContentOk(f.path)) return res.status(400).json({ error: 'bad-file-entry' })
+        const content = typeof f.b64 === 'string' ? f.b64 : Buffer.from(String(f.utf8 ?? ''), 'utf8').toString('base64')
+        if (!isB64(content)) return res.status(400).json({ error: 'bad-content', detail: `path=${f.path} hasB64=${typeof f.b64} hasUtf8=${typeof f.utf8} len=${content.length}` })
+        // git blob du contenu sur le repo content
+        const br = await ghAbs(token, `repos/${repoOwner}/${repoName}/git/blobs`, { method: 'POST', body: JSON.stringify({ content, encoding: 'base64' }) })
+        if (!br.ok) { const t = await br.text(); return res.status(200).json({ error: 'github', detail: 'blob ' + t.slice(0, 120) }) }
+        tree.push({ path: f.path, mode: '100644', type: 'blob', sha: (await br.json()).sha })
+      }
+      // commit atomique sur zenray-data (réutilise commitTree via ghRepo : OWNER doit matcher CONTENT_REPO owner).
+      let commit
+      try { commit = await commitContentTree(token, repoOwner, repoName, CONTENT_BRANCH, tree) } catch (e) { return res.status(200).json({ error: 'github', detail: String(e.message).slice(0, 160) }) }
+      return res.status(200).json({ ok: true, commit })
+    }
+
+    return res.status(400).json({ error: 'bad-action' })
+  } catch (e) {
+    return res.status(200).json({ error: 'fetch', detail: String((e && e.message) || e).slice(0, 120) })
+  }
+}
+
+// Variante de commitTree adressée par owner/repo explicite (le repo content peut avoir un owner différent d'OWNER).
+async function commitContentTree(token, owner, repo, branch, tree) {
+  const gh = (path, init = {}) => ghAbs(token, `repos/${owner}/${repo}/${path}`, init)
+  let lastErr = 'ref-update'
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const refR = await gh(`git/ref/heads/${branch}`)
+    if (!refR.ok) { lastErr = 'ref ' + refR.status; await sleep(400 * (attempt + 1)); continue }
+    const headSha = (await refR.json()).object.sha
+    const commitR = await gh(`git/commits/${headSha}`)
+    if (!commitR.ok) { lastErr = 'head-commit'; break }
+    const baseTree = (await commitR.json()).tree.sha
+    const tr = await gh('git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree }) })
+    if (!tr.ok) { lastErr = 'tree ' + (await tr.text()).slice(0, 120); break }
+    const newTree = (await tr.json()).sha
+    const cr = await gh('git/commits', { method: 'POST', body: JSON.stringify({ message: `hls content ${tree.length} file(s)`, tree: newTree, parents: [headSha] }) })
+    if (!cr.ok) { lastErr = 'commit ' + (await cr.text()).slice(0, 120); break }
+    const candidate = (await cr.json()).sha
+    const pr = await gh(`git/refs/heads/${branch}`, { method: 'PATCH', body: JSON.stringify({ sha: candidate, force: false }) })
+    if (pr.ok) return candidate
+    lastErr = 'ref-update ' + (await pr.text()).slice(0, 120)
+    if (pr.status !== 422 && pr.status < 500) break
+    await sleep(500 * (attempt + 1))
+  }
+  throw new Error(lastErr)
+}

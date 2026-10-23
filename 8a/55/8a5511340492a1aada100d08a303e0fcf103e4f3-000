@@ -1,0 +1,116 @@
+import React, { useEffect, useState } from 'react'
+import { ColumnMenuColumn, ColumnMenuItem, ColumnMenuShell } from '../components/ColumnMenu.jsx'
+import Icon from '../components/Icon.jsx'
+import { getIndexPaths, loadSearchIndex } from '../search/searchIndexClient.js'
+
+// Lecture SANS sha, via raw.githubusercontent (raw=1) -- HORS quota API REST GitHub (5000/h), contrairement
+// à readJson() de saveJson.js (pensé pour l'édition, sha requis, compte dans le quota). Bug réel PAYÉ le
+// 2026-07-20 : ce fichier appelait readJson() en boucle sur TOUT l'index (potentiellement des centaines de
+// .media.json) à chaque ouverture du widget queue -- quota épuisé en quelques ouvertures, site entier passé
+// en 403 (protection anti-abus Vercel). Ce composant n'écrit jamais rien : raw=1 est strictement correct ici.
+async function readManifestRaw(path) {
+  const json = await fetch(`/api/page?action=read&raw=1&path=${encodeURIComponent(path)}`, { cache: 'no-store' })
+    .then((r) => r.ok ? r.json() : null).catch(() => null)
+  try { return json && !json.missing ? JSON.parse(json.markdown) : null } catch { return null }
+}
+
+const MAX_UPCOMING = 20
+const fmt = (seconds) => {
+  const value = Number(seconds) || 0
+  return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}`
+}
+const cover = (track) => {
+  const src = track && track.cover
+  if (!src) return null
+  return /^(https?:|data:|blob:|\/)/.test(src) ? src : `/api/img?path=${encodeURIComponent(src)}`
+}
+
+// Toutes les playlists du site (get all playlists, retour Matthieu 2026-07-20) : scan de l'index
+// complet, en cache module 60s -- le popover peut s'ouvrir/se fermer plusieurs fois par minute
+// pendant une session d'écoute, la liste des playlists, elle, ne bouge presque jamais. Le lecteur
+// FLOTTANT (PlayerBar global) n'a accès à aucune prop de ZenRay Audio : le popover se suffit.
+// Cache 5 min (au lieu de 60s) : encore moins de bruit, hors quota de toute façon désormais mais un
+// widget de lecture n'a aucune raison de re-scanner le site à chaque ouverture.
+let playlistsCache = { at: 0, items: null }
+async function fetchAllPlaylists() {
+  if (playlistsCache.items && Date.now() - playlistsCache.at < 300000) return playlistsCache.items
+  await loadSearchIndex().catch(() => null)
+  const paths = getIndexPaths().filter((path) => path.startsWith('pages/') && path.endsWith('.media.json'))
+  const out = []
+  let cursor = 0
+  await Promise.all(Array.from({ length: Math.min(8, paths.length) }, async () => {
+    while (cursor < paths.length) {
+      const index = cursor++
+      const data = await readManifestRaw(paths[index])
+      if (data?.type === 'playlist') out.push({
+        path: paths[index], name: data.title || data.name || 'Playlist', cover: data.cover || '',
+        items: data.items || [], createdAt: data.createdAt || '',
+      })
+    }
+  }))
+  out.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+  playlistsCache = { at: Date.now(), items: out }
+  return out
+}
+
+// Retour Matthieu 2026-07-16 : "un peu comme la vue Ask Columns... mais monter au lieu de descendre" --
+// même coque (ColumnMenuShell) que le Finder Create. ColumnMenuShell calcule déjà openAbove tout seul :
+// ancré sur un bouton du lecteur EN BAS de l'écran, il s'ouvre naturellement vers le HAUT.
+// 2 colonnes depuis le 2026-07-20 : File d'attente (les prochains titres, clic = sauter dessus) +
+// Playlists (TOUTES les playlists du drive, clic = lancer la playlist entière) -- accessible depuis le
+// mini player flottant ET le lecteur ZenRay Audio complet, via le même bouton queue.playlist.
+export default function QueuePopover({ t, anchor, queue, idx, onJump, onPlayPlaylist, onClose }) {
+  const upcoming = (queue || []).slice(Math.max(0, idx + 1), Math.max(0, idx + 1) + MAX_UPCOMING)
+  const [playlists, setPlaylists] = useState(playlistsCache.items)
+  useEffect(() => {
+    let live = true
+    fetchAllPlaylists().then((items) => { if (live) setPlaylists(items) })
+    return () => { live = false }
+  }, [])
+
+  return <ColumnMenuShell
+    t={t}
+    anchor={anchor}
+    ariaLabel="File d’attente et playlists"
+    columnWidth={250}
+    maxHeight={420}
+    onClose={onClose}
+    columns={[
+      <ColumnMenuColumn key="queue" t={t} width={250} label="File d’attente" index={0}>
+        {upcoming.length ? upcoming.map((track, index) => (
+          <ColumnMenuItem
+            key={`${track.uri || track.streamPath || track.videoId || track.title}:${index}`}
+            t={t}
+            icon={cover(track)
+              ? <img src={cover(track)} alt="" style={{ width: 22, height: 22, borderRadius: 4, objectFit: 'cover' }} />
+              : <Icon name="music.note" size={16} />}
+            trailing={track.dur ? fmt(track.dur) : null}
+            title={`${track.title || ''} — ${track.artist || ''}`}
+            onClick={() => { onJump(idx + 1 + index); onClose?.() }}
+          >
+            {track.title || 'Titre inconnu'}
+          </ColumnMenuItem>
+        )) : <ColumnMenuItem t={t} disabled>File d’attente vide</ColumnMenuItem>}
+      </ColumnMenuColumn>,
+      <ColumnMenuColumn key="playlists" t={t} width={250} label="Playlists" index={1}>
+        {playlists == null
+          ? <ColumnMenuItem t={t} disabled>Chargement…</ColumnMenuItem>
+          : playlists.length ? playlists.map((playlist) => (
+            <ColumnMenuItem
+              key={playlist.path}
+              t={t}
+              icon={cover(playlist)
+                ? <img src={cover(playlist)} alt="" style={{ width: 22, height: 22, borderRadius: 4, objectFit: 'cover' }} />
+                : <Icon name="queue.playlist" size={16} />}
+              trailing={`${playlist.items.length}`}
+              title={playlist.name}
+              disabled={!playlist.items.length}
+              onClick={() => { if (playlist.items.length) { onPlayPlaylist?.(playlist.items); onClose?.() } }}
+            >
+              {playlist.name}
+            </ColumnMenuItem>
+          )) : <ColumnMenuItem t={t} disabled>Aucune playlist</ColumnMenuItem>}
+      </ColumnMenuColumn>,
+    ]}
+  />
+}

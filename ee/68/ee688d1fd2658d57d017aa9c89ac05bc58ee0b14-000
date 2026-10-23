@@ -1,0 +1,807 @@
+// 18 October 2026 : ZenRay Books (Shelf C · Registre Éditorial Minimaliste sur Papier Ivoire + Lecteur Design C · Double-Page Livre Ouvert).
+// Réunit les fichiers hébergés dans Create/Books (pages/Books/) et le catalogue /shelf/books.json (213 livres).
+// Uniquement AnthropicSerif Medium (500) et InterVariable Medium (500), zéro Light.
+
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { captureFiles } from '../capture/universalCapture.js'
+import { notify } from '../components/Notifications.jsx'
+import { downloadUrls, effectiveManifest } from '../lib/archiveChunks.js'
+import { streamDownload } from '../lib/fetchAsset.js'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+import { urlLectureAffichage } from '../lib/urlLecture.js'
+import './books.css'
+
+const LS_PROGRESS_KEY = 'zr:books:progress:v1'
+const LS_PREFS_KEY = 'zr:books:prefs:v1'
+const LS_CUSTOM_BOOKS_KEY = 'zr:books:custom:v1'
+const CLOUD_PROGRESS_PATH = 'pages/Books/reading-progress.json'
+
+// Les 5 livres initialement présents dans Create/Books (pages/Books/) avec leurs JSON de pages extraites
+export const CLOUD_BOOKS_SEED = [
+  {
+    id: 'win-without-pitching',
+    name: 'The Win Without Pitching Manifesto',
+    author: 'Blair Enns',
+    cloudPath: 'pages/Books/The Win Without Pitching Manifesto - Blair Enns.pdf.file.json',
+    textJson: '/books/win-without-pitching.json',
+    totalPages: 82,
+    coverColor: '#1D222B',
+    defaultStatus: 'in_progress',
+    defaultScore: 97,
+  },
+  {
+    id: 'convenience-store-woman',
+    name: 'Convenience Store Woman',
+    author: 'Sayaka Murata',
+    cloudPath: 'pages/Books/Convenience Store Woman - Sayaka Murata.pdf.file.json',
+    textJson: '/books/convenience-store-woman.json',
+    totalPages: 103,
+    coverColor: '#263E33',
+    defaultStatus: 'in_progress',
+    defaultScore: 92,
+  },
+  {
+    id: 'japanese-society',
+    name: 'An Introduction to Japanese Society (5th Edition)',
+    author: 'Yoshio Sugimoto',
+    cloudPath: 'pages/Books/An Introduction to Japanese Society (5th Edition) - Yoshio Sugimoto.pdf.file.json',
+    textJson: '/books/japanese-society.json',
+    totalPages: 352,
+    coverColor: '#4E2825',
+    defaultStatus: 'in_progress',
+    defaultScore: 91,
+  },
+  {
+    id: 'platonic',
+    name: 'Platonic : Science of Attachment',
+    author: 'Marisa G. Franco',
+    cloudPath: 'pages/Books/Platonic - Marisa G Franco.pdf.file.json',
+    textJson: '/books/platonic.json',
+    totalPages: 320,
+    coverColor: '#342E49',
+    defaultStatus: 'in_progress',
+    defaultScore: 89,
+  },
+  {
+    id: 'anatomy-for-sculptors',
+    name: 'Anatomy for Sculptors (Anatomia dlya Skulptorov)',
+    author: 'Uldis Zarins',
+    cloudPath: 'pages/Books/anatomia_dlya_skulptorov.pdf.ok1fi8.media.json',
+    textJson: null,
+    totalPages: 228,
+    coverColor: '#423A30',
+    defaultStatus: 'in_progress',
+    defaultScore: 96,
+  },
+]
+
+const STATUS_LABELS = {
+  in_progress: 'En cours',
+  backlog: 'À lire',
+  done: 'Lu',
+  dropped: 'Abandonné',
+}
+
+const STATUS_ORDER = ['in_progress', 'backlog', 'done', 'dropped']
+
+function readLocalJson(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key)
+    return raw ? JSON.parse(raw) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function writeLocalJson(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {}
+}
+
+function splitParagraphs(pageText = '') {
+  const cleaned = String(pageText || '').trim()
+  if (!cleaned) return ['Page vierge ou illustration dans le document original.']
+  const parts = cleaned.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
+  if (parts.length >= 2) return parts
+  const lines = cleaned.split('\n').map((s) => s.trim()).filter(Boolean)
+  if (lines.length <= 4) return [lines.join(' ')]
+  const mid = Math.ceil(lines.length / 2)
+  return [lines.slice(0, mid).join(' '), lines.slice(mid).join(' ')]
+}
+
+export default function BooksView() {
+  const [prefs, setPrefs] = useState(() => readLocalJson(LS_PREFS_KEY, {
+    theme: 'ivoire',
+    fontSize: 18,
+    lineHeight: 1.72,
+    colWidth: 54,
+  }))
+  const [progressMap, setProgressMap] = useState(() => readLocalJson(LS_PROGRESS_KEY, {
+    'win-without-pitching': { page: 1, totalPages: 82, status: 'in_progress', score: 97, notes: '' },
+    'convenience-store-woman': { page: 1, totalPages: 103, status: 'in_progress', score: 92, notes: '' },
+    'japanese-society': { page: 1, totalPages: 352, status: 'in_progress', score: 91, notes: '' },
+    'platonic': { page: 1, totalPages: 320, status: 'in_progress', score: 89, notes: '' },
+    'anatomy-for-sculptors': { page: 1, totalPages: 228, status: 'in_progress', score: 96, notes: '' },
+  }))
+  const [customBooks, setCustomBooks] = useState(() => readLocalJson(LS_CUSTOM_BOOKS_KEY, []))
+  const [shelfCatalog, setShelfCatalog] = useState([])
+  const [cloudTreeFiles, setCloudTreeFiles] = useState([])
+  const [filterTab, setFilterTab] = useState('all')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [showAa, setShowAa] = useState(false)
+  const [activeBookId, setActiveBookId] = useState(null)
+  const [loadedBookPages, setLoadedBookPages] = useState({})
+  const [showNotesDrawer, setShowNotesDrawer] = useState(false)
+  const [showAddModal, setShowAddModal] = useState(false)
+  const [newTitle, setNewTitle] = useState('')
+  const [newAuthor, setNewAuthor] = useState('')
+  const [newPages, setNewPages] = useState('200')
+  const [downloadingPdf, setDownloadingPdf] = useState(false)
+  const fileInputRef = useRef(null)
+  const syncTimerRef = useRef(null)
+
+  useEffect(() => {
+    writeLocalJson(LS_PREFS_KEY, prefs)
+  }, [prefs])
+
+  // Lecture initiale du catalogue /shelf/books.json et de l'arbre Create/Books (pages/Books) hors quota
+  useEffect(() => {
+    let alive = true
+    fetch('/shelf/books.json')
+      .then((r) => (r.ok ? r.json() : []))
+      .then((arr) => {
+        if (alive && Array.isArray(arr)) setShelfCatalog(arr)
+      })
+      .catch(() => {})
+
+    fetch('/api/page?action=tree&dir=pages/Books', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : { paths: [] }))
+      .then((j) => {
+        if (alive && Array.isArray(j.paths)) setCloudTreeFiles(j.paths)
+      })
+      .catch(() => {})
+
+    fetch(urlLectureAffichage(CLOUD_PROGRESS_PATH))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (!alive || !j || !j.markdown) return
+        try {
+          const remote = JSON.parse(j.markdown)
+          if (remote && typeof remote === 'object' && remote.progressMap) {
+            setProgressMap((prev) => {
+              const merged = { ...remote.progressMap, ...prev }
+              writeLocalJson(LS_PROGRESS_KEY, merged)
+              return merged
+            })
+          }
+        } catch {}
+      })
+      .catch(() => {})
+
+    return () => { alive = false }
+  }, [])
+
+  const saveProgress = (nextMap) => {
+    setProgressMap(nextMap)
+    writeLocalJson(LS_PROGRESS_KEY, nextMap)
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current)
+    syncTimerRef.current = setTimeout(() => {
+      saveJsonWithRetry(CLOUD_PROGRESS_PATH, (cur) => ({
+        ...(cur && typeof cur === 'object' ? cur : {}),
+        updatedAt: new Date().toISOString(),
+        progressMap: nextMap,
+      })).catch(() => {})
+    }, 1200)
+  }
+
+  // Fusionne Create/Books (en tête) + livres ajoutés + /shelf/books.json
+  const allBooks = useMemo(() => {
+    const map = new Map()
+
+    for (const seed of CLOUD_BOOKS_SEED) {
+      const prog = progressMap[seed.id] || {}
+      map.set(seed.id, {
+        id: seed.id,
+        name: seed.name,
+        author: seed.author,
+        cloudPath: seed.cloudPath,
+        textJson: seed.textJson,
+        isCloud: true,
+        coverColor: seed.coverColor,
+        image: '',
+        page: Math.max(1, Number(prog.page) || 1),
+        totalPages: Math.max(1, Number(prog.totalPages) || seed.totalPages || 100),
+        status: prog.status || seed.defaultStatus || 'in_progress',
+        score: prog.score !== undefined ? prog.score : seed.defaultScore,
+        notes: prog.notes || '',
+      })
+    }
+
+    // Tout nouveau fichier .file.json ou .media.json ajouté dans pages/Books/
+    for (const p of cloudTreeFiles) {
+      if (p === CLOUD_PROGRESS_PATH) continue
+      const already = Array.from(map.values()).some((b) => b.cloudPath === p)
+      if (already) continue
+      const rawLeaf = p.split('/').pop() || p
+      const cleanName = rawLeaf
+        .replace(/\.(file|media|img)\.json$/i, '')
+        .replace(/\.[a-z0-9]{6}$/i, '')
+        .replace(/\.(pdf|epub)$/i, '')
+      const id = 'cloud-' + cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+      const prog = progressMap[id] || {}
+      map.set(id, {
+        id,
+        name: cleanName,
+        author: prog.author || 'Create / Books',
+        cloudPath: p,
+        textJson: null,
+        isCloud: true,
+        coverColor: '#2B3340',
+        image: '',
+        page: Math.max(1, Number(prog.page) || 1),
+        totalPages: Math.max(1, Number(prog.totalPages) || 160),
+        status: prog.status || 'in_progress',
+        score: prog.score !== undefined ? prog.score : null,
+        notes: prog.notes || '',
+      })
+    }
+
+    for (const cb of customBooks) {
+      if (!cb || !cb.id) continue
+      const prog = progressMap[cb.id] || {}
+      map.set(cb.id, {
+        ...cb,
+        page: Math.max(1, Number(prog.page) || cb.page || 1),
+        totalPages: Math.max(1, Number(prog.totalPages) || cb.totalPages || 200),
+        status: prog.status || cb.status || 'in_progress',
+        score: prog.score !== undefined ? prog.score : cb.score,
+        notes: prog.notes || cb.notes || '',
+      })
+    }
+
+    for (const sb of shelfCatalog) {
+      if (!sb || !sb.id || map.has(sb.id)) continue
+      const prog = progressMap[sb.id] || {}
+      map.set(sb.id, {
+        id: sb.id,
+        name: sb.name || 'Sans titre',
+        author: sb.notes || (Array.isArray(sb.tags) && sb.tags.length ? sb.tags.join(', ') : 'Shelf'),
+        cloudPath: null,
+        textJson: null,
+        isCloud: false,
+        coverColor: '#3A3630',
+        image: sb.image || '',
+        page: Math.max(1, Number(prog.page) || (sb.status === 'done' ? 200 : 1)),
+        totalPages: Math.max(1, Number(prog.totalPages) || 200),
+        status: prog.status || sb.status || 'backlog',
+        score: prog.score !== undefined ? prog.score : sb.score,
+        notes: prog.notes || sb.notes || '',
+      })
+    }
+
+    return Array.from(map.values())
+  }, [progressMap, customBooks, shelfCatalog, cloudTreeFiles])
+
+  const filteredBooks = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase()
+    return allBooks.filter((b) => {
+      if (filterTab === 'cloud' && !b.isCloud) return false
+      if (filterTab === 'in_progress' && b.status !== 'in_progress') return false
+      if (filterTab === 'backlog' && b.status !== 'backlog') return false
+      if (filterTab === 'done' && b.status !== 'done') return false
+      if (q) {
+        const hay = `${b.name} ${b.author} ${b.notes || ''}`.toLowerCase()
+        if (!hay.includes(q)) return false
+      }
+      return true
+    })
+  }, [allBooks, filterTab, searchQuery])
+
+  const activeBook = useMemo(
+    () => allBooks.find((b) => b.id === activeBookId) || null,
+    [allBooks, activeBookId]
+  )
+
+  // Charge le JSON des pages du livre lorsqu'on l'ouvre dans le lecteur Design C
+  useEffect(() => {
+    if (!activeBook || !activeBook.textJson || loadedBookPages[activeBook.id]) return
+    let alive = true
+    fetch(activeBook.textJson)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!alive || !data || !Array.isArray(data.pages)) return
+        setLoadedBookPages((prev) => ({ ...prev, [activeBook.id]: data.pages }))
+      })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [activeBook, loadedBookPages])
+
+  // Flèches gauche/droite pour tourner les doubles pages dans le lecteur Design C
+  useEffect(() => {
+    if (!activeBook) return undefined
+    const onKey = (e) => {
+      const el = document.activeElement
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return
+      if (e.key === 'ArrowRight') {
+        e.preventDefault()
+        turnSpread(2)
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault()
+        turnSpread(-2)
+      } else if (e.key === 'Escape') {
+        setActiveBookId(null)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
+
+  const updateBookProgress = (bookId, patch) => {
+    const cur = progressMap[bookId] || {}
+    const next = { ...progressMap, [bookId]: { ...cur, ...patch } }
+    saveProgress(next)
+  }
+
+  const cycleStatus = (e, book) => {
+    e.stopPropagation()
+    const idx = STATUS_ORDER.indexOf(book.status)
+    const nextStatus = STATUS_ORDER[(idx + 1) % STATUS_ORDER.length]
+    updateBookProgress(book.id, { status: nextStatus })
+  }
+
+  const turnSpread = (delta) => {
+    if (!activeBook) return
+    const pagesArr = loadedBookPages[activeBook.id]
+    const maxP = pagesArr && pagesArr.length ? pagesArr.length : activeBook.totalPages
+    const nextP = Math.max(1, Math.min(maxP, activeBook.page + delta))
+    updateBookProgress(activeBook.id, { page: nextP, totalPages: maxP })
+  }
+
+  const handleUploadFiles = async (e) => {
+    const files = Array.from(e.target.files || [])
+    e.target.value = ''
+    if (!files.length) return
+    notify({ label: 'Create / Books', title: `Envoi de ${files.length} livre(s) vers Create/Books…`, ttl: 4000 })
+    try {
+      await captureFiles(files, { folder: 'pages/Books' })
+      const treeRes = await fetch('/api/page?action=tree&dir=pages/Books', { cache: 'no-store' }).then((r) => r.json()).catch(() => ({ paths: [] }))
+      if (Array.isArray(treeRes.paths)) setCloudTreeFiles(treeRes.paths)
+      notify({ label: 'Create / Books', title: 'Livre archivé dans Create/Books ✓', ttl: 4500 })
+    } catch (err) {
+      notify({ label: 'Create / Books', title: 'Erreur lors de l’envoi', body: String(err?.message || err), ttl: 6000 })
+    }
+  }
+
+  const handleAddBookEntry = (e) => {
+    e.preventDefault()
+    if (!newTitle.trim()) return
+    const id = 'book-' + Date.now().toString(36)
+    const entry = {
+      id,
+      name: newTitle.trim(),
+      author: newAuthor.trim() || 'Auteur',
+      cloudPath: null,
+      textJson: null,
+      isCloud: false,
+      coverColor: '#2C3545',
+      image: '',
+      page: 1,
+      totalPages: Math.max(1, Number(newPages) || 200),
+      status: 'in_progress',
+      score: null,
+      notes: '',
+    }
+    const nextCustom = [entry, ...customBooks]
+    setCustomBooks(nextCustom)
+    writeLocalJson(LS_CUSTOM_BOOKS_KEY, nextCustom)
+    updateBookProgress(id, { page: 1, totalPages: entry.totalPages, status: 'in_progress' })
+    setNewTitle('')
+    setNewAuthor('')
+    setShowAddModal(false)
+  }
+
+  const handleDownloadCloudPdf = async (book) => {
+    if (!book || !book.cloudPath || downloadingPdf) return
+    setDownloadingPdf(true)
+    try {
+      const r = await fetch(urlLectureAffichage(book.cloudPath))
+      const j = await r.json()
+      const manifest = JSON.parse(j.markdown)
+      const eff = effectiveManifest(manifest)
+      const urls = downloadUrls(eff)
+      await streamDownload({
+        urls,
+        name: eff.name || `${book.name}.pdf`,
+        mime: eff.mime || 'application/pdf',
+      })
+    } catch (err) {
+      notify({ label: 'Create / Books', title: 'Téléchargement PDF impossible', body: String(err?.message || err), ttl: 5000 })
+    } finally {
+      setDownloadingPdf(false)
+    }
+  }
+
+  const exportCsv = () => {
+    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
+    const rows = [
+      ['Titre', 'Auteur', 'Source_Cloud', 'Statut', 'Page', 'Total_Pages', 'Progression_Pct', 'Note_100'].join(','),
+      ...allBooks.map((b) => {
+        const pct = Math.min(100, Math.round((b.page / Math.max(1, b.totalPages)) * 100))
+        return [
+          esc(b.name),
+          esc(b.author),
+          esc(b.isCloud ? 'Create / Books' : 'Shelf'),
+          esc(STATUS_LABELS[b.status] || b.status),
+          b.page,
+          b.totalPages,
+          `${pct}%`,
+          b.score ?? '',
+        ].join(',')
+      }),
+    ]
+    const blob = new Blob(['\ufeff' + rows.join('\n')], { type: 'text/csv;charset=utf-8' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = 'zenray-books-registre.csv'
+    a.click()
+  }
+
+  const rootStyle = {
+    '--zrb-book-size': `${prefs.fontSize}px`,
+    '--zrb-book-lh': String(prefs.lineHeight),
+    '--zrb-book-width': `${prefs.colWidth}ch`,
+  }
+
+  const cloudCount = allBooks.filter((b) => b.isCloud).length
+
+  // =========================================================
+  // VUE LECTEUR : DESIGN C · DOUBLE-PAGE LIVRE OUVERT (ZÉRO CHROME, PAPIER NU)
+  // =========================================================
+  if (activeBook) {
+    const pagesArr = loadedBookPages[activeBook.id] || null
+    const maxPages = pagesArr && pagesArr.length ? pagesArr.length : activeBook.totalPages
+    const leftPageNum = Math.max(1, Math.min(maxPages, activeBook.page))
+    const rightPageNum = Math.min(maxPages, leftPageNum + 1)
+    const pct = Math.min(100, Math.round((leftPageNum / Math.max(1, maxPages)) * 100))
+
+    const leftText = pagesArr
+      ? pagesArr[leftPageNum - 1]
+      : `${activeBook.name} (${activeBook.author})\n\nPage ${leftPageNum} sur ${maxPages}.\n\n${activeBook.notes || 'Utilise le panneau Notes ci-dessus pour consigner tes passages clés ou clique sur Télécharger PDF pour ouvrir le fichier original hébergé dans Create/Books.'}`
+    const rightText = pagesArr && rightPageNum > leftPageNum
+      ? pagesArr[rightPageNum - 1]
+      : `Notes de lecture · ${activeBook.name}\n\n${activeBook.notes || 'Aucune note enregistrée pour ce chapitre. Clique sur « Notes » en haut à droite pour écrire directement à côté de ta lecture.'}`
+
+    const leftParas = splitParagraphs(leftText)
+    const rightParas = splitParagraphs(rightText)
+
+    return (
+      <div className="zrb-root" data-theme={prefs.theme} style={rootStyle}>
+        <header className="zrb-top">
+          <div className="zrb-brand">
+            <span className="zrb-brand-title">{activeBook.name}</span>
+            <span>{activeBook.author}</span>
+          </div>
+
+          <div className="zrb-actions">
+            <button type="button" className="zrb-tab-btn is-active" onClick={() => setActiveBookId(null)}>
+              ← Bibliothèque (<span className="zrb-num">{allBooks.length}</span>)
+            </button>
+            <button type="button" className={`zrb-tab-btn${showAa ? ' is-active' : ''}`} onClick={() => setShowAa((v) => !v)}>
+              Aa
+            </button>
+            <button type="button" className={`zrb-tab-btn${showNotesDrawer ? ' is-active' : ''}`} onClick={() => setShowNotesDrawer((v) => !v)}>
+              Notes
+            </button>
+            {activeBook.cloudPath && (
+              <button type="button" className="zrb-pill-btn" onClick={() => handleDownloadCloudPdf(activeBook)}>
+                {downloadingPdf ? 'Téléchargement…' : 'PDF Original'}
+              </button>
+            )}
+          </div>
+        </header>
+
+        {showAa && (
+          <div className="zrb-aa-bar">
+            <div className="zrb-aa-group">
+              <span>Corps</span>
+              <input type="range" min="15" max="23" step="0.5" value={prefs.fontSize}
+                onChange={(e) => setPrefs((p) => ({ ...p, fontSize: Number(e.target.value) }))} />
+              <span className="zrb-num">{prefs.fontSize}px</span>
+            </div>
+
+            <div className="zrb-aa-group">
+              <span>Interligne</span>
+              <input type="range" min="1.45" max="2.0" step="0.05" value={prefs.lineHeight}
+                onChange={(e) => setPrefs((p) => ({ ...p, lineHeight: Number(e.target.value) }))} />
+              <span className="zrb-num">{prefs.lineHeight}</span>
+            </div>
+
+            <div className="zrb-aa-group">
+              <span>Largeur</span>
+              <input type="range" min="44" max="68" step="2" value={prefs.colWidth}
+                onChange={(e) => setPrefs((p) => ({ ...p, colWidth: Number(e.target.value) }))} />
+              <span className="zrb-num">{prefs.colWidth}ch</span>
+            </div>
+
+            <div className="zrb-aa-group">
+              <span>Papier :</span>
+              {['ivoire', 'sepia', 'nuit'].map((th) => (
+                <button key={th} type="button"
+                  className={`zrb-pill-btn${prefs.theme === th ? ' is-primary' : ''}`}
+                  onClick={() => setPrefs((p) => ({ ...p, theme: th }))}>
+                  {th === 'ivoire' ? 'Ivoire' : th === 'sepia' ? 'Sépia' : 'Nuit'}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {showNotesDrawer && (
+          <div className="zrb-aa-bar" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <strong>Notes de lecture · {activeBook.name}</strong>
+              <span className="zrb-num">Sauvegardé automatiquement dans Create/Books</span>
+            </div>
+            <textarea
+              value={activeBook.notes || ''}
+              onChange={(e) => updateBookProgress(activeBook.id, { notes: e.target.value })}
+              placeholder="Écris tes notes, citations ou idées clés sur ce livre…"
+              rows={4}
+              style={{
+                width: '100%',
+                padding: '10px 12px',
+                borderRadius: 8,
+                border: '1px solid var(--zrb-line-hair)',
+                background: 'var(--zrb-bg-page)',
+                color: 'var(--zrb-fg-ink)',
+                fontFamily: 'var(--zrb-serif)',
+                fontWeight: 500,
+                fontSize: 14,
+                lineHeight: 1.55,
+              }}
+            />
+          </div>
+        )}
+
+        <div className="zrb-spread-container">
+          <div className="zrb-two-page-spread">
+            <article className="zrb-prose-col" onClick={() => turnSpread(-2)} title="Cliquer pour revenir de 2 pages (ou flèche gauche)">
+              <div className="zrb-ch-label">Page <span className="zrb-num">{leftPageNum}</span> · {activeBook.name}</div>
+              {leftParas.map((p, idx) => (
+                <p key={idx}>{p}</p>
+              ))}
+            </article>
+
+            <div className="zrb-spine-line" />
+
+            <article className="zrb-prose-col" onClick={() => turnSpread(2)} title="Cliquer pour avancer de 2 pages (ou flèche droite)">
+              <div className="zrb-ch-label">Page <span className="zrb-num">{rightPageNum}</span> · {activeBook.author}</div>
+              {rightParas.map((p, idx) => (
+                <p key={idx}>{p}</p>
+              ))}
+            </article>
+          </div>
+        </div>
+
+        <footer className="zrb-bottom">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <button type="button" className="zrb-pill-btn" onClick={() => turnSpread(-2)}>← Précédent</button>
+            <span className="zrb-num">Page {leftPageNum}</span>
+          </div>
+
+          <div className="zrb-hair-progress" title={`${pct}% lu`}>
+            <div className="zrb-hair-fill" style={{ width: `${pct}%` }} />
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <span className="zrb-num">Page {rightPageNum} sur {maxPages} · {pct}%</span>
+            <button type="button" className="zrb-pill-btn" onClick={() => turnSpread(2)}>Suivant →</button>
+          </div>
+        </footer>
+      </div>
+    )
+  }
+
+  // =========================================================
+  // VUE SHELF C : REGISTRE ÉDITORIAL MINIMALISTE (INDEX TABULAIRE SUR PAPIER IVOIRE)
+  // =========================================================
+  return (
+    <div className="zrb-root" data-theme={prefs.theme} style={rootStyle}>
+      <input ref={fileInputRef} type="file" accept=".pdf,.epub" multiple style={{ display: 'none' }} onChange={handleUploadFiles} />
+
+      <header className="zrb-top">
+        <div className="zrb-brand">
+          <span className="zrb-brand-title">Index des Livres</span>
+          <span>
+            <span className="zrb-num">{filteredBooks.length}</span> entrées · <span className="zrb-num">{cloudCount}</span> PDF dans Create/Books
+          </span>
+        </div>
+
+        <div className="zrb-actions">
+          {[
+            ['all', `Registre (${allBooks.length})`],
+            ['cloud', `Create / Books (${cloudCount})`],
+            ['in_progress', 'En cours'],
+            ['backlog', 'À lire'],
+            ['done', 'Lus'],
+          ].map(([key, label]) => (
+            <button key={key} type="button"
+              className={`zrb-tab-btn${filterTab === key ? ' is-active' : ''}`}
+              onClick={() => setFilterTab(key)}>
+              {label}
+            </button>
+          ))}
+
+          <input
+            type="search"
+            className="zrb-search-input"
+            placeholder="Rechercher un livre…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+
+          <button type="button" className={`zrb-tab-btn${showAa ? ' is-active' : ''}`} onClick={() => setShowAa((v) => !v)}>
+            Aa
+          </button>
+
+          <button type="button" className="zrb-pill-btn" onClick={exportCsv}>
+            Exporter CSV
+          </button>
+
+          <button type="button" className="zrb-pill-btn" onClick={() => setShowAddModal((v) => !v)}>
+            + Fiche
+          </button>
+
+          <button type="button" className="zrb-pill-btn is-primary" onClick={() => fileInputRef.current?.click()}>
+            + Nouveau PDF (Create/Books)
+          </button>
+        </div>
+      </header>
+
+      {showAa && (
+        <div className="zrb-aa-bar">
+          <div className="zrb-aa-group">
+            <span>Corps lecteur</span>
+            <input type="range" min="15" max="23" step="0.5" value={prefs.fontSize}
+              onChange={(e) => setPrefs((p) => ({ ...p, fontSize: Number(e.target.value) }))} />
+            <span className="zrb-num">{prefs.fontSize}px</span>
+          </div>
+          <div className="zrb-aa-group">
+            <span>Interligne</span>
+            <input type="range" min="1.45" max="2.0" step="0.05" value={prefs.lineHeight}
+              onChange={(e) => setPrefs((p) => ({ ...p, lineHeight: Number(e.target.value) }))} />
+            <span className="zrb-num">{prefs.lineHeight}</span>
+          </div>
+          <div className="zrb-aa-group">
+            <span>Papier :</span>
+            {['ivoire', 'sepia', 'nuit'].map((th) => (
+              <button key={th} type="button"
+                className={`zrb-pill-btn${prefs.theme === th ? ' is-primary' : ''}`}
+                onClick={() => setPrefs((p) => ({ ...p, theme: th }))}>
+                {th === 'ivoire' ? 'Ivoire' : th === 'sepia' ? 'Sépia' : 'Nuit'}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showAddModal && (
+        <form className="zrb-aa-bar" onSubmit={handleAddBookEntry}>
+          <div className="zrb-aa-group" style={{ flex: 1 }}>
+            <input className="zrb-search-input" style={{ width: '42%' }} placeholder="Titre du livre…" value={newTitle} onChange={(e) => setNewTitle(e.target.value)} />
+            <input className="zrb-search-input" style={{ width: '32%' }} placeholder="Auteur…" value={newAuthor} onChange={(e) => setNewAuthor(e.target.value)} />
+            <input className="zrb-search-input zrb-num" style={{ width: 90 }} type="number" min="1" placeholder="Pages" value={newPages} onChange={(e) => setNewPages(e.target.value)} />
+            <button type="submit" className="zrb-pill-btn is-primary">Ajouter au registre</button>
+          </div>
+        </form>
+      )}
+
+      <div className="zrb-shelf-wrap">
+        <table className="zrb-editorial-table">
+          <thead>
+            <tr>
+              <th>Livre</th>
+              <th>Auteur / Note</th>
+              <th>Source Cloud</th>
+              <th>Statut</th>
+              <th>Progression</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredBooks.map((book) => {
+              const pct = Math.min(100, Math.round((book.page / Math.max(1, book.totalPages)) * 100))
+              return (
+                <tr key={book.id} onClick={() => setActiveBookId(book.id)} title="Cliquer pour ouvrir en Double-Page Livre Ouvert (Design C)">
+                  <td>
+                    <div className="zrb-book-cell">
+                      {book.image ? (
+                        <img className="zrb-tiny-cover" src={book.image} alt="" loading="lazy" />
+                      ) : (
+                        <div className="zrb-tiny-cover" style={{ background: book.coverColor || '#263240' }}>
+                          {book.name.slice(0, 2).toUpperCase()}
+                        </div>
+                      )}
+                      <span className="zrb-row-title">{book.name}</span>
+                    </div>
+                  </td>
+                  <td style={{ color: 'var(--zrb-fg-muted)', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {book.author}
+                  </td>
+                  <td>
+                    <span className={`zrb-cloud-pill${book.isCloud ? ' is-cloud' : ''}`}>
+                      {book.isCloud ? 'Create / Books · PDF' : 'Shelf.json'}
+                    </span>
+                  </td>
+                  <td>
+                    <button type="button" className="zrb-pill-btn" onClick={(e) => cycleStatus(e, book)} title="Cliquer pour changer le statut">
+                      {STATUS_LABELS[book.status] || book.status}
+                    </button>
+                  </td>
+                  <td className="zrb-num" onClick={(e) => e.stopPropagation()}>
+                    <div className="zrb-prog-cell">
+                      <div>
+                        Page{' '}
+                        <input
+                          type="number"
+                          min="1"
+                          max={book.totalPages}
+                          value={book.page}
+                          onChange={(e) => updateBookProgress(book.id, { page: Math.max(1, Number(e.target.value) || 1) })}
+                          style={{
+                            width: 48,
+                            border: '1px solid var(--zrb-line-hair)',
+                            borderRadius: 4,
+                            background: 'transparent',
+                            color: 'var(--zrb-fg-ink)',
+                            fontFamily: 'var(--zrb-serif)',
+                            fontWeight: 500,
+                            fontSize: 12,
+                            padding: '1px 4px',
+                          }}
+                        />{' '}
+                        / {book.totalPages} ({pct}%)
+                      </div>
+                      <div className="zrb-mini-bar"><div style={{ width: `${pct}%` }} /></div>
+                    </div>
+                  </td>
+                  <td className="zrb-num" onClick={(e) => e.stopPropagation()}>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      placeholder="-"
+                      value={book.score ?? ''}
+                      onChange={(e) => {
+                        const val = e.target.value === '' ? null : Math.max(0, Math.min(100, Number(e.target.value)))
+                        updateBookProgress(book.id, { score: val })
+                      }}
+                      style={{
+                        width: 48,
+                        border: '1px solid var(--zrb-line-hair)',
+                        borderRadius: 4,
+                        background: 'transparent',
+                        color: 'var(--zrb-fg-ink)',
+                        fontFamily: 'var(--zrb-serif)',
+                        fontWeight: 500,
+                        fontSize: 12.5,
+                        padding: '1px 4px',
+                      }}
+                    />{' '}
+                    <span style={{ color: 'var(--zrb-fg-muted)' }}>/ 100</span>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <footer className="zrb-bottom">
+        <span>Double source unifiée : Create/Books (`pages/Books/`) + `public/shelf/books.json`</span>
+        <span className="zrb-num">{cloudCount} PDF Cloud prêts à ouvrir en Double-Page (Design C)</span>
+      </footer>
+    </div>
+  )
+}

@@ -1,0 +1,87 @@
+// regen-thumbs-hd.mjs — TEST « vignette 1080p » (2026-07-12, Matthieu : vignettes 384px pixélisées sur
+// écran Retina type iPhone 15 Pro Max). Régénère UNIQUEMENT la vignette (petit côté <= 1080px, jamais
+// d'upscale, qualité webp réglable) des images déjà en ligne sous un dossier donné, à partir des fichiers
+// LOCAUX correspondants (par nom exact — jamais deviné). L'ORIGINAL chiffré et le reste du manifeste sont
+// INTACTS ; seuls thumb/thumbIv/thumbW/thumbH changent. Jumeau de regen-thumbs-oriented.mjs, mais cible un
+// DOSSIER précis (pas un filtre EXIF) et une résolution/qualité réglables (voir img-ingest.mjs:regenThumbAt).
+//
+// Usage : GITHUB_TOKEN=.. node scripts/regen-thumbs-hd.mjs "<dossier local>" "<dossier site>" [maxShort] [quality]
+// Exemple (test 74 images) :
+//   GITHUB_TOKEN=.. node scripts/regen-thumbs-hd.mjs \
+//     "/Users/zenray/Downloads/DJI/10 Juillet 2026/Iphone/Photos" \
+//     "pages/Photos/DJI/10 Juillet 2026/Iphone/Artstation-ejxb"
+
+import { makeImgShardCtx, regenThumbAt } from './img-ingest.mjs'
+import { THUMB_MAX_SHORT, THUMB_QUALITY } from './lib/img-pipeline.mjs'
+import { pushBlobs } from './video-mse-lib.mjs'
+import path from 'node:path'
+
+const token = process.env.GITHUB_TOKEN
+const OWNER = 'matthieuhuguet'
+const DATA = 'zenray-data'
+const REPO = '/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress'
+const LOCAL_ROOT = process.argv[2]
+const DEST = (process.argv[3] || '').replace(/\/+$/, '')
+const MAX_SHORT = parseInt(process.argv[4] || String(THUMB_MAX_SHORT), 10)
+const QUALITY = parseInt(process.argv[5] || String(THUMB_QUALITY), 10)
+if (!token || !LOCAL_ROOT || !DEST) { console.error(`usage: GITHUB_TOKEN=.. node regen-thumbs-hd.mjs <dossier local> <dossier site> [maxShort=${THUMB_MAX_SHORT}] [quality=${THUMB_QUALITY}]`); process.exit(1) }
+
+async function listDir(dir) {
+  const enc = encodeURIComponent(dir).replace(/%2F/g, '/')
+  const r = await fetch(`https://api.github.com/repos/${OWNER}/${DATA}/contents/${enc}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zr' } })
+  if (r.status !== 200) throw new Error(`listDir ${dir}: HTTP ${r.status}`)
+  return r.json()
+}
+async function fetchManifest(mp) {
+  const enc = encodeURIComponent(mp).replace(/%2F/g, '/')
+  const r = await fetch(`https://api.github.com/repos/${OWNER}/${DATA}/contents/${enc}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zr' } })
+  if (r.status !== 200) return null
+  try { return JSON.parse(await r.text()) } catch { return null }
+}
+
+const entries = await listDir(DEST)
+const items = entries.filter((e) => e.type === 'file' && e.name.endsWith('.img.json'))
+console.log(`\n=== ${items.length} image(s) référencée(s) sous ${DEST} ===`)
+
+const pend = []      // { mp, m, srcFile }
+let skippedNoLocal = 0, skippedDone = 0
+for (const e of items) {
+  const base = e.name.replace(/\.img\.json$/, '')
+  const mp = `${DEST}/${e.name}`
+  const srcFile = path.join(LOCAL_ROOT, base)
+  const m = await fetchManifest(mp)
+  if (!m) { console.log(`  ⏭ manifeste illisible : ${base}`); continue }
+  // idempotent : déjà régénérée à une résolution >= la cible actuelle -> rien à refaire
+  const already = m.thumbW && m.thumbW >= Math.min(MAX_SHORT, Math.min(m.w || 1e9, m.h || 1e9))
+  if (already) { skippedDone++; continue }
+  const st = await import('node:fs/promises').then((fs) => fs.stat(srcFile).catch(() => null))
+  if (!st) { console.log(`  ✗ fichier local introuvable, sauté : ${srcFile}`); skippedNoLocal++; continue }
+  pend.push({ mp, m, srcFile, base })
+}
+console.log(`=== ${pend.length} à régénérer (${skippedDone} déjà HD, ${skippedNoLocal} sans fichier local) ===\n`)
+if (!pend.length) { console.log('rien à faire.'); process.exit(0) }
+
+const ctx = makeImgShardCtx({ token, work: process.env.HOME + '/.zr-archive-work-thumbhd', repoRoot: REPO, log: (...a) => console.log('   ', ...a) })
+await ctx.openShard()
+
+const resolved = []
+let done = 0
+for (const p of pend) {
+  try {
+    const r = await regenThumbAt(p.srcFile, ctx, MAX_SHORT, QUALITY)
+    if (!r) { console.log(`  ✗ vignette KO : ${p.base}`); continue }
+    p.m.thumbIv = r.thumbIv
+    p.m.thumbW = r.thumbW
+    p.m.thumbH = r.thumbH
+    resolved.push({ mp: p.mp, m: p.m, repo: r.repo, thumbPath: r.thumbPath })
+    done++
+    if (done % 20 === 0) console.log(`  ${done}/${pend.length} régénérées`)
+  } catch (e) { console.log(`  ✗ ÉCHEC ${p.base} : ${(e && e.message || e).toString().slice(0, 120)}`) }
+}
+await ctx.flush()
+
+const { thumbUrlForRegen } = await import('./img-ingest.mjs')
+const blobs = resolved.map((r) => { r.m.thumb = thumbUrlForRegen(ctx, r.repo, r.thumbPath); return { path: r.mp, content: JSON.stringify(r.m) } })
+for (let i = 0; i < blobs.length; i += 150) await pushBlobs(token, DATA, blobs.slice(i, i + 150), `regen thumb HD (${MAX_SHORT}px/q${QUALITY})`, () => {})
+console.log(`\n✓✓ REGEN THUMB HD COMPLET — ${blobs.length}/${items.length} vignettes régénérées (maxShort=${MAX_SHORT}, q=${QUALITY}), original intact.`)
+process.exit(0)

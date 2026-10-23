@@ -1,0 +1,147 @@
+import { urlLectureAffichage } from '../lib/urlLecture.js'
+// Visibilité d'un dossier Finder pour la capture média (public CDN vs privé proxy).
+//
+// MARQUEUR : un fichier .zrvis.json {vis:'public'|'private'} posé DANS un dossier fixe sa visibilité.
+// HÉRITAGE : un dossier sans marqueur hérite de son parent (on remonte l'arbre). Défaut = 'public' (tout-public).
+//   Ex. pages/Photos/.zrvis.json {vis:'public'} -> pages/Photos ET pages/Photos/Vacances sont publics
+//   tant que Vacances n'a pas son propre marqueur qui dirait le contraire.
+//
+// POURQUOI un fichier marqueur et pas un champ ailleurs : c'est le même modèle que tout le reste du
+// Finder (un nœud = un fichier dans zenray-data), donc lisible/déplaçable/versionné sans schéma à part.
+//
+// Lecture via /api/page action read (no-store : la visibilité peut changer en cours de session via le
+// toggle). Best-effort + cache mémoire : un dossier déjà résolu n'est pas relu en boucle.
+
+const VIS_FILE = '.zrvis.json'
+const _cache = new Map() // dir -> 'public' | 'private' (résultat EFFECTIF, hérité compris)
+// Cache des MARQUEURS lus par chemin (y compris les ABSENCES). CRUCIAL perf : sans lui, résoudre 261 dossiers
+// frères relisait 261 fois le marqueur de leur parent commun et de la racine 'pages' -> tempête de fetchs qui
+// sature le navigateur et fige la navigation. Avec lui, chaque chemin n'est lu QU'UNE fois par session.
+const _markerCache = new Map() // path normalisé -> 'public' | 'private' | null (null = pas de marqueur ici)
+const _markerInflight = new Map() // path -> Promise (dédup des lectures concurrentes du même chemin)
+
+// 14 October 2026: the markers survive a page reload for ten minutes (localStorage). Every start used to read ~36 of them, one request each,
+// before the first folder could be drawn with its public/private badge. The window is shorter than the in-memory cache already was
+// (a whole session), and a toggle or move clears both (invalidateVisibility).
+// FR : les marqueurs survivent dix minutes a un rechargement ; un basculement ou un deplacement vide les deux caches.
+const PERSIST_KEY = 'zr:folderVis:v1'
+const PERSIST_TTL_MS = 10 * 60 * 1000
+let _persistTimer = null
+function hydrateMarkers() {
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(PERSIST_KEY) : null
+    if (!raw) return
+    const saved = JSON.parse(raw)
+    if (!saved || typeof saved.at !== 'number' || Date.now() - saved.at > PERSIST_TTL_MS || typeof saved.entries !== 'object') return
+    for (const [key, value] of Object.entries(saved.entries)) if (value === 'public' || value === 'private' || value === null) _markerCache.set(key, value)
+  } catch {}
+}
+function persistMarkers() {
+  if (_persistTimer || typeof localStorage === 'undefined') return
+  _persistTimer = setTimeout(() => {
+    _persistTimer = null
+    try { localStorage.setItem(PERSIST_KEY, JSON.stringify({ at: Date.now(), entries: Object.fromEntries(_markerCache) })) } catch {}
+  }, 400)
+}
+hydrateMarkers()
+
+// Normalise un chemin de dossier (retire le slash final, défaut 'pages').
+function norm(dir) {
+  return String(dir || 'pages').replace(/\/+$/, '') || 'pages'
+}
+
+// Lit le marqueur .zrvis.json POSÉ DIRECTEMENT dans `dir` (pas d'héritage). Renvoie 'public'|'private'|null.
+// Mémoïsé (résultat ET absence) + dédup des requêtes en vol : un même chemin n'est jamais refetché.
+async function readMarker(dir) {
+  const key = norm(dir)
+  if (_markerCache.has(key)) return _markerCache.get(key)
+  if (_markerInflight.has(key)) return _markerInflight.get(key)
+  const p = (async () => {
+    try {
+      // Lecture d'AFFICHAGE : hors quota REST. Le cache memoire au-dessus rend deja chaque chemin
+      // unique, donc le cache CDN de raw n'ajoute aucun retard percu ; il retire seulement le cout.
+      const r = await fetch(urlLectureAffichage(key + '/' + VIS_FILE), { cache: 'no-store' })
+        .then((x) => x.json()).catch(() => null)
+      // A transient failure (no answer, error answer) is NOT an absence: it is never cached, so it can never become a persisted "no marker"
+      // that would route a private folder as public. Only a confirmed absence (`missing`) or a readable marker is remembered.
+      if (!r || (r.error && !r.missing)) return null
+      let out = null
+      if (!r.missing && r.markdown != null) {
+        try {
+          const v = JSON.parse(r.markdown)
+          out = v && v.vis === 'public' ? 'public' : v && v.vis === 'private' ? 'private' : null
+        } catch { out = null }
+      }
+      _markerCache.set(key, out); persistMarkers()
+      return out
+    } catch { return null }
+    finally { _markerInflight.delete(key) }
+  })()
+  _markerInflight.set(key, p)
+  return p
+}
+
+// Visibilité EFFECTIVE d'un dossier : son marqueur, sinon celui du parent le plus proche, sinon DÉFAUT = 'public'.
+// CHANGEMENT (tout-public) : le modèle est maintenant "public par défaut" (CDN jsDelivr, hors quota API) ; seul un
+// marqueur .zrvis.json {vis:'private'} EXPLICITE rend un dossier privé. Avant, l'absence de marqueur tombait sur
+// 'private' -> les nouvelles images partaient sur des shards privés servis par le proxy (quota + pastille orange).
+// On remonte segment par segment jusqu'à la racine. Résultat mis en cache (vidé par invalidateVisibility après un toggle).
+//
+// PIÈGE RÉEL PAYÉ (2026-07-21) : un marqueur .zrvis.json {vis:'private'} posé à la RACINE `pages` (résidu de
+// l'ère "privé par défaut") est hérité par TOUT le site -> 100% des images importées partaient en privé/Vercel,
+// SANS erreur visible, juste une pastille jaune. Le routage était correct ; la CAUSE était cette donnée périmée.
+// Corrigé en basculant pages/.zrvis.json en {vis:'public'}. Leçon : un marqueur privé à la racine = blackout
+// silencieux de la voie publique. Si une pastille Vercel apparaît sur des uploads censés être publics, VÉRIFIER
+// D'ABORD le marqueur racine (gh api contents pages/.zrvis.json) avant de soupçonner le code de découpage.
+export async function resolveFolderVis(dir) {
+  const start = norm(dir)
+  if (_cache.has(start)) return _cache.get(start)
+  let cur = start
+  // Remonte tant qu'il reste un segment ; teste chaque niveau.
+  for (;;) {
+    const here = await readMarker(cur)
+    if (here) { _cache.set(start, here); return here }
+    const slash = cur.lastIndexOf('/')
+    if (slash < 0) break
+    cur = cur.slice(0, slash) || 'pages'
+    if (cur === 'pages' || cur === start) {
+      const root = await readMarker('pages')
+      if (root) { _cache.set(start, root); return root }
+      break
+    }
+  }
+  _cache.set(start, 'public')
+  return 'public'
+}
+
+// Écrit/maj le marqueur de visibilité d'un dossier (toggle UX). Invalide le cache ensuite.
+// Renvoie la nouvelle visibilité écrite (ou null si échec).
+export async function setFolderVis(dir, vis) {
+  const v = vis === 'public' ? 'public' : 'private'
+  const path = norm(dir) + '/' + VIS_FILE
+  const body = JSON.stringify({ vis: v })
+  const save = (sha) => fetch('/api/page', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'save', path, markdown: body, ...(sha ? { sha } : {}) }),
+  }).then((x) => x.json()).catch(() => null)
+  try {
+    // Le marqueur existe déjà dès la 2e bascule -> GitHub exige le sha courant. Read-modify-write :
+    // on tente sans sha (création), et si le serveur répond 'conflict' (fichier existant), on re-sauve
+    // avec le sha qu'il nous renvoie. 2 essais suffisent pour absorber une course.
+    let r = await save()
+    for (let i = 0; i < 2 && r && r.conflict && r.sha; i++) r = await save(r.sha)
+    if (!r || r.error || !r.ok) return null
+    invalidateVisibility()
+    return v
+  } catch { return null }
+}
+
+// Vide le cache (après un toggle, ou un déplacement de dossier qui change l'héritage).
+export function invalidateVisibility() {
+  _cache.clear(); _markerCache.clear()
+  try { if (typeof localStorage !== 'undefined') localStorage.removeItem(PERSIST_KEY) } catch {}
+}
+
+// Lecture SYNCHRONE du cache (pas de réseau) : sert au rendu des tuiles (badge public) où l'on ne peut pas
+// await. Renvoie 'public' | 'private' si déjà résolu, sinon undefined (on lancera resolveFolderVis ailleurs).
+export function peekFolderVis(dir) { return _cache.get(norm(dir)) }

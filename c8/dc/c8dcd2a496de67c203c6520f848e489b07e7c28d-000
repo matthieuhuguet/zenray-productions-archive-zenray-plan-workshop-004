@@ -1,0 +1,69 @@
+// 14 October 2026: the files a streamed film gives back. FR : les fichiers qu'un film streame peut rendre.
+import { describe, it, expect } from 'vitest'
+import { gzipSync } from 'node:zlib'
+import { parseMaster, parseMedia, planStreamFiles, safeName, decodeSubtitle, playlistPathOf } from './streamFiles.js'
+
+const MASTER = [
+  '#EXTM3U', '#EXT-X-VERSION:7',
+  '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="日本語",LANGUAGE="jpn",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="/api/hls?path=pages%2FX%2Fmedia_1.m3u8"',
+  '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Français",LANGUAGE="fre",DEFAULT=NO,AUTOSELECT=YES,CHANNELS="2",URI="/api/hls?path=pages%2FX%2Fmedia_2.m3u8"',
+  '#EXT-X-STREAM-INF:BANDWIDTH=5976690,RESOLUTION=1920x1080,CODECS="hvc1.1.6.L120.90,mp4a.40.2",AUDIO="audio"',
+  '/api/hls?path=pages%2FX%2Fmedia_0.m3u8', '',
+].join('\n')
+const media = (init, n) => ['#EXTM3U', `#EXT-X-MAP:URI="${init}"`, ...Array.from({ length: n }, (_, i) => `https://cdn.example/${init.split('/').pop().split('_')[1]}_${i}.m4s`)].join('\n')
+const MEDIA = {
+  'pages/X/media_0.m3u8': media('https://cdn.example/init_0.m4s', 3),
+  'pages/X/media_1.m3u8': media('https://cdn.example/init_1.m4s', 3),
+  'pages/X/media_2.m3u8': media('https://cdn.example/init_2.m4s', 3),
+}
+
+describe('streamFiles', () => {
+  it('reads the master: audio names, languages, default and the video rendition', () => {
+    const m = parseMaster(MASTER)
+    expect(m.audios.map((a) => [a.name, a.lang, a.default, a.uri])).toEqual([['日本語', 'jpn', true, 'pages/X/media_1.m3u8'], ['Français', 'fre', false, 'pages/X/media_2.m3u8']])
+    expect(m.videos[0]).toMatchObject({ uri: 'pages/X/media_0.m3u8', resolution: '1920x1080' })
+  })
+  it('reads a media playlist: init first, then the segments in order', () => {
+    const p = parseMedia(MEDIA['pages/X/media_0.m3u8'])
+    expect(p.initUrl).toBe('https://cdn.example/init_0.m4s')
+    expect(p.segments).toHaveLength(3)
+  })
+  it('plans one video file, one file per audio with its language in the name, and the subtitles in their format', () => {
+    const plan = planStreamFiles({ manifest: { name: 'Bleach S17E48.mkv', subtitles: [{ lang: 'fre', label: 'Français', format: 'ass', data: '' }] }, masterText: MASTER, media: MEDIA })
+    expect(plan.problems).toEqual([])
+    expect(plan.files.map((f) => f.name)).toEqual(['Bleach S17E48.mp4', 'Bleach S17E48 - 日本語.m4a', 'Bleach S17E48 - Français.m4a', 'Bleach S17E48 - Français.ass'])
+    expect(plan.files[0].urls[0]).toBe('https://cdn.example/init_0.m4s')
+    expect(plan.files[0].urls).toHaveLength(4)
+  })
+  it('RED: a missing audio playlist is reported, never silently dropped', () => {
+    const plan = planStreamFiles({ manifest: { name: 'x.mkv' }, masterText: MASTER, media: { 'pages/X/media_0.m3u8': MEDIA['pages/X/media_0.m3u8'] } })
+    expect(plan.problems.join(' ')).toContain('audio playlist missing')
+    expect(plan.files.filter((f) => f.kind === 'audio')).toHaveLength(0)
+  })
+  it('two tracks of the same language are numbered, never overwritten', () => {
+    const master = MASTER.replace('NAME="Français"', 'NAME="日本語"')
+    const plan = planStreamFiles({ manifest: { name: 'x.mkv' }, masterText: master, media: MEDIA })
+    expect(plan.files.filter((f) => f.kind === 'audio').map((f) => f.name)).toEqual(['x - 日本語.m4a', 'x - 日本語 2.m4a'])
+  })
+  it('file names are safe', () => {
+    expect(safeName('a/b:c?"d". ')).toBe('a b c d')
+    expect(playlistPathOf('/api/hls?path=pages%2FA%20B%2Fm.m3u8')).toBe('pages/A B/m.m3u8')
+  })
+  it('decodes a gzip + base64 subtitle back to its exact text', async () => {
+    const text = '[Script Info]\nTitle: é\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Bonjour\n'
+    const sub = { encoding: 'gzip+base64', data: gzipSync(Buffer.from(text)).toString('base64') }
+    expect(await decodeSubtitle(sub)).toBe(text)
+  })
+})
+
+import { rawFallbackUrl } from './streamFiles.js'
+describe('rawFallbackUrl', () => {
+  it('maps a jsDelivr URL to the same commit on GitHub raw', () => {
+    expect(rawFallbackUrl('https://cdn.jsdelivr.net/gh/matthieuhuguet/zenray-vid-public-80@1d60292793dbaeed6ca77189ae1fe7cdbbb2fec2/a b/chunk_0_00107.m4s'))
+      .toBe('https://raw.githubusercontent.com/matthieuhuguet/zenray-vid-public-80/1d60292793dbaeed6ca77189ae1fe7cdbbb2fec2/a b/chunk_0_00107.m4s')
+  })
+  it('RED: anything else has no fallback', () => {
+    expect(rawFallbackUrl('https://example.com/x.m4s')).toBe(null)
+    expect(rawFallbackUrl('https://cdn.jsdelivr.net/npm/hls.js@1.6.0/dist/hls.js')).toBe(null)
+  })
+})

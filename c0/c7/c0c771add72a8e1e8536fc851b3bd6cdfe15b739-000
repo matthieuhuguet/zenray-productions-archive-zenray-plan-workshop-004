@@ -1,0 +1,205 @@
+import React from 'react'
+import { PALETTE, RADII, SHADOWS } from '../theme.js'
+import Icon from './Icon.jsx'
+import { fmt, Menu, PlayPauseGlyph, SPEEDS } from '../media/playerControls.jsx'
+import { PLAYER_PREF_KEYS, readPlayerPrefs, writePlayerPref, playerStorage, trackLang } from '../media/playerPrefs.js'
+
+// X — Lecteur natif RICHE pour les vidéos web-natives (mp4/webm). Source = /api/stream (Range chunké
+// GitHub) -> démarrage ~1,3 s, ZÉRO ffmpeg.wasm. Ajoute ce qui manquait au <video controls> nu :
+//   - sélecteur de piste audio (HTMLMediaElement.audioTracks ; solide sur Safari, dégrade ailleurs)
+//   - sous-titres WebVTT (sidecars listés dans manifest.probe.subs) via <track>
+//   - vitesse de lecture (avec preservesPitch)
+const enc = encodeURIComponent
+// Accent ROUGE #FF3B30 : ce lecteur legacy est servi par Vercel /api/stream (mauvaise méthode, à
+// terme remplacée par HLS/jsDelivr en orange). Le rouge le signale visuellement. HLS reste orange.
+// Menu/fmt/SPEEDS partagés désormais dans src/media/playerControls.jsx (2026-07-16) : le menu y utilise
+// PALETTE.primary comme StreamVideoMSE/VideoPlayer, pas ce rouge legacy — la couleur du menu déroulant
+// change donc ici (harmonisation demandée par l'audit), RED/RED_GRAD restent pour le reste du chrome.
+const RED = '#FF3B30'
+const RED_GRAD = 'linear-gradient(135deg, #FF3B30, #C92D24)'
+
+export default function StreamVideo({ t, path, manifest }) {
+  const v = React.useRef(null)
+  const [playing, setPlaying] = React.useState(false)
+  const [cur, setCur] = React.useState(0)
+  const [dur, setDur] = React.useState((manifest && manifest.probe && manifest.probe.duration) || (manifest && manifest.duration) || 0)
+  const [buffered, setBuffered] = React.useState(0)
+  // 14 October 2026: speed and subtitle language follow from one video to the next (src/media/playerPrefs.js).
+  // FR : la vitesse et la langue des sous-titres suivent d'une video a l'autre.
+  const [speed, setSpeed] = React.useState(() => readPlayerPrefs(playerStorage()).speed)
+  const [openMenu, setOpenMenu] = React.useState(null)
+  const [audioTracks, setAudioTracks] = React.useState([]) // [{id,label}]
+  const [audioSel, setAudioSel] = React.useState(0)
+  const [subSel, setSubSel] = React.useState(null)
+  const [vol, setVol] = React.useState(1)
+  const [muted, setMuted] = React.useState(false)
+  const [fs, setFs] = React.useState(false)
+  const [pip, setPip] = React.useState(false)
+  const wrapRef = React.useRef(null)
+
+  const streamUrl = `/api/stream?path=${enc(path)}`
+
+  // PRÉCHARGEUR — combat le stuttering : <video> demande ses Range au fil de l'eau, chaque Range
+  // = aller-retour GitHub (~1s) -> stalls (pire en x2). On garde ~60s d'octets d'avance toujours
+  // chauds dans le cache HTTP (navigateur + edge, /api/stream renvoie cache immutable) en tirant
+  // des fenêtres de 4Mo dont on jette le corps. Un seul fetch à la fois, curseur en octets.
+  const mediaSize = (manifest && manifest.size) || 0
+  const mediaDur = (manifest && manifest.probe && manifest.probe.duration) || (manifest && manifest.duration) || 0
+  const bytesPerSec = (mediaSize > 0 && mediaDur > 0) ? mediaSize / mediaDur : 0
+  const prefetchTo = React.useRef(0)   // octet jusqu'où c'est préchauffé
+  const inFlight = React.useRef(false)  // 1 seul fetch concurrent
+  const aborter = React.useRef(null)
+  const PREFETCH_AHEAD = 60             // secondes d'avance visées
+  const WINDOW = 4 * 1024 * 1024        // taille d'une fenêtre de préchauffe
+  const LANG = { jpn: '日本語', fre: 'Français', fra: 'Français', eng: 'English', und: 'Piste' }
+  // Où vivent les binaires ? Le manifest .media.json porte `repo` quand les chunks (et donc les
+  // sidecars VTT extraits au même endroit) sont dans un SHARD PRIVÉ zenray-media-NN (capture
+  // universelle). Sans `repo`, ils sont dans zenray-content PUBLIC (pipeline video-transcode.mjs,
+  // qui pousse media/<id>/*.bin + media/<id>/subN_lang.vtt dans content). On route le <track> en
+  // conséquence : shard privé -> /api/shard?repo=&path= (token serveur), content -> /api/img?path=.
+  const shardRepo = (manifest && typeof manifest.repo === 'string' && /^zenray-media-\d{2,}$/.test(manifest.repo)) ? manifest.repo : null
+  const subSrc = (p) => shardRepo ? `/api/shard?repo=${enc(shardRepo)}&path=${enc(p)}` : `/api/img?path=${enc(p)}`
+  // sous-titres : sidecars WebVTT listés dans le manifest (produits par le pipeline de transcodage X)
+  const subs = ((manifest && manifest.probe && manifest.probe.subs) || []).filter((s) => s.path && /\.vtt$/i.test(s.path))
+  const subItems = [{ id: null, label: 'Sous-titres désactivés' }, ...subs.map((s, i) => ({ id: i, label: s.label || (s.lang && s.lang !== 'und' ? s.lang : `Sous-titres ${i + 1}`) }))]
+  // pistes audio depuis le MANIFEST (probe.audio) -> le sélecteur s'affiche toujours, même si le navigateur
+  // n'expose pas audioTracks. Le switch effectif utilise l'API audioTracks (solide sur Safari).
+  const probeAudio = (manifest && manifest.probe && manifest.probe.audio) || []
+  const audioItems = probeAudio.map((a, i) => ({ id: i, label: `${LANG[a.lang] || a.lang || 'Piste'} ${i + 1}${a.codec ? ' · ' + a.codec : ''}` }))
+
+  // pistes audio : lues sur l'élément (Safari les expose ; Chrome souvent non -> sélecteur masqué)
+  const readAudio = () => {
+    const el = v.current; const list = el && el.audioTracks
+    if (!list || list.length <= 1) { setAudioTracks([]); return }
+    const arr = []; let sel = 0
+    for (let i = 0; i < list.length; i++) { const tr = list[i]; arr.push({ id: i, label: `${tr.language && tr.language !== 'und' ? tr.language : 'Piste'} ${i + 1}${tr.label ? ' · ' + tr.label : ''}` }); if (tr.enabled) sel = i }
+    setAudioTracks(arr); setAudioSel(sel)
+  }
+  // LIMITE NAVIGATEUR sur le switch audio : le menu s'affiche dès que le MANIFEST liste 2+ pistes
+  // (probeAudio), mais le changement effectif passe par HTMLMediaElement.audioTracks. Cette API n'est
+  // peuplée que par Safari (et Edge legacy). Chrome/Firefox lisant un mp4 multi-pistes en <video src>
+  // simple n'exposent PAS audioTracks (souvent length<=1) -> el.audioTracks est vide, la boucle ne
+  // touche rien, on ne fait que mémoriser la sélection (UI cohérente) sans changer le son réel.
+  // Pour un switch fiable hors Safari il faudrait soit MSE/sourceBuffer multi-pistes, soit un fichier
+  // par langue côté serveur. Donc : menu visible partout, switch réel garanti seulement sur Safari.
+  const pickAudio = (id) => { setOpenMenu(null); const el = v.current; setAudioSel(id); if (!el || !el.audioTracks || el.audioTracks.length <= 1) return; for (let i = 0; i < el.audioTracks.length; i++) el.audioTracks[i].enabled = (i === id) }
+  const pickSub = (id) => {
+    setOpenMenu(null); setSubSel(id)
+    writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.subsOn, id == null ? '0' : '1')
+    if (id != null) { const lang = trackLang(subs[id]); if (lang) writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.subLang, lang) }
+    const el = v.current; if (!el) return
+    const tt = el.textTracks; for (let i = 0; i < tt.length; i++) tt[i].mode = (id != null && i === id) ? 'showing' : 'disabled'
+  }
+  const applySpeed = (s) => { setSpeed(s); setOpenMenu(null); writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.speed, s); const el = v.current; if (el) { el.playbackRate = s; for (const k of ['preservesPitch', 'webkitPreservesPitch']) if (k in el) el[k] = true } }
+
+  // the track in the saved language opens by itself when the film has it. FR : la piste de la langue sauvegardee s'ouvre seule.
+  const subSignature = subs.map((s) => `${s.path}:${s.lang}`).join('|')
+  React.useEffect(() => {
+    const prefs = readPlayerPrefs(playerStorage())
+    if (!prefs.subsOn || !prefs.subLang) return
+    const i = subs.findIndex((s) => trackLang(s) === prefs.subLang)
+    if (i >= 0) pickSub(i)
+  }, [subSignature]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const onMeta = () => { const el = v.current; if (el && isFinite(el.duration) && el.duration) setDur(el.duration); readAudio(); el.playbackRate = speed }
+  const onTime = () => { const el = v.current; setCur(el.currentTime); if (el.buffered.length) setBuffered(el.buffered.end(el.buffered.length - 1)); pump() }
+
+  // pump() : tire la prochaine fenêtre de 4Mo si on n'a pas encore 60s d'avance. Recale le curseur
+  // sur un seek arrière (currentTime revenu loin derrière le curseur préchauffé).
+  const pump = React.useCallback(() => {
+    if (!bytesPerSec) return
+    const el = v.current; if (!el) return
+    if (el.paused) return
+    const targetByte = Math.min(mediaSize, Math.ceil((el.currentTime + PREFETCH_AHEAD) * bytesPerSec))
+    const curByte = Math.floor(el.currentTime * bytesPerSec)
+    // seek arrière : le lecteur est revenu nettement avant le curseur -> on repart de currentTime
+    if (curByte < prefetchTo.current - WINDOW) { prefetchTo.current = curByte; if (aborter.current) { aborter.current.abort(); aborter.current = null; inFlight.current = false } }
+    if (inFlight.current) return
+    if (prefetchTo.current >= targetByte || prefetchTo.current >= mediaSize) return
+    const a = prefetchTo.current
+    const b = Math.min(mediaSize - 1, a + WINDOW - 1)
+    inFlight.current = true
+    const ac = new AbortController(); aborter.current = ac
+    fetch(streamUrl, { headers: { Range: `bytes=${a}-${b}` }, signal: ac.signal })
+      .then((r) => r.arrayBuffer())
+      .then(() => { prefetchTo.current = b + 1 })
+      .catch(() => {})
+      .finally(() => { inFlight.current = false; aborter.current = null; const e2 = v.current; if (e2 && !e2.paused) pump() })
+  }, [bytesPerSec, mediaSize, streamUrl])
+
+  React.useEffect(() => {
+    if (!bytesPerSec) return
+    const id = setInterval(() => pump(), 2000)
+    return () => { clearInterval(id); if (aborter.current) { aborter.current.abort(); aborter.current = null } inFlight.current = false }
+  }, [pump, bytesPerSec])
+  const toggle = () => { const el = v.current; if (el.paused) el.play().catch(() => {}); else el.pause() }
+  const skip = (d) => { const el = v.current; if (!el) return; el.currentTime = Math.min(Math.max(0, el.currentTime + d), el.duration || dur || el.currentTime + d) }
+  const seek = (e) => { const el = v.current; if (!el) return; const d = el.duration || dur || 0; if (d) el.currentTime = (parseInt(e.target.value, 10) / 1000) * d }
+  const applyVol = (nv) => { const el = v.current; if (!el) return; el.volume = nv; el.muted = nv === 0; setVol(nv); setMuted(nv === 0) }
+  const toggleMute = () => { const el = v.current; if (!el) return; el.muted = !el.muted; setMuted(el.muted) }
+  const toggleFs = () => { const node = wrapRef.current; if (!node) return; if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); else node.requestFullscreen().catch(() => {}) }
+  const togglePip = async () => { const el = v.current; if (!el) return; try { if (document.pictureInPictureElement) { await document.exitPictureInPicture(); setPip(false) } else { await el.requestPictureInPicture(); setPip(true) } } catch {} }
+  React.useEffect(() => { const on = () => setFs(!!document.fullscreenElement); document.addEventListener('fullscreenchange', on); return () => document.removeEventListener('fullscreenchange', on) }, [])
+
+  const wrap = { position: 'relative', maxWidth: 980, margin: '0 auto', borderRadius: RADII.md, background: '#0b0b0c', overflow: 'hidden' }
+  const pr = dur ? cur / dur : 0, br = dur ? buffered / dur : 0
+  const volIcon = muted || vol === 0 ? 'speaker.slash' : (vol < 0.5 ? 'speaker.wave.1' : 'speaker.wave.2')
+
+  return (
+    <div style={{ padding: 0 }}>
+      {/* Mention legacy : ce lecteur passe par Vercel /api/stream (mauvaise méthode, remplacée par HLS). */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, maxWidth: 980, margin: '0 auto 8px', fontSize: 'var(--zr-ui-sm)', fontWeight: 600, color: RED }}>
+        <span aria-hidden style={{ fontSize: 'var(--zr-ui-md)' }}>⚠</span>
+        <span>Vercel · lecteur legacy (méthode à remplacer par HLS)</span>
+      </div>
+      <div ref={wrapRef} style={wrap}>
+        <video ref={v} src={streamUrl} preload="auto" crossOrigin="anonymous" onClick={toggle}
+          onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onLoadedMetadata={onMeta}
+          onDurationChange={onMeta} onProgress={onTime} onTimeUpdate={onTime}
+          onVolumeChange={() => { const el = v.current; if (el) { setVol(el.volume); setMuted(el.muted) } }}
+          style={{ width: '100%', display: 'block', background: '#0b0b0c', borderRadius: fs ? 0 : RADII.md }}>
+          {subs.map((s, i) => <track key={i} kind="subtitles" src={subSrc(s.path)} srcLang={s.lang || 'und'} label={s.label || `Sous-titres ${i + 1}`} default={false} />)}
+        </video>
+
+        {/* Playback overlay V9 (design ui-components-zenray-v9.html) : mêmes classes zr-video-* que
+            StreamVideoMSE — verre en dégradé, rim, deux thèmes. La vieille barre rouge legacy en bas
+            (scrub pointer maison) est remplacée par la même composition que le moteur MSE. */}
+        <div className="zr-video-controls" style={{ opacity: 1 }}>
+          <div className="zr-video-top-left">
+            {typeof document !== 'undefined' && document.pictureInPictureEnabled && <button onClick={togglePip} className="zr-video-glass zr-video-control-sm" title="Picture-in-Picture (P)"><Icon name="pip" size={18} color={pip ? PALETTE.primary : undefined} /></button>}
+          </div>
+          <div className="zr-video-top-right zr-video-volume-pill">
+            <input type="range" min="0" max="1" step="0.01" value={muted ? 0 : vol} onChange={(e) => applyVol(parseFloat(e.target.value))}
+              className="zr-video-volume" title="Volume" style={{ '--zr-video-volume': `${Math.round((muted ? 0 : vol) * 100)}%` }} />
+            <button onClick={toggleMute} className="zr-video-volume-toggle" title="Muet (M)"><Icon name={volIcon} size={18} /></button>
+          </div>
+          <div className="zr-video-transport">
+            <button onClick={() => skip(-10)} className="zr-video-glass zr-video-control-md" title="Reculer de 10 s (J)"><Icon name="gobackward" size={24} /></button>
+            <button onClick={toggle} className="zr-video-glass zr-video-play-center" title="Lecture/Pause (Espace)"><PlayPauseGlyph playing={playing} size={34} pauseSize={32} /></button>
+            <button onClick={() => skip(10)} className="zr-video-glass zr-video-control-md" title="Avancer de 10 s (L)"><Icon name="goforward" size={24} /></button>
+          </div>
+          <div className="zr-video-bottom-right">
+            {audioItems.length > 1 && <button onClick={() => setOpenMenu(openMenu === 'audio' ? null : 'audio')} className="zr-video-glass zr-video-control-sm" title="Pistes audio"><Icon name="music.note" size={18} /></button>}
+            {subItems.length > 1 && <button onClick={() => setOpenMenu(openMenu === 'subs' ? null : 'subs')} className="zr-video-glass" style={{ color: subSel != null ? PALETTE.primary : undefined, minWidth: 48, height: 48, padding: '0 13px', fontWeight: 700 }} title="Sous-titres (C)">CC</button>}
+            <div className="zr-video-options-pill">
+              <button onClick={() => setOpenMenu(openMenu === 'speed' ? null : 'speed')} className="zr-video-option-button" title={`Vitesse de lecture${speed !== 1 ? ` · ${speed}×` : ''}`}><Icon name="gauge" size={18} /></button>
+              <button onClick={toggleFs} className="zr-video-option-button" title="Plein écran (F)"><Icon name={fs ? 'fullscreen.exit' : 'fullscreen.enter'} size={18} /></button>
+            </div>
+            {openMenu === 'audio' && <Menu t={t} items={audioItems} activeId={audioSel} onPick={pickAudio} />}
+            {openMenu === 'subs' && <Menu t={t} items={subItems} activeId={subSel} onPick={pickSub} />}
+            {openMenu === 'speed' && (
+              <div style={{ position: 'absolute', bottom: 52, right: 8, background: t.surface, border: `1px solid ${t.border}`, borderRadius: RADII.md, boxShadow: SHADOWS.lg, padding: 8, display: 'flex', flexWrap: 'wrap', gap: 6, width: 210, zIndex: 30 }}>
+                {SPEEDS.map((s) => <button key={s} onClick={() => applySpeed(s)} style={{ padding: '5px 11px', borderRadius: RADII.sm, border: 'none', cursor: 'pointer', fontSize: 'var(--zr-ui-sm)', fontWeight: 600, background: s === speed ? RED_GRAD : t.btnSecondaryBg, color: s === speed ? '#fff' : t.btnSecondaryText }}>{s}×</button>)}
+              </div>
+            )}
+          </div>
+          <div className="zr-video-bottom zr-video-seek-pill">
+            <span className="zr-video-time">{fmt(cur)}</span>
+            <input className="zr-video-seek" aria-label="Position de lecture" type="range" min="0" max="1000" step="1" value={Math.round(pr * 1000)} disabled={!dur} onChange={seek} style={{ '--zr-video-played': `${Math.min(100, pr * 100)}%`, '--zr-video-buffered': `${Math.min(100, br * 100)}%` }} />
+            <span className="zr-video-time">−{fmt(Math.max(0, dur - cur))}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,358 @@
+// Construit l'INDEX DE RECHERCHE v2 de zenray-data (pages/.zr-search-index.json).
+//
+// EN CLAIR POUR TOUS : la recherche tape dans une grande liste de tous les fichiers. Avant (v1),
+// cette liste ne contenait QUE des chemins. Du coup, pour afficher la petite image (vignette) de
+// chaque résultat, l'appli devait, image par image, aller relire un petit fichier descripteur
+// (.img.json) juste pour reconstruire l'adresse de la vignette. Sur 1 million d'images, ce sont
+// 1 million de petits allers-retours = lent et ça épuise le quota GitHub.
+//
+// v2 ajoute, à côté de la liste de chemins, une CARTE "thumbs" : pour chaque image, l'adresse
+// directe de sa vignette, déjà calculée. L'appli n'a donc plus rien à relire : elle affiche tout
+// de suite. Deux formes possibles dans la carte :
+//   - PUBLIQUE : { "u": "<url jsDelivr .webp figée sur un commit>" }  -> immuable, hors quota.
+//   - PRIVÉE   : { "r": "<repo shard>", "p": "<chemin .webp haché>" } -> l'appli bâtit /api/shard.
+// Une image sans vignette calculable est OMISE (pas de fausse vignette : placeholder propre côté rendu).
+//
+// CONSTRUCTION EN GIT (hors quota REST, parallélisable) : on CLONE zenray-data en local (sparse sur
+// pages/, blob:none pour ne pas tirer l'historique), on marche l'arbre DISQUE pour la liste de
+// chemins (identique v1), et on lit/parse chaque .img.json SUR DISQUE (zéro réseau) pour bâtir la
+// carte thumbs. Aucune consommation de quota GitHub.
+//
+// DRY-RUN PAR DÉFAUT (CONTRAINTE P0) : par défaut le script NE PUSH RIEN. Il logge la taille, le
+// nombre d'images indexées et 5 exemples de thumbs. Le push (Git Data API : base_tree + 1 entrée,
+// préserve tout le reste) n'a lieu QUE si on passe le flag --apply (réservé à Matthieu après revue).
+//
+// Usage DRY-RUN : GITHUB_TOKEN=$(gh auth token) node scripts/build-search-index.mjs
+// Usage PUSH    : GITHUB_TOKEN=$(gh auth token) node scripts/build-search-index.mjs --apply
+
+import { readFile, readdir, rm, writeFile, mkdir, stat } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { webcrypto, createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import os from 'node:os'
+import path from 'node:path'
+import { RE_NOEUD } from '../server/extensionsNoeuds.js'
+
+// 9 October 2026 08:06 CEST: Share the canonical matcher so every registered node reaches search.
+
+const OWNER = 'matthieuhuguet'
+const REPO = `${OWNER}/zenray-data`
+const BRANCH = 'main'
+const TOKEN = process.env.GITHUB_TOKEN
+const APPLY = process.argv.includes('--apply')
+const WORK = path.join(os.tmpdir(), 'zr_index_build')
+const INDEX_PATH = 'pages/.zr-search-index.json'
+// ═══ CETTE LISTE AVAIT OUBLIÉ ref.json ET plan.json (corrigé le 2026-08-31) ═════════════════════
+//
+// Conséquence VÉRIFIÉE sur le drive : trois boards Ref et un plan existent réellement, et chaque
+// reconstruction complète de l'index les effaçait de la recherche. Ils n'étaient pas perdus — ils
+// devenaient introuvables, ce qui est pire, puisque rien ne le signalait.
+//
+const CPU = Math.max(1, (os.cpus() || []).length || 8)
+
+if (!TOKEN) { console.error('no GITHUB_TOKEN'); process.exit(1) }
+
+// URL jsDelivr PINNÉE commit (alignée sur shardNaming.js buildJsDelivrUrl côté client).
+const buildJsDelivrUrl = (repo, commit, p) => (!repo || !commit || !p) ? null : `https://cdn.jsdelivr.net/gh/${OWNER}/${repo}@${commit}/${p}`
+const toWebp = (p) => (typeof p === 'string' ? p.replace(/\.[^./]+$/, '.webp') : null)
+
+// Valeur thumbs pour un manifeste .img.json, RÉUTILISE EXACTEMENT la logique de shardThumbUrl
+// (ImageNodeViewer.jsx) : public + cdnRepo/cdnPath/cdnCommit -> {u} jsDelivr .webp ; sinon repo+path
+// (privé/legacy) -> {r,p} avec path.webp ; sinon (rien de constructible) -> null (omis).
+// search-8 : MIROIR de thumbEntry (server/page.js index-add) et de shardThumbUrl (ImageNodeViewer.jsx).
+// Ces TROIS implémentations encodent le même invariant « manifeste -> vignette vis-aware ». Si la règle
+// de visibilité change, garder les trois synchronisées (sinon vignettes incohérentes selon le chemin).
+//
+// E (chiffrement public) : un thumb public peut désormais être CHIFFRÉ (modèle "public + chiffré + jsDelivr").
+// Dans ce cas l'URL jsDelivr pointe sur du CIPHERTEXT inutilisable tel quel dans <img> : la recherche doit
+// fetch + déchiffrer (AES-GCM) avec l'IV de la VIGNETTE avant d'afficher. On joint donc `iv` à l'entrée -> {u, iv}.
+// L'IV de la vignette est `thumbIv` (IV propre au .webp chiffré, distinct de l'IV du binaire plein). Rétro-compat :
+// un manifeste public NON chiffré (pas de thumbIv/alg) reste `{u}` seul -> URL servie directement à <img> (clair),
+// comportement inchangé. L'IV n'est PAS secret (juste unique par chiffrement) : aucune fuite à le publier dans l'index.
+function thumbEntry(m) {
+  if (!m || typeof m !== 'object') return null
+  // Gate élargi (2026-07-07) : ancien schéma mono-fichier (cdnPath) ET nouveau découpé en morceaux ≤19 Mo
+  // (cdnChunks[]) — la vignette n'est jamais chunkée, seul ce test doit reconnaître les deux formes.
+  const hasChunks = Array.isArray(m.cdnChunks) && m.cdnChunks.length > 0
+  if (m.vis === 'public' && m.cdnRepo && (m.cdnPath || hasChunks) && m.cdnCommit) {
+    // La VIGNETTE a son PROPRE hash de contenu (≠ hash de l'original = cdnPath). Le manifeste porte l'URL
+    // jsDelivr CORRECTE dans m.thumb -> l'utiliser telle quelle. toWebp(cdnPath) donnait le hash de l'original
+    // + .webp (404). Repli (vieux manifestes sans thumb) : toWebp(cdnPath), uniquement possible côté cdnPath.
+    const u = m.thumb || (m.cdnPath ? buildJsDelivrUrl(m.cdnRepo, m.cdnCommit, toWebp(m.cdnPath)) : null)
+    if (!u) return null
+    // Vignette chiffrée -> joindre l'IV du .webp (thumbIv) pour permettre le déchiffrement client.
+    if (m.thumbIv && m.alg) return { u, iv: m.thumbIv }
+    return { u }
+  }
+  if (m.repo) {
+    // Vignette = chemin haché + .webp (vérité unique ; aucun champ `thumb` n'est jamais écrit au manifest).
+    const p = toWebp(m.path)
+    if (p) return { r: m.repo, p }
+  }
+  return null
+}
+
+// Marche récursive de l'arbre disque (sous pages/) -> chemins de nœuds (relatifs à la racine du repo).
+async function walk(absRoot, relDir, out) {
+  const abs = path.join(absRoot, relDir)
+  let entries
+  try { entries = await readdir(abs, { withFileTypes: true }) } catch { return }
+  const subdirs = []
+  for (const e of entries) {
+    const rel = relDir ? `${relDir}/${e.name}` : e.name
+    if (e.isDirectory()) subdirs.push(rel)
+    else if (e.isFile() && RE_NOEUD.test(e.name)) out.push(rel)
+  }
+  for (const d of subdirs) await walk(absRoot, d, out)
+}
+
+// CONTENU PLEIN-TEXTE (recherche par mot-clé dans les markdowns ET les tables).
+// .md  : on dégraisse la syntaxe markdown (liens/images/marqueurs) -> texte brut.
+// .db.json : noms de colonnes + toutes les valeurs de cellules concaténés.
+// Normalisé (minuscules, accents retirés, espaces compactés) + tronqué (~6 Ko) pour garder l'index léger.
+const normTxt = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().slice(0, 6000)
+const mdToText = (md) => (md || '')
+  .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ') // images
+  .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // liens -> texte
+  .replace(/[#>*_`~|-]+/g, ' ') // marqueurs
+  .replace(/<[^>]+>/g, ' ')
+const dbToText = (json) => {
+  try {
+    const j = JSON.parse(json)
+    const heads = (j.columns || []).map((c) => c.name).join(' ')
+    const cells = (j.rows || []).map((r) => Object.values(r.cells || r || {}).map((v) => (v && typeof v === 'object') ? '' : String(v ?? '')).join(' ')).join(' ')
+    return `${j.name || ''} ${heads} ${cells}`
+  } catch { return '' }
+}
+async function buildContent(absRoot, textPaths) {
+  const content = {}
+  let i = 0
+  async function worker() {
+    while (i < textPaths.length) {
+      const rel = textPaths[i++]
+      try {
+        const raw = await readFile(path.join(absRoot, rel), 'utf8')
+        const txt = normTxt(rel.endsWith('.db.json') ? dbToText(raw) : mdToText(raw))
+        if (txt) content[rel] = txt
+      } catch { /* illisible -> omis */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CPU, 16) }, worker))
+  return content
+}
+
+// ═══ LES LIENS EAGLE ONT AUSSI UNE VIGNETTE, ET IL FAUT ALLER LA CHERCHER (2026-08-31) ══════════
+//
+// LE SYMPTÔME, signalé par Matthieu : « aucune miniature des médias isolés en mode liens », et une
+// pastille de provenance orange au lieu de verte.
+//
+// LA CAUSE. Un lien Eagle est un `.img.json` qui ne contient QUE `{ v, type, resourceId, title,
+// createdAt }` — c'est tout son intérêt, cent cinquante octets au lieu d'une photo. Il n'a donc ni
+// `thumb`, ni `cdnRepo`, ni `size`, ni `mime`. `thumbEntry` rendait `null`, l'index n'avait aucune
+// vignette à servir, et la tuile affichait une case vide. La pastille, qui lit la provenance dans
+// les mêmes champs, tombait sur « aucune source connue » et virait à l'orange.
+//
+// LA RÉSOLUTION SE FAIT ICI ET NON DANS L'INTERFACE, et c'est le point important. Faire résoudre
+// chaque lien par la grille coûterait un appel réseau PAR TUILE — trois pour trois liens, mais sept
+// cent quarante-huit pour un dossier de photos, sur un quota de cinq mille par heure déjà épuisé
+// deux fois sur ce dépôt. L'index, lui, est construit une fois et lu par tout le monde : c'est
+// exactement ce pour quoi la carte `thumbs` existe.
+//
+// TOUT SE LIT SUR DISQUE. Le clone contient `pages/`, donc aussi `pages/.zr-resources/` où vivent
+// les registres. Zéro octet de réseau ajouté.
+
+// Carte `resourceId -> chemin du manifeste canonique`, construite en une passe.
+async function lireRegistres(absRoot) {
+  const carte = new Map()
+  const dir = path.join(absRoot, 'pages/.zr-resources')
+  let noms = []
+  try { noms = await readdir(dir) } catch { return carte }   // aucun lien encore créé : rien à faire
+  for (const nom of noms) {
+    if (!nom.endsWith('.json')) continue
+    try {
+      const r = JSON.parse(await readFile(path.join(dir, nom), 'utf8'))
+      if (r && typeof r.resourceId === 'string' && typeof r.sourcePath === 'string') carte.set(r.resourceId, r.sourcePath)
+    } catch { /* registre illisible -> le lien restera sans vignette, pas de fausse vignette */ }
+  }
+  return carte
+}
+
+const estLienEagle = (m) => !!(m && m.type === 'zenray-eagle-link/v1' && typeof m.resourceId === 'string')
+
+// Lecture + parse parallélisée (CPU cœurs) des .img.json -> remplit la carte thumbs.
+async function buildThumbs(absRoot, imgPaths, registres) {
+  const thumbs = {}
+  // Un manifeste canonique sert souvent plusieurs liens : on ne le relit qu'une fois.
+  const cacheCanonique = new Map()
+  let i = 0
+  async function worker() {
+    while (i < imgPaths.length) {
+      const idx = i++
+      const rel = imgPaths[idx]
+      try {
+        const txt = await readFile(path.join(absRoot, rel), 'utf8')
+        const m = JSON.parse(txt)
+        if (estLienEagle(m)) {
+          const source = registres.get(m.resourceId)
+          if (!source) continue                      // registre absent : pas de fausse vignette
+          if (!cacheCanonique.has(source)) {
+            try { cacheCanonique.set(source, JSON.parse(await readFile(path.join(absRoot, source), 'utf8'))) }
+            catch { cacheCanonique.set(source, null) }
+          }
+          const canon = cacheCanonique.get(source)
+          const v = canon ? thumbEntry(canon) : null
+          if (v) thumbs[rel] = v
+          continue
+        }
+        const v = thumbEntry(m)
+        if (v) thumbs[rel] = v
+      } catch { /* manifeste illisible -> omis (placeholder propre) */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CPU, 16) }, worker))
+  return thumbs
+}
+
+const t0 = Date.now()
+console.log(`clone sparse ${REPO} (pages/, blob:none) -> ${WORK} ...`)
+await rm(WORK, { recursive: true, force: true }).catch(() => {})
+const url = `https://x-access-token:${TOKEN}@github.com/${REPO}.git`
+execFileSync('git', ['clone', '--quiet', '--filter=blob:none', '--no-checkout', '--depth=1', url, WORK], { stdio: 'inherit' })
+execFileSync('git', ['-C', WORK, 'sparse-checkout', 'init', '--cone'], { stdio: 'inherit' })
+execFileSync('git', ['-C', WORK, 'sparse-checkout', 'set', 'pages'], { stdio: 'inherit' })
+execFileSync('git', ['-C', WORK, 'checkout', BRANCH, '--quiet'], { stdio: 'inherit' })
+
+console.log('marche de l arbre disque (pages/) ...')
+const all = []
+await walk(WORK, 'pages', all)
+const paths = [...new Set(all)].filter((p) => !p.endsWith('.zr-search-index.json')).sort()
+const imgPaths = paths.filter((p) => p.endsWith('.img.json'))
+console.log(`noeuds: ${paths.length} | images: ${imgPaths.length} | ${((Date.now() - t0) / 1000).toFixed(0)}s`)
+
+console.log(`lecture + parse des ${imgPaths.length} manifestes (.img.json) sur disque, ${Math.min(CPU, 16)} workers ...`)
+const registres = await lireRegistres(WORK)
+if (registres.size) console.log(`registres de liens Eagle : ${registres.size}`)
+const thumbs = await buildThumbs(WORK, imgPaths, registres)
+const nThumb = Object.keys(thumbs).length
+const nPublic = Object.values(thumbs).filter((v) => v.u).length
+const nPrivate = nThumb - nPublic
+
+// Contenu plein-texte des markdowns + tables (recherche par mot-clé).
+const textPaths = paths.filter((p) => p.endsWith('.md') || p.endsWith('.db.json'))
+console.log(`extraction contenu plein-texte de ${textPaths.length} fichiers (.md/.db.json) ...`)
+const content = await buildContent(WORK, textPaths)
+const nContent = Object.keys(content).length
+
+// TAILLES par nœud (octets) -> l'app affiche la taille de N'IMPORTE quel fichier SANS appel API.
+// Manifestes (img/media/file) : champ `size` du JSON. Autres (.md/.db/.canvas/.embed) : taille sur disque.
+// Lecture locale parallèle, hors quota. Couvre archive (.file.json) ET drag-drop/bulk (.media/.img.json).
+// Récupère AUSSI le mime des nœuds média/fichier (mimes) -> l'app choisit la bonne icône (ex: PDF) depuis
+// l'index, sans fetch runtime fragile. mimes ne contient QUE les .media/.file (pas les images : icône déjà connue).
+async function buildSizes(absRoot, all, registres) {
+  const sizes = {}, mimes = {}; let i = 0
+  async function w() {
+    while (i < all.length) {
+      const rel = all[i++]
+      try {
+        if (/\.(img|media|file)\.json$/.test(rel)) {
+          let m = JSON.parse(await readFile(path.join(absRoot, rel), 'utf8'))
+          // Un lien porte 172 octets ; sa TAILLE affichée doit être celle du média, pas celle du
+          // lien, sinon l'app annonce « 172 o » pour une photo de dix-huit mégaoctets.
+          if (estLienEagle(m)) {
+            const source = registres.get(m.resourceId)
+            if (!source) continue
+            try { m = JSON.parse(await readFile(path.join(absRoot, source), 'utf8')) } catch { continue }
+          }
+          if (Number.isFinite(m.size)) sizes[rel] = m.size
+          if (m.mime && /\.(media|file)\.json$/.test(rel)) mimes[rel] = m.mime
+        } else sizes[rel] = (await stat(path.join(absRoot, rel))).size
+      } catch { /* illisible -> omis */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CPU, 16) }, w))
+  return { sizes, mimes }
+}
+console.log(`tailles + mimes par nœud (manifestes + disque) ...`)
+const { sizes, mimes } = await buildSizes(WORK, paths, registres)
+const index = { v: 3, count: paths.length, builtAt: new Date().toISOString(), paths, thumbs, content, sizes, mimes }
+console.log(`contenu indexé: ${nContent} fichiers | +${(JSON.stringify(content).length / 1048576).toFixed(1)} Mo`)
+const json = JSON.stringify(index)
+console.log(`index v2 : ${(json.length / 1048576).toFixed(1)} Mo | thumbs: ${nThumb} (public ${nPublic} / privé ${nPrivate}) | images sans thumb: ${imgPaths.length - nThumb}`)
+
+// Échantillon lisible (5 thumbs) pour vérification humaine, sans nom de média sensible (chemins déjà hachés).
+const sample = Object.entries(thumbs).slice(0, 5)
+for (const [p, v] of sample) console.log('  thumb', p, '=>', JSON.stringify(v))
+
+if (!APPLY) {
+  console.log(`\nDRY-RUN (aucun push). Pour appliquer après revue : node scripts/build-search-index.mjs --apply`)
+  await rm(WORK, { recursive: true, force: true }).catch(() => {})
+  process.exit(0)
+}
+
+// --apply : push via GIT LOCAL (le clone WORK a pages/ en checkout). L'API blob plafonne à ~40 Mo de payload ;
+// l'index v3 (avec contenu) dépasse -> on écrit le fichier dans le clone, commit + push. Git pousse le gros blob
+// proprement (recommandation GitHub). Sparse/blob:none/depth=1 : le commit a pour parent le HEAD fetché -> push OK.
+console.log('\n--apply : push de l index v3 via git local (gros blob) ...')
+await writeFile(path.join(WORK, INDEX_PATH), json, 'utf8')
+const gitWork = (...args) => execFileSync('git', ['-C', WORK, ...args], { stdio: 'inherit' })
+gitWork('add', INDEX_PATH)
+gitWork('-c', 'user.email=index@zenray', '-c', 'user.name=zr-index', 'commit', '-m', `search index v3: ${paths.length} noeuds, ${nThumb} thumbs, ${nContent} contenus`)
+gitWork('push', 'origin', `HEAD:${BRANCH}`)
+console.log(`pushé ${INDEX_PATH} (v3) via git local`)
+
+// ── SHARDS CHIFFRÉS PAR DOSSIER RACINE -> repo PUBLIC (servi par raw, 0 quota API GitHub) ────────────
+// Modèle "public + chiffré + jsDelivr/raw" (même clé maître que les médias). On découpe l'index en UN shard
+// par dossier de 1er niveau sous pages/, chiffré AES-GCM. head.json (clair, sans noms : dossiers hachés)
+// liste les shards + le builtAt. Le client lit head.json + le(s) shard(s) via raw@main (cache ~5 min, hors
+// quota REST), déchiffre avec la clé maître. Scalable : ouvrir un dossier = 1 shard, indépendant du total.
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
+const loadKeyB64 = () => { const e = process.env.ZENRAY_MEDIA_KEY; if (e && /^[A-Za-z0-9+/=]{40,}$/.test(e)) return e.trim(); return readFileSync(path.join(SCRIPT_DIR, '..', '.zenray-media-key'), 'utf8').trim() }
+const rootOf = (p) => { const parts = p.split('/'); return parts.length > 2 ? parts[1] : '_root' } // parts[0]='pages'
+const hashRoot = (r) => createHash('sha256').update(r).digest('hex').slice(0, 16)
+async function encStr(key, str) {
+  const iv = webcrypto.getRandomValues(new Uint8Array(12))
+  const ct = new Uint8Array(await webcrypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(str)))
+  return { iv: Buffer.from(iv).toString('base64'), ct: Buffer.from(ct).toString('base64') }
+}
+console.log('\n--apply : shards chiffrés par dossier -> zenray-index-public (raw, 0 API) ...')
+const cryptoKey = await webcrypto.subtle.importKey('raw', Uint8Array.from(Buffer.from(loadKeyB64(), 'base64')), { name: 'AES-GCM' }, false, ['encrypt'])
+const groups = new Map()
+for (const p of paths) { const r = rootOf(p); if (!groups.has(r)) groups.set(r, { paths: [], thumbs: {}, content: {}, sizes: {}, mimes: {} }); const g = groups.get(r); g.paths.push(p); if (thumbs[p]) g.thumbs[p] = thumbs[p]; if (content[p]) g.content[p] = content[p]; if (sizes[p] != null) g.sizes[p] = sizes[p]; if (mimes[p]) g.mimes[p] = mimes[p] }
+const IREPO = `${OWNER}/zenray-index-public`
+try { execFileSync('gh', ['repo', 'view', IREPO], { stdio: 'ignore' }) } catch { execFileSync('gh', ['repo', 'create', IREPO, '--public', '-d', 'ZenRay search index — shards chiffrés (AES-GCM), servis par CDN'], { stdio: 'inherit' }) }
+const W2 = path.join(os.tmpdir(), 'zr_index_public')
+await rm(W2, { recursive: true, force: true }).catch(() => {})
+execFileSync('git', ['clone', '--quiet', '--depth=1', `https://x-access-token:${TOKEN}@github.com/${IREPO}.git`, W2], { stdio: 'inherit' })
+await rm(path.join(W2, 's'), { recursive: true, force: true }).catch(() => {}) // repart d'un set de shards propre
+await mkdir(path.join(W2, 's'), { recursive: true })
+// Un dossier énorme (ex. References, 117k images) dépasserait la limite 50 Mo/fichier jsDelivr -> on le
+// re-découpe en TRANCHES de PART nœuds. Fichier `s/<h>-<part>.json`, head liste chaque tranche {h, part, n}.
+const shardList = []
+let maxShard = 0
+const PART = 20000
+for (const [r, g] of groups) {
+  const h = hashRoot(r)
+  const nParts = Math.max(1, Math.ceil(g.paths.length / PART))
+  for (let pi = 0; pi < nParts; pi++) {
+    const slice = g.paths.slice(pi * PART, (pi + 1) * PART)
+    const sub = { paths: slice, thumbs: {}, content: {}, sizes: {}, mimes: {} }
+    for (const p of slice) { if (g.thumbs[p]) sub.thumbs[p] = g.thumbs[p]; if (g.content[p]) sub.content[p] = g.content[p]; if (g.sizes[p] != null) sub.sizes[p] = g.sizes[p]; if (g.mimes[p]) sub.mimes[p] = g.mimes[p] }
+    const blob = await encStr(cryptoKey, JSON.stringify(sub))
+    maxShard = Math.max(maxShard, blob.ct.length)
+    await writeFile(path.join(W2, 's', `${h}-${pi}.json`), JSON.stringify(blob))
+    shardList.push({ h, part: pi, n: slice.length })
+  }
+}
+await writeFile(path.join(W2, 'head.json'), JSON.stringify({ v: 1, builtAt: index.builtAt, count: paths.length, shards: shardList }))
+// Le rebuild complet replie tout dans les shards -> on REMET LE DELTA À ZÉRO (ajouts déjà inclus ci-dessus).
+const emptyDelta = await encStr(cryptoKey, JSON.stringify({ paths: [], thumbs: {}, content: {} }))
+await writeFile(path.join(W2, 'delta.json'), JSON.stringify({ v: 1, builtAt: index.builtAt, ...emptyDelta }))
+const g2 = (...a) => execFileSync('git', ['-C', W2, ...a], { stdio: 'inherit' })
+g2('add', '-A')
+g2('-c', 'user.email=index@zenray', '-c', 'user.name=zr-index', 'commit', '-m', `index shards: ${groups.size} dossiers, ${paths.length} noeuds`)
+g2('push', 'origin', 'HEAD:main')
+await rm(W2, { recursive: true, force: true }).catch(() => {})
+console.log(`shards poussés: ${groups.size} dossiers -> ${IREPO} (plus gros shard ~${(maxShard / 1048576).toFixed(1)} Mo)`)
+
+await rm(WORK, { recursive: true, force: true }).catch(() => {})

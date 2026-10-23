@@ -1,0 +1,573 @@
+import React from 'react'
+import { PALETTE, RADII, SHADOWS } from '../theme.js'
+import Icon from './Icon.jsx'
+import { fmt, Menu, PlayPauseGlyph, SPEEDS } from '../media/playerControls.jsx'
+import { PLAYER_PREF_KEYS, readPlayerPrefs, writePlayerPref, playerStorage, trackLang } from '../media/playerPrefs.js'
+
+// StreamVideoMSE — lecteur fMP4 via Media Source Extensions (MSE), double SourceBuffer (vidéo + audio).
+// Pourquoi : <video src=/api/stream> nu ne peut PAS changer de piste audio hors Safari (l'API
+// HTMLMediaElement.audioTracks n'est peuplée que par Safari). Ici chaque flux (1 vidéo, N audios) est
+// un fichier fMP4 indépendant, chunké en 3 Mo, avec son propre .media.json servi par /api/stream en
+// HTTP Range. On alimente nous-mêmes les SourceBuffer : changer de langue = vider le SourceBuffer audio
+// et ré-alimenter depuis le flux de l'autre langue, currentTime préservé. Marche partout (Chrome, Edge,
+// Firefox, Safari) car on ne dépend plus du multiplexage de pistes du navigateur.
+//
+// MANIFEST attendu (type 'mse-av') :
+//   { type:'mse-av', name, mime:'video/mp4', size, count, repo?,
+//     video:{ manifest:'pages/.../x.video.media.json', codecs:'avc1.640028', w, h, size },
+//     audio:[{ lang, label, default, manifest:'pages/.../x.audio.jpn.media.json', codecs:'mp4a.40.2', size }, ...],
+//     subs:[{ path:'media/<id>/sub0_jpn.vtt', lang, label }],
+//     probe:{ duration } }
+// Chaque .video/.audio.media.json est un manifest chunked classique (size, chunkSize, dir, parts[], repo?).
+
+const enc = encodeURIComponent
+const LANG = { jpn: '日本語', jp: '日本語', fre: 'Français', fra: 'Français', fr: 'Français', eng: 'English', en: 'English', und: 'Piste' }
+
+const PREFETCH_AHEAD = 45              // secondes de média à garder en avance dans chaque SourceBuffer
+const EVICT_BEHIND = 30                // secondes en arrière qu'on autorise avant d'évincer (quota)
+const WINDOW = 1024 * 1024             // taille d'une requête Range (1 Mo) — petit = réactif, sous le cap /api/stream
+const INIT_BYTES = 512 * 1024          // fenêtre de tête (ftyp+moov d'un fMP4 +empty_moov) à charger AVANT tout fragment mid-stream. 512 Ko = marge sûre pour un moov audio complet (edit lists, multiples sample descriptions) ; un moov tronqué = SourceBuffer muet car MSE refuse tout moof sans init complet.
+const MIME_MP4 = (codecs) => `video/mp4; codecs="${codecs}"`
+
+const labelFor = (a, i) => a.label || (a.lang && a.lang !== 'und' ? (LANG[a.lang] || a.lang) : `Piste ${i + 1}`)
+
+// StreamFeeder — pilote UN SourceBuffer : tire des fenêtres d'octets de /api/stream dans l'ordre et les
+// appendBuffer, jusqu'à PREFETCH_AHEAD secondes d'avance. Gère la file (1 append à la fois), le quota
+// (évince le passé), et l'abandon propre pour le switch audio. Le mapping octets<->temps est linéaire
+// (bytesPerSec = size/duration) : suffisant pour décider QUAND s'arrêter de précharger ; les fragments
+// fMP4 portent leur propre timing, donc l'append reste exact peu importe l'approximation.
+class StreamFeeder {
+  constructor(sb, manifestPath, size, duration, onError, fragIndex) {
+    this.sb = sb
+    this.url = `/api/stream?path=${enc(manifestPath)}`
+    this.size = size
+    this.bps = (size > 0 && duration > 0) ? size / duration : 0
+    this.fragIndex = Array.isArray(fragIndex) ? fragIndex : []
+    this.onError = onError
+    this.cursor = 0            // prochain octet à demander
+    this.queue = []            // ArrayBuffers en attente d'append
+    this.appending = false
+    this.fetching = false
+    this.aborter = null
+    this.dead = false
+    this.lastTime = 0          // dernier currentTime vu (sert à l'éviction sur quota)
+    this.initBuf = null        // segment d'init fMP4 (ftyp+moov) mis en cache après 1er chargement
+    this.needInit = false      // true quand on (re)démarre mid-stream : il faut (re)pousser l'init d'abord
+    this.initDone = false       // true dès que l'init fMP4 a bien été appendé sur ce SourceBuffer
+    this.pendingInit = false    // true entre le moment où on lance l'append de l'init et son updateend
+    this.failed = false         // passe à true si un append a échoué (init tronqué, codec, fragment)
+    this._onUpdateEnd = () => {
+      this.appending = false
+      if (this.pendingInit) { this.pendingInit = false; this.initDone = true }
+      this._drain()
+    }
+    sb.addEventListener('updateend', this._onUpdateEnd)
+    sb.addEventListener('error', () => { try { console.error('[MSE] SourceBuffer error event') } catch {}; this.onError && this.onError('append') })
+  }
+
+  // octet du fragment fMP4 dont le temps est <= `time` (frontière décodable). Sans index -> linéaire (approx).
+  byteForTime(time) {
+    const fi = this.fragIndex
+    if (fi && fi.length) {
+      let lo = 0, hi = fi.length - 1, ans = 0
+      while (lo <= hi) { const mid = (lo + hi) >> 1; if (fi[mid].t <= time) { ans = fi[mid].b; lo = mid + 1 } else hi = mid - 1 }
+      return ans
+    }
+    // Sans index de fragments : approximation linéaire (peu fiable en débit variable). On quantifie le
+    // résultat à la frontière de 64 Ko inférieure pour atterrir moins souvent au milieu d'un fragment moof.
+    if (!this.bps) return 0
+    const approx = Math.floor(time * this.bps)
+    return approx & ~(64 * 1024 - 1)
+  }
+
+  // combien de secondes de média sont déjà bufferisées au-delà de `time`
+  bufferedAhead(time) {
+    const b = this.sb.buffered
+    for (let i = 0; i < b.length; i++) {
+      if (time >= b.start(i) - 0.25 && time <= b.end(i) + 0.25) return b.end(i) - time
+    }
+    return 0
+  }
+
+  // récupère une tranche d'octets [a,b] de /api/stream en ArrayBuffer (206/200 acceptés).
+  _fetchRange(a, b, signal) {
+    return fetch(this.url, { headers: { Range: `bytes=${a}-${b}` }, signal })
+      .then((r) => { if (!r.ok && r.status !== 206 && r.status !== 200) throw new Error('http ' + r.status); return r.arrayBuffer() })
+  }
+
+  // tente de tirer la prochaine fenêtre si on n'a pas assez d'avance
+  pump(time) {
+    this.lastTime = time
+    if (this.dead || this.fetching || !this.bps) return
+    if (this.cursor >= this.size) return
+    if (this.failed) return    // un append a échoué : ne pas empiler des fragments indécodables
+    // garde-fou quota : si une fenêtre est déjà en attente d'append (quota plein, en cours d'éviction,
+    // ou init en cours d'append), on ne va pas en chercher d'autres — sinon la file grossit sans fin.
+    if (this.queue.length || this.appending) return
+    if (this.bufferedAhead(time) >= PREFETCH_AHEAD) return
+
+    // INIT SEGMENT : un fMP4 +empty_moov porte son ftyp+moov en tête (octet 0). Tout fragment moof/mdat
+    // mid-stream est INDÉCODABLE sans cet init dans le SourceBuffer. Donc à chaque (re)démarrage mid-stream
+    // (seek, switch audio), on (re)pousse l'init AVANT le premier fragment. On le met en cache une fois lu.
+    if (this.needInit && this.cursor > 0) {
+      this.fetching = true
+      const ac = new AbortController(); this.aborter = ac
+      const ready = this.initBuf ? Promise.resolve(this.initBuf) : this._fetchRange(0, INIT_BYTES - 1, ac.signal)
+      ready
+        .then((buf) => { if (this.dead) return; this.initBuf = buf; this.needInit = false; this.pendingInit = true; this.queue.push(buf); this._drain() })
+        .catch((e) => { if (e && e.name === 'AbortError') return; this.onError && this.onError('init') })
+        .finally(() => { this.fetching = false; this.aborter = null })
+      return
+    }
+
+    // CŒUR DU FIX : ne JAMAIS aller chercher un fragment mid-stream tant que l'init de CE SourceBuffer
+    // n'a pas fini d'être appendé. Sans cette garde, un switch audio enchaînait fetch init + fetch fragment
+    // de façon concurrente ; si l'init n'était pas encore confirmé appendé, le décodeur recevait un moof
+    // sans init complet => audio muet, sans erreur console. initDone le garantit.
+    if (this.cursor > 0 && !this.initDone) return
+
+    const a = this.cursor
+    const b = Math.min(this.size - 1, a + WINDOW - 1)
+    // Montage initial (a === 0) : la 1re fenêtre porte ftyp+moov en tête, c'est elle l'init.
+    // Une fois appendée, initDone bascule et les fenêtres suivantes peuvent suivre.
+    const carriesInit = (a === 0)
+    this.fetching = true
+    const ac = new AbortController(); this.aborter = ac
+    this._fetchRange(a, b, ac.signal)
+      .then((buf) => { if (this.dead) return; this.cursor = b + 1; if (carriesInit) this.pendingInit = true; this.queue.push(buf); this._drain() })
+      .catch((e) => { if (e && e.name === 'AbortError') return; this.onError && this.onError('fetch') })
+      .finally(() => { this.fetching = false; this.aborter = null })
+  }
+
+  _drain() {
+    if (this.dead || this.appending || !this.queue.length) return
+    if (this.sb.updating) return
+    const buf = this.queue.shift()
+    try { this.appending = true; this.sb.appendBuffer(buf) }
+    catch (e) {
+      this.appending = false
+      if (e && e.name === 'QuotaExceededError') {
+        // quota MSE plein : on remet la fenêtre dans la file et on force une éviction du passé.
+        // L'éviction déclenche un updateend qui relancera _drain -> append réussira une fois la place libérée.
+        this.queue.unshift(buf)
+        this.evict(this.lastTime)
+      }
+      else {
+        // Tout autre échec d'append (init tronqué, codec mismatch, fragment malformé) échouait jusqu'ici
+        // SILENCIEUSEMENT (aucune trace console, audio muet). On le rend visible et on le signale.
+        try { console.error('[MSE] appendBuffer échec', (e && e.name) || e, (e && e.message) || '') } catch {}
+        this.failed = true
+        this.onError && this.onError('drain')
+      }
+    }
+  }
+
+  // évince le média trop en arrière pour libérer le quota MSE
+  evict(time) {
+    if (this.dead || this.sb.updating || this.appending) return
+    const b = this.sb.buffered
+    if (!b.length) return
+    const start = b.start(0)
+    const safe = time - EVICT_BEHIND
+    if (safe > start + 1) {
+      try { this.appending = true; this.sb.remove(start, safe) }
+      catch { this.appending = false }
+    }
+  }
+
+  // stoppe tout (fetch + file) sans toucher au SourceBuffer (pour reconfigurer ou détruire)
+  abort() {
+    if (this.aborter) { try { this.aborter.abort() } catch {} this.aborter = null }
+    this.fetching = false
+    this.queue = []
+  }
+
+  destroy() {
+    this.dead = true
+    this.abort()
+    try { this.sb.removeEventListener('updateend', this._onUpdateEnd) } catch {}
+  }
+}
+
+export default function StreamVideoMSE({ t, path, manifest }) {
+  const v = React.useRef(null)
+  const msRef = React.useRef(null)
+  const videoFeeder = React.useRef(null)
+  const audioFeeder = React.useRef(null)
+  const audioSBRef = React.useRef(null)     // SourceBuffer audio (recréé au switch)
+  const wrapRef = React.useRef(null)
+
+  const [playing, setPlaying] = React.useState(false)
+  const [cur, setCur] = React.useState(0)
+  const [dur, setDur] = React.useState((manifest && manifest.probe && manifest.probe.duration) || 0)
+  const [buffered, setBuffered] = React.useState(0)
+  // 14 October 2026: speed and subtitle language follow from one video to the next (src/media/playerPrefs.js).
+  // FR : la vitesse et la langue des sous-titres suivent d'une video a l'autre.
+  const [speed, setSpeed] = React.useState(() => readPlayerPrefs(playerStorage()).speed)
+  const [openMenu, setOpenMenu] = React.useState(null)
+  const [audioSel, setAudioSel] = React.useState(0)
+  const [subSel, setSubSel] = React.useState(null)
+  const [fs, setFs] = React.useState(false)
+  const [err, setErr] = React.useState(null)
+  const [switching, setSwitching] = React.useState(false)
+  const [vol, setVol] = React.useState(1)
+  const [muted, setMuted] = React.useState(false)
+  const [pip, setPip] = React.useState(false)
+  const [scrubbing, setScrubbing] = React.useState(false)
+  const [scrubTime, setScrubTime] = React.useState(0)
+
+  // --- description des flux depuis le manifest ---
+  const video = manifest && manifest.video
+  const audios = (manifest && Array.isArray(manifest.audio)) ? manifest.audio : []
+  const defaultAudio = Math.max(0, audios.findIndex((a) => a.default))
+  const audioSelRef = React.useRef(defaultAudio === -1 ? 0 : defaultAudio)
+
+  // sous-titres : sidecars VTT (shard privé -> /api/shard, content public -> /api/img)
+  const shardRepo = (manifest && typeof manifest.repo === 'string' && /^zenray-media-\d{2,}$/.test(manifest.repo)) ? manifest.repo : null
+  const subSrc = (p) => shardRepo ? `/api/shard?repo=${enc(shardRepo)}&path=${enc(p)}` : `/api/img?path=${enc(p)}`
+  const subs = ((manifest && manifest.subs) || []).filter((s) => s && s.path && /\.vtt$/i.test(s.path))
+  const subItems = [{ id: null, label: 'Sous-titres désactivés' }, ...subs.map((s, i) => ({ id: i, label: s.label || (s.lang && s.lang !== 'und' ? (LANG[s.lang] || s.lang) : `Sous-titres ${i + 1}`) }))]
+  const audioItems = audios.map((a, i) => ({ id: i, label: labelFor(a, i) }))
+
+  const duration = (manifest && manifest.probe && manifest.probe.duration) || dur || 0
+
+  // boucle d'alimentation : tire des octets pour chaque feeder selon currentTime, évince le passé.
+  const pumpAll = React.useCallback((time) => {
+    const tt = (typeof time === 'number') ? time : (v.current ? v.current.currentTime : 0)
+    if (videoFeeder.current) { videoFeeder.current.pump(tt); videoFeeder.current.evict(tt) }
+    if (audioFeeder.current) { audioFeeder.current.pump(tt); audioFeeder.current.evict(tt) }
+  }, [])
+
+  // --- montage MSE ---
+  React.useEffect(() => {
+    if (defaultAudio !== -1) { setAudioSel(defaultAudio); audioSelRef.current = defaultAudio }
+    if (!video || !video.manifest) { setErr('manifest mse-av invalide (pas de flux vidéo)'); return }
+    if (typeof window === 'undefined' || typeof window.MediaSource === 'undefined') { setErr('MediaSource non supporté par ce navigateur'); return }
+
+    const el = v.current
+    const ms = new MediaSource()
+    msRef.current = ms
+    const objUrl = URL.createObjectURL(ms)
+    el.src = objUrl
+
+    const onOpen = () => {
+      ms.removeEventListener('sourceopen', onOpen)
+      try {
+        if (duration && isFinite(duration)) { try { ms.duration = duration } catch {} }
+
+        // SourceBuffer vidéo
+        const vCodecs = (video.codecs || 'avc1.4d401f')
+        const vType = MIME_MP4(vCodecs)
+        if (!window.MediaSource.isTypeSupported(vType)) { setErr('codec vidéo non supporté : ' + vType); return }
+        const vsb = ms.addSourceBuffer(vType)
+        vsb.mode = 'segments'
+        videoFeeder.current = new StreamFeeder(vsb, video.manifest, video.size || 0, duration, () => {}, video.fragIndex)
+
+        // SourceBuffer audio (langue par défaut)
+        const a0 = audios[audioSelRef.current] || audios[0]
+        if (a0 && a0.manifest) {
+          const aType = MIME_MP4(a0.codecs || 'mp4a.40.2')
+          if (window.MediaSource.isTypeSupported(aType)) {
+            const asb = ms.addSourceBuffer(aType)
+            asb.mode = 'segments'
+            audioSBRef.current = asb
+            audioFeeder.current = new StreamFeeder(asb, a0.manifest, a0.size || 0, duration, () => {}, a0.fragIndex)
+          }
+        }
+        pumpAll(0)
+      } catch (e) {
+        setErr('init MSE : ' + ((e && e.message) || e))
+      }
+    }
+    ms.addEventListener('sourceopen', onOpen)
+
+    return () => {
+      try { videoFeeder.current && videoFeeder.current.destroy() } catch {}
+      try { audioFeeder.current && audioFeeder.current.destroy() } catch {}
+      videoFeeder.current = null; audioFeeder.current = null; audioSBRef.current = null
+      try { if (ms.readyState === 'open') ms.endOfStream() } catch {}
+      try { URL.revokeObjectURL(objUrl) } catch {}
+      try { el.removeAttribute('src'); el.load() } catch {}
+      msRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path])
+
+  React.useEffect(() => {
+    const id = setInterval(() => pumpAll(), 1000)
+    return () => clearInterval(id)
+  }, [pumpAll])
+
+  // seek : repositionne un feeder sur l'octet correspondant au temps cible. fMP4 fragmenté => on peut
+  // reprendre l'alimentation à n'importe quel offset proche. Approximation linéaire octet<->temps.
+  const reseekFeeder = (feeder, time) => {
+    if (!feeder) return
+    feeder.abort()
+    const byte = feeder.byteForTime(time)
+    feeder.cursor = Math.max(0, Math.min(feeder.size, byte))
+    // saut mid-stream => le SourceBuffer doit revoir l'init fMP4 avant le prochain fragment.
+    feeder.needInit = feeder.cursor > 0
+  }
+
+  const onMeta = () => { const el = v.current; if (el) { if (isFinite(el.duration) && el.duration) setDur(el.duration); el.playbackRate = speed; for (const k of ['preservesPitch', 'webkitPreservesPitch']) if (k in el) el[k] = true } }
+  const onTime = () => {
+    const el = v.current; if (!el) return
+    setCur(el.currentTime)
+    if (el.buffered.length) setBuffered(el.buffered.end(el.buffered.length - 1))
+    pumpAll(el.currentTime)
+  }
+  const onSeeking = () => {
+    const el = v.current; if (!el) return
+    const ahead = videoFeeder.current ? videoFeeder.current.bufferedAhead(el.currentTime) : 0
+    if (!ahead) {
+      reseekFeeder(videoFeeder.current, el.currentTime)
+      reseekFeeder(audioFeeder.current, el.currentTime)
+      pumpAll(el.currentTime)
+    }
+  }
+
+  // SWITCH AUDIO — le coeur de ce lecteur. On détruit le feeder audio, on retire le SourceBuffer audio,
+  // on en recrée un pour la nouvelle langue, et on ré-alimente à partir de currentTime. La vidéo n'est
+  // jamais touchée -> l'image continue, currentTime préservé. Fonctionne dans tous les navigateurs.
+  const pickAudio = (id) => {
+    setOpenMenu(null)
+    if (id === audioSelRef.current) return
+    const a = audios[id]; const ms = msRef.current; const el = v.current
+    if (!a || !a.manifest || !ms || !el) return
+    setSwitching(true)
+    audioSelRef.current = id; setAudioSel(id)
+    const time = el.currentTime
+    const aType = MIME_MP4(a.codecs || 'mp4a.40.2')
+
+    const reattach = () => {
+      try {
+        if (audioFeeder.current) { audioFeeder.current.destroy(); audioFeeder.current = null }
+        if (audioSBRef.current) { try { ms.removeSourceBuffer(audioSBRef.current) } catch {} audioSBRef.current = null }
+        if (!window.MediaSource.isTypeSupported(aType)) { setSwitching(false); return }
+        const asb = ms.addSourceBuffer(aType)
+        asb.mode = 'segments'
+        audioSBRef.current = asb
+        // onError non muet : un échec de switch (init tronqué, codec) doit se voir et lever le voile "changement audio…".
+        const onFeedErr = (kind) => { try { console.error('[MSE] switch audio échec:', kind) } catch {}; setSwitching(false) }
+        const feeder = new StreamFeeder(asb, a.manifest, a.size || 0, duration, onFeedErr, a.fragIndex)
+        feeder.cursor = Math.max(0, Math.min(feeder.size, feeder.byteForTime(time)))
+        // nouveau flux audio repris en cours de lecture => il faut d'abord son init fMP4 (ftyp+moov).
+        feeder.needInit = feeder.cursor > 0
+        audioFeeder.current = feeder
+        feeder.pump(time)
+        setSwitching(false)
+      } catch (e) { setSwitching(false) }
+    }
+    // attendre la fin d'une éventuelle opération en cours sur l'ancien SourceBuffer avant de le retirer
+    const sb = audioSBRef.current
+    if (sb && sb.updating) {
+      if (audioFeeder.current) audioFeeder.current.abort()
+      const wait = () => { sb.removeEventListener('updateend', wait); reattach() }
+      sb.addEventListener('updateend', wait)
+      try { sb.abort() } catch {}
+    } else {
+      if (audioFeeder.current) audioFeeder.current.abort()
+      reattach()
+    }
+  }
+
+  const pickSub = (id) => {
+    setOpenMenu(null); setSubSel(id)
+    writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.subsOn, id == null ? '0' : '1')
+    if (id != null) { const lang = trackLang(subs[id]); if (lang) writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.subLang, lang) }
+    const el = v.current; if (!el) return
+    const tx = el.textTracks; for (let i = 0; i < tx.length; i++) tx[i].mode = (id != null && i === id) ? 'showing' : 'disabled'
+  }
+  const applySpeed = (s) => { setSpeed(s); setOpenMenu(null); writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.speed, s); const el = v.current; if (el) { el.playbackRate = s; for (const k of ['preservesPitch', 'webkitPreservesPitch']) if (k in el) el[k] = true } }
+  const toggle = () => { const el = v.current; if (!el) return; if (el.paused) el.play().catch(() => {}); else el.pause() }
+
+  // the track in the saved language opens by itself when the film has it. FR : la piste de la langue sauvegardee s'ouvre seule.
+  const subSignature = subs.map((s) => `${s.path}:${s.lang}`).join('|')
+  React.useEffect(() => {
+    const prefs = readPlayerPrefs(playerStorage())
+    if (!prefs.subsOn || !prefs.subLang) return
+    const i = subs.findIndex((s) => trackLang(s) === prefs.subLang)
+    if (i >= 0) pickSub(i)
+  }, [subSignature]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const commitSeek = (targetTime) => {
+    const el = v.current
+    if (!el) return
+    const total = el.duration || duration || 0
+    const clamped = Math.max(0, Math.min(total, targetTime))
+    el.currentTime = clamped
+    setCur(clamped)
+  }
+  const seek = (e) => {
+    const el = v.current; if (!el) return
+    const total = el.duration || duration || 0
+    const target = (Number(e.target.value) / 1000) * total
+    if (scrubbing) setScrubTime(target)
+    else commitSeek(target)
+  }
+  // saut relatif (flèches / boutons ±10 s). Le feeder se repositionne via onSeeking si le tampon est vide.
+  const skip = (delta) => { const el = v.current; if (!el) return; commitSeek(el.currentTime + delta) }
+  // volume : on pilote l'élément <video> et on reflète l'état. Régler le volume lève le mute.
+  const applyVol = (val) => { const el = v.current; const x = Math.min(1, Math.max(0, val)); setVol(x); if (el) { el.volume = x; if (x > 0 && el.muted) { el.muted = false; setMuted(false) } } }
+  const toggleMute = () => { const el = v.current; if (!el) return; const next = !el.muted; el.muted = next; setMuted(next) }
+  // Picture-in-Picture : sort la vidéo dans une fenêtre flottante native du navigateur (Chrome/Safari/Edge).
+  const togglePip = async () => {
+    const el = v.current; if (!el) return
+    try {
+      if (document.pictureInPictureElement) await document.exitPictureInPicture()
+      else if (el.requestPictureInPicture) await el.requestPictureInPicture()
+    } catch {}
+  }
+  const toggleFs = () => {
+    const node = wrapRef.current; if (!node) return
+    if (!document.fullscreenElement) { (node.requestFullscreen || node.webkitRequestFullscreen || (() => {})).call(node) }
+    else { (document.exitFullscreen || document.webkitExitFullscreen || (() => {})).call(document) }
+  }
+  React.useEffect(() => {
+    const h = () => setFs(!!document.fullscreenElement)
+    document.addEventListener('fullscreenchange', h)
+    return () => document.removeEventListener('fullscreenchange', h)
+  }, [])
+
+  // PiP : refléter l'entrée/sortie de la fenêtre flottante (peut être déclenchée par le navigateur lui-même).
+  React.useEffect(() => {
+    const el = v.current; if (!el) return
+    const on = () => setPip(true), off = () => setPip(false)
+    el.addEventListener('enterpictureinpicture', on)
+    el.addEventListener('leavepictureinpicture', off)
+    return () => { el.removeEventListener('enterpictureinpicture', on); el.removeEventListener('leavepictureinpicture', off) }
+  }, [])
+
+  // Raccourcis clavier type lecteur de bureau, actifs quand le lecteur a le focus (ou en plein écran).
+  // espace/k = play/pause · flèches ←/→ = ±5 s · j/l = ±10 s · ↑/↓ = volume · m = mute · f = plein écran
+  // c = sous-titres on/off · p = Picture-in-Picture. On ignore les frappes quand on tape dans un champ.
+  React.useEffect(() => {
+    const onKey = (e) => {
+      const node = wrapRef.current; if (!node) return
+      const tag = (e.target && e.target.tagName) || ''
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (e.target && e.target.isContentEditable)) return
+      // n'agir que si le lecteur est focalisé/survolé ou en plein écran (évite de voler les touches de la page)
+      const active = document.fullscreenElement === node || node.contains(document.activeElement) || node.matches(':hover')
+      if (!active) return
+      const el = v.current; if (!el) return
+      switch (e.key) {
+        case ' ': case 'k': e.preventDefault(); toggle(); break
+        case 'ArrowRight': e.preventDefault(); skip(5); break
+        case 'ArrowLeft': e.preventDefault(); skip(-5); break
+        case 'l': e.preventDefault(); skip(10); break
+        case 'j': e.preventDefault(); skip(-10); break
+        case 'ArrowUp': e.preventDefault(); applyVol((el.volume || 0) + 0.1); break
+        case 'ArrowDown': e.preventDefault(); applyVol((el.volume || 0) - 0.1); break
+        case 'm': e.preventDefault(); toggleMute(); break
+        case 'f': e.preventDefault(); toggleFs(); break
+        case 'p': e.preventDefault(); togglePip(); break
+        case 'c': e.preventDefault(); pickSub(subSel == null ? (subs.length ? 0 : null) : null); break
+        default: break
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subSel, subs.length, speed])
+
+  // synchroniser le volume initial de l'élément <video> au montage
+  React.useEffect(() => { const el = v.current; if (el) { el.volume = vol; el.muted = muted } }, [])
+
+  const volIcon = muted || vol === 0 ? 'speaker.slash' : (vol < 0.5 ? 'speaker.wave.1' : 'speaker.wave.2')
+
+  const wrap = { position: 'relative', maxWidth: 980, margin: '0 auto', borderRadius: RADII.md, background: '#1C1C1E', overflow: 'hidden' }
+  const d = duration || dur || 0
+  const activeCur = scrubbing ? scrubTime : cur
+  const pr = d ? activeCur / d : 0, br = d ? buffered / d : 0
+
+  if (err) {
+    return (
+      <div style={{ padding: 0 }}>
+        <div style={{ ...wrap, padding: 24, color: '#fff', fontSize: 'var(--zr-ui-lg)' }}>
+          Lecture MSE impossible : {err}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ padding: 0 }}>
+      <div ref={wrapRef} tabIndex={0} style={{ ...wrap, outline: 'none' }}>
+        <style>{`
+          .zr-mse-controls { display:flex; align-items:center; gap:8px; position:relative; }
+          .zr-mse-controls .zr-video-actions { margin-left:auto; }
+          .zr-mse-menu-button { min-width:48px; padding:0 13px; font-weight:700; }
+          @media (max-width:720px) {
+            .zr-mse-controls { gap:6px; }
+            .zr-mse-controls .zr-video-control-md { width:44px; height:44px; }
+            .zr-mse-controls .zr-video-volume-pill { display:none; }
+          }
+          /* Sous-titres lisibles : texte clair, fond translucide, jamais de blanc/noir purs (charte). */
+          video::cue { color: #F2F2F0; background: rgba(28,28,30,.78); font-size: 1.05em; line-height: 1.35; font-family: var(--zr-police-sans); text-shadow: 0 1px 2px rgba(0,0,0,.5); }
+        `}</style>
+        <video ref={v} playsInline crossOrigin="anonymous" onClick={toggle}
+          onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onLoadedMetadata={onMeta}
+          onDurationChange={onMeta} onProgress={onTime} onTimeUpdate={onTime} onSeeking={onSeeking}
+          onVolumeChange={() => { const el = v.current; if (el) { setVol(el.volume); setMuted(el.muted) } }}
+          style={{ width: '100%', display: 'block', background: '#1C1C1E', borderRadius: fs ? 0 : RADII.md }}>
+          {subs.map((s, i) => <track key={i} kind="subtitles" src={subSrc(s.path)} srcLang={s.lang || 'und'} label={s.label || `Sous-titres ${i + 1}`} default={false} />)}
+        </video>
+
+        {/* Playback overlay V9 (Memory/Design/ui-design/ui-components-zenray-v9.html, 2026-07-19) : mêmes
+            primitives partagées que VideoPlayer2/StreamVideo (zr-video-*, fonts.css), recette verre en
+            dégradé + rim + deux thèmes light/dark via variables --g9-*. Les couleurs des glyphes sont
+            héritées (currentColor -> var(--g9-fg)), plus aucun #fff ni drop-shadow forcé. */}
+        <div className="zr-video-controls" style={{ opacity: 1 }}>
+          <div className="zr-video-top-left">
+            {typeof document !== 'undefined' && document.pictureInPictureEnabled && <button onClick={togglePip} className="zr-video-glass zr-video-control-sm" title="Picture-in-Picture (P)"><Icon name="pip" size={18} color={pip ? PALETTE.primary : undefined} /></button>}
+          </div>
+          <div className="zr-video-top-right zr-video-volume-pill">
+            <input type="range" min="0" max="1" step="0.01" value={muted ? 0 : vol} onChange={(e) => applyVol(parseFloat(e.target.value))}
+              className="zr-video-volume" title="Volume" style={{ '--zr-video-volume': `${Math.round((muted ? 0 : vol) * 100)}%` }} />
+            <button onClick={toggleMute} className="zr-video-volume-toggle" title="Muet (M)"><Icon name={volIcon} size={18} /></button>
+          </div>
+          <div className="zr-video-transport">
+            <button onClick={() => skip(-10)} className="zr-video-glass zr-video-control-md" title="Reculer de 10 s (J)"><Icon name="gobackward" size={24} /></button>
+            <button onClick={toggle} className="zr-video-glass zr-video-play-center" title="Lecture/Pause (Espace)"><PlayPauseGlyph playing={playing} size={34} pauseSize={32} /></button>
+            <button onClick={() => skip(10)} className="zr-video-glass zr-video-control-md" title="Avancer de 10 s (L)"><Icon name="goforward" size={24} /></button>
+          </div>
+          <div className="zr-video-bottom-right">
+            {switching && <span style={{ color: 'var(--g9-muted)', fontSize: 'var(--zr-ui-xs)' }}>changement audio…</span>}
+            {audioItems.length > 1 && <button onClick={() => setOpenMenu(openMenu === 'audio' ? null : 'audio')} className="zr-video-glass zr-video-control-sm" title="Pistes audio"><Icon name="music.note" size={18} /></button>}
+            {subItems.length > 1 && <button onClick={() => setOpenMenu(openMenu === 'subs' ? null : 'subs')} className="zr-video-glass zr-mse-menu-button" style={{ color: subSel != null ? PALETTE.primary : undefined }} title="Sous-titres (C)">CC</button>}
+            <div className="zr-video-options-pill">
+              <button onClick={() => setOpenMenu(openMenu === 'speed' ? null : 'speed')} className="zr-video-option-button" title={`Vitesse de lecture${speed !== 1 ? ` · ${speed}×` : ''}`}><Icon name="gear" size={18} /></button>
+              <button onClick={toggleFs} className="zr-video-option-button" title="Plein écran (F)"><Icon name={fs ? 'fullscreen.exit' : 'fullscreen.enter'} size={18} /></button>
+            </div>
+            {openMenu === 'audio' && <Menu t={t} items={audioItems} activeId={audioSel} onPick={pickAudio} />}
+            {openMenu === 'subs' && <Menu t={t} items={subItems} activeId={subSel} onPick={pickSub} />}
+            {openMenu === 'speed' && (
+              <div style={{ position: 'absolute', bottom: 52, right: 8, background: t.surface, border: `1px solid ${t.border}`, borderRadius: RADII.md, boxShadow: SHADOWS.lg, padding: 8, display: 'flex', flexWrap: 'wrap', gap: 6, width: 210, zIndex: 30 }}>
+                {SPEEDS.map((s) => <button key={s} onClick={() => applySpeed(s)} style={{ padding: '5px 11px', borderRadius: RADII.sm, border: 'none', cursor: 'pointer', fontSize: 'var(--zr-ui-sm)', fontWeight: 600, background: s === speed ? PALETTE.gradient : t.btnSecondaryBg, color: s === speed ? '#fff' : t.btnSecondaryText }}>{s}×</button>)}
+              </div>
+            )}
+          </div>
+          <div className="zr-video-bottom zr-video-seek-pill">
+            <span className="zr-video-time">{fmt(activeCur)}</span>
+            <input
+              className="zr-video-seek"
+              aria-label="Position de lecture"
+              type="range"
+              min="0"
+              max="1000"
+              step="1"
+              value={Math.round(pr * 1000)}
+              disabled={!d}
+              onPointerDown={(e) => { try { e.target.setPointerCapture?.(e.pointerId) } catch {} setScrubbing(true); setScrubTime(cur) }}
+              onPointerUp={(e) => { try { e.target.releasePointerCapture?.(e.pointerId) } catch {} setScrubbing(false); commitSeek((Number(e.target.value) / 1000) * d) }}
+              onPointerCancel={() => setScrubbing(false)}
+              onChange={seek}
+              style={{ '--zr-video-played': `${Math.min(100, pr * 100)}%`, '--zr-video-buffered': `${Math.min(100, br * 100)}%` }}
+            />
+            <span className="zr-video-time">−{fmt(Math.max(0, d - activeCur))}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

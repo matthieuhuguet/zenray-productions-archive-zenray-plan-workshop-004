@@ -1,0 +1,240 @@
+// Localhost-with-token : sert le build dist/ + route /api/* vers les handlers Vercel-style, avec le token
+// GITHUB_TOKEN en env. Permet de voir l'app RÉELLE (drive GitHub) en local. Lecture/écriture sur le vrai drive.
+// Usage : GITHUB_TOKEN=$(gh auth token) node scripts/local-server.mjs [port]
+import http from 'node:http'
+import { readFile, stat, mkdir, rm } from 'node:fs/promises'
+import { createWriteStream, createReadStream, readFileSync, existsSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { createAssetsService, atomicJson } from './AssetsService.mjs'
+import { createAssetsCloudPublisher } from './AssetsCloudPublisher.mjs'
+import { createAssetsCloudGitWriter } from './AssetsCloudGitWriter.mjs'
+import { createFeedbackCapture } from './AssetsFeedbackCapture.mjs'
+import { config as assetsConfig } from './Assets/BridgeClient.mjs'
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+// SECRETS LOCAUX : on charge .env.local (gitignored) pour les variables NON déjà fournies par le shell. Pratique
+// pour poser ZENRAY_API_SECRET (mot de passe du gate /api) et ZENRAY_MEDIA_KEY (clé de déchiffrement) une fois,
+// hors historique de terminal. On N'ÉCRASE JAMAIS une variable déjà présente dans l'env (le shell reste prioritaire).
+try {
+  const envFile = path.join(ROOT, '.env.local')
+  if (existsSync(envFile)) {
+    for (const line of readFileSync(envFile, 'utf8').split('\n')) {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/)
+      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '')
+    }
+  }
+} catch {}
+const DIST = path.join(ROOT, 'dist')
+const PORT = parseInt(process.argv[2] || '3000', 10)
+// 21 October 2026: `launchctl kickstart -k` kills the daemon wrapper but not this child, so two services briefly shared one Git clone and one
+// publication failed on its lock. The child now leaves when the wrapper that started it is gone.
+const PARENT_PID = Number(process.env.ZR_PARENT_PID) || 0
+if (PARENT_PID) setInterval(() => { try { process.kill(PARENT_PID, 0) } catch (error) { if (error.code !== 'EPERM') process.exit(0) } }, 2000).unref()
+// 8 October 2026, 11:18 CEST: keep oversized registry commits in the service-owned sparse Git cache.
+const contentRepository = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const cloudGitWriter = createAssetsCloudGitWriter({
+  repositoryPath: path.join(assetsConfig.storage.stateDir, 'repositories', contentRepository.replace(/[^A-Za-z0-9._-]/g, '_')),
+  remoteUrl: `https://github.com/${contentRepository}.git`,
+  branch: process.env.CONTENT_BRANCH || 'main',
+})
+// 2 October 2026, 13:36 CEST: filesystem access stays in the loopback server and is never bundled for Pages.
+const assetsService = await createAssetsService({ publishCloud: createAssetsCloudPublisher({ baseUrl: `http://127.0.0.1:${PORT}`, gitWriter: cloudGitWriter }) })
+// 4 October 2026, 10:15 CEST: incremental original-session staging uses the existing verified backup queue.
+// 14 October 2026: ZR_ASSETS_PASSIVE=1 serves the page and the bridge for reading only. No watcher, mirror, index sync or capture starts,
+// so a preview or a second dev server never competes with the daemon for the single cloud writer.
+const ASSETS_PASSIVE = process.env.ZR_ASSETS_PASSIVE === '1'
+if (!ASSETS_PASSIVE) assetsService.conversationMirror.start()
+// 7 October 2026, 10:30 CEST: the conversation index follows the bound sessions without any command.
+if (!ASSETS_PASSIVE) assetsService.conversationIndexSync.start()
+if (!ASSETS_PASSIVE) assetsService.feedbackCapture = await createFeedbackCapture({ config: assetsService.config, projects: () => [...assetsService.projects.values()], atomicJson,
+  // 3 October 2026, 03:50 CEST: collection errors clear after a healthy scan and remain visible in the live bridge.
+  onError: (error) => console.error('Assets feedback capture:', error.message), onStatus: ({ error }) => { assetsService.feedbackError = error } })
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.webp': 'image/webp', '.avif': 'image/avif', '.woff2': 'font/woff2', '.ico': 'image/x-icon' }
+
+const adaptRes = (res) => {
+  res.status = (c) => { res.statusCode = c; return res }
+  res.json = (o) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(o)); return res }
+  res.send = (d) => { res.end(d); return res }
+  return res
+}
+
+// ─── TRANSCODAGE VIDÉO NATIF (Phase 3) ────────────────────────────────────────────────────────────────
+// Drag-drop d'une vidéo dans l'app -> le navigateur STREAME les octets ici -> on écrit dans /tmp -> on spawn
+// le ffmpeg NATIF (rapide, Phase 2) via scripts/video-hls.mjs --push --emit-progress -> progression LIVE
+// poussée au navigateur en SSE. Plus de Terminal, plus de ffmpeg.wasm. UN seul ffmpeg à la fois (file série,
+// le GPU/CPU sature sinon). Le token vient de l'env du serveur (déjà présent), pas d'un sous-shell `gh`.
+const jobs = new Map() // jobId -> { jobId, name, dest, srcPath, status, progress, stage, error, nodePath, listeners:Set }
+const snapshot = (j) => ({ jobId: j.jobId, status: j.status, progress: j.progress, stage: j.stage, name: j.name, error: j.error || null, nodePath: j.nodePath || null })
+const sseSend = (res, obj) => { try { res.write(`data: ${JSON.stringify(obj)}\n\n`) } catch {} }
+const update = (job, patch) => { Object.assign(job, patch); for (const r of job.listeners) sseSend(r, snapshot(job)) }
+const queue = []
+let running = false
+const pump = () => {
+  if (running) return
+  const job = queue.shift(); if (!job) return
+  running = true
+  runJob(job).catch(() => {}).finally(() => { running = false; pump() })
+}
+async function runJob(job) {
+  update(job, { status: 'running', stage: 'transcodage', progress: 1 })
+  const proc = spawn('node', [path.join(ROOT, 'scripts/video-hls.mjs'), job.srcPath, '--push', '--dest', job.dest, '--api', `http://localhost:${PORT}`, '--emit-progress'], { cwd: ROOT, env: process.env })
+  let buf = ''
+  const onLine = (line) => {
+    let m = line.match(/^@@P (\d+) (\S+)/); if (m) { update(job, { progress: Number(m[1]), stage: m[2] }); return }
+    m = line.match(/^@@DONE (.+)/); if (m) { job.nodePath = m[1].trim(); return }
+    if (/^échec |Error|fatal/.test(line)) job.error = line.slice(0, 200)
+  }
+  proc.stdout.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { onLine(buf.slice(0, i)); buf = buf.slice(i + 1) } })
+  proc.stderr.on('data', (d) => { const s = String(d); if (/Error|fatal|échec/.test(s)) job.error = s.slice(0, 200) })
+  const ok = await new Promise((resolve) => proc.on('close', (code) => {
+    if (job.nodePath) { update(job, { status: 'done', progress: 100, stage: 'terminé' }); resolve(true) }
+    else { update(job, { status: 'error', error: job.error || `ffmpeg code ${code}` }); resolve(false) }
+    for (const r of job.listeners) { try { r.end() } catch {} }
+  }))
+  // On ne supprime la source uploadee QUE sur SUCCES. Sur echec, on la CONSERVE pour permettre un retry sans
+  // re-uploader (et on log le chemin). Sinon un echec reseau effacait le fichier -> il fallait tout re-glisser.
+  if (ok) { try { await rm(path.dirname(job.srcPath), { recursive: true, force: true }) } catch {} }
+  else { job.srcKept = job.srcPath; console.error(`[transcode echoue] source conservee: ${job.srcPath} (job ${job.jobId})`) }
+  setTimeout(() => jobs.delete(job.jobId), 600000) // purge la trace après 10 min
+}
+
+const server = http.createServer(async (req, res) => {
+  adaptRes(res)
+  const url = new URL(req.url, `http://localhost:${PORT}`)
+  if (url.pathname === '/api/assets-workspace') return assetsService.handleHttp(req, res)
+  if (url.pathname === '/api/assets-workspace-preview' && req.method === 'GET') return assetsService.handlePreview(req, res)
+
+  // POST /api/transcode-local?dest=&name= : reçoit le fichier vidéo brut (stream), lance le job, renvoie {jobId}.
+  if (url.pathname === '/api/transcode-local' && req.method === 'POST') {
+    try {
+      const jobId = randomUUID().slice(0, 8)
+      const name = (url.searchParams.get('name') || 'video.mp4').replace(/[/\\]/g, '_')
+      // dest BORNÉ sous pages/ (pas de .. ni d'absolu) : l'endpoint spawn ffmpeg + pousse sur le drive, donc une
+      // dest arbitraire serait une injection de chemin. Defaut pages/Videos.
+      let dest = (url.searchParams.get('dest') || 'pages/Videos').replace(/\/+$/, '')
+      if (!/^pages\//.test(dest) || dest.includes('..')) dest = 'pages/Videos'
+      const dir = path.join('/tmp/zr_in', jobId); await mkdir(dir, { recursive: true })
+      const srcPath = path.join(dir, name)
+      const ws = createWriteStream(srcPath)
+      await new Promise((resolve, reject) => { req.pipe(ws); ws.on('finish', resolve); ws.on('error', reject); req.on('error', reject) })
+      const job = { jobId, name, dest, srcPath, status: 'queued', progress: 0, stage: 'en file', listeners: new Set() }
+      jobs.set(jobId, job); queue.push(job); pump()
+      return res.json({ ok: true, jobId })
+    } catch (e) { res.statusCode = 500; return res.json({ error: String(e.message || e) }) }
+  }
+  // GET /api/transcode-events?jobId= : flux SSE de progression d'un job.
+  if (url.pathname === '/api/transcode-events' && req.method === 'GET') {
+    const job = jobs.get(url.searchParams.get('jobId') || '')
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+    if (!job) { sseSend(res, { status: 'unknown' }); return res.end() }
+    job.listeners.add(res); sseSend(res, snapshot(job))
+    if (job.status === 'done' || job.status === 'error') { try { res.end() } catch {}; return }
+    req.on('close', () => job.listeners.delete(res))
+    return
+  }
+  // GET /api/transcode-status : liste des jobs en cours (reprise d'affichage après reload).
+  if (url.pathname === '/api/transcode-status' && req.method === 'GET') {
+    return res.json({ jobs: [...jobs.values()].map(snapshot) })
+  }
+
+  // GET /api/ytdlp-download?videoId=&name= : extrait l'audio d'un lien YouTube (widget audio, bouton
+  // Télécharger) et le sert en MP3 (Content-Disposition: attachment). LOCAL UNIQUEMENT PAR DESIGN (cf.
+  // docs/ytdlp-terminal-design.md) : cette route n'existe que dans ce fichier, jamais dans api/[...route].js
+  // -> absente du déploiement Vercel, inatteignable en prod. videoId validé par regex stricte avant tout
+  // spawn (pas de shell, argv tableau -> aucune injection possible même avec un id malformé).
+  //
+  // PIÈGE trouvé en test réel (2026-07-04) : `-o -` (stdout direct) empêche yt-dlp/ffmpeg de POST-TRAITER
+  // (conversion réelle en mp3) — le flux ne peut pas être « remuxé » sur un pipe non-seekable, donc yt-dlp
+  // livre l'audio BRUT (webm/opus) sans le convertir, avec une extension .mp3 mensongère. Fix : écrire dans un
+  // fichier temporaire réel (conversion mp3 fonctionne), PUIS streamer ce fichier fini au navigateur, PUIS le
+  // supprimer. Le navigateur ne voit rien de cette étape intermédiaire (juste un délai avant que le
+  // téléchargement démarre, proportionnel à la durée de la piste).
+  if (url.pathname === '/api/ytdlp-download' && req.method === 'GET') {
+    const videoId = (url.searchParams.get('videoId') || '').trim()
+    if (!/^[A-Za-z0-9_-]{6,20}$/.test(videoId)) { res.statusCode = 400; return res.json({ error: 'bad-video-id' }) }
+    const name = (url.searchParams.get('name') || videoId).replace(/[/\\":*?<>|]/g, '_').slice(0, 150)
+    const jobId = randomUUID().slice(0, 8)
+    const outDir = path.join('/tmp/zr_ytdlp', jobId)
+    try {
+      await mkdir(outDir, { recursive: true })
+      const outTemplate = path.join(outDir, 'audio.%(ext)s')
+      await new Promise((resolve, reject) => {
+        const proc = spawn('yt-dlp', ['-x', '--audio-format', 'mp3', '--audio-quality', '0', '-o', outTemplate, `https://www.youtube.com/watch?v=${videoId}`])
+        let errBuf = ''
+        proc.stderr.on('data', (d) => { errBuf += String(d) })
+        proc.on('error', reject)
+        proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(errBuf.slice(-400) || `yt-dlp exit ${code}`)))
+      })
+      const outFile = path.join(outDir, 'audio.mp3')
+      const st = await stat(outFile)
+      res.writeHead(200, { 'content-type': 'audio/mpeg', 'content-length': String(st.size), 'content-disposition': `attachment; filename="${name}.mp3"` })
+      const rs = createReadStream(outFile)
+      rs.pipe(res)
+      rs.on('close', () => { rm(outDir, { recursive: true, force: true }).catch(() => {}) })
+    } catch (e) {
+      console.error('[yt-dlp]', e.message || e)
+      try { rm(outDir, { recursive: true, force: true }) } catch {}
+      if (!res.headersSent) { res.statusCode = 500; return res.json({ error: String(e.message || e) }) }
+      try { res.end() } catch {}
+    }
+    return
+  }
+
+  // ── PARTAGE (miroir des rewrites vercel.json) : /watch, /view, /folder -> share-og (balises OG dynamiques). ──
+  const SHARE_TYPE = { '/watch': 'watch', '/view': 'view', '/folder': 'folder' }[url.pathname]
+  if (SHARE_TYPE) {
+    try {
+      const mod = await import(path.join(ROOT, 'api', '[...route].js'))
+      req.query = Object.fromEntries(url.searchParams)
+      req.query.route = ['share-og'] // miroir EXACT de vercel.json : un seul segment, le type voyage en query
+      req.query.shareType = SHARE_TYPE
+      await mod.default(req, res)
+    } catch (e) { res.statusCode = 500; res.end('share-og error: ' + (e.message || e)) }
+    return
+  }
+  // ── API ──
+  if (url.pathname.startsWith('/api/')) {
+    // Route via le MÊME catch-all que Vercel (api/[...route].js) : une seule source de vérité, handlers dans ../server/.
+    const parts = url.pathname.slice(5).split('/').filter(Boolean)
+    try {
+      const mod = await import(path.join(ROOT, 'api', '[...route].js'))
+      req.query = Object.fromEntries(url.searchParams)
+      req.query.route = parts // segment dynamique = `route` (ne PAS écraser ?path= des handlers)
+      if (req.method === 'POST' || req.method === 'PUT') {
+        const chunks = []; for await (const c of req) chunks.push(c)
+        const raw = Buffer.concat(chunks).toString('utf8')
+        try { req.body = JSON.parse(raw) } catch { req.body = raw }
+      }
+      await mod.default(req, res)
+    } catch (e) { res.statusCode = 500; res.end('api error: ' + (e.message || e)) }
+    return
+  }
+  // ── static (SPA) ──
+  let f = path.join(DIST, url.pathname === '/' ? 'index.html' : url.pathname)
+  try { await stat(f) } catch { f = path.join(DIST, 'index.html') } // fallback SPA
+  try {
+    const buf = await readFile(f)
+    res.setHeader('content-type', MIME[path.extname(f)] || 'application/octet-stream')
+    // index.html (et tout .html) : JAMAIS en cache. Sinon, après un rebuild, le navigateur garde un
+    // ancien index.html qui pointe vers des assets JS hashés SUPPRIMÉS -> 404 -> app blanche (bug observé).
+    // Les assets hashés (/assets/*.js) sont immuables -> cache long. Le reste : revalidation.
+    const ext = path.extname(f)
+    if (ext === '.html') res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
+    else if (/\/assets\//.test(f) && /\.[0-9a-zA-Z_-]{8}\.(js|css)$/.test(f)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+    else res.setHeader('Cache-Control', 'no-cache')
+    res.end(buf)
+  } catch { res.statusCode = 404; res.end('not found') }
+})
+// SÉCURITÉ : on écoute UNIQUEMENT sur la loopback (127.0.0.1), JAMAIS sur 0.0.0.0. Sinon le serveur (qui porte
+// le GITHUB_TOKEN, sert la clé maître de déchiffrement et accepte les écritures sur le drive) serait joignable
+// par TOUT appareil du réseau local. Bind loopback = accessible seulement depuis cette machine.
+const HOST = process.env.ZR_BIND || '127.0.0.1'
+server.listen(PORT, HOST, () => {
+  console.log(`ZenRay local -> http://localhost:${PORT}  (bind ${HOST}, token: ${process.env.GITHUB_TOKEN ? 'OK' : 'ABSENT'})`)
+  if (!ASSETS_PASSIVE) assetsService.startWatching().catch((error) => console.error('Assets watcher:', error.message))
+})
+process.on('SIGTERM', () => { assetsService.close().finally(() => server.close()) })

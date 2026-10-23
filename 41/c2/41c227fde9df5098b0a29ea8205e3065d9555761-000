@@ -1,0 +1,86 @@
+// POST unique vers /api/page (save/delete/move/move-tree/index-add…). Remplace la ~trentaine de
+// fetch('/api/page', { method:'POST', headers:{...}, body: JSON.stringify({ action, ... }) }) dupliqués
+// dans App.jsx : même verbe, mêmes en-têtes, même enveloppe { action, ...payload }.
+//
+// ═══ POURQUOI CETTE FONCTION LÈVE, ALORS QU'ELLE SE CONTENTAIT DE RENDRE (2026-08-31) ═══════════
+//
+// CE QUE L'ANCIENNE VERSION A FAILLI COÛTER, et ce n'est pas une gêne d'affichage. Elle faisait
+// `.then((r) => r.json())` sans jamais regarder `r.ok`. Un 500, un 403 de quota épuisé ou un 409 de
+// conflit de sha rendent TOUS un JSON parfaitement valide, décrivant l'erreur — et la promesse
+// résolvait donc normalement, avec un objet que personne ne lisait.
+//
+// Le code de la corbeille enchaînait alors, en deux endroits (App.jsx, mise en corbeille et
+// restauration) :
+//
+//     await apiPost('save',   { path: destination, markdown })   // échoue en silence
+//     await apiPost('delete', { path: source, sha })             // s'exécute QUAND MÊME
+//
+// Autrement dit : restaurer une page pendant que le quota GitHub est épuisé la copiait nulle part,
+// puis la supprimait de la corbeille. Perte définitive, sans un message. Le quota est réellement
+// tombé à 0/5000 deux fois dans la nuit du 30 au 31 août 2026, si bien que le cas n'avait rien de
+// théorique.
+//
+// LA RÈGLE DU PROJET le disait déjà, quatrième des cinq fautes critiques HDA : « un paramètre non
+// résolu qui passe en silence au lieu de lever une erreur qui le nomme ». C'est exactement cela, et
+// la bannière SORTIR DU PROTOTYPE ajoute le reste : « un échec muet est le seul défaut qui
+// disqualifie vraiment un produit ».
+//
+// CE QU'ON A ÉCARTÉ. Ajouter la vérification dans les deux appelants fautifs aurait réparé la
+// corbeille en laissant les quarante-deux autres appels muets, et aurait posé une seconde vérité sur
+// « ce qu'est une réponse valide ». Le défaut est structurel, donc le correctif l'est aussi.
+//
+// CE QUE CELA CHANGE POUR LES APPELANTS. Ceux qui portent `.catch()` gardent leur comportement, à
+// ceci près qu'ils rattrapent désormais aussi les erreurs serveur, ce qu'ils croyaient déjà faire.
+// Ceux qui n'en portent pas laissent l'erreur remonter, ce qui est le comportement voulu : mieux
+// vaut un échec visible qu'une suite d'opérations construites sur une réponse fausse.
+
+// Erreur nommée : l'appelant peut lire l'action, le statut et le message du serveur sans réanalyser
+// une chaîne. `ErreurApi` plutôt qu'un `Error` nu, pour que `catch` puisse trier.
+export class ErreurApi extends Error {
+  constructor(action, statut, message, corps) {
+    super(`${action} a échoué (${statut}) : ${message}`)
+    this.name = 'ErreurApi'
+    this.action = action
+    this.statut = statut
+    this.corps = corps
+  }
+}
+
+export async function apiPost(action, payload = {}) {
+  const r = await fetch('/api/page', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action, ...payload }),
+  })
+  // Une réponse peut être illisible (HTML d'une page d'erreur, corps vide) : on ne masque pas le
+  // statut derrière l'échec du parseur.
+  let corps = null
+  let illisible = false
+  try { corps = await r.json() } catch { illisible = true }
+
+  // Un 200 dont le corps ne se parse pas est un échec, pas un succès vide : rendre `null` ici
+  // reconstituerait exactement l'échec muet que cette fonction existe pour supprimer.
+  if (r.ok && illisible) throw new ErreurApi(action, r.status, 'réponse illisible (JSON invalide)', null)
+
+  if (!r.ok) throw new ErreurApi(action, r.status, (corps && (corps.error || corps.message)) || r.statusText || 'réponse non lisible', corps)
+  // Le serveur répond parfois 200 en portant l'échec dans le corps : `{ error: '…' }`. Le statut
+  // seul ne suffit donc pas, et c'est le cas qui trompait le plus.
+  if (corps && corps.error) throw new ErreurApi(action, r.status, corps.error, corps)
+  return corps
+}
+
+
+// ═══ RENDRE LA CAUSE, PLUTOT QUE DE L AVALER ═══════════════════════════════════════════════════
+//
+// Une vingtaine d appelants ecrivaient `apiPost(...).catch(causeApi)`. Cette forme etait correcte
+// tant qu apiPost ne levait pas : le `catch` n attrapait qu une panne reseau, et un echec serveur
+// arrivait normalement sous la forme `{ error: '...' }`, que l appelant affichait.
+//
+// En faisant lever apiPost, j ai casse ce contrat sans le voir : l echec serveur tombait desormais
+// dans le meme `catch`, qui rendait `null`, et l interface affichait « erreur move » suivi de RIEN.
+// Matthieu a vu « 0 deplace(s), 1 echec(s) » sans la moindre cause, le 2026-08-31.
+//
+// `causeApi` rend la forme que ces appelants attendent depuis toujours, en y remettant la cause :
+// le corps de la reponse quand il existe, sinon un objet qui porte le message. Aucun appelant n a
+// besoin de changer sa logique, et tous retrouvent l information qu ils avaient perdue.
+export const causeApi = (e) => (e && e.corps) || { ok: false, error: (e && e.message) || 'reseau', detail: e && e.statut ? `HTTP ${e.statut}` : undefined }

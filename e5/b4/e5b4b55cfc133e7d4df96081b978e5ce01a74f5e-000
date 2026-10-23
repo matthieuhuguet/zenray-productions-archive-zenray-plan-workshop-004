@@ -1,0 +1,119 @@
+// 8 October 2026, 11:24 CEST: verify large registry reads and writes through a sparse Git clone and reject stale writers.
+import { afterEach, expect, it } from 'vitest'
+import { execFile, execFileSync } from 'node:child_process'
+import { promisify } from 'node:util'
+import { access, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { createAssetsCloudGitWriter } from './AssetsCloudGitWriter.mjs'
+import { WORKSPACE_CATALOGUE_PATH } from '../src/lib/assetsWorkspaceCatalogue.js'
+
+const registryPath = 'pages/.zr-assets-workspaces.json'
+const roots = []
+const runGit = (args, options = {}) => execFileSync('git', ['-c', 'maintenance.auto=false', ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...options }).trim()
+const git = (directory, ...args) => runGit(['-C', directory, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args])
+const run = promisify(execFile)
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+})
+
+it('pushes a large UTF-8 registry and refuses a stale writer', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'assets-git-writer-'))
+  roots.push(root)
+  const remote = path.join(root, 'remote.git')
+  const seed = path.join(root, 'seed')
+  const firstClone = path.join(root, 'first')
+  const staleClone = path.join(root, 'stale')
+  runGit(['init', '--bare', '--quiet', '--initial-branch=main', remote])
+  runGit(['clone', '--quiet', remote, seed])
+  await mkdir(path.dirname(path.join(seed, registryPath)), { recursive: true })
+  await writeFile(path.join(seed, registryPath), JSON.stringify({ projects: [] }))
+  git(seed, 'add', '--', registryPath)
+  git(seed, 'commit', '--quiet', '-m', 'initial registry')
+  git(seed, 'push', '--quiet', 'origin', 'HEAD:main')
+  const initialSha = git(seed, 'rev-parse', `HEAD:${registryPath}`)
+  const registry = JSON.stringify({ projects: [], padding: 'é'.repeat(1_100_000) })
+  // 8 October 2026, 16:51 CEST: assert that clone, read, and write commands cannot spawn detached maintenance.
+  const calls = []
+  const first = createAssetsCloudGitWriter({ repositoryPath: firstClone, remoteUrl: remote, branch: 'main', authorName: 'Test', authorEmail: 'test@example.com',
+    exec: async (file, args, options) => { calls.push({ file, args }); return run(file, args, options) } })
+  const saved = await first.save({ markdown: registry, expectedSha: initialSha, message: 'large registry update' })
+  expect(saved.ok).toBe(true)
+  expect(saved.sha).toBeTruthy()
+  expect(await first.read({ expectedSha: saved.sha })).toEqual({ ok: true, sha: saved.sha, markdown: registry })
+  const remoteBody = git(remote, 'show', `refs/heads/main:${registryPath}`)
+  expect(remoteBody).toBe(registry)
+  expect(calls.length).toBeGreaterThan(0)
+  expect(calls.every(({ file, args }) => file === 'git' && args[0] === '-c' && args[1] === 'maintenance.auto=false')).toBe(true)
+
+  const stale = createAssetsCloudGitWriter({ repositoryPath: staleClone, remoteUrl: remote, branch: 'main', authorName: 'Test', authorEmail: 'test@example.com' })
+  const rejected = await stale.save({ markdown: JSON.stringify({ projects: ['stale'] }), expectedSha: initialSha, message: 'stale registry update' })
+  expect(rejected).toMatchObject({ ok: false, conflict: true })
+  expect(git(remote, 'show', `refs/heads/main:${registryPath}`)).toBe(registry)
+})
+
+// 8 October 2026, 12:57 CEST: verify sparse writes can target project snapshots and context documents.
+it('reads and writes workspace metadata paths and rejects stale snapshots', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'assets-git-metadata-'))
+  roots.push(root)
+  const remote = path.join(root, 'remote.git')
+  const seed = path.join(root, 'seed')
+  const checkout = path.join(root, 'writer')
+  const workspacePath = 'pages/ZenRayAssets/tiles/.workspace.json'
+  const contextPath = 'pages/ZenRayAssets/tiles/.context.md'
+  runGit(['init', '--bare', '--quiet', '--initial-branch=main', remote])
+  runGit(['clone', '--quiet', remote, seed])
+  await mkdir(path.dirname(path.join(seed, workspacePath)), { recursive: true })
+  await writeFile(path.join(seed, registryPath), JSON.stringify({ projects: [] }))
+  await writeFile(path.join(seed, workspacePath), JSON.stringify({ id: 'tiles', name: 'Old' }))
+  await writeFile(path.join(seed, contextPath), '# Old context')
+  git(seed, 'add', '--', registryPath, workspacePath, contextPath)
+  git(seed, 'commit', '--quiet', '-m', 'initial workspace metadata')
+  git(seed, 'push', '--quiet', 'origin', 'HEAD:main')
+  const oldWorkspaceSha = git(seed, 'rev-parse', `HEAD:${workspacePath}`)
+  const contextSha = git(seed, 'rev-parse', `HEAD:${contextPath}`)
+  const writer = createAssetsCloudGitWriter({ repositoryPath: checkout, remoteUrl: remote, branch: 'main', authorName: 'Test', authorEmail: 'test@example.com' })
+  const workspace = JSON.stringify({ id: 'tiles', name: 'Tiles' })
+  const savedWorkspace = await writer.save({ path: workspacePath, markdown: workspace, expectedSha: oldWorkspaceSha, message: 'workspace update' })
+  expect(savedWorkspace.ok).toBe(true)
+  // 8 October 2026, 13:05 CEST: the publisher can read known metadata before it has a SHA snapshot.
+  expect(await writer.read({ path: workspacePath })).toEqual({ ok: true, sha: savedWorkspace.sha, markdown: workspace })
+  expect(await writer.read({ path: workspacePath, expectedSha: savedWorkspace.sha })).toEqual({ ok: true, sha: savedWorkspace.sha, markdown: workspace })
+  const context = '# Tiles context'
+  const savedContext = await writer.save({ path: contextPath, markdown: context, expectedSha: contextSha, message: 'context update' })
+  expect(savedContext.ok).toBe(true)
+  expect(await writer.read({ path: contextPath, expectedSha: savedContext.sha })).toEqual({ ok: true, sha: savedContext.sha, markdown: context })
+  const stale = await writer.save({ path: workspacePath, markdown: 'stale', expectedSha: oldWorkspaceSha, message: 'stale update' })
+  expect(stale).toMatchObject({ ok: false, conflict: true })
+  expect(git(remote, 'show', `refs/heads/main:${workspacePath}`)).toBe(workspace)
+  expect(git(remote, 'show', `refs/heads/main:${contextPath}`)).toBe(context)
+})
+
+// 9 October 2026, 09:58 CEST: Verify routine index writes do not check out the oversized legacy registry.
+it('sparsely reads and writes the small workspace index without checking out the legacy registry', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'assets-index-writer-'))
+  roots.push(root)
+  const remote = path.join(root, 'remote.git')
+  const seed = path.join(root, 'seed')
+  const checkout = path.join(root, 'writer')
+  runGit(['init', '--bare', '--quiet', '--initial-branch=main', remote])
+  runGit(['clone', '--quiet', remote, seed])
+  await mkdir(path.dirname(path.join(seed, registryPath)), { recursive: true })
+  await writeFile(path.join(seed, registryPath), JSON.stringify({ projects: [], padding: 'x'.repeat(1_000_000) }))
+  await mkdir(path.dirname(path.join(seed, WORKSPACE_CATALOGUE_PATH)), { recursive: true })
+  await writeFile(path.join(seed, WORKSPACE_CATALOGUE_PATH), JSON.stringify({ schemaVersion: 1, projects: [] }))
+  git(seed, 'add', '--', registryPath, WORKSPACE_CATALOGUE_PATH)
+  git(seed, 'commit', '--quiet', '-m', 'initial catalogues')
+  git(seed, 'push', '--quiet', 'origin', 'HEAD:main')
+
+  const writer = createAssetsCloudGitWriter({ repositoryPath: checkout, remoteUrl: remote, branch: 'main', authorName: 'Test', authorEmail: 'test@example.com' })
+  const initial = await writer.read({ path: WORKSPACE_CATALOGUE_PATH })
+  expect(initial.ok).toBe(true)
+  await expect(access(path.join(checkout, registryPath))).rejects.toMatchObject({ code: 'ENOENT' })
+  const next = JSON.stringify({ schemaVersion: 1, projects: [{ id: 'tiles', folder: 'pages/ZenRayAssets/tiles' }] })
+  const saved = await writer.save({ path: WORKSPACE_CATALOGUE_PATH, markdown: next, expectedSha: initial.sha, message: 'workspace index update' })
+  expect(saved.ok).toBe(true)
+  expect((await writer.read({ path: WORKSPACE_CATALOGUE_PATH, expectedSha: saved.sha })).markdown).toBe(next)
+  await expect(writer.read({ path: 'pages/.zr-assets-workspaces-other.json' })).rejects.toThrow('cannot update path')
+})

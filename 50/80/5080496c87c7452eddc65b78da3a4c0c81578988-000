@@ -1,0 +1,225 @@
+// bulkZip.js — téléchargement en masse (ZIP) de tous les médias d'UN dossier (non récursif).
+//
+// SCOPE ASSUMÉ (2026-07-02, cf. PROGRESS.md) : images (.img.json) et fichiers bruts (.file.json) sont zippés
+// (déchiffrement/reconstruction réutilise EXACTEMENT le code déjà éprouvé de ImageNodeViewer.jsx/archiveChunks.js,
+// aucune nouvelle logique crypto). Les vidéos (.media.json streamé DASH/HLS/chunked) sont exclues du ZIP —
+// un flux adaptatif fragmenté n'est pas un blob téléchargeable simple, et chaque lecteur vidéo a déjà son
+// propre bouton "Télécharger". Elles sont proposées en téléchargements natifs séparés, échelonnés (le
+// navigateur bloque les rafales de <a download> simultanées).
+//
+// ANTI-OOM (même politique que fetchAsset.js) : quand l'API File System Access existe (Chrome/Edge desktop),
+// le ZIP est ÉCRIT SUR DISQUE AU FIL DE L'EAU (fflate en mode streaming, store-only — les médias sont déjà
+// compressés, recompresser gaspille du CPU sans gain) : UN SEUL fichier plein en RAM à la fois, jamais tout
+// le dossier. Sans cette API (Safari/Firefox) : repli Blob borné au même plafond que fetchAsset.js (500 Mo).
+import { Zip, ZipPassThrough, zipSync } from 'fflate'
+import { readImgManifestCached, resolveOriginalUrl, downloadMedia } from '../components/ImageNodeViewer.jsx'
+import { downloadUrls as fileDownloadUrls } from './archiveChunks.js'
+import { BLOB_CAP_BYTES, streamDownload } from './fetchAsset.js'
+import { appendShareCredential } from './shareLinks.js'
+import { urlLectureAffichage } from './urlLecture.js'
+
+const hasFileSystemAccess = () => typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function'
+
+const safeZipName = (name) => (name || 'fichier').replace(/[/\\]/g, '_')
+// Désambiguïse les doublons de nom (2 photos qui, une fois l'extension normalisée, portent le même nom).
+function uniqueName(name, seen, preservePaths = false) {
+  // 2 October 2026, 13:32 CEST: project ZIPs preserve scoped folders and reject unsafe archive paths.
+  if (preservePaths && (typeof name !== 'string' || /^[\\/]|^[a-z]:/i.test(name) || /[\\\x00-\x1f]/.test(name) || name.split('/').some((part) => !part || part === '.' || part === '..'))) throw new Error('Unsafe ZIP path')
+  let n = preservePaths ? name : safeZipName(name)
+  if (!seen.has(n)) { seen.add(n); return n }
+  const dot = n.lastIndexOf('.')
+  const base = dot > 0 ? n.slice(0, dot) : n
+  const ext = dot > 0 ? n.slice(dot) : ''
+  let i = 2
+  while (seen.has(`${base} (${i})${ext}`)) i++
+  n = `${base} (${i})${ext}`
+  seen.add(n)
+  return n
+}
+
+// Résout UN entry (contentPath) en {name, bytes} en clair, ou null si non zippable (vidéo/dossier/type inconnu).
+// Résolveur par défaut = contexte Create AUTHENTIFIÉ (déchiffrement client via la clé déjà en mémoire). La
+// vue PARTAGÉE (SharedFolderPage.jsx, visiteur anonyme sans clé) fournit son PROPRE résolveur en option
+// (voir `resolveBytes` dans downloadFolderAsZip) qui passe par /api/shared-media (déchiffrement serveur).
+export async function resolveEntryBytes(entry) {
+  const p = entry.contentPath
+  if (!p) return null
+  if (p.endsWith('.img.json')) {
+    const m = await readImgManifestCached(p)
+    if (!m) return null
+    const url = await resolveOriginalUrl(m)
+    if (!url) return null
+    const buf = await fetch(url).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error('img ' + r.status))))
+    const name = (m.name || entry.name || 'image') + (/\.[^./]+$/.test(m.name || '') ? '' : (m.ext ? '.' + m.ext : ''))
+    return { name, bytes: new Uint8Array(buf), size: buf.byteLength }
+  }
+  if (p.endsWith('.file.json')) {
+    const r = await fetch(`/api/page?action=read&path=${encodeURIComponent(p)}&raw=1`, { cache: 'no-store' }).then((x) => x.json()).catch(() => null)
+    let m = null; try { m = r && r.markdown != null ? JSON.parse(r.markdown) : null } catch { m = null }
+    if (!m) return null
+    const urls = fileDownloadUrls(m)
+    if (!urls || !urls.length) return null
+    const parts = []
+    let total = 0
+    for (const u of urls) {
+      const buf = await fetch(u).then((x) => (x.ok ? x.arrayBuffer() : Promise.reject(new Error('part ' + x.status))))
+      total += buf.byteLength
+      if (total > BLOB_CAP_BYTES) throw new Error(`« ${m.name || entry.name} » trop volumineux pour le ZIP (> ${Math.round(BLOB_CAP_BYTES / 1e6)} Mo) — télécharge-le individuellement.`)
+      parts.push(new Uint8Array(buf))
+    }
+    const bytes = new Uint8Array(total)
+    let off = 0; for (const part of parts) { bytes.set(part, off); off += part.length }
+    return { name: m.name || entry.name || 'fichier', bytes, size: total }
+  }
+  return null // .media.json (vidéo/audio streamé) : géré séparément, hors ZIP
+}
+
+const defaultIsZippable = (e) => !!(e.contentPath && (e.contentPath.endsWith('.img.json') || e.contentPath.endsWith('.file.json')))
+const defaultIsVideo = (e) => !!(e.contentPath && e.contentPath.endsWith('.media.json'))
+const defaultDownloadVideo = (e) => downloadMedia(e.contentPath, e.name)
+
+// downloadFolderAsZip : point d'entrée. `entries` = items À ZIPPER (déjà filtrés par l'appelant — soit TOUT le
+//   dossier courant non récursif, soit une SÉLECTION explicite de l'utilisateur). `folderLabel` nomme le fichier
+//   zip. onProgress(ratio 0..1, label) informe l'UI (nombre de fichiers traités / total).
+// `opts` permet de RÉUTILISER ce moteur de zip dans un contexte différent (2026-07-02) : le Finder authentifié
+//   (Create) déchiffre côté client par défaut ; la vue PARTAGÉE PUBLIQUE (SharedFolderPage.jsx, visiteur sans
+//   clé) fournit son propre `resolveBytes` (passe par /api/shared-media, déchiffrement serveur) et son propre
+//   `downloadVideo`/`isZippable`/`isVideo` adaptés à sa forme d'entrée ({path,kind,name} au lieu de {contentPath}).
+export async function downloadFolderAsZip(entries, folderLabel, onProgress, opts = {}) {
+  const resolveBytes = opts.resolveBytes || resolveEntryBytes
+  const downloadVideo = opts.downloadVideo || defaultDownloadVideo
+  const isZippable = opts.isZippable || defaultIsZippable
+  const isVideo = opts.isVideo || defaultIsVideo
+
+  const zippable = (entries || []).filter(isZippable)
+  const videos = (entries || []).filter(isVideo)
+  if (!zippable.length && !videos.length) throw new Error('aucun média sélectionnable')
+
+  const zipName = safeZipName(folderLabel || 'dossier') + '.zip'
+  const seen = new Set()
+  let ok = 0, fail = 0
+  // 2026-09-03 12:52 : un fichier en lecture et la fermeture disque restent visibles avant le succès.
+  const report = (done, label) => onProgress?.(done / (zippable.length + 1), label)
+  report(0, 'Préparation du téléchargement…')
+
+  if (zippable.length) {
+    if (hasFileSystemAccess()) {
+      let handle
+      report(0, 'Choix de l’emplacement…')
+      try { handle = await window.showSaveFilePicker({ suggestedName: zipName, types: [{ description: 'Archive ZIP', accept: { 'application/zip': ['.zip'] } }] }) }
+      catch (e) { if (e && e.name === 'AbortError') return { ok: 0, fail: 0, cancelled: true, videosQueued: 0 }; handle = null }
+      // BUG TROUVÉ EN PROD (2026-07-02, Matthieu) : createWritable() peut échouer MÊME APRÈS que le picker a
+      // réussi (permission refusée par le navigateur/OS — message "not allowed by the user agent or the
+      // platform"). Avant ce fix, cet appel était HORS du try/catch : l'erreur brute remontait telle quelle au
+      // lieu de retomber sur le repli Blob (zipViaBlobFallback) comme le fait déjà l'échec du picker lui-même.
+      let writable = null
+      if (handle) {
+        try { writable = await handle.createWritable() } catch { handle = null; writable = null }
+      }
+      if (handle && writable) {
+        let chain = Promise.resolve()
+        const zip = new Zip((err, chunk) => {
+          if (err) throw err
+          chain = chain.then(() => writable.write(chunk))
+        })
+        try {
+          for (let i = 0; i < zippable.length; i++) {
+            report(i, `Lecture ${i + 1}/${zippable.length} : ${zippable[i].name || 'fichier'}`)
+            let res
+            try { res = await resolveBytes(zippable[i]) } catch { res = null }
+            if (res) {
+              report(i, `Écriture ${i + 1}/${zippable.length} : ${res.name}`)
+              const stream = new ZipPassThrough(uniqueName(opts.preservePaths ? zippable[i].archivePath || res.name : res.name, seen, opts.preservePaths))
+              zip.add(stream)
+              stream.push(res.bytes, true)
+              await chain
+              ok++
+            } else fail++
+          }
+          report(zippable.length, 'Finalisation du ZIP…')
+          zip.end()
+          await chain
+          await writable.close()
+        } catch (error) {
+          zip.terminate()
+          await writable.abort().catch(() => {})
+          throw error
+        }
+      } else {
+        await zipViaBlobFallback(zippable, zipName, seen, onProgress, resolveBytes, (o, f) => { ok += o; fail += f }, opts)
+      }
+    } else {
+      await zipViaBlobFallback(zippable, zipName, seen, onProgress, resolveBytes, (o, f) => { ok += o; fail += f }, opts)
+    }
+  }
+
+  // Vidéos : hors ZIP, téléchargements natifs échelonnés (400ms) pour ne pas se faire bloquer par le navigateur.
+  videos.forEach((e, i) => { setTimeout(() => { Promise.resolve(downloadVideo(e)).catch(() => {}) }, i * 400) })
+
+  onProgress?.(1, videos.length ? 'Vidéos confiées au navigateur' : 'ZIP prêt')
+  return { ok, fail, videosQueued: videos.length }
+}
+
+async function zipViaBlobFallback(zippable, zipName, seen, onProgress, resolveBytes, addCounts, opts = {}) {
+  const files = {}
+  let total = 0, ok = 0, fail = 0
+  for (let i = 0; i < zippable.length; i++) {
+    onProgress?.(i / (zippable.length + 1), `Lecture ${i + 1}/${zippable.length} : ${zippable[i].name || 'fichier'}`)
+    try {
+      const res = await resolveBytes(zippable[i])
+      if (res) {
+        total += res.size
+        if (total > BLOB_CAP_BYTES) throw new Error(`dossier trop volumineux pour ce navigateur (> ${Math.round(BLOB_CAP_BYTES / 1e6)} Mo cumulés). Ouvre l'app sur Chrome/Edge (bureau) pour le ZIP streamé sans limite.`)
+        files[uniqueName(opts.preservePaths ? zippable[i].archivePath || res.name : res.name, seen, opts.preservePaths)] = res.bytes
+        ok++
+      } else fail++
+    } catch (e) { fail++; if (/trop volumineux/.test(e.message || '')) throw e }
+  }
+  onProgress?.(zippable.length / (zippable.length + 1), 'Finalisation du ZIP…')
+  // Laisser le navigateur peindre cet état avant l’assemblage synchrone.
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const zipped = zipSync(files, { level: 0 }) // store-only : médias déjà compressés
+  const blob = new Blob([zipped], { type: 'application/zip' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a'); a.href = url; a.download = zipName
+  document.body.appendChild(a); a.click(); a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 30000)
+  addCounts(ok, fail)
+}
+
+// ── RÉSOLVEURS POUR LA VUE PARTAGÉE PUBLIQUE (SharedFolderPage.jsx, visiteur SANS clé) ─────────────────────
+// Entrée attendue : { path, name, kind:'image'|'video' } (forme produite par SharedFolderPage.jsx), PAS
+// {contentPath} comme le Finder authentifié. Le déchiffrement passe par /api/shared-media (côté SERVEUR,
+// la clé ne quitte jamais le serveur — cf. server/shared-media.js) au lieu du décodage client de
+// ImageNodeViewer.jsx qui suppose une clé déjà en mémoire (absente pour un visiteur anonyme).
+async function readSharedManifest(path, shareToken) {
+  // Lecture d'AFFICHAGE : un zip de deux cents images lisait deux cents fois le quota.
+  const r = await fetch(appendShareCredential(urlLectureAffichage(path), shareToken), { cache: 'no-store' })
+    .then((x) => (x.ok ? x.json() : null)).catch(() => null)
+  try { return r && r.markdown != null ? JSON.parse(r.markdown) : null } catch { return null }
+}
+export async function resolveSharedEntryBytes(entry) {
+  if (!entry || entry.kind !== 'image') return null
+  const m = await readSharedManifest(entry.path, entry.shareToken)
+  if (!m) return null
+  const buf = await fetch(appendShareCredential(`/api/shared-media?path=${encodeURIComponent(entry.path)}&kind=full`, entry.shareToken))
+    .then((x) => (x.ok ? x.arrayBuffer() : Promise.reject(new Error('shared-media ' + x.status))))
+  const name = (m.name || entry.name || 'image') + (/\.[^./]+$/.test(m.name || '') ? '' : (m.ext ? '.' + m.ext : ''))
+  return { name, bytes: new Uint8Array(buf), size: buf.byteLength }
+}
+// Vidéo partagée : hors ZIP (même raison que le Finder), téléchargement natif via le MÊME mécanisme que le
+// bouton "Télécharger" du lecteur (VideoPlayer2.jsx download()) — parts brutes si vidéo-brute, sinon
+// manifest.download (piste mp4 muxée dédiée), toujours streamé anti-OOM (fetchAsset.js).
+export async function downloadSharedVideo(entry) {
+  const m = await readSharedManifest(entry.path, entry.shareToken)
+  if (!m) throw new Error('manifest introuvable')
+  // FMP4-SINGLE (14 October 2026): this is the DOWNLOAD path of a film (parts decrypted from the archive). If the single fMP4 mode is adopted,
+  // a film with `download.kind === 'fmp4-single'` is downloaded by writing its public parts in order (no decryption, no ffmpeg).
+  // FR : chemin de TELECHARGEMENT ; en mode fMP4 unique, ecrire les parts publiques dans l'ordre, sans dechiffrer.
+  const isRaw = m.type === 'video-raw'
+  const urls = isRaw && Array.isArray(m.parts) ? m.parts.map((p) => p.url)
+    : (m.download && Array.isArray(m.download.parts) ? m.download.parts : null)
+  if (!urls || !urls.length) throw new Error('téléchargement indisponible pour cette vidéo')
+  const name = (m.download && m.download.name) || m.name || entry.name || 'video.mp4'
+  await streamDownload({ urls, name, mime: m.mime || 'video/mp4' })
+}

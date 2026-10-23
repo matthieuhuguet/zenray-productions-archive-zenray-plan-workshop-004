@@ -1,0 +1,128 @@
+// REBUILD PROPRE d'UN shard public : supprime le dépôt (objets morts compris) + le recrée à neuf + re-pousse
+// SON contenu actuel (les images encore pinées dessus) par LOTS, puis re-pin les manifests (cdnCommit).
+//
+// POURQUOI : après un orphan force-push, GitHub garde les anciens objets (inaccessibles) jusqu'à son GC ->
+// la taille reste gonflée (public-01 affichait 8 Go morts + 4,3 Go vivants). Seul delete+recreate remet la
+// taille à 0 immédiatement. Nécessite le scope token delete_repo (gh auth refresh -s delete_repo).
+//
+// Les blobs sont DÉJÀ en local (.migrate-encrypt-tmp/<shard> working tree) -> aucun re-chiffrement, aucun re-fetch.
+// USAGE : GITHUB_TOKEN=$(gh auth token) node scripts/rebuild-shard-clean.mjs --shard=zenray-img-public-01 [--apply]
+
+import { execFileSync } from 'node:child_process'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, copyFileSync, readdirSync, statSync } from 'node:fs'
+import path from 'node:path'
+
+const args = Object.fromEntries(process.argv.slice(2).map((a) => { const m = a.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [a, true] }))
+const APPLY = !!args.apply
+const SHARD = String(args.shard || 'zenray-img-public-01')
+const OWNER = process.env.OWNER || 'matthieuhuguet'
+const TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
+if (!TOKEN) { console.error('GITHUB_TOKEN manquant'); process.exit(1) }
+const CAP = Math.floor(4.3 * 1024 * 1024 * 1024)
+const WORK = path.resolve(args.workdir || '.migrate-encrypt-tmp')
+const DATA = path.join(WORK, 'zenray-data')
+const SRC = path.join(WORK, SHARD)
+const cloneUrl = (repo) => `https://x-access-token:${TOKEN}@github.com/${OWNER}/${repo}.git`
+const human = (b) => (b / 1073741824).toFixed(2) + ' Go'
+const git = (cwd, ...a) => execFileSync('git', a, { cwd, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 30 }).toString().trim()
+if (!existsSync(path.join(SRC, '.git'))) { console.error('clone local absent :', SRC); process.exit(1) }
+if (!existsSync(path.join(DATA, '.git'))) { console.error('clone local absent :', DATA); process.exit(1) }
+
+// 1. manifests encore pinés sur SHARD
+console.log('• lecture des manifests pinés sur', SHARD, '…')
+git(DATA, 'fetch', 'origin', 'main'); git(DATA, 'reset', '--hard', 'origin/main')
+function walk(dir, out = []) { for (const e of readdirSync(dir, { withFileTypes: true })) { const p = path.join(dir, e.name); if (e.isDirectory()) walk(p, out); else if (e.name.endsWith('.img.json')) out.push(p) } return out }
+const pagesDir = path.join(DATA, 'pages')
+const manifests = existsSync(pagesDir) ? walk(pagesDir) : []
+const thumbRelOf = (rel) => rel.replace(/\.[^./]+$/, '.webp')
+const sizeOf = (rel) => { try { return statSync(path.join(SRC, rel)).size } catch { return -1 } }
+const items = []
+let missing = 0
+for (const f of manifests) {
+  let m; try { m = JSON.parse(readFileSync(f, 'utf8')) } catch { continue }
+  if (m.vis !== 'public' || m.cdnRepo !== SHARD || !m.cdnPath) continue
+  const sMain = sizeOf(m.cdnPath); if (sMain < 0) { missing++; continue }
+  const t = thumbRelOf(m.cdnPath); const sT = sizeOf(t)
+  items.push({ file: f, cdnPath: m.cdnPath, thumbRel: sT >= 0 ? t : null, bytes: sMain + Math.max(0, sT) })
+}
+const total = items.reduce((s, x) => s + x.bytes, 0)
+console.log('  images pinées sur', SHARD, ':', items.length, '| octets blobs (local) :', human(total), '| blobs manquants en local :', missing)
+if (missing) { console.error('  ⚠️ blobs manquants en local -> ABANDON (re-fetch le clone source avant).'); if (APPLY) process.exit(1) }
+if (total > CAP) { console.error('  ⚠️ contenu (', human(total), ') > CAP (', human(CAP), ') -> il faudrait scinder (reorg-public-shards), pas un simple rebuild.'); if (APPLY) process.exit(1) }
+
+console.log('\n=== PLAN REBUILD (' + (APPLY ? 'APPLY' : 'DRY-RUN') + ') ===')
+console.log('  supprimer', OWNER + '/' + SHARD, '-> recréer à neuf -> pousser', items.length, 'images (' + human(total) + ') par lots -> re-pin', items.length, 'manifests')
+if (!APPLY) { console.log('\n— DRY-RUN. Relance avec --apply (nécessite scope delete_repo). —'); process.exit(0) }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const repoExists = () => {
+  try {
+    execFileSync('gh', ['repo', 'view', `${OWNER}/${SHARD}`, '--json', 'name'], { stdio: 'ignore' })
+    return true
+  } catch { return false }
+}
+async function recreateRepoWithRetry() {
+  const attempts = 6
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      execFileSync('gh', ['repo', 'create', `${OWNER}/${SHARD}`, '--public', '-d', 'ZenRay drive — shard PUBLIC chiffré (rebuild propre)'], { stdio: 'inherit' })
+      if (repoExists()) return true
+    } catch {
+      // Une réponse locale peut échouer après création distante : vérifier avant de retenter.
+      if (repoExists()) return true
+    }
+    if (attempt < attempts) {
+      const waitMs = Math.min(30000, 2000 * (2 ** (attempt - 1)))
+      console.warn(`  recréation retry ${attempt}/${attempts} dans ${Math.round(waitMs / 1000)} s…`)
+      await sleep(waitMs)
+    }
+  }
+  return false
+}
+
+// 2. delete + recreate. Dès que delete a réussi, toute erreur de create est un état critique explicite.
+console.log('• suppression de', SHARD, '…')
+execFileSync('gh', ['repo', 'delete', `${OWNER}/${SHARD}`, '--yes'], { stdio: 'inherit' })
+console.log('• recréation de', SHARD, '…')
+if (!(await recreateRepoWithRetry())) {
+  console.error(`\nÉTAT CRITIQUE : ${OWNER}/${SHARD} A ÉTÉ SUPPRIMÉ MAIS N'A PAS PU ÊTRE RECRÉÉ après 6 essais.`)
+  console.error(`Réparation manuelle requise : gh repo create ${OWNER}/${SHARD} --public`)
+  console.error('Ne relance aucun push/re-pin avant que gh repo view confirme la recréation du shard.')
+  process.exit(2)
+}
+
+// 3. build + push par lots (petits packs -> pas de HTTP 500)
+function pushRetry(dir, ...a) { for (let i = 0; i < 5; i++) { try { git(dir, 'push', ...a); return } catch (e) { if (i === 4) throw e; console.log('   push retry', i + 1) } } }
+const BATCH = 1500
+const dir = path.join(WORK, 'rebuild-' + SHARD)
+rmSync(dir, { recursive: true, force: true }); mkdirSync(dir, { recursive: true })
+git(dir, 'init', '-q'); git(dir, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+writeFileSync(path.join(dir, 'README.md'), `# ${SHARD}\n\nShard PUBLIC d'images chiffrées (AES-GCM), servi via jsDelivr. Noms hashés.\n`)
+git(dir, 'remote', 'add', 'origin', cloneUrl(SHARD))
+for (let b = 0; b < items.length; b += BATCH) {
+  const slice = items.slice(b, b + BATCH)
+  for (const img of slice) for (const rel of [img.cdnPath, img.thumbRel].filter(Boolean)) { const s = path.join(SRC, rel), d = path.join(dir, rel); mkdirSync(path.dirname(d), { recursive: true }); copyFileSync(s, d) }
+  git(dir, 'add', '-A'); git(dir, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-q', '-m', `rebuild ${SHARD} lot ${b / BATCH + 1}`)
+  console.log('• push', SHARD, 'lot', b / BATCH + 1, '->', Math.min(b + BATCH, items.length) + '/' + items.length)
+  pushRetry(dir, 'origin', 'main')
+}
+const sha = git(dir, 'rev-parse', 'HEAD')
+console.log('  commit', SHARD, '=', sha)
+
+// 4. re-pin (cdnCommit) + push zenray-data résilient
+console.log('• re-pin des manifests + push zenray-data…')
+git(DATA, 'fetch', 'origin', 'main'); git(DATA, 'reset', '--hard', 'origin/main')
+const pin = new Set(items.map((x) => x.cdnPath))
+let rewritten = 0
+for (const f of (existsSync(pagesDir) ? walk(pagesDir) : [])) {
+  let m; try { m = JSON.parse(readFileSync(f, 'utf8')) } catch { continue }
+  if (m.vis !== 'public' || m.cdnRepo !== SHARD || !pin.has(m.cdnPath)) continue
+  m.cdnCommit = sha; writeFileSync(f, JSON.stringify(m)); rewritten++
+}
+console.log('  manifests re-pinés :', rewritten)
+git(DATA, 'add', '-A')
+if (git(DATA, 'status', '--porcelain')) {
+  git(DATA, '-c', 'user.email=zr@local', '-c', 'user.name=zenray', 'commit', '-q', '-m', `rebuild ${SHARD}: re-pin ${rewritten} manifests`)
+  for (let i = 0; i < 6; i++) { try { git(DATA, 'push', 'origin', 'HEAD:main'); console.log('• zenray-data poussé.'); break } catch (e) { if (i === 5) throw e; console.log('• retry push zenray-data…'); git(DATA, 'fetch', 'origin', 'main'); try { git(DATA, 'rebase', 'origin/main') } catch { try { git(DATA, 'rebase', '--abort') } catch {} git(DATA, 'rebase', '-X', 'theirs', 'origin/main') } } }
+}
+console.log('\n✅ REBUILD TERMINÉ.', SHARD, '=', human(total), '(propre, sans objets morts) ·', rewritten, 'manifests re-pinés.')

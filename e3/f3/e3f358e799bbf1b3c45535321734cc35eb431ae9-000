@@ -1,0 +1,129 @@
+// @vitest-environment node
+// 7 October 2026, 09:45 CEST: the conversation index regenerates by itself and is verified in both directions (green on a good index, red on a broken one).
+import { it, expect } from 'vitest'
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat } from 'node:fs/promises'
+import path from 'node:path'
+import os from 'node:os'
+import { createConversationIndexSync, completeWithBound, verifyWrittenIndex, memoryFolder } from './ConversationIndexSync.mjs'
+
+const line = value => JSON.stringify(value) + '\n'
+const user = (text, at) => line({ type: 'user', timestamp: at, message: { role: 'user', content: text } })
+const assistant = (text, at) => line({ type: 'assistant', timestamp: at, message: { role: 'assistant', content: [{ type: 'text', text }] } })
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+async function world(overrides = {}) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'index-sync-')), stateDir = path.join(dir, 'state'), memory = path.join(dir, 'memory-lily'), project = path.join(dir, 'Production-Lily-Collection-01')
+  await mkdir(stateDir, { recursive: true }); await mkdir(memory, { recursive: true }); await mkdir(project, { recursive: true })
+  const put = (file, value) => writeFile(path.join(stateDir, file), JSON.stringify(value))
+  await put('GlobalProjectIndex.json', { projects: { lily: { locations: { memory: [{ localPath: memory }], houdini: [{ localPath: project }] } } } })
+  await put('SessionBindings.json', { s1: 'lily' })
+  const transcripts = { s1: path.join(dir, 's1.jsonl'), s2: path.join(dir, 's2.jsonl') }
+  await writeFile(transcripts.s1, user('hello, nothing about paths yet', '2026-10-07T08:00:00Z'))
+  await writeFile(transcripts.s2, user(`open ${project}/hip`, '2026-10-07T08:05:00Z') + assistant(`I edit ${project}/Scripts/a.py`, '2026-10-07T08:06:00Z'))
+  const updated = { s1: '2026-10-07T08:00:00Z', s2: '2026-10-07T08:06:00Z' }, events = []
+  const item = id => ({ id: `claude:${id}`, provider: 'claude', sessionId: id, title: `Conversation ${id}`, readable: true, localPath: transcripts[id], transcriptPaths: [transcripts[id]], updatedAt: updated[id], bytes: 10 })
+  const catalog = { list: async () => ({ conversations: Object.keys(transcripts).map(item) }), read: async () => ({ messages: [] }) }
+  const sync = createConversationIndexSync({ stateDir, catalog, onEvent: (projectId, type, detail) => events.push({ projectId, type, detail }), settings: { quietMs: 20, maxWaitMs: 200, sweepMs: 10_000 }, ...overrides })
+  const indexJson = async () => JSON.parse(await readFile(path.join(memory, 'ConversationIndex.json'), 'utf8'))
+  return { dir, stateDir, memory, project, put, transcripts, updated, events, sync, indexJson, cleanup: async () => { await sync.close(); await rm(dir, { recursive: true, force: true }) } }
+}
+
+it('lists a bound session before its transcript cites any project path, and the written files pass verification', async () => {
+  const w = await world()
+  try {
+    w.sync.request('lily', { immediate: true }); await w.sync.flush()
+    const json = await w.indexJson(), bound = json.conversations.find(item => item.sessionId === 's1')
+    expect(bound).toMatchObject({ strength: 'bound', boundProject: 'lily', conversationId: 'claude:s1' })
+    expect(await readFile(path.join(w.memory, 'ConversationIndex.md'), 'utf8')).toContain('Strength `bound`')
+    expect(await verifyWrittenIndex({ projectId: 'lily', folder: w.memory, bindings: { s1: 'lily' } })).toEqual([])
+    expect(w.sync.status()).toMatchObject({ lastOk: true, error: null })
+    // the unbound session that worked on the project paths is listed by evidence, not bound
+    expect(json.conversations.find(item => item.sessionId === 's2')).toMatchObject({ boundProject: null })
+  } finally { await w.cleanup() }
+})
+
+it('turns RED on a broken index: a bound session removed from the JSON, a markdown from another scan', async () => {
+  const w = await world()
+  try {
+    w.sync.request('lily', { immediate: true }); await w.sync.flush()
+    const file = path.join(w.memory, 'ConversationIndex.json'), good = JSON.parse(await readFile(file, 'utf8'))
+    await writeFile(file, JSON.stringify({ ...good, conversations: good.conversations.filter(item => item.sessionId !== 's1') }))
+    expect((await verifyWrittenIndex({ projectId: 'lily', folder: w.memory, bindings: { s1: 'lily' } })).join(' ')).toContain('bound session s1 is missing')
+    await writeFile(file, JSON.stringify({ ...good, scannedAt: '2020-01-01T00:00:00.000Z' }))
+    expect((await verifyWrittenIndex({ projectId: 'lily', folder: w.memory, bindings: {} })).join(' ')).toContain('different scans')
+    await writeFile(file, JSON.stringify({ ...good, projectId: 'other' }))
+    expect((await verifyWrittenIndex({ projectId: 'lily', folder: w.memory, bindings: {} })).join(' ')).toContain('names project other')
+  } finally { await w.cleanup() }
+})
+
+it('detects a stale index: new activity, a newly bound session, a deleted file; and stays quiet when fresh', async () => {
+  const w = await world()
+  try {
+    w.sync.request('lily', { immediate: true }); await w.sync.flush()
+    await w.sync.sweep(); expect(w.sync.status().pending).toEqual([])
+    w.updated.s1 = new Date(Date.now() + 60_000).toISOString()
+    await w.sync.sweep(); expect(w.sync.status().pending).toEqual(['lily'])
+    await w.sync.flush(); w.updated.s1 = '2026-10-07T08:00:00Z'
+    await w.put('SessionBindings.json', { s1: 'lily', s2: 'lily' })
+    await w.sync.sweep(); expect(w.sync.status().pending).toEqual(['lily'])
+    await w.sync.flush(); expect((await w.indexJson()).conversations.find(item => item.sessionId === 's2').boundProject).toBe('lily')
+    await w.sync.sweep(); expect(w.sync.status().pending).toEqual([])
+    await rm(path.join(w.memory, 'ConversationIndex.json'))
+    await w.sync.sweep(); expect(w.sync.status().pending).toEqual(['lily'])
+  } finally { await w.cleanup() }
+})
+
+it('reports an unwritable index as a visible error, keeps the project pending, and recovers', async () => {
+  const w = await world()
+  try {
+    await rm(w.memory, { recursive: true }); await writeFile(w.memory, 'a file where a folder should be')
+    w.sync.request('lily', { immediate: true }); await w.sync.flush()
+    expect(w.sync.status()).toMatchObject({ lastOk: false }); expect(w.sync.status().error).toContain('lily')
+    expect(w.sync.status().pending).toEqual(['lily']); expect(w.events.some(event => event.type === 'conversation-index-error')).toBe(true)
+    await rm(w.memory); await mkdir(w.memory)
+    await w.sync.flush(); w.sync.request('lily', { immediate: true }); await w.sync.flush()
+    expect(w.sync.status()).toMatchObject({ lastOk: true, error: null, pending: [] })
+    expect((await w.indexJson()).conversations.length).toBeGreaterThan(0)
+  } finally { await w.cleanup() }
+})
+
+it('warns, without throwing, about a project with no memory folder and about a bound session without a readable transcript', async () => {
+  const w = await world()
+  try {
+    await w.put('GlobalProjectIndex.json', { projects: { lily: { locations: { memory: [{ localPath: w.memory }], houdini: [{ localPath: w.project }] } }, ghost: { locations: {} } } })
+    await w.put('SessionBindings.json', { s1: 'lily', ghostly: 'lily' })
+    w.sync.request('ghost', { immediate: true }); w.sync.request('lily', { immediate: true }); await w.sync.flush()
+    const warnings = w.sync.status().warnings.join(' | ')
+    expect(warnings).toContain('ghost: no memory folder'); expect(warnings).toContain('ghostly is bound to lily')
+    expect((await w.indexJson()).conversations.find(item => item.sessionId === 'ghostly')).toMatchObject({ strength: 'bound', boundProject: 'lily' })
+    expect(memoryFolder({ projects: {} }, 'x')).toBeNull()
+  } finally { await w.cleanup() }
+})
+
+// 13 October 2026: louisiana-bayou had a social post folder as its first memory source, so its index was written there and missing beside FEEDBACK.md.
+it('writes the index in the project notes folder even when another memory source is listed first', () => {
+  const index = { projects: { bayou: { locations: { memory: [{ sourceId: 'posts', localPath: '/m/SocialMedia/Posts/short' }, { sourceId: 'project-notes', localPath: '/m/Projects/bayou' }] } } } }
+  expect(memoryFolder(index, 'bayou')).toBe('/m/Projects/bayou')
+  const legacy = { projects: { old: { locations: { memory: [{ sourceId: 'letters', localPath: '/m/Letters' }, { sourceId: 'notes', localPath: '/m/Projects/old' }] } } } }
+  expect(memoryFolder(legacy, 'old')).toBe('/m/Projects/old')
+  expect(memoryFolder({ projects: { solo: { locations: { memory: [{ localPath: '/m/solo' }] } } } }, 'solo')).toBe('/m/solo')
+})
+
+it('coalesces a burst of requests into one run and runs again for a request that arrives during a run', async () => {
+  const w = await world()
+  try {
+    for (let n = 0; n < 5; n += 1) w.sync.request('lily')
+    await wait(150)
+    expect(w.events.filter(event => event.type === 'conversation-index')).toHaveLength(1)
+    w.sync.request('lily', { immediate: true }); w.sync.request('lily', { immediate: true })
+    await wait(200)
+    expect(w.events.filter(event => event.type === 'conversation-index').length).toBeGreaterThanOrEqual(2)
+    expect(w.sync.status().pending).toEqual([])
+  } finally { await w.cleanup() }
+})
+
+it('completeWithBound adds only the missing bound sessions of that project', () => {
+  const links = { byProject: { lily: [{ sessionId: 'a', conversationId: 'claude:a' }] } }
+  const { list, boundOnly } = completeWithBound({ projectId: 'lily', links, bindings: { a: 'lily', b: 'lily', c: 'other' }, conversations: [{ sessionId: 'b', id: 'codex:b', provider: 'codex', readable: true, title: 'B', updatedAt: '2026-10-07T00:00:00Z' }] })
+  expect(list.map(item => item.sessionId)).toEqual(['a', 'b']); expect(boundOnly).toBe(1)
+})

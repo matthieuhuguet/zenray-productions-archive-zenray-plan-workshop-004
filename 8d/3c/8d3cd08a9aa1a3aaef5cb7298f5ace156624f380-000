@@ -1,0 +1,120 @@
+#!/usr/bin/env node
+// zenray-uploader.mjs — WORKER AUTONOME d'upload vidéo (tourne en fond sur le Mac, lancé au login).
+//
+// EN UNE PHRASE : tu déposes une vidéo dans un dossier surveillé (par défaut ~/Downloads), et ce worker
+// la remuxe en MP4 faststart sans perte puis la pousse, chiffrée, sur ZenRayShards.
+// Le navigateur ne peut PAS connaître le chemin disque d'un fichier glissé (sécurité) ; ce petit programme
+// local, lui, voit les fichiers -> c'est le pont qui manque pour automatiser l'upload.
+//
+// LANCEMENT : GITHUB_TOKEN=$(gh auth token) node scripts/zenray-uploader.mjs \
+//               [--watch ~/Downloads] [--dest pages/Videos] [--api http://localhost:3100] [--interval 4] [--crf 21]
+//
+// COMPORTEMENT : poll du dossier toutes les `interval` s. Pour chaque NOUVELLE vidéo stable (taille qui ne
+// bouge plus = copie/téléchargement terminé) : remux lossless + push privé + manifeste video-raw.
+// Le fichier SOURCE n'est JAMAIS supprimé. Idempotent : une VERSION déjà traitée n'est pas reprise ; si un
+// nom de caméra est réutilisé avec un nouveau fichier, sa signature change et l'upload repart normalement.
+//
+// SÉCURITÉ : token via env, jamais committé. Binaires sur shard PRIVÉ, parts AES-GCM adressées par hash ;
+// seul le manifeste est écrit sur zenray-data. Aucun repo n'est créé avant la première vidéo stable.
+
+import path from 'node:path'
+import os from 'node:os'
+import { readdir, stat, readFile, writeFile, mkdir, rm } from 'node:fs/promises'
+import { makeVidRawShardCtx, ingestVideoRaw } from './video-raw-lib.mjs'
+import { pushBlobs } from './video-mse-lib.mjs'
+
+const args = process.argv.slice(2)
+const getArg = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d }
+const home = os.homedir()
+const expand = (p) => p.replace(/^~(?=$|\/)/, home)
+const TOKEN = process.env.GITHUB_TOKEN
+const WATCH = expand(getArg('--watch', path.join(home, 'Downloads')))
+const DEST = getArg('--dest', 'pages/Videos').replace(/\/$/, '')
+// --api reste accepté pour ne pas casser les anciens .command, mais video-raw n'en dépend plus.
+getArg('--api', 'http://localhost:3100')
+const INTERVAL = Math.max(2, parseInt(getArg('--interval', '4'), 10)) * 1000
+getArg('--crf', '21') // option historique acceptée ; video-raw ne réencode plus.
+const VIDEO_RE = /\.(mkv|mp4|webm|avi|mov|m4v|ts|flv|wmv)$/i
+
+if (!TOKEN) { console.error('GITHUB_TOKEN manquant : lance avec GITHUB_TOKEN=$(gh auth token) node scripts/zenray-uploader.mjs'); process.exit(1) }
+
+const STATE_DIR = path.join(home, '.zenray')
+const SEEN_FILE = path.join(STATE_DIR, 'uploader-seen.json')
+const WORK_DIR = path.join(os.tmpdir(), 'zr_zenray_uploader')
+const log = (...a) => console.log(new Date().toLocaleTimeString('fr-FR'), ...a)
+
+async function loadSeen() {
+  try {
+    const parsed = JSON.parse(await readFile(SEEN_FILE, 'utf8'))
+    if (parsed && parsed.v === 2 && parsed.files && typeof parsed.files === 'object') return new Map(Object.entries(parsed.files))
+    // Migration non destructive de l'ancien tableau de chemins : on adopte la version actuellement présente
+    // au premier tick sans la ré-uploader, puis toute future réutilisation du même nom sera détectée.
+    if (Array.isArray(parsed)) return new Map(parsed.map((file) => [file, 'legacy']))
+  } catch {}
+  return new Map()
+}
+async function saveSeen(map) {
+  try {
+    await mkdir(STATE_DIR, { recursive: true })
+    await writeFile(SEEN_FILE, JSON.stringify({ v: 2, files: Object.fromEntries(map) }))
+  } catch {}
+}
+
+const fileSignature = (st) => `${st.size}:${Math.round(st.mtimeMs || 0)}:${st.ino || 0}`
+
+const sizes = new Map() // fichier -> dernière taille vue (pour détecter une copie terminée)
+const seen = await loadSeen()
+
+log(`ZenRay uploader — surveille ${WATCH} -> ${DEST}. Dépose une vidéo, elle s'uploade en video-raw chiffré.`)
+
+let shardCtx = null
+async function getShardCtx() {
+  if (shardCtx) return shardCtx
+  await rm(WORK_DIR, { recursive: true, force: true })
+  shardCtx = makeVidRawShardCtx({ token: TOKEN, work: WORK_DIR, log: (...parts) => log('   ', ...parts) })
+  return shardCtx
+}
+
+async function tick() {
+  let files = []
+  try { files = (await readdir(WATCH)).filter((f) => VIDEO_RE.test(f)) } catch { return }
+  for (const name of files) {
+    const full = path.join(WATCH, name)
+    let st
+    try { st = await stat(full) } catch { continue }
+    const sz = st.size
+    const signature = fileSignature(st)
+    const previous = seen.get(full)
+    if (previous === 'legacy') { seen.set(full, signature); await saveSeen(seen); continue }
+    if (previous === signature) continue
+    // Attendre la STABILITÉ (2 ticks à la même signature) : évite de transcoder un fichier en cours de copie,
+    // y compris quand un téléchargement remplace un ancien fichier par un nouveau de taille identique.
+    if (sizes.get(full) !== signature) { sizes.set(full, signature); continue }
+    log(`→ nouvelle vidéo : ${name} (${(sz / 1048576).toFixed(0)} Mo). Découpage exact + upload privé…`)
+    try {
+      const vctx = await getShardCtx()
+      const base = path.basename(name).replace(/\.[^.]+$/, '')
+      const { manifestPath, manifest } = await ingestVideoRaw(full, {
+        dest: DEST,
+        base,
+        vctx,
+        workDir: path.join(WORK_DIR, 'tmp'),
+        log: (...parts) => log('   ', ...parts),
+      })
+      const commit = await pushBlobs(TOKEN, 'zenray-data', [{
+        path: manifestPath,
+        content: JSON.stringify(manifest),
+        encoding: 'utf-8',
+      }], `vidraw ${base}`, (...parts) => log('   ', ...parts))
+      seen.set(full, signature)
+      await saveSeen(seen)
+      log(`✓ ${name} uploadée dans ${DEST} · ${manifestPath} · commit ${commit.slice(0, 7)}. Source conservée.`)
+    } catch (e) {
+      // La signature n'est enregistrée qu'après le commit du manifeste : un échec reste réessayable.
+      log(`✗ échec ${name} : ${String(e.message || e).slice(0, 160)}`)
+    }
+  }
+}
+
+// Boucle de poll (pas de dépendance externe type chokidar : readdir suffit et reste robuste).
+for (;;) { await tick(); await new Promise((r) => setTimeout(r, INTERVAL)) }

@@ -1,0 +1,429 @@
+// 10 October 2026, 16:10 CEST: Keep video restore and unload bound to one pinned recovery proof.
+// 12 October 2026: a receipt now names HOW the cloud copy was proven (verificationMode): the identity proof of
+// video-identity-proof.mjs, or the full read-back of this file. The unload refuses a receipt whose evidence is incomplete.
+// FR : un recu dit COMMENT la copie cloud a ete prouvee ; le dechargement refuse un recu dont la preuve est incomplete.
+import fs from 'node:fs'
+import { createReadStream } from 'node:fs'
+import { mkdtemp, mkdir, open, readFile, realpath, rename, rm, stat, statfs, unlink, link } from 'node:fs/promises'
+import { createHash, createDecipheriv, randomUUID } from 'node:crypto'
+import { spawnSync, execFileSync } from 'node:child_process'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { loadMasterKey } from './img-pipeline.mjs'
+import { isPublicPosterUrl } from './film-poster.mjs'
+
+const OWNER = 'matthieuhuguet'
+const TRANSIENT_GIT_FAILURE = /ETIMEDOUT|ECONNRESET|EAI_AGAIN|ENOTFOUND|could not resolve host|failed to connect|route to host|unexpected disconnect|remote end hung up|RPC failed|HTTP 408|HTTP 429|HTTP 5\d\d|curl 28/i
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex')
+
+// 12 October 2026: the only two ways a receipt can authorise deleting a local original. A receipt without the field was
+// written before the identity proof existed and IS a full read-back.
+// FR : les deux seules preuves qui autorisent l'effacement ; un recu sans champ est une relecture integrale historique.
+export const VERIFICATION_MODES = Object.freeze({ identity: 'identity-v1', fullReadBack: 'full-readback' })
+export { TRANSIENT_GIT_FAILURE }
+
+// 12 October 2026: the recovery proof must not break when a poster, an audio name or a subtitle is added to the manifest.
+// Only the fields the restore really reads are fingerprinted; the restored bytes are still checked against proof.sha256.
+// FR : l'empreinte ne couvre que ce que la restauration lit (parts chiffrees, taille, nom) ; le SHA-256 du fichier restaure reste verifie.
+const RECOVERY_FIELDS = ['type', 'enc', 'alg', 'size', 'parts'] // `name` is excluded: a clean rename must not invalidate the proof
+const stableJson = (value) => (Array.isArray(value) ? `[${value.map(stableJson).join(',')}]`
+  : value && typeof value === 'object' ? `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`
+    : JSON.stringify(value))
+export const recoveryFingerprint = (manifest) => sha256(Buffer.from(stableJson(Object.fromEntries(RECOVERY_FIELDS.map((k) => [k, manifest?.[k] ?? null])))))
+
+function gitEnvironment(token) {
+  if (!token) throw new Error('GitHub token is required for private video shards')
+  return { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+    GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}` }
+}
+
+async function git(dir, args, env, binary = false) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      return execFileSync('git', ['-C', dir, ...args], { env, timeout: 600000, maxBuffer: 128 * 1024 * 1024,
+        ...(binary ? {} : { encoding: 'utf8' }), stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      const stderr = Buffer.isBuffer(error.stderr) ? error.stderr.toString('utf8') : String(error.stderr || '')
+      const details = `${error.code || ''}\n${error.message || ''}\n${stderr}`
+      if (attempt === 5 || !TRANSIENT_GIT_FAILURE.test(details)) throw error
+      const delay = Math.min(60000, 5000 * (2 ** (attempt - 1)))
+      console.warn(`Transient cloud read failure; retry ${attempt}/5 after ${delay}ms`)
+      await wait(delay)
+    }
+  }
+  throw new Error('Cloud Git read retries exhausted')
+}
+
+async function createPinnedBlobReader({ scratchParent, token, owner = OWNER }) {
+  const scratchRoot = await mkdtemp(path.join(scratchParent, 'CloudVideo-'))
+  const scratch = path.join(scratchRoot, 'repo')
+  const env = gitEnvironment(token)
+  let current = null
+  return {
+    async read(repo, commit, blobPath) {
+      const identity = `${repo}@${commit}`
+      if (identity !== current) {
+        await rm(scratch, { recursive: true, force: true })
+        await mkdir(scratch, { recursive: true })
+        const init = spawnSync('git', ['init', '-q', scratch], { env, encoding: 'utf8' })
+        if (init.status !== 0) throw new Error(`Could not initialize cloud reader: ${init.stderr || init.error}`)
+        // 12 October 2026: every Git call is awaited; a transient fetch failure used to be retried in the background
+        // while the blob read started without its commit. FR : chaque appel Git est attendu.
+        await git(scratch, ['remote', 'add', 'origin', `https://github.com/${owner}/${repo}.git`], env)
+        await git(scratch, ['config', 'remote.origin.promisor', 'true'], env)
+        await git(scratch, ['config', 'remote.origin.partialclonefilter', 'blob:none'], env)
+        await git(scratch, ['fetch', '-q', '--filter=blob:none', '--depth=1', 'origin', commit], env)
+        current = identity
+      }
+      return await git(scratch, ['cat-file', 'blob', `${commit}:${blobPath}`], env, true)
+    },
+    async close() { await rm(scratchRoot, { recursive: true, force: true }) },
+  }
+}
+
+function parsePinnedPartUrl(url, owner = OWNER) {
+  const pattern = new RegExp(`^https://raw\\.githubusercontent\\.com/${owner}/(zenrayshards-vid-[a-z0-9-]+)/([a-f0-9]{40})/([a-f0-9]{2}/[a-f0-9]{2}/([a-f0-9]{64})\\.bin)$`)
+  const match = pattern.exec(url || '')
+  if (!match) throw new Error('Video part URL is not a pinned private shard reference')
+  return { repo: match[1], commit: match[2], blobPath: match[3], cipherHash: match[4] }
+}
+
+export async function reconstructVideoCloud({ manifest, expectedBytes, expectedSha256, expectedShards,
+  key, readPart, onPlaintext = async () => {}, owner = OWNER }) {
+  if (manifest?.type !== 'video-raw' || manifest.enc !== true || !Array.isArray(manifest.parts) || !manifest.parts.length) {
+    throw new Error('Unsupported video recovery manifest')
+  }
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes <= 0 || manifest.size !== expectedBytes
+    || !/^[a-f0-9]{64}$/i.test(expectedSha256 || '') || !Buffer.isBuffer(key) || key.length !== 32) {
+    throw new Error('Invalid expected video recovery evidence')
+  }
+  const hash = createHash('sha256')
+  const refs = []
+  let offset = 0
+  for (const [index, part] of manifest.parts.entries()) {
+    if (!Number.isSafeInteger(part.size) || part.size <= 0 || part.start !== offset
+      || part.end !== offset + part.size - 1 || !/^[A-Za-z0-9+/]{16}=?$/.test(part.iv || '')
+      || Buffer.from(part.iv, 'base64').length !== 12) throw new Error('Invalid video part offsets or IV')
+    const { repo, commit, blobPath, cipherHash } = parsePinnedPartUrl(part.url, owner)
+    const identity = `${repo}@${commit}`
+    if (refs.at(-1) !== identity) refs.push(identity)
+    const cipher = await readPart(repo, commit, blobPath)
+    if (!Buffer.isBuffer(cipher) || cipher.length !== part.size + 16 || sha256(cipher) !== cipherHash) {
+      throw new Error(`Cloud ciphertext verification failed for part ${index + 1}`)
+    }
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(part.iv, 'base64'))
+    decipher.setAuthTag(cipher.subarray(-16))
+    const plaintext = Buffer.concat([decipher.update(cipher.subarray(0, -16)), decipher.final()])
+    if (plaintext.length !== part.size) throw new Error(`Cloud plaintext size mismatch for part ${index + 1}`)
+    hash.update(plaintext)
+    await onPlaintext(plaintext, index)
+    offset += plaintext.length
+    console.log(JSON.stringify({ part: index + 1, parts: manifest.parts.length, verifiedBytes: offset }))
+  }
+  const actualSha256 = hash.digest('hex')
+  const actualShards = [...new Set(refs)]
+  if (offset !== expectedBytes || actualSha256 !== expectedSha256.toLowerCase()) {
+    throw new Error('Complete cloud recovery differs from its expected size or SHA-256')
+  }
+  if (expectedShards && JSON.stringify(actualShards) !== JSON.stringify(expectedShards)) {
+    throw new Error('Pinned shard references differ from the recovery receipt')
+  }
+  return { bytes: offset, sha256: actualSha256, pinnedShards: actualShards }
+}
+
+export async function hashFile(file) {
+  const hash = createHash('sha256')
+  for await (const chunk of createReadStream(file)) hash.update(chunk)
+  return hash.digest('hex')
+}
+
+export function sourceStatRecord(info) {
+  return { bytes: info.size, mtimeMs: info.mtimeMs, inode: info.ino, device: info.dev, mode: info.mode & 0o777 }
+}
+
+export function sameSourceStat(info, saved) {
+  return saved && info.size === saved.bytes && Math.abs(info.mtimeMs - saved.mtimeMs) < 1
+    && info.ino === saved.inode && info.dev === saved.device
+}
+
+export async function atomicJsonWrite(target, value) {
+  await mkdir(path.dirname(target), { recursive: true })
+  const temp = `${target}.${randomUUID()}.tmp`
+  const handle = await open(temp, 'wx', 0o600)
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`)
+    await handle.sync()
+  } finally { await handle.close() }
+  await rename(temp, target)
+}
+
+// This is the FULL READ-BACK: every part is downloaded, hashed, decrypted and compared with the source. It stays the
+// strongest proof at the instant T; the identity proof (video-identity-proof.mjs) replaces it as the unload authority for
+// all but one film in `fullReadBackEvery`, and as the escalation target whenever the identity proof fails remotely.
+// FR : la relecture integrale reste la preuve la plus forte ; la preuve par identite la remplace sauf 1 film sur N.
+export async function verifyVideoCloud({ manifestPath, source, receiptPath, token = null, owner = OWNER,
+  key = null, readPart = null, writeReceipt = true, extraFields = {} }) {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+  const manifestBytes = await readFile(manifestPath)
+  const manifest = JSON.parse(manifestBytes.toString('utf8'))
+  const before = await stat(source)
+  const expectedSha256 = await hashFile(source)
+  const masterKey = key || loadMasterKey(repoRoot, fs)
+  if (!masterKey) throw new Error('Existing media key unavailable')
+  const reader = readPart ? null : await createPinnedBlobReader({ scratchParent: path.dirname(receiptPath),
+    token: token || execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim(), owner })
+  try {
+    const recovered = await reconstructVideoCloud({ manifest, expectedBytes: before.size, expectedSha256,
+      key: masterKey, readPart: readPart || reader.read, owner })
+    const after = await stat(source)
+    if (!sameSourceStat(after, sourceStatRecord(before))) throw new Error('Local source changed during cloud verification')
+    const receipt = { verifiedAt: new Date().toISOString(), source: path.resolve(source), manifestPath: path.resolve(manifestPath),
+      manifestSha256: sha256(manifestBytes), manifestRecoverySha256: recoveryFingerprint(manifest), sourceStat: sourceStatRecord(before), ...recovered,
+      localSha256: expectedSha256, restoredSha256: recovered.sha256, sourceRetained: true,
+      completeCloudRecoveryVerified: true, verificationMode: VERIFICATION_MODES.fullReadBack, ...extraFields }
+    if (writeReceipt) {
+      await atomicJsonWrite(receiptPath, receipt)
+      console.log('Complete cloud recovery verified; source retained')
+    }
+    return receipt
+  } finally { await reader?.close() }
+}
+
+/** The receipt of a film is the ONLY thing that authorises deleting its local original, so its evidence is checked here, not
+ *  trusted: a receipt that claims the identity proof must carry every counter of that proof, equal to the manifest it names.
+ *  FR : le recu est la seule autorite d'effacement ; une preuve par identite incomplete est refusee. */
+export function assertVerificationEvidence(proof, manifest) {
+  const mode = proof.verificationMode ?? VERIFICATION_MODES.fullReadBack
+  if (mode === VERIFICATION_MODES.fullReadBack) return mode
+  if (mode !== VERIFICATION_MODES.identity) throw new Error(`Recovery receipt has an unknown verification mode: ${String(mode).slice(0, 40)}`)
+  const evidence = proof.identityProof
+  const parts = manifest?.parts?.length
+  const complete = evidence && Number.isInteger(parts) && parts > 0
+    && evidence.parts === parts && evidence.nameHashOk === parts && evidence.remoteIdOk === parts && evidence.gcmRoundTripOk === parts
+    && Array.isArray(evidence.partBlobIds) && evidence.partBlobIds.length === parts
+    && Number.isInteger(evidence.realPartsRead) && evidence.realPartsRead >= Math.max(1, evidence.realPartsRequired || 1)
+    && evidence.coversSource === true && evidence.manifestOnline === true && evidence.manifestRecoveryMatches === true
+    && /^[a-f0-9]{64}$/.test(proof.manifestRecoverySha256 || '') && evidence.remoteManifestRecoverySha256 === proof.manifestRecoverySha256
+  if (!complete) throw new Error('Identity proof receipt lacks complete evidence; the local original is retained')
+  return mode
+}
+
+async function readAndValidateReceipt(receiptPath, manifestPath) {
+  const proof = JSON.parse(await readFile(receiptPath, 'utf8'))
+  // sourceStat measures the uploaded copy, so its size is proof.bytes; filteredSourceStat is the original, checked at unload (11 October 2026)
+  const expectedStatBytes = proof.bytes
+  if (proof.completeCloudRecoveryVerified !== true || proof.sourceRetained !== true
+    || proof.source !== path.resolve(proof.source) || proof.manifestPath !== path.resolve(manifestPath)
+    || !/^[a-f0-9]{64}$/i.test(proof.localSha256 || '') || proof.localSha256 !== proof.restoredSha256
+    || proof.sha256 !== proof.restoredSha256 || !Number.isSafeInteger(proof.bytes) || proof.bytes <= 0
+    || !Array.isArray(proof.pinnedShards) || !proof.pinnedShards.length
+    || !proof.sourceStat || proof.sourceStat.bytes !== expectedStatBytes) throw new Error('Recovery receipt is incomplete or mismatched')
+  const manifestBytes = await readFile(manifestPath)
+  const manifest = JSON.parse(manifestBytes.toString('utf8'))
+  const unchanged = proof.manifestRecoverySha256
+    ? recoveryFingerprint(manifest) === proof.manifestRecoverySha256
+    : sha256(manifestBytes) === proof.manifestSha256
+  if (!unchanged) throw new Error('Manifest changed since cloud recovery verification')
+  const verificationMode = assertVerificationEvidence(proof, manifest)
+  return { proof, manifest, verificationMode }
+}
+
+export async function restoreVideoCloud({ receiptPath, manifestPath, destination = null, token = null, owner = OWNER }) {
+  const { proof, manifest } = await readAndValidateReceipt(receiptPath, manifestPath)
+  const target = path.resolve(destination || proof.source)
+  await mkdir(path.dirname(target), { recursive: true })
+  try { await stat(target); throw new Error(`Restore destination already exists: ${target}`) }
+  catch (error) { if (error.code !== 'ENOENT') throw error }
+  const available = await statfs(path.dirname(target))
+  if (available.bavail * available.bsize < proof.bytes) throw new Error('Insufficient free disk space for exact restore')
+  const tempDir = await mkdtemp(path.join(path.dirname(target), '.zenray-restore-'))
+  const tempFile = path.join(tempDir, path.basename(target))
+  let output
+  try {
+    output = await open(tempFile, 'wx', proof.sourceStat.mode || 0o600)
+    const key = loadMasterKey(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..'), fs)
+    if (!key) throw new Error('Existing media key unavailable')
+    const reader = await createPinnedBlobReader({ scratchParent: tempDir,
+      token: token || execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim(), owner })
+    try {
+      await reconstructVideoCloud({ manifest, expectedBytes: proof.bytes, expectedSha256: proof.restoredSha256,
+        expectedShards: proof.pinnedShards, key, readPart: reader.read, owner,
+        onPlaintext: async (chunk) => {
+          let offset = 0
+          while (offset < chunk.length) {
+            const result = await output.write(chunk, offset, chunk.length - offset, null)
+            if (result.bytesWritten <= 0) throw new Error('Restore destination stopped accepting bytes')
+            offset += result.bytesWritten
+          }
+        } })
+    } finally { await reader.close() }
+    await output.sync()
+    await output.close()
+    output = null
+    if (await hashFile(tempFile) !== proof.restoredSha256 || (await stat(tempFile)).size !== proof.bytes) {
+      throw new Error('Materialized restore failed its independent SHA-256 check')
+    }
+    await link(tempFile, target)
+    await unlink(tempFile)
+    const restored = await stat(target)
+    if (restored.size !== proof.bytes || await hashFile(target) !== proof.restoredSha256) {
+      throw new Error('Published restore failed its final SHA-256 check')
+    }
+    await atomicJsonWrite(`${target}.restore.json`, { restoredAt: new Date().toISOString(), source: proof.source,
+      destination: target, manifestPath: path.resolve(manifestPath), bytes: restored.size,
+      sha256: proof.restoredSha256, completeRestoreVerified: true })
+    console.log(`Restored and verified ${restored.size} bytes at ${target}`)
+    return { destination: target, bytes: restored.size, sha256: proof.restoredSha256 }
+  } catch (error) {
+    if (output) await output.close().catch(() => {})
+    throw error
+  } finally { await rm(tempDir, { recursive: true, force: true }) }
+}
+
+function isOpenInLsof(source) {
+  const result = spawnSync('lsof', ['-nP', '--', source], { encoding: 'utf8' })
+  if (result.error) throw new Error(`Could not check open-file handles: ${result.error.message}`)
+  if (result.status === 0 && result.stdout.split('\n').filter(Boolean).length > 1) return true
+  if (result.status === 1 && !result.stdout && !result.stderr) return false
+  throw new Error(`Could not prove the file is closed: ${(result.stderr || result.stdout || `lsof exit ${result.status}`).trim()}`)
+}
+
+function uploadQueueRequires(source, queueFiles) {
+  const plans = queueFiles.flatMap((file) => {
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch (error) {
+      if (error.code === 'ENOENT') return []
+      throw error
+    }
+  })
+  return plans.some((entry) => path.resolve(entry.src || entry.source || '') === source)
+}
+
+function uploadWorkerIsActive() {
+  const result = spawnSync('ps', ['-Ao', 'command='], { encoding: 'utf8' })
+  if (result.status !== 0) throw new Error('Could not inspect active upload processes')
+  return /ResumeMoviesUpload\.py|upload-mapped-git\.mjs|FinishFilteredUploads\.py/.test(result.stdout)
+}
+
+export async function unloadVerifiedVideo({ receiptPath, manifestPath, sourceRoot, auditDir,
+  isOpen = isOpenInLsof, isQueueRequired = null, requireStreaming = process.env.ZR_UNLOAD_REQUIRE_STREAMING !== '0',
+  requirePoster = process.env.ZR_UNLOAD_REQUIRE_POSTER !== '0' }) {
+  const { proof, manifest, verificationMode } = await readAndValidateReceipt(receiptPath, manifestPath)
+  // 14 October 2026: a film or an episode is not finished without its CMAF streaming (master + mpd in the manifest). Seven Bleach
+  // episodes were archived without it and their sources deleted; the unload now refuses. ZR_UNLOAD_REQUIRE_STREAMING=0 lifts it.
+  // FR : un film n'est pas fini sans son streaming CMAF ; le dechargement refuse un manifeste sans master ni mpd.
+  // 14 October 2026: a film is not finished without its thumbnail either: a public jsDelivr image URL, never a proxy of a private shard
+  // (black in production). The worker repairs it before the proof; this refuses to unload if it is still missing.
+  // FR : un film n'est pas fini sans sa miniature publique ; le dechargement refuse sinon.
+  if (requirePoster && !isPublicPosterUrl(manifest.poster)) {
+    throw new Error('Unload refused: the manifest has no public poster (jsDelivr image URL); run RepairFilmPosters.mjs --only <manifest> first (ZR_UNLOAD_REQUIRE_POSTER=0 lifts this guard)')
+  }
+  // FMP4-SINGLE (14 October 2026): if the single fMP4 mode is adopted, this guard must ALSO accept `manifest.download` (parts + SHA-256)
+  // after re-reading the parts online and running verifyAgainstSource (subtitle text and timestamps). FR : accepter aussi `manifest.download`.
+  if (requireStreaming && !(typeof manifest.master === 'string' && manifest.master && typeof manifest.mpd === 'string' && manifest.mpd)) {
+    throw new Error('Unload refused: the manifest has no CMAF streaming (master and mpd); run AttachVideoCmafDashHls.mjs first (ZR_UNLOAD_REQUIRE_STREAMING=0 lifts this guard)')
+  }
+  const root = await realpath(sourceRoot)
+  const source = await realpath(proof.source)
+  const relative = path.relative(root, source)
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Source is outside the approved unload root')
+  const info = await fs.promises.lstat(source)
+  const expectedSourceStat = proof.filteredSourceStat || proof.sourceStat
+  const expectedLocalHash = proof.filteredSourceSha256 || proof.restoredSha256
+  if (!info.isFile() || info.isSymbolicLink() || path.resolve(proof.source) !== source
+    || !sameSourceStat(info, expectedSourceStat) || (manifest.name !== path.basename(source) && proof.identicalToManifest !== true) || manifest.size !== proof.bytes) {
+    throw new Error('Source path, metadata, or manifest does not match the recovery receipt')
+  }
+  if (await hashFile(source) !== expectedLocalHash) throw new Error('Source changed after cloud recovery verification')
+  const activeQueue = isQueueRequired
+    ? await isQueueRequired(source)
+    : (uploadWorkerIsActive() && uploadQueueRequires(source, [
+      '/Users/zenray/.claude/tmp/tmp-movies-series-upload/ReadyUploadPlan.json',
+      '/Users/zenray/.claude/tmp/tmp-movies-series-upload/PreparedUploadPlan.json',
+      '/Users/zenray/.claude/tmp/tmp-movies-series-upload/FullFilteredQueue.json',
+    ]))
+  if (activeQueue) throw new Error('Active upload or recovery verification still needs this source')
+  if (await isOpen(source)) throw new Error('Source file is open in another process')
+  const auditRoot = path.resolve(auditDir)
+  const auditRelative = path.relative(root, auditRoot)
+  if (!auditRelative.startsWith('..') || path.isAbsolute(auditRelative)) throw new Error('Unload audit must be outside the source folder')
+  await mkdir(auditRoot, { recursive: true })
+  const id = randomUUID()
+  const intentPath = path.join(auditRoot, `${id}.intent.json`)
+  const donePath = path.join(auditRoot, `${id}.unload.json`)
+  const beforeFs = await statfs(root)
+  const intent = { createdAt: new Date().toISOString(), status: 'unload-started', source, receiptPath: path.resolve(receiptPath),
+    manifestPath: path.resolve(manifestPath), bytes: proof.bytes, allocatedBlocks: info.blocks,
+    sha256: proof.restoredSha256, completeCloudRecoveryVerified: true, verificationMode }
+  await atomicJsonWrite(intentPath, intent)
+  const fresh = await fs.promises.lstat(source)
+  if (!sameSourceStat(fresh, expectedSourceStat) || await hashFile(source) !== expectedLocalHash || await isOpen(source)) {
+    throw new Error(`Source changed or became busy after unload intent was saved: ${intentPath}`)
+  }
+  await unlink(source)
+  try { await stat(source); throw new Error('Source still exists after unload') }
+  catch (error) { if (error.code !== 'ENOENT') throw error }
+  const afterFs = await statfs(root)
+  const result = { ...intent, status: 'unloaded', unloadedAt: new Date().toISOString(),
+    availableBytesBefore: beforeFs.bavail * beforeFs.bsize, availableBytesAfter: afterFs.bavail * afterFs.bsize,
+    availableBytesGained: (afterFs.bavail - beforeFs.bavail) * beforeFs.bsize, intentPath,
+    completeRestoreCommand: ['node', path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../RestoreVideoCloud.mjs'),
+      path.resolve(receiptPath)] }
+  await atomicJsonWrite(donePath, result)
+  await atomicJsonWrite(intentPath, { ...intent, status: 'unload-completed', completedAt: result.unloadedAt, resultPath: donePath })
+  return result
+}
+
+// 14 October 2026 (policy: streaming only): the unload authority of a STREAMED film is the streaming proof receipt (kind streaming-v1,
+// scripts/lib/streaming-proof.mjs), not the archive proof. Same safety as unloadVerifiedVideo: inside the approved root, same stat, same
+// hash, not open, not needed by an active queue, an audit trail written before the unlink. FR : l'autorite de dechargement d'un film
+// streame est le recu de preuve du streaming ; memes garde-fous que pour une archive.
+export async function unloadStreamedVideo({ receiptPath, manifestPath, sourceRoot, auditDir, isOpen = isOpenInLsof, isQueueRequired = null }) {
+  const proof = JSON.parse(await readFile(receiptPath, 'utf8'))
+  if (proof.kind !== 'streaming-v1' || proof.completeStreamingVerified !== true || proof.manifestPath !== path.resolve(manifestPath)
+    || !/^[a-f0-9]{64}$/i.test(proof.localSha256 || '') || !Number.isSafeInteger(proof.bytes) || proof.bytes <= 0 || !proof.sourceStat) {
+    throw new Error('Streaming receipt is incomplete or mismatched')
+  }
+  const manifestBytes = await readFile(manifestPath)
+  if (sha256(manifestBytes) !== proof.manifestSha256) throw new Error('Manifest changed since the streaming verification')
+  const manifest = JSON.parse(manifestBytes.toString('utf8'))
+  if (!isPublicPosterUrl(manifest.poster)) throw new Error('Unload refused: the manifest has no public poster')
+  if (!(typeof manifest.master === 'string' && manifest.master && typeof manifest.mpd === 'string' && manifest.mpd)) throw new Error('Unload refused: the manifest has no streaming (master and mpd)')
+  const root = await realpath(sourceRoot)
+  const source = await realpath(proof.source)
+  const relative = path.relative(root, source)
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Source is outside the approved unload root')
+  const info = await fs.promises.lstat(source)
+  if (!info.isFile() || info.isSymbolicLink() || path.resolve(proof.source) !== source || !sameSourceStat(info, proof.sourceStat) || info.size !== proof.bytes) {
+    throw new Error('Source path or metadata does not match the streaming receipt')
+  }
+  if (await hashFile(source) !== proof.localSha256) throw new Error('Source changed after the streaming verification')
+  if (isQueueRequired && await isQueueRequired(source)) throw new Error('Active upload still needs this source')
+  if (await isOpen(source)) throw new Error('Source file is open in another process')
+  const auditRoot = path.resolve(auditDir)
+  const auditRelative = path.relative(root, auditRoot)
+  if (!auditRelative.startsWith('..') || path.isAbsolute(auditRelative)) throw new Error('Unload audit must be outside the source folder')
+  await mkdir(auditRoot, { recursive: true })
+  const id = randomUUID()
+  const intentPath = path.join(auditRoot, `${id}.intent.json`)
+  const donePath = path.join(auditRoot, `${id}.unload.json`)
+  const beforeFs = await statfs(root)
+  const intent = { createdAt: new Date().toISOString(), status: 'unload-started', source, receiptPath: path.resolve(receiptPath), manifestPath: path.resolve(manifestPath),
+    bytes: proof.bytes, allocatedBlocks: info.blocks, sha256: proof.localSha256, completeStreamingVerified: true, verificationMode: 'streaming-v1' }
+  await atomicJsonWrite(intentPath, intent)
+  const fresh = await fs.promises.lstat(source)
+  if (!sameSourceStat(fresh, proof.sourceStat) || await hashFile(source) !== proof.localSha256 || await isOpen(source)) {
+    throw new Error(`Source changed or became busy after unload intent was saved: ${intentPath}`)
+  }
+  await unlink(source)
+  try { await stat(source); throw new Error('Source still exists after unload') } catch (error) { if (error.code !== 'ENOENT') throw error }
+  const afterFs = await statfs(root)
+  const result = { ...intent, status: 'unloaded', unloadedAt: new Date().toISOString(), availableBytesBefore: beforeFs.bavail * beforeFs.bsize,
+    availableBytesAfter: afterFs.bavail * afterFs.bsize, availableBytesGained: (afterFs.bavail - beforeFs.bavail) * beforeFs.bsize, intentPath }
+  await atomicJsonWrite(donePath, result)
+  await atomicJsonWrite(intentPath, { ...intent, status: 'unload-completed', completedAt: result.unloadedAt, resultPath: donePath })
+  return result
+}
+
+export { parsePinnedPartUrl }

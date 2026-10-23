@@ -1,0 +1,124 @@
+// L'adaptateur Cloudflare, éprouvé contre des handlers de trois lignes.
+//
+// Il ne sera jamais exécuté sur Cloudflare avant le jour où l'on bascule. Ces tests sont donc la
+// SEULE chose qui distingue un adaptateur qui marche d'un adaptateur qui a l'air de marcher, et
+// c'est pour cela qu'ils existent avant tout déploiement plutôt qu'après le premier incident.
+import { describe, it, expect } from 'vitest'
+import { adapterHandlerNode } from './_cloudflare-adapter.js'
+
+const req = (url, init) => new Request(`https://exemple.test${url}`, init)
+
+describe('adaptateur Cloudflare', () => {
+  it('traduit une réponse JSON, son statut et ses en-têtes', async () => {
+    const handler = (rq, rs) => rs.status(201).setHeader('x-essai', 'oui').json({ ok: true, methode: rq.method })
+    const r = await adapterHandlerNode(handler, req('/api/page'))
+    expect(r.status).toBe(201)
+    expect(r.headers.get('x-essai')).toBe('oui')
+    expect(r.headers.get('content-type')).toContain('application/json')
+    expect(await r.json()).toEqual({ ok: true, methode: 'GET' })
+  })
+
+  it('expose la chaîne de requête sous forme d’objet, comme le fait Vercel', async () => {
+    const handler = (rq, rs) => rs.json(rq.query)
+    const r = await adapterHandlerNode(handler, req('/api/page?action=tree&dir=pages'))
+    expect(await r.json()).toEqual({ action: 'tree', dir: 'pages' })
+  })
+
+  it('décode un corps JSON, et laisse les binaires en octets', async () => {
+    const vuJson = await adapterHandlerNode((rq, rs) => rs.json(rq.body),
+      req('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"a":1}' }))
+    expect(await vuJson.json()).toEqual({ a: 1 })
+
+    const vuBin = await adapterHandlerNode((rq, rs) => rs.json({ octets: rq.body.length, premier: rq.body[0] }),
+      req('/api/upload', { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: new Uint8Array([7, 8, 9]) }))
+    expect(await vuBin.json()).toEqual({ octets: 3, premier: 7 })
+  })
+
+  it('ne lit jamais le corps d’un GET', async () => {
+    // Lire `json()` sur une requête sans corps jette ; l'adaptateur doit s'en abstenir plutôt que
+    // de rattraper l'erreur, sinon un GET malformé deviendrait indistinguable d'un GET normal.
+    const r = await adapterHandlerNode((rq, rs) => rs.json({ corps: rq.body === undefined }), req('/api/page'))
+    expect(await r.json()).toEqual({ corps: true })
+  })
+
+  it('STREAME : la réponse part avant que le handler ait fini d’écrire', async () => {
+    // C'est le cas qui justifie tout le fichier. `stream.js` et `shard.js` servent des médias
+    // déchiffrés au fil de l'eau ; si l'adaptateur attendait la fin, un flux de plusieurs centaines
+    // de mégaoctets deviendrait un tampon en mémoire et ferait tomber le Worker.
+    let libere = false
+    const handler = async (rq, rs) => {
+      rs.setHeader('content-type', 'text/plain')
+      rs.write('premier')
+      await new Promise((r) => setTimeout(r, 30))
+      libere = true
+      rs.write('-second')
+      rs.end()
+    }
+    const r = await adapterHandlerNode(handler, req('/api/stream'))
+    // La réponse existe DÉJÀ alors que le handler dort encore : c'est exactement ce qu'on veut.
+    expect(libere).toBe(false)
+    expect(r.headers.get('content-type')).toBe('text/plain')
+    expect(await r.text()).toBe('premier-second')
+    expect(libere).toBe(true)
+  })
+
+  it('rend un 500 lisible quand le handler jette avant d’avoir répondu', async () => {
+    const r = await adapterHandlerNode(() => { throw new Error('cassé') }, req('/api/page'))
+    expect(r.status).toBe(500)
+    expect((await r.json()).error).toContain('cassé')
+  })
+
+  it('ferme le flux quand le handler jette APRÈS avoir commencé à écrire', async () => {
+    // Sans cette fermeture, le client resterait suspendu sur une réponse qui ne se termine jamais,
+    // ce qui est pire qu'une erreur : une erreur se voit, une attente infinie passe pour de la
+    // lenteur.
+    const handler = (rq, rs) => { rs.write('debut'); throw new Error('coupé en vol') }
+    const r = await adapterHandlerNode(handler, req('/api/stream'))
+    expect(r.status).toBe(200)
+    expect(await r.text()).toBe('debut')
+  })
+
+  it('accepte plusieurs valeurs pour un même en-tête', async () => {
+    const handler = (rq, rs) => rs.setHeader('set-cookie', ['a=1', 'b=2']).end('')
+    const r = await adapterHandlerNode(handler, req('/api/page'))
+    expect(r.headers.get('set-cookie')).toContain('a=1')
+    expect(r.headers.get('set-cookie')).toContain('b=2')
+  })
+
+  it('expose statusCode et headersSent comme Node', async () => {
+    const vu = {}
+    const handler = (rq, rs) => {
+      vu.avant = rs.headersSent
+      rs.statusCode = 418
+      rs.end('')
+      vu.apres = rs.headersSent
+    }
+    const r = await adapterHandlerNode(handler, req('/api/page'))
+    expect(vu).toEqual({ avant: false, apres: true })
+    expect(r.status).toBe(418)
+  })
+
+  it('TRANSMET les paramètres de route, sans quoi le routeur ne trouve rien', async () => {
+    // La panne du premier déploiement Cloudflare, le 2026-07-31 : le routeur lit `req.query.route`,
+    // Vercel le remplit depuis le nom de fichier, Cloudflare le passe dans `context.params`, et
+    // l'adaptateur ne le transmettait pas. Tout répondait « not-found, route: null ».
+    const handler = (rq, rs) => rs.json({ route: rq.query.route, action: rq.query.action })
+    const r = await adapterHandlerNode(handler, req('/api/page?action=tree'), undefined, { route: ['page'] })
+    expect(await r.json()).toEqual({ route: ['page'], action: 'tree' })
+  })
+
+  it('rend un 304 SANS corps, sinon la plateforme rejette la réponse', async () => {
+    // Trouvé en production le 2026-08-01 : l'arborescence répondait 500 à toute requête conditionnelle,
+    // parce qu'un corps était attaché à un statut qui n'en admet pas. Conséquence invisible et chère :
+    // le client retombait sur les 3,16 Mo complets à chaque ouverture, le 304 ne servant jamais.
+    const r = await adapterHandlerNode((rq, rs) => rs.status(304).end(), req('/api/page?action=tree'))
+    expect(r.status).toBe(304)
+    expect(r.body).toBeNull()
+  })
+
+  it('rend un 204 sans corps, même règle', async () => {
+    const r = await adapterHandlerNode((rq, rs) => rs.status(204).end(), req('/api/x'))
+    expect(r.status).toBe(204)
+    expect(r.body).toBeNull()
+  })
+})

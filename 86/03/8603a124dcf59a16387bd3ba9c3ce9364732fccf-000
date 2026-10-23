@@ -1,0 +1,173 @@
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
+// 4 October 2026, 00:15 CEST: index original sessions separately and read bounded transcript windows on demand.
+import { readdir, stat, open, readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { createHash } from 'node:crypto'
+import { transcriptEntry, transcriptIdentity } from '../AssetsFeedbackCapture.mjs'
+
+import { CONVERSATION_SETTINGS } from '../../src/lib/assetsConversations.js'
+export const CONVERSATION_LIMITS = CONVERSATION_SETTINGS
+const run = promisify(execFile)
+const geminiReader = fileURLToPath(new URL('./ReadGeminiConversation.py', import.meta.url))
+const identity = (provider, sessionId) => `${provider}:${sessionId}`
+const hash = text => createHash('sha256').update(text).digest('hex')
+async function window(filename, start, length) {
+  const descriptor = await open(filename, 'r')
+  try { const bytes = Buffer.alloc(length); const result = await descriptor.read(bytes, 0, length, start); return bytes.subarray(0, result.bytesRead) }
+  finally { await descriptor.close() }
+}
+function records(bytes, offset = 0) {
+  const lines = bytes.toString('utf8').split('\n')
+  if (offset) lines.shift()
+  lines.pop()
+  return lines.filter(line => line.trim()).map(line => JSON.parse(line))
+}
+export function createConversationCatalog({ home = process.env.HOME, stateDir, fileToken = info => JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs]) }) {
+  const metadata = new Map()
+  let latest = [], checkedAt = 0, pending, lastFailures = []
+  async function walk(root, provider, found) {
+    let entries
+    try { entries = await readdir(root, { withFileTypes: true }) } catch (error) { if (error.code === 'ENOENT') return; throw error }
+    for (const entry of entries) {
+      const filename = path.join(root, entry.name)
+      if (entry.isDirectory() && entry.name !== 'subagents') await walk(filename, provider, found)
+      else if (entry.isFile() && (provider === 'gemini' ? /^[a-f0-9-]{36}\.db$/.test(entry.name) : provider === 'claude-card' ? entry.name.endsWith('.json') : entry.name.endsWith('.jsonl'))) found.push({ filename, provider })
+    }
+  }
+  async function scan() {
+    const found = [], failures = []
+    for (const [folder, provider] of [['.claude/projects', 'claude'], ['.codex/sessions', 'codex'], ['.codex/archived_sessions', 'codex'], ['.gemini/antigravity/conversations', 'gemini'], ['Library/Application Support/Claude/claude-code-sessions', 'claude-card']]) {
+      try { await walk(path.join(home, folder), provider, found) } catch (error) { failures.push(`${provider}: ${error.message}`) }
+    }
+    let bindings = {}
+    try { bindings = JSON.parse(await readFile(path.join(stateDir, 'SessionBindings.json'), 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+    const collected = []
+    for (const { filename, provider } of found) {
+      try {
+        const info = await stat(filename), cached = metadata.get(filename)
+        const sourceTokens = [`${filename}:${fileToken(info)}`]
+        if (provider === 'gemini') {
+          try { const wal = await stat(`${filename}-wal`); sourceTokens.push(fileToken(wal)); info.mtimeMs = Math.max(info.mtimeMs, wal.mtimeMs); info.mtime = new Date(info.mtimeMs); info.size += wal.size } catch (error) { if (error.code !== 'ENOENT') throw error }
+        }
+        let item = cached?.size === info.size && cached?.mtimeMs === info.mtimeMs ? cached.item : null
+        if (!item) {
+          if (provider === 'claude-card') {
+            const card = JSON.parse(await readFile(filename, 'utf8'))
+            if (!card.sessionId) continue
+            item = { sessionId: card.cliSessionId || card.sessionId, desktopSessionId: card.sessionId, title: card.title || 'Conversation Claude', readable: false, unavailableReason: 'transcript-missing', dateBasis: 'desktop-card', updatedAt: Number.isFinite(Number(card.lastActivityAt)) ? new Date(Number(card.lastActivityAt)).toISOString() : info.mtime.toISOString() }
+          } else if (provider === 'gemini') item = { sessionId: path.basename(filename, '.db'), title: `Conversation Gemini ${path.basename(filename, '.db').slice(0, 8)}`, readable: true, nativeFormat: 'antigravity-sqlite', dateBasis: 'file-modified', updatedAt: info.mtime.toISOString() }
+          else {
+            const beginning = records(await window(filename, 0, Math.min(info.size, CONVERSATION_LIMITS.metadataBytes)))
+            // 6 October 2026, 20:55 CEST: a RESUMED Claude session starts with the records of its ancestor, so the first sessionId in the file is the parent's, not the session's. Claude Code names the transcript after its own session id: the file name wins, the ancestors are kept as lineage. Before this, the 986 MB transcript of 2562b086 was catalogued as 20b28879 and its Desktop card stayed 'transcript-missing'.
+            const claudeFileId = provider === 'claude' && /^[a-f0-9-]{36}\.jsonl$/.test(path.basename(filename)) ? path.basename(filename, '.jsonl') : null
+            const sessionId = claudeFileId || beginning.find(record => record.type === 'session_meta')?.payload?.id || beginning.find(record => record.sessionId)?.sessionId
+            const ancestorSessionIds = provider === 'claude' ? [...new Set(beginning.map(record => record.sessionId).filter(value => typeof value === 'string' && value && value !== sessionId))] : []
+            if (!sessionId) continue
+            const start = Math.max(0, info.size - CONVERSATION_LIMITS.metadataBytes)
+            const ending = records(await window(filename, start, Math.min(info.size, CONVERSATION_LIMITS.metadataBytes)), start)
+            const firstPrompt = beginning.map(transcriptEntry).find(entry => entry?.kind === 'prompt')
+            const timestamps = [...beginning, ...ending].map(record => record.timestamp).filter(value => Number.isFinite(Date.parse(value)))
+            item = { sessionId, ancestorSessionIds, title: firstPrompt?.text.replace(/\s+/g, ' ').slice(0, 140) || `Conversation ${provider} ${sessionId.slice(0, 8)}`, readable: true, dateBasis: timestamps.length ? 'transcript' : 'file-modified', updatedAt: timestamps.sort((a, b) => Date.parse(a) - Date.parse(b)).at(-1) || info.mtime.toISOString() }
+          }
+          metadata.set(filename, { size: info.size, mtimeMs: info.mtimeMs, item })
+        }
+        const actualProvider = provider === 'claude-card' ? 'claude' : provider
+        collected.push({ ...item, id: identity(actualProvider, item.sessionId), provider: actualProvider, sourceTokens, sourceKind: provider === 'claude-card' ? 'desktop-card' : 'transcript', localPath: filename, bytes: info.size, sourceModifiedAt: info.mtime.toISOString(), projectId: bindings[item.sessionId] || null, cloudPath: null, backupState: 'not-confirmed' })
+      } catch (error) { failures.push(`${path.basename(filename)}: ${error.message}`) }
+    }
+    // 4 October 2026, 00:15 CEST: multiple physical transcript files retain one session identity and the newest original.
+    const unique = new Map()
+    for (const item of collected) {
+      const previous = unique.get(item.id)
+      if (!previous) unique.set(item.id, { ...item, cardTitle: item.sourceKind === 'desktop-card' && item.title !== 'Conversation Claude' ? item.title : null, originalPaths: [item.localPath], transcriptPaths: item.readable ? [item.localPath] : [] })
+      else {
+        const paths = [...new Set([...previous.originalPaths, item.localPath])]
+        const transcripts = [...new Set([...previous.transcriptPaths, ...(item.readable ? [item.localPath] : [])])]
+        const newer = Date.parse(item.updatedAt) > Date.parse(previous.updatedAt)
+        // 6 October 2026: the human title chosen in Claude Desktop beats the first prompt of the transcript, which for a resumed session belongs to the ancestor.
+        const cardTitle = (item.sourceKind === 'desktop-card' && item.title !== 'Conversation Claude' ? item.title : null) || previous.cardTitle
+        unique.set(item.id, { ...(newer ? item : previous), cardTitle, title: cardTitle || (item.sourceKind === 'desktop-card' && newer ? item.title : previous.title), sourceTokens: [...previous.sourceTokens, ...item.sourceTokens], originalPaths: paths, transcriptPaths: transcripts, readable: transcripts.length > 0, localPath: transcripts[0] || (newer ? item.localPath : previous.localPath), sourceModifiedAt: Date.parse(item.sourceModifiedAt) > Date.parse(previous.sourceModifiedAt) ? item.sourceModifiedAt : previous.sourceModifiedAt, unavailableReason: transcripts.length ? null : item.unavailableReason || previous.unavailableReason })
+      }
+    }
+    latest = [...unique.values()].map(({ sourceTokens, cardTitle, ...item }) => ({ ...item, sourceSignature: hash(sourceTokens.join('\n')) })).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || left.id.localeCompare(right.id))
+    lastFailures = failures
+    checkedAt = Date.now()
+    return { conversations: latest, failures, checkedAt: new Date(checkedAt).toISOString() }
+  }
+  async function list() {
+    if (pending) return pending
+    if (checkedAt && Date.now() - checkedAt < CONVERSATION_LIMITS.refreshMs) return { conversations: latest, failures: lastFailures, checkedAt: new Date(checkedAt).toISOString() }
+    pending = scan()
+    try { return await pending } finally { pending = null }
+  }
+  async function read(id, before, fallback) {
+    await list()
+    const original = latest.find(item => item.id === id)
+    const item = original?.readable ? original : fallback || original
+    if (!item) throw new Error('Conversation not found in the original-session catalog')
+    if (!item.readable) return { conversation: item, messages: [], unsupported: true, nextBefore: null }
+    if (item.provider === 'gemini') {
+      if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) throw new Error('Invalid native conversation cursor')
+      const result = await run('python3', [geminiReader, item.localPath, ...(before === undefined ? [] : [String(before)]), '--session-id', item.sessionId], { timeout: 45000, maxBuffer: 8388608 })
+      const decoded = JSON.parse(result.stdout)
+      if (decoded.title) item.title = decoded.title
+      if (before === undefined && decoded.updatedAt) { item.updatedAt = decoded.updatedAt; item.dateBasis = 'transcript' }
+      const cached = metadata.get(item.localPath)
+      if (cached) cached.item = { ...cached.item, title: item.title, updatedAt: item.updatedAt, dateBasis: item.dateBasis }
+      return { ...decoded, conversation: item, unsupported: false, checkedAt: new Date().toISOString() }
+    }
+    const messages = [], seen = new Set(), next = {}, sources = [], initialRead = before === undefined
+    if (before !== undefined && (typeof before !== 'object' || before === null || Array.isArray(before))) throw new Error('Invalid conversation cursor')
+    for (const filename of item.transcriptPaths) {
+      const sourceKey = hash(filename), info = await stat(filename)
+      const end = before === undefined ? info.size : before[sourceKey]
+      if (end === undefined) continue
+      if (!Number.isSafeInteger(end) || end < 0 || end > info.size) throw new Error('Invalid conversation cursor')
+      sources.push({ filename, sourceKey, end, foundMessage: false, exhausted: false })
+      if (initialRead && end > 0) next[sourceKey] = end
+    }
+    // 9 October 2026, 14:48 CEST: open long turns with both the prompt and its final answer when the bounded scan finds them.
+    let windowsScanned = 0
+    const scanLimit = initialRead ? CONVERSATION_LIMITS.initialPromptScanLimit : CONVERSATION_LIMITS.emptyPageScanLimit
+    const hasPrompt = () => messages.some(message => message.kind === 'prompt')
+    const hasAnswer = () => messages.some(message => message.kind !== 'prompt')
+    const needsInitialRead = () => sources.some(source => !source.exhausted && !source.foundMessage)
+    const needsPromptAnchor = () => hasAnswer() && !hasPrompt() && sources.some(source => !source.exhausted)
+    const needsRead = () => initialRead ? needsInitialRead() || needsPromptAnchor() : sources.some(source => !source.exhausted && !source.foundMessage)
+    while (windowsScanned < scanLimit && needsRead()) {
+      for (const source of sources) {
+        if (windowsScanned >= scanLimit || !needsRead()) break
+        if (source.exhausted || (source.foundMessage && (!initialRead || !hasAnswer() || hasPrompt()))) continue
+        const start = Math.max(0, source.end - CONVERSATION_LIMITS.windowBytes)
+        const bytes = await window(source.filename, start, source.end - start)
+        const messagesBefore = messages.length
+        for (const record of records(bytes, start)) {
+          const entry = transcriptEntry(record)
+          if (!entry) continue
+          // 9 October 2026, 14:08 CEST: use the Codex turn identity to hide duplicate final wrappers in the reader.
+          const key = hash(`${item.id}:${transcriptIdentity(record, entry, entry.timestamp)}`)
+          if (seen.has(key)) continue
+          seen.add(key); messages.push({ ...entry, id: key })
+        }
+        source.foundMessage = messages.length > messagesBefore
+        windowsScanned++
+        const firstNewline = start ? bytes.indexOf(10) : -1
+        // 5 October 2026, 13:32 CEST: an oversized record must not return the same cursor forever.
+        if (start) {
+          const boundary = start + (firstNewline < 0 ? 0 : firstNewline + 1)
+          const olderEnd = boundary < source.end ? boundary : start
+          if (olderEnd < source.end) {
+            source.end = olderEnd
+            next[source.sourceKey] = olderEnd
+          } else { source.exhausted = true; delete next[source.sourceKey] }
+        } else { source.exhausted = true; delete next[source.sourceKey] }
+      }
+    }
+    messages.sort((a, b) => Date.parse(a.timestamp || 0) - Date.parse(b.timestamp || 0))
+    return { conversation: item, messages, nextBefore: Object.keys(next).length ? next : null, ...(messages.length ? {} : { emptyPagesScanned: windowsScanned }), ...(initialRead ? { promptAnchorFound: hasPrompt() } : {}), unsupported: false, checkedAt: new Date().toISOString() }
+
+  }
+  return { list, read }
+}

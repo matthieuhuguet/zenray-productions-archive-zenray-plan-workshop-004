@@ -1,0 +1,274 @@
+#!/usr/bin/env node
+// 2026-09-23 18:55 : journal relay. The REAL local ~/.claude/PROGRESS.md is the only truth.
+// This daemon (1) serves that file live on 127.0.0.1 for the site opened on this Mac, and
+// (2) pushes it byte for byte to a private repo a few seconds after every change, with a
+// status.json written in the SAME commit (size + sha256), so the site can prove it is in sync.
+// Nothing is ever parsed, rewritten or edited here: bytes in, bytes out.
+//
+// FR : le vrai PROGRESS.md local reste la seule verite. Le relais le sert en direct sur le Mac
+// et le pousse octet pour octet dans un depot prive, avec son empreinte dans le meme commit.
+
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import http from 'node:http'
+import crypto from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { collectActivity, localCwdForPid } from './activity-source.mjs'
+
+const run = promisify(execFile)
+
+// One place for every value (HDA law). / FR : toutes les valeurs ici, nulle part ailleurs.
+export const CONFIG = {
+  source: path.join(os.homedir(), '.claude', 'PROGRESS.md'),
+  repo: 'matthieuhuguet/zenray-journal',
+  branch: 'main',
+  cloneDir: path.join(os.homedir(), '.zenray-journal-relay', 'repo'),
+  targetFile: 'PROGRESS.md',
+  statusFile: 'status.json',
+  host: '127.0.0.1',
+  port: 47831,
+  debounceMs: 2500,       // wait for a burst of appends to settle before pushing
+  pollMs: 2000,           // fs.watchFile fallback, survives atomic renames
+  retryMs: 30000,         // push retry when the network or GitHub is down
+  heartbeatMs: 25000,     // SSE keep-alive
+  allowedOrigins: [
+    'https://zenray-progress.pages.dev',
+    /^https:\/\/[a-z0-9-]+\.zenray-progress\.pages\.dev$/,
+    /^http:\/\/(localhost|127\.0\.0\.1):\d+$/,
+  ],
+}
+
+const state = {
+  size: 0, sha256: '', mtimeMs: 0,
+  pushedSha256: '', pushedAt: null, pushing: false, pending: false,
+  lastError: null, startedAt: new Date().toISOString(),
+}
+const listeners = new Set()
+let debounceTimer = null
+let retryTimer = null
+let activityCache = null
+let activityCacheAt = 0
+let activityRead = null
+
+function log(...args) { console.log(new Date().toISOString(), ...args) }
+
+export function sha256(buf) { return crypto.createHash('sha256').update(buf).digest('hex') }
+
+function readSource() {
+  const buf = fs.readFileSync(CONFIG.source)
+  const st = fs.statSync(CONFIG.source)
+  return { buf, size: buf.length, sha256: sha256(buf), mtimeMs: st.mtimeMs }
+}
+
+function refresh() {
+  try {
+    const cur = readSource()
+    const changed = cur.sha256 !== state.sha256
+    Object.assign(state, { size: cur.size, sha256: cur.sha256, mtimeMs: cur.mtimeMs })
+    if (changed) {
+      broadcast({ size: cur.size, sha256: cur.sha256, mtimeMs: cur.mtimeMs })
+      schedulePush()
+    }
+    return cur
+  } catch (err) {
+    state.lastError = `read: ${err.message}`
+    log('read error', err.message)
+    return null
+  }
+}
+
+function schedulePush() {
+  state.pending = true
+  clearTimeout(debounceTimer)
+  debounceTimer = setTimeout(pushNow, CONFIG.debounceMs)
+}
+
+async function git(...args) {
+  return run('git', ['-C', CONFIG.cloneDir, ...args], { maxBuffer: 64 * 1024 * 1024 })
+}
+
+async function ensureClone() {
+  if (fs.existsSync(path.join(CONFIG.cloneDir, '.git'))) return
+  fs.mkdirSync(path.dirname(CONFIG.cloneDir), { recursive: true })
+  const url = `https://github.com/${CONFIG.repo}.git`
+  try {
+    await run('git', ['clone', url, CONFIG.cloneDir])
+  } catch {
+    // Empty repository: start a local repo and set the remote. / FR : depot vide.
+    fs.mkdirSync(CONFIG.cloneDir, { recursive: true })
+    await git('init', '-b', CONFIG.branch)
+    await git('remote', 'add', 'origin', url)
+  }
+}
+
+async function pushNow() {
+  if (state.pushing) { state.pending = true; return }
+  const cur = refresh()
+  if (!cur) return
+  if (cur.sha256 === state.pushedSha256) { state.pending = false; return }
+  state.pushing = true
+  try {
+    await ensureClone()
+    fs.writeFileSync(path.join(CONFIG.cloneDir, CONFIG.targetFile), cur.buf)
+    const status = {
+      size: cur.size,
+      sha256: cur.sha256,
+      sourceMtime: new Date(cur.mtimeMs).toISOString(),
+      pushedAt: new Date().toISOString(),
+      host: os.hostname(),
+      source: CONFIG.source.replace(os.homedir(), '~'),
+    }
+    fs.writeFileSync(path.join(CONFIG.cloneDir, CONFIG.statusFile), JSON.stringify(status, null, 2) + '\n')
+    await git('add', CONFIG.targetFile, CONFIG.statusFile)
+    const diff = await git('status', '--porcelain')
+    if (diff.stdout.trim()) {
+      await git('-c', 'user.name=ZenRay journal relay', '-c', 'user.email=relay@zenray.local',
+        'commit', '-m', `journal ${status.pushedAt} ${cur.size} bytes`)
+    }
+    try {
+      await git('push', 'origin', `HEAD:${CONFIG.branch}`)
+    } catch (err) {
+      // Only this relay writes here; a rejection means an edit elsewhere. Rebase, keep ours.
+      // FR : seul ce relais ecrit ici ; un refus veut dire une edition ailleurs, on rebase.
+      await git('pull', '--rebase', '-X', 'theirs', 'origin', CONFIG.branch)
+      await git('push', 'origin', `HEAD:${CONFIG.branch}`)
+    }
+    state.pushedSha256 = cur.sha256
+    state.pushedAt = status.pushedAt
+    state.lastError = null
+    log('pushed', cur.size, cur.sha256.slice(0, 12))
+    broadcast({ size: cur.size, sha256: cur.sha256, mtimeMs: cur.mtimeMs, pushedAt: state.pushedAt })
+  } catch (err) {
+    state.lastError = `push: ${(err.stderr || err.message || '').toString().slice(0, 400)}`
+    log('push failed, retry in', CONFIG.retryMs, 'ms:', state.lastError)
+    clearTimeout(retryTimer)
+    retryTimer = setTimeout(pushNow, CONFIG.retryMs)
+  } finally {
+    state.pushing = false
+    if (state.pending && state.sha256 !== state.pushedSha256 && !retryTimer) schedulePush()
+    else state.pending = state.sha256 !== state.pushedSha256
+  }
+}
+
+function broadcast(payload) {
+  const line = `event: journal\ndata: ${JSON.stringify(payload)}\n\n`
+  for (const res of listeners) { try { res.write(line) } catch { listeners.delete(res) } }
+}
+
+export function originAllowed(origin) {
+  if (!origin) return false
+  return CONFIG.allowedOrigins.some((o) => (typeof o === 'string' ? o === origin : o.test(origin)))
+}
+
+function corsHeaders(req) {
+  const origin = req.headers.origin
+  const h = { 'Vary': 'Origin' }
+  if (originAllowed(origin)) {
+    h['Access-Control-Allow-Origin'] = origin
+    h['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+    h['Access-Control-Allow-Headers'] = 'If-None-Match, Content-Type'
+    h['Access-Control-Expose-Headers'] = 'ETag, X-Journal-Size, X-Journal-Sha256, X-Journal-Mtime, X-Journal-Source, X-Journal-Pushed-At'
+    // Chrome Private/Local Network Access preflight. / FR : acces reseau local de Chrome.
+    h['Access-Control-Allow-Private-Network'] = 'true'
+  }
+  return h
+}
+
+// Bytes after `since`, or everything when `since` is absent, past the end, or the file shrank.
+// FR : les octets apres `since` ; tout le fichier si `since` est absent ou incoherent.
+export function sliceSince(buf, since) {
+  const n = Number(since)
+  if (!Number.isInteger(n) || n < 0 || n > buf.length) return { body: buf, from: 0 }
+  return { body: buf.subarray(n), from: n }
+}
+
+async function currentActivity() {
+  const now = Date.now()
+  if (activityCache && now - activityCacheAt < 1000) return activityCache
+  if (activityRead) return activityRead
+  activityRead = collectActivity({ cwdForPid: localCwdForPid })
+    .then((value) => { activityCache = value; activityCacheAt = Date.now(); return value })
+    .finally(() => { activityRead = null })
+  return activityRead
+}
+
+async function handle(req, res) {
+  const url = new URL(req.url, `http://${CONFIG.host}:${CONFIG.port}`)
+  const cors = corsHeaders(req)
+  if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end() }
+  if (req.method !== 'GET') { res.writeHead(405, cors); return res.end() }
+
+  if (url.pathname === '/status') {
+    res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+    return res.end(JSON.stringify({ ...state, source: CONFIG.source.replace(os.homedir(), '~'), repo: CONFIG.repo }))
+  }
+
+  if (url.pathname === '/activity') {
+    try {
+      const payload = await currentActivity()
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+      return res.end(JSON.stringify(payload))
+    } catch (err) {
+      res.writeHead(503, { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+      return res.end(JSON.stringify({ error: 'local activity unavailable', detail: String(err?.message || err).slice(0, 160) }))
+    }
+  }
+
+  if (url.pathname === '/journal') {
+    const cur = refresh()
+    if (!cur) { res.writeHead(503, cors); return res.end('source unreadable') }
+    const etag = `"${cur.sha256}"`
+    const headers = {
+      ...cors,
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'ETag': etag,
+      'X-Journal-Size': String(cur.size),
+      'X-Journal-Sha256': cur.sha256,
+      'X-Journal-Mtime': new Date(cur.mtimeMs).toISOString(),
+      'X-Journal-Source': 'local',
+      'X-Journal-Pushed-At': state.pushedAt || '',
+    }
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); return res.end() }
+    const { body, from } = sliceSince(cur.buf, url.searchParams.get('since'))
+    res.writeHead(200, { ...headers, 'X-Journal-From': String(from) })
+    return res.end(body)
+  }
+
+  if (url.pathname === '/events') {
+    res.writeHead(200, { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive' })
+    res.write(`event: journal\ndata: ${JSON.stringify({ size: state.size, sha256: state.sha256, mtimeMs: state.mtimeMs, pushedAt: state.pushedAt })}\n\n`)
+    listeners.add(res)
+    const beat = setInterval(() => { try { res.write(': beat\n\n') } catch {} }, CONFIG.heartbeatMs)
+    req.on('close', () => { clearInterval(beat); listeners.delete(res) })
+    return
+  }
+
+  res.writeHead(404, cors); res.end()
+}
+
+function watch() {
+  // fs.watch misses atomic renames; watchFile polls and always sees the new inode.
+  // FR : fs.watch rate les renommages atomiques ; watchFile interroge et voit tout.
+  fs.watchFile(CONFIG.source, { interval: CONFIG.pollMs }, () => refresh())
+  try { fs.watch(CONFIG.source, () => refresh()) } catch {}
+}
+
+export async function main() {
+  refresh()
+  try {
+    await ensureClone()
+    const remote = path.join(CONFIG.cloneDir, CONFIG.targetFile)
+    if (fs.existsSync(remote)) state.pushedSha256 = sha256(fs.readFileSync(remote))
+  } catch (err) { state.lastError = `clone: ${err.message}` }
+  watch()
+  http.createServer((req, res) => { void handle(req, res).catch((err) => {
+    if (!res.headersSent) res.writeHead(500, corsHeaders(req))
+    res.end(String(err?.message || err).slice(0, 160))
+  }) }).listen(CONFIG.port, CONFIG.host, () => log(`journal relay on http://${CONFIG.host}:${CONFIG.port}`))
+  if (state.sha256 !== state.pushedSha256) schedulePush()
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) main()

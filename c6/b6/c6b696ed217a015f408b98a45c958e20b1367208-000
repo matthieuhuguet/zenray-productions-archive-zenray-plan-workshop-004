@@ -1,0 +1,1919 @@
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { PROGRESS_LINKS } from '../config/progressDomains.js'
+import { createPortal } from 'react-dom'
+import { UI } from '../config/colors.js'
+import Icon from '../components/Icon.jsx'
+import { PALETTE } from '../theme.js'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+import { scrollAnimeVers, cibleCentree, trouverScroller } from '../lib/scrollAnime.js'
+import { getIndexPaths, getNodeThumb, loadSearchIndex } from '../search/searchIndexClient.js'
+import { interpolatedScore, planScore } from './planScore.js'
+import { PLAN_CSS_VARIABLES, PLAN_UI, planDateDirection, planDayLabel, planTileBareTitle, planTileTime } from './planUiConfig.js'
+import { PLAN_REFRESH_MS, readCachedPlan, readPlanState, shouldAdoptPlan, writeCachedPlan } from './planCache.js'
+import { notify } from '../components/Notifications.jsx'
+import PlanAttachments from './PlanAttachments.jsx'
+import PlanDayFocus from './PlanDayFocus.jsx'
+import { STANDARD_SLOTS, nextAvailableSlot, getSlotPresets } from './planSlots.js'
+import './PlanBoard.css'
+
+// ZenRay Plan (2026-07-20) -- calendrier/tâches, port fidèle de Memory/Design/ui-design/
+// ui-components-zenray-v14.html (section ZenRay Plan). Un fichier .plan.json = un calendrier complet
+// (titre + liste de tâches), au même titre qu'une playlist .media.json contient ses pistes.
+//
+// TOUTE l'interface est en ANGLAIS : le fichier de référence est écrit intégralement en anglais
+// (Today, "19 July 2026", Mon..Sun, Missed deadlines, Time block, Add/Cancel...) -- retour Matthieu
+// 2026-07-20 après un premier passage traduit en français par erreur.
+
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+// Paliers, plafond, défaut, habitudes et préfixe vivent maintenant dans `planHabitudes.js`, sorti d'ici
+// le 2026-08-27 pour que le fournisseur du minuteur, monté à la racine de l'app, n'ait pas à tirer ce
+// fichier entier dans le lot initial. On les RÉEXPORTE : tout ce qui les importait depuis `PlanBoard`
+// continue de marcher, et il n'existe toujours qu'une seule définition.
+export { DURATION_PRESETS, DUREE_MAX, DUREE_DEFAUT, HABITUDES, prefixeHabitude, majTitreHabitude } from './planHabitudes.js'
+import { DURATION_PRESETS, DUREE_MAX, DUREE_DEFAUT, HABITUDES, prefixeHabitude, majTitreHabitude } from './planHabitudes.js'
+
+const pad2 = (n) => String(n).padStart(2, '0')
+const isoOf = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+const todayIso = () => isoOf(new Date())
+const parseIso = (s) => { const [y, m, d] = String(s || '').split('-').map(Number); return new Date(y || 2026, (m || 1) - 1, d || 1) }
+const addDays = (iso, delta) => { const d = parseIso(iso); d.setDate(d.getDate() + delta); return isoOf(d) }
+const fmtDuration = (min) => (min >= 60 ? (min % 60 ? `${Math.floor(min / 60)}h${min % 60}` : `${min / 60}h`) : `${min}m`)
+// "19 July 2026" -- format exact du readout de la référence (fullDateForDay).
+const fmtFullDate = (iso) => { const d = parseIso(iso); return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}` }
+// "Jul 18" -- format court des lignes Overdue de la référence ("Missed Jul 18 · 90m").
+const fmtShortDate = (iso) => { const d = parseIso(iso); return `${MONTHS_SHORT[d.getMonth()]} ${d.getDate()}` }
+const uid = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`
+// One draft definition is shared by toolbar and calendar creation. Automatically slots into the next available 90m slot. (20 October 2026)
+const newPlanDraft = (date, tasks = []) => ({ id: uid(), attachments: [], title: '', date, time: nextAvailableSlot(tasks, date, DUREE_DEFAUT), duration: DUREE_DEFAUT, habit: '', customOpen: false, customMinutes: 30, streak: false, streakEvery: 1, streakEnd: '', publish: false, firstMovement: false })
+// Verrou d'engagement (retour Matthieu 2026-07-20, choix de design assumé) : une tâche créée il y a
+// plus de 4 heures ne peut PLUS être supprimée -- "si tu t'engages à créer une tâche, tu t'y tiens",
+// c'est exactement pour ça que les manquées s'accumulent dans Missed deadlines au lieu de disparaître.
+const DELETE_WINDOW_MS = 4 * 3600 * 1000
+const canDeleteTask = (task) => !task?.createdAt || (Date.now() - Date.parse(task.createdAt)) < DELETE_WINDOW_MS
+// Images d'une tâche : nouveau champ `images` (tableau d'URLs/dataURLs) ; l'ancien champ `image`
+// ('placeholder' du prototype) est ignoré s'il ne pointe pas une vraie image.
+const imagesOf = (task) => Array.isArray(task?.images) ? task.images : (task?.image && task.image !== 'placeholder' ? [task.image] : [])
+// Fréquences de streak : jamais plus d'une occurrence PAR JOUR (décision explicite), donc l'intervalle
+// minimal est 1 jour. Libellés courts affichés DANS les ronds (mêmes ronds que les presets de durée).
+
+// ── L'ANNEAU DE DURÉE (2026-08-27, demande de Matthieu, deux images à l'appui) ─────────────────────
+//
+// Ce qu'il a décrit : « un cercle anneau rond où tu cliques sur la zone découpée en 15 30 90, plus un
+// anneau complété similaire à celui de Claude Code, l'anneau visuel qui se remplit à l'extérieur, en
+// plus du camembert ». Deux objets superposés, donc, et ils ne disent pas la même chose :
+//
+//   — LE CAMEMBERT, au centre, est le CHOIX : trois parts égales, une par palier, on clique dedans.
+//     Des parts égales et non proportionnelles à la durée, sinon 15 minutes offrirait une cible six
+//     fois plus petite que 90 et deviendrait pénible à viser, exactement à l'inverse de ce qu'on veut
+//     puisque c'est le palier par défaut.
+//   — L'ANNEAU EXTÉRIEUR est la MESURE : il se remplit à proportion de la durée retenue sur le
+//     plafond. Lui est proportionnel, puisqu'il ne se clique pas et n'a qu'à donner l'échelle d'un
+//     coup d'œil.
+//
+// Tout est en SVG et en `currentColor` : aucune image, aucune police, le composant suit le thème clair
+// ou sombre sans une ligne de plus.
+const ANNEAU = { taille: 132, rExt: 58, rInt: 44, largeurAnneau: 7 }
+// Un point du cercle, l'angle compté depuis le HAUT et dans le sens horaire — le sens de lecture d'une
+// horloge, celui qu'on attend d'un cadran. Le repère SVG ayant ses ordonnées vers le bas, le sinus et le
+// cosinus s'échangent par rapport à la formule scolaire ; c'est la seule subtilité du calcul.
+const pointCercle = (cx, cy, r, deg) => {
+  const a = ((deg - 90) * Math.PI) / 180
+  return [cx + r * Math.cos(a), cy + r * Math.sin(a)]
+}
+// Une part de camembert : centre, arc, retour au centre.
+const partCamembert = (cx, cy, r, debut, fin) => {
+  const [x1, y1] = pointCercle(cx, cy, r, debut)
+  const [x2, y2] = pointCercle(cx, cy, r, fin)
+  const grand = fin - debut > 180 ? 1 : 0
+  return `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${grand} 1 ${x2} ${y2} Z`
+}
+
+function AnneauDuree({ minutes, onChoisir }) {
+  const { taille, rExt, rInt, largeurAnneau } = ANNEAU
+  const c = taille / 2
+  const circonference = 2 * Math.PI * rExt
+  const part = Math.max(0, Math.min(1, (minutes || 0) / DUREE_MAX))
+  const parts = DURATION_PRESETS.length
+  return (
+    <svg className="zrp-anneau" viewBox={`0 0 ${taille} ${taille}`} width={taille} height={taille}
+      role="group" aria-label="Durée du bloc">
+      {/* Anneau extérieur : la piste, puis la portion remplie. `rotate(-90)` fait partir le remplissage
+          du haut ; sans lui il commencerait à trois heures, ce qui se lit mal sur un cadran. */}
+      <circle cx={c} cy={c} r={rExt} className="zrp-anneau-piste" strokeWidth={largeurAnneau} fill="none" />
+      <circle cx={c} cy={c} r={rExt} className="zrp-anneau-plein" strokeWidth={largeurAnneau} fill="none"
+        strokeLinecap="round" transform={`rotate(-90 ${c} ${c})`}
+        strokeDasharray={`${circonference * part} ${circonference}`} />
+      {DURATION_PRESETS.map(({ minutes: m, label }, i) => {
+        const debut = (360 / parts) * i
+        const fin = debut + 360 / parts
+        const actif = minutes === m
+        const [tx, ty] = pointCercle(c, c, rInt * 0.58, debut + 180 / parts)
+        return (
+          <g key={m} className={`zrp-anneau-part${actif ? ' zrp-actif' : ''}`} role="button" tabIndex={0}
+            aria-label={`${label} minutes`} aria-pressed={actif}
+            onClick={() => onChoisir(m)}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onChoisir(m) } }}>
+            <path d={partCamembert(c, c, rInt, debut, fin)} />
+            <text x={tx} y={ty} textAnchor="middle" dominantBaseline="central">{label}</text>
+          </g>
+        )
+      })}
+      {/* PAS DE CHIFFRE AU CENTRE : trois parts égales s'y rejoignent, un texte posé là tomberait sur
+          leur jonction. La valeur retenue est annoncée dans l'en-tête du bloc, où elle a de la place —
+          c'est aussi le seul endroit qui sait dire une durée personnalisée, laquelle n'allume aucune part. */}
+    </svg>
+  )
+}
+
+const STREAK_PRESETS = [{ days: 1, label: '1d' }, { days: 2, label: '2d' }, { days: 3, label: '3d' }, { days: 7, label: '7d' }]
+const STREAK_MAX_OCCURRENCES = 120
+
+// LE CDN DE LECTURE EST EN RETARD SUR NOS PROPRES ÉCRITURES — MESURÉ, PAS SUPPOSÉ (2026-08-12).
+//
+// C'est LA cause du bug que Matthieu décrivait comme « les cartes des tâches ne sont pas
+// sauvegardées », et elle n'est pas dans l'écriture : elle est dans la relecture.
+//
+// L'écriture passe par l'API contents de GitHub, immédiatement cohérente. La relecture périodique,
+// elle, passe par `raw.githubusercontent` (choix délibéré : hors quota REST, cf. server/page.js).
+// Or ce chemin sert un contenu MIS EN CACHE. Le paramètre `?zr=<horodatage>` ajouté par le serveur
+// défait bien les caches intermédiaires, mais il ne force pas l'origine à re-résoudre la référence.
+//
+// MESURE DU JOUR, sur ce plan précis : écriture confirmée (112 tâches via l'API contents), puis
+// relecture raw pendant 105 secondes — 87 tâches, invariablement. Le poller tourne toutes les 30 s :
+// il relisait donc trois ou quatre fois l'état ANTÉRIEUR à la tâche qu'on venait d'ajouter, le
+// trouvait « différent », et l'adoptait. La tâche disparaissait de l'écran ET du cache local, sans
+// la moindre erreur affichée, alors qu'elle était bel et bien enregistrée sur le drive.
+//
+// La garde `pendingWritesRef` ne suffit pas : à ce moment-là l'écriture est TERMINÉE et réussie.
+// D'où le filigrane : après un enregistrement, on n'adopte plus rien tant que la relecture ne rend
+// pas exactement ce qu'on vient d'écrire. Fenêtre à cinq minutes, valeur déjà retenue ailleurs dans
+// ce dépôt pour ce même cache (server/page.js, note sur `appendPublicDelta`).
+const LATENCE_RAW_MS = 5 * 60 * 1000
+// Réduction d'une image collée : dataURL JPEG bornée à 1024px de large -- un screenshot brut pèserait
+// des centaines de Ko dans le .plan.json (sauvé via l'API GitHub), le canvas le ramène à ~50-120 Ko.
+const shrinkImageFile = (file) => new Promise((resolve) => {
+  const url = URL.createObjectURL(file)
+  const img = new Image()
+  img.onload = () => {
+    const scale = Math.min(1, 1024 / img.width)
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(img.width * scale)
+    canvas.height = Math.round(img.height * scale)
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height)
+    URL.revokeObjectURL(url)
+    resolve(canvas.toDataURL('image/jpeg', 0.82))
+  }
+  img.onerror = () => { URL.revokeObjectURL(url); resolve(null) }
+  img.src = url
+})
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
+const motionWait = (ms) => wait(reducedMotion() ? 0 : ms)
+const emptyBoard = () => ({ type: 'plan', v: 1, title: 'Plan', tasks: [], createdAt: new Date().toISOString() })
+
+// Grille mensuelle : autant de rangées de 7 que nécessaire pour couvrir le mois (4/5/6 selon les mois),
+// jamais un padding fixe à 6 -- chaque cellule porte sa vraie date, `outside` = mois adjacent.
+function buildMonthGrid(year, month) {
+  const firstWeekday = (new Date(year, month, 1).getDay() + 6) % 7 // lundi = 0
+  const daysInMonth = new Date(year, month + 1, 0).getDate()
+  const total = Math.ceil((firstWeekday + daysInMonth) / 7) * 7
+  const cells = []
+  for (let i = 0; i < total; i++) {
+    const d = new Date(year, month, i - firstWeekday + 1)
+    cells.push({ iso: isoOf(d), day: d.getDate(), outside: d.getMonth() !== month })
+  }
+  return cells
+}
+
+// Algorithme de placement EXACT du fichier de référence (performOpen, script v14) : préférence colonnes
+// de droite, bascule à gauche près du bord, bascule vers le haut sur la dernière rangée. L'ancre (la
+// cellule de la tâche cliquée) n'est JAMAIS absorbée : le bloc occupe les 2x2 cellules voisines.
+function computePlacement(cellIndex, totalCells) {
+  const row = Math.floor(cellIndex / 7) + 1
+  const col = (cellIndex % 7) + 1
+  const side = col <= 5 ? 'right' : 'left'
+  const maxRows = Math.ceil(totalCells / 7)
+  const vertical = row < maxRows ? 'down' : 'up'
+  const startCol = side === 'right' ? col + 1 : col - 2
+  const startRow = vertical === 'down' ? row : Math.max(1, row - 1)
+  return { side, vertical, startCol, startRow }
+}
+function absorbedIsosFor(cells, { startCol, startRow }) {
+  const out = []
+  cells.forEach((cell, index) => {
+    const r = Math.floor(index / 7) + 1
+    const c = (index % 7) + 1
+    if (r >= startRow && r < startRow + 2 && c >= startCol && c < startCol + 2) out.push(cell.iso)
+  })
+  return out
+}
+
+// Statut affiché = DÉRIVÉ à la lecture (jamais stocké "late" tel quel) : en retard = date passée et pas
+// terminé. `overdueSince` se fixe une seule fois et ne bouge plus -- badge "Missed ..." conservé même
+// après un rescue "Today" (règle explicite : jamais traité comme une tâche neuve). Libellés = ceux du
+// statusFor de la référence.
+function statusOf(task, today) {
+  // ABANDONNÉE (2026-08-07) : testée AVANT tout le reste, parce qu'elle prime sur la date. Une tâche
+  // qu'on renonce à faire n'est ni en retard ni à faire — elle sort du décompte sans disparaître de
+  // l'historique, ce que Matthieu résume par « ça arrête d'update dans ma to-do list ».
+  if (task.status === 'dropped') return { key: 'dropped', tone: 'muted', label: 'Abandonnée' }
+  if (task.status === 'late-complete') return { key: 'late-complete', tone: 'violet', label: 'Finished later' }
+  if (task.status === 'done') return { key: 'done', tone: 'green', label: 'Done on time' }
+  if (task.date < today) return { key: 'late', tone: 'orange', label: 'Past deadline' }
+  return { key: 'planned', tone: '', label: 'Planned' }
+}
+
+// L'ICÔNE D'ABANDON, fournie par Matthieu (croix dans un cercle). Recopiée en composant plutôt que
+// laissée en fichier : elle se pose EN SURCOUCHE semi-opaque sur la tuile, donc elle doit hériter de
+// la couleur et de la taille du contexte, ce qu'un `<img>` ne sait pas faire.
+function DroppedMark() {
+  return (
+    <svg className="zrp-dropped-mark" viewBox="0 0 30.8789 30.5508" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M15.2578 30.5273C23.6836 30.5273 30.5273 23.6953 30.5273 15.2695C30.5273 6.84375 23.6836 0 15.2578 0C6.83203 0 0 6.84375 0 15.2695C0 23.6953 6.83203 30.5273 15.2578 30.5273ZM15.2578 28.3477C8.02734 28.3477 2.17969 22.5 2.17969 15.2695C2.17969 8.03906 8.02734 2.19141 15.2578 2.19141C22.4883 2.19141 28.3359 8.03906 28.3359 15.2695C28.3359 22.5 22.4883 28.3477 15.2578 28.3477Z" />
+      <path fill="currentColor" d="M10.7812 21.2344L21.2109 10.793C21.4219 10.5938 21.5391 10.3359 21.5391 10.0547C21.5391 9.46875 21.0703 9.02344 20.4844 9.02344C20.2031 9.02344 19.957 9.12891 19.7578 9.33984L9.29297 19.7695C9.08203 19.9805 8.97656 20.2148 8.97656 20.5195C8.97656 21.0938 9.43359 21.5625 10.0195 21.5625C10.3242 21.5625 10.5703 21.4453 10.7812 21.2344ZM19.7344 21.2344C19.9336 21.4453 20.1797 21.5625 20.4844 21.5625C21.0703 21.5625 21.5391 21.0938 21.5391 20.5195C21.5391 20.2148 21.4219 19.9805 21.2109 19.7695L10.7578 9.33984C10.5469 9.12891 10.3125 9.02344 10.0195 9.02344C9.43359 9.02344 8.97656 9.46875 8.97656 10.0547C8.97656 10.3359 9.08203 10.5938 9.29297 10.793Z" />
+    </svg>
+  )
+}
+
+// Éditeur du bloc de détail (titre + note) -- bug réel corrigé le 2026-07-20 ("à mesure que j'écris,
+// l'écriture se désagrège") : les champs étaient contrôlés par le board GLOBAL avec sauvegarde débouncée ;
+// quand le round-trip GitHub (1-2 s) revenait, son setBoard(res.data) écrasait les frappes tapées ENTRE
+// TEMPS -- caractères perdus, curseur qui saute. Solution (le pattern Notion/Apple Notes) : la frappe vit
+// dans un BUFFER LOCAL, rien ne part au réseau pendant qu'on tape ; le commit se fait au blur du champ et
+// à la fermeture du bloc (unmount -- y compris fermeture auto/Escape/changement de tâche). key={task.id}
+// posé par l'appelant garantit un buffer neuf par tâche ouverte.
+// Sélecteur d'images DU SITE : uniquement l'index auto-généré (getIndexPaths + getNodeThumb) --
+// ZÉRO appel REST/raw par résultat (règle dure post-incident quota du 2026-07-20). thumb.u est une
+// URL CDN directe, utilisée telle quelle comme vignette ET comme image stockée dans la tâche.
+// Sélecteur de date maison (retour Matthieu 2026-07-20 : "je ne veux pas taper la date, je veux un
+// tableau/widget avec le bon liseré" -- le calendrier natif du navigateur ("truc Windows moche") est
+// remplacé partout par ce mini-calendrier, même recette glass/rim que le reste du Plan (--zrp-rim,
+// pas l'opaque .zrp-popover). Réutilise buildMonthGrid/MONTHS déjà définis plus haut dans ce fichier.
+function MiniCalendar({ value, min, onSelect }) {
+  const base = parseIso(value || todayIso())
+  const [view, setView] = useState({ year: base.getFullYear(), month: base.getMonth() })
+  const cells = useMemo(() => buildMonthGrid(view.year, view.month), [view])
+  const shiftMonth = (delta) => setView((v) => { const d = new Date(v.year, v.month + delta, 1); return { year: d.getFullYear(), month: d.getMonth() } })
+  const today = todayIso()
+  return (
+    <div className="zrp-mini-cal" onClick={(e) => e.stopPropagation()}>
+      <div className="zrp-mini-cal-head">
+        <button type="button" aria-label="Previous month" onClick={() => shiftMonth(-1)}><Icon name="chevron.left" size={12} /></button>
+        <span>{MONTHS[view.month]} {view.year}</span>
+        <button type="button" aria-label="Next month" onClick={() => shiftMonth(1)}><Icon name="chevron.right" size={12} /></button>
+      </div>
+      <div className="zrp-mini-cal-weekdays">{WEEKDAYS.map((w) => <span key={w}>{w[0]}</span>)}</div>
+      <div className="zrp-mini-cal-grid">
+        {cells.map((cell) => {
+          const disabled = !!min && cell.iso < min
+          return (
+            <button key={cell.iso} type="button" disabled={disabled}
+              className={`zrp-mini-cal-day${cell.outside ? ' zrp-outside' : ''}${cell.iso === value ? ' zrp-selected' : ''}${cell.iso === today ? ' zrp-today' : ''}`}
+              onClick={() => onSelect(cell.iso)}>{cell.day}</button>
+          )
+        })}
+      </div>
+      <button type="button" className="zrp-mini-cal-today" onClick={() => onSelect(today)}>Today</button>
+    </div>
+  )
+}
+
+// HEURE EN 12 H À L'AFFICHAGE, EN 24 H DANS LE FICHIER.
+//
+// Le stockage reste `"HH:MM"` sur vingt-quatre heures et la conversion ne vit qu'à l'affichage.
+// Stocker « 7:07 PM » aurait deux coûts immédiats : les tâches déjà créées deviendraient illisibles,
+// et le tri par heure de la grille comparerait des chaînes qui ne s'ordonnent plus (« 7:07 PM » passe
+// avant « 9:00 AM » en ordre alphabétique). Un format d'affichage ne doit jamais remonter jusqu'au
+// format de données.
+const TIME_H12 = Array.from({ length: 12 }, (_, i) => i + 1)
+const TIME_M60 = Array.from({ length: 60 }, (_, i) => i)
+// POINT D'ANCRAGE DE LA BARRE COLLANTE — miroir exact du `top` calculé dans PlanBoard.css
+// (`calc(6px - var(--zrp-app-pad-top))`, soit 6 - 70). La valeur vit à deux endroits parce que l'un
+// positionne et l'autre mesure ; ce commentaire est le lien entre les deux, et changer l'un sans
+// l'autre décalerait le moment où la barre prend son verre par rapport au moment où elle se colle.
+const ANCRAGE_BARRE = 6 - 70
+
+const to12 = (hhmm) => {
+  const [H, M] = String(hhmm || '09:00').split(':').map(Number)
+  return { h12: (H % 12) === 0 ? 12 : (H % 12), m: M || 0, period: H >= 12 ? 'PM' : 'AM' }
+}
+const to24 = (h12, m, period) => {
+  const H = period === 'PM' ? (h12 === 12 ? 12 : h12 + 12) : (h12 === 12 ? 0 : h12)
+  return `${pad2(H)}:${pad2(m)}`
+}
+// Lisible par un humain : « 7:07 PM ». Tiret simple quand il n'y a pas d'heure, jamais « 00:00 ».
+const fmt12 = (hhmm) => { if (!hhmm) return '-'; const { h12, m, period } = to12(hhmm); return `${h12}:${pad2(m)} ${period}` }
+// Même principe pour l'heure : deux colonnes de capsules (heures / minutes par quart d'heure) au lieu
+// du widget natif à molette. `onSelect` reçoit la nouvelle valeur "HH:MM" à chaque clic (les deux
+// colonnes restent ouvertes -- ajuster l'heure puis les minutes sans réouvrir le widget).
+function MiniTimePicker({ value, onSelect }) {
+  // LE PICKER TIENT SA PROPRE COMPOSITION, et c'est un correctif de perte de saisie.
+  //
+  // Dériver les trois colonnes de `value` à chaque rendu paraît plus simple, mais chaque
+  // gestionnaire de clic capture alors la valeur du rendu COURANT. Deux clics rapprochés dans la
+  // même image partent donc tous les deux de l'ancienne heure, et le second écrase le premier.
+  // Mesuré au banc : cliquer 7, puis 07, puis PM donnait « 9:00 PM » — seul le dernier clic
+  // survivait, les deux autres étaient perdus. C'est exactement le symptôme « l'horaire n'est pas
+  // sauvegardé à l'heure exacte » : il l'était, mais partiellement, et de façon imprévisible
+  // puisque tout dépendait du rythme des clics.
+  const [t, setT] = useState(() => to12(value))
+  const lastValueRef = useRef(value)
+  if (value !== lastValueRef.current) {
+    // Le parent a changé l'heure par un autre chemin (bouton « Now », ouverture d'une autre
+    // tâche) : on se réaligne PENDANT le rendu, pas dans un effet, sinon une image s'affiche avec
+    // l'ancienne composition avant de se corriger.
+    lastValueRef.current = value
+    const next = to12(value)
+    if (next.h12 !== t.h12 || next.m !== t.m || next.period !== t.period) setT(next)
+  }
+  const emit = (patch) => {
+    const n = { ...t, ...patch }
+    setT(n)
+    // On note la valeur qu'on émet : le parent va la renvoyer par `value`, et sans cette note on
+    // se croirait modifié de l'extérieur à chaque clic.
+    lastValueRef.current = to24(n.h12, n.m, n.period)
+    onSelect(lastValueRef.current)
+  }
+  // Chaque colonne amène sa sélection dans le champ de vision à l'ouverture. Sur douze heures et
+  // soixante minutes, la valeur choisie est presque toujours hors écran, et un sélecteur qui
+  // s'ouvre sur une valeur invisible se lit exactement comme un sélecteur vide.
+  const colsRef = useRef(null)
+  useEffect(() => {
+    for (const col of colsRef.current?.querySelectorAll('.zrp-mini-time-col') || []) {
+      const cell = col.querySelector('.zrp-selected')
+      if (cell) col.scrollTop = cell.offsetTop - (col.clientHeight / 2) + (cell.clientHeight / 2)
+    }
+  }, [])
+  return (
+    <div className="zrp-mini-time" ref={colsRef} onClick={(e) => e.stopPropagation()}>
+      <div className="zrp-mini-time-col" role="listbox" aria-label="Hour">
+        {TIME_H12.map((hh) => (
+          <button key={hh} type="button" className={`zrp-mini-time-cell${hh === t.h12 ? ' zrp-selected' : ''}`}
+            onClick={() => emit({ h12: hh })}>{hh}</button>
+        ))}
+      </div>
+      <div className="zrp-mini-time-col zrp-mini-time-minutes" role="listbox" aria-label="Minute">
+        {/* Les multiples de cinq portent un relief : sur une colonne de soixante, l'oeil a besoin
+            de repères pour viser, sinon il compte les cellules une à une. */}
+        {TIME_M60.map((mm) => (
+          <button key={mm} type="button"
+            className={`zrp-mini-time-cell${mm === t.m ? ' zrp-selected' : ''}${mm % 5 === 0 ? ' zrp-tick' : ''}`}
+            onClick={() => emit({ m: mm })}>{pad2(mm)}</button>
+        ))}
+      </div>
+      <div className="zrp-mini-time-col zrp-mini-time-period" role="listbox" aria-label="AM or PM">
+        {['AM', 'PM'].map((pp) => (
+          <button key={pp} type="button" className={`zrp-mini-time-cell${pp === t.period ? ' zrp-selected' : ''}`}
+            onClick={() => emit({ period: pp })}>{pp}</button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function PlanTimePicker({ value, onSelect, onClose, tasks = [], dateIso, durationMin = DUREE_DEFAUT }) {
+  const [currentTime, setCurrentTime] = useState(value || '09:00')
+  const debounceRef = useRef(null)
+
+  useEffect(() => {
+    setCurrentTime(value || '09:00')
+  }, [value])
+
+  const handlePick = (time) => {
+    setCurrentTime(time)
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(() => {
+      onSelect(time)
+    }, 350)
+  }
+
+  const handleImmediate = (time) => {
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    setCurrentTime(time)
+    onSelect(time)
+  }
+
+  const handleConfirm = () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    onSelect(currentTime)
+    if (onClose) onClose()
+  }
+
+  const slotPresets = getSlotPresets(tasks, dateIso, durationMin)
+  const nextSlot = nextAvailableSlot(tasks, dateIso, durationMin)
+
+  return (
+    <div className="zrp-time-picker-popover" onClick={(e) => e.stopPropagation()}>
+      <div className="zrp-meta-time-actions">
+        <button type="button" className="zrp-meta-now" title="Use current time"
+          onClick={() => { const n = new Date(); handleImmediate(`${pad2(n.getHours())}:${pad2(n.getMinutes())}`); if (onClose) onClose() }}>
+          <Icon name="clock.arrow.2.circlepath" size={13} />Now
+        </button>
+        <button type="button" className="zrp-meta-now" title="Next free 90m slot"
+          onClick={() => { handleImmediate(nextSlot); if (onClose) onClose() }}>
+          <Icon name="arrow.right" size={13} />Next slot ({fmt12(nextSlot)})
+        </button>
+        {onClose && (
+          <button type="button" className="zrp-meta-now zrp-meta-save" title="Save chosen time"
+            onClick={handleConfirm}>
+            <Icon name="checkmark" size={13} />Done
+          </button>
+        )}
+      </div>
+
+      <div className="zrp-slot-presets" role="group" aria-label="90m slots">
+        {slotPresets.map(({ time, occupied, taskTitle }) => (
+          <button
+            key={time}
+            type="button"
+            className={`zrp-slot-chip${currentTime === time ? ' zrp-selected' : ''}${occupied ? ' zrp-occupied' : ''}`}
+            title={occupied ? `Occupied by "${taskTitle || 'another task'}"` : `Slot ${fmt12(time)}`}
+            onClick={() => handleImmediate(time)}
+          >
+            {fmt12(time)}
+          </button>
+        ))}
+      </div>
+
+      <MiniTimePicker value={currentTime} onSelect={handlePick} />
+    </div>
+  )
+}
+
+// La MÊME limite que la fenêtre glissante du visionneur d'images (96, voir QuickLookOverlay et
+// App.jsx) — demande explicite de Matthieu : « utilise la même limite ». Vingt-quatre était une
+// valeur locale inventée ici, sans rapport avec le reste du produit.
+const PICKER_MAX = 96
+
+function ImagePicker({ onPick, onClose }) {
+  const [query, setQuery] = useState('')
+  const [ready, setReady] = useState(false)
+  // ÉCHEC D'INDEX : bug réel corrigé le 2026-08-07. Le `.catch(() => {})` avalait l'erreur SANS
+  // jamais lever `ready`, si bien que le panneau affichait « Loading index… » indéfiniment — c'est
+  // le « ça charge à l'infini sans jamais m'afficher mes images » de Matthieu. On distingue
+  // désormais « en cours » de « échoué », et l'échec le DIT, avec le collage toujours possible.
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let live = true
+    loadSearchIndex()
+      .then(() => { if (live) setReady(true) })
+      .catch(() => { if (live) { setFailed(true); setReady(true) } })
+    return () => { live = false }
+  }, [])
+  const results = useMemo(() => {
+    if (!ready) return []
+    const needle = query.trim().toLowerCase()
+    const out = []
+    for (const path of getIndexPaths()) {
+      if (!path.endsWith('.img.json')) continue
+      const name = path.split('/').pop().replace(/\.img\.json$/, '')
+      if (needle && !name.toLowerCase().includes(needle)) continue
+      const thumb = getNodeThumb(path)
+      if (!thumb?.u) continue
+      out.push({ path, name, url: thumb.u })
+      if (out.length >= PICKER_MAX) break
+    }
+    return out
+  }, [ready, query])
+  return (
+    <div className="zrp-image-picker" onClick={(e) => e.stopPropagation()}>
+      <div className="zrp-image-picker-head">
+        <input autoFocus value={query} placeholder="Search site images… or paste (⌘V)" aria-label="Search images"
+          onChange={(e) => setQuery(e.target.value)}
+          onPaste={async (e) => {
+            const file = [...(e.clipboardData?.items || [])].map((it) => it.kind === 'file' ? it.getAsFile() : null).find((f) => f && f.type.startsWith('image/'))
+            if (!file) return
+            e.preventDefault()
+            const dataUrl = await shrinkImageFile(file)
+            if (dataUrl) onPick(dataUrl)
+          }}
+          onKeyDown={(e) => { if (e.key === 'Escape') onClose() }} />
+        <button type="button" className="zrp-detail-icon" title="Close picker" aria-label="Close picker" onClick={onClose}><Icon name="xmark" size={12} /></button>
+      </div>
+      <div className="zrp-image-picker-grid">
+        {!ready && <div className="zrp-image-picker-note">Chargement de l’index des images…</div>}
+        {ready && failed && <div className="zrp-image-picker-note">Index des images indisponible. Colle une image (⌘V) en attendant.</div>}
+        {ready && !failed && !results.length && <div className="zrp-image-picker-note">Aucune image trouvée. Colle-en une (⌘V).</div>}
+        {results.map((r) => (
+          <button key={r.path} type="button" title={r.name} onClick={() => onPick(r.url)}
+            style={{ backgroundImage: `url(${r.url})` }} aria-label={`Add ${r.name}`} />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// Ajuste la hauteur d'un champ multiligne a son contenu. Remise a `auto` AVANT de lire
+// `scrollHeight` : sans ce retour a zero, la hauteur ne fait que croitre et ne redescend jamais
+// quand on raccourcit le titre.
+function autoHauteur(el) {
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${el.scrollHeight}px`
+}
+
+function DetailEditor({ task, today, allTasks = [], titleInputRef, onCommit, onPatch, onDelete, onToggleDropped, onClose }) {
+  const [title, setTitle] = useState(task.title)
+  const [note, setNote] = useState(task.note || '')
+  // Chips méta éditables (retour Matthieu 2026-07-20) : cliquer Date / Start / Block ouvre un petit
+  // widget animé (0.35s, .zrp-meta-editor) sous la rangée ; un seul ouvert à la fois.
+  const [editingMeta, setEditingMeta] = useState(null) // 'date' | 'start' | 'block' | null
+  const [pickerOpen, setPickerOpen] = useState(false)
+  // Refs lues par le cleanup d'unmount : toujours la DERNIÈRE frappe, jamais une closure figée.
+  const draftRef = useRef(null)
+  draftRef.current = { title, note, changed: title !== task.title || note !== (task.note || '') }
+  const onCommitRef = useRef(onCommit)
+  onCommitRef.current = onCommit
+  useEffect(() => () => {
+    const draft = draftRef.current
+    if (draft.changed) onCommitRef.current({ title: draft.title.trim() || 'Untitled', note: draft.note })
+  }, [])
+  const commitNow = () => {
+    const draft = draftRef.current
+    if (draft.changed) onCommit({ title: draft.title.trim() || 'Untitled', note: draft.note })
+  }
+  // ── SAUVEGARDE PENDANT LA FRAPPE, ET NON SEULEMENT À LA SORTIE (2026-08-16) ──────────────────────
+  // Le bug de Matthieu : « quand j'écris trop de texte, il disparaît de la carte dans les notes, pas le
+  // titre ». La cause n'est pas la longueur, c'est le MOMENT : jusqu'ici la note ne partait qu'au `blur`
+  // de la zone de texte ou au démontage du panneau. Tout ce qui contourne ces deux instants — recharger
+  // la page, fermer l'onglet, une navigation, un plantage, un rafraîchissement pendant qu'on écrit —
+  // emportait le texte avec lui. Plus le texte est long, plus la fenêtre pour se faire prendre est
+  // grande : d'où l'impression que c'est la longueur qui pose problème.
+  //
+  // POURQUOI CE N'EST PAS UN RETOUR AU BUG DE JUILLET. La sauvegarde débouncée avait été retirée le
+  // 2026-07-20 parce que les champs étaient alors CONTRÔLÉS PAR LE BOARD GLOBAL : chaque retour du drive
+  // réécrivait la zone de texte en pleine frappe, d'où les caractères perdus et le curseur qui saute.
+  // Ici la frappe reste dans l'état LOCAL du composant, et rien de ce qui revient du drive ne touche à
+  // `note` ni à `title`. On peut donc écrire souvent sans jamais déranger celui qui tape.
+  //
+  // Huit cents millisecondes : assez long pour ne pas écrire à chaque lettre, assez court pour qu'aucun
+  // geste humain ne s'intercale — on ne ferme pas un onglet en moins d'une seconde après sa dernière
+  // frappe. Le `blur` et le démontage restent en place : ce sont désormais des filets, plus le mécanisme.
+  useEffect(() => {
+    if (!draftRef.current.changed) return
+    const t = setTimeout(commitNow, 800)
+    return () => clearTimeout(t)
+  }, [title, note])
+  // LE DERNIER TROU : recharger la page ou fermer l'onglet MOINS d'une seconde après la dernière frappe.
+  // La temporisation ne s'est pas encore déclenchée, le `blur` n'a pas eu lieu, le démontage non plus.
+  // `visibilitychange` couvre le changement d'onglet, la mise en arrière-plan et le verrouillage de
+  // l'écran ; `pagehide` couvre la fermeture et le rechargement, et c'est le seul des deux sur lequel
+  // Safari soit fiable. On écrit dans les deux cas : une écriture de trop ne coûte rien, une écriture
+  // manquée coûte le texte.
+  useEffect(() => {
+    const filet = () => { if (document.visibilityState === 'hidden') commitNow() }
+    document.addEventListener('visibilitychange', filet)
+    window.addEventListener('pagehide', commitNow)
+    return () => {
+      document.removeEventListener('visibilitychange', filet)
+      window.removeEventListener('pagehide', commitNow)
+    }
+  })
+  // La hauteur se cale a l'ouverture ET a chaque changement de tache : sans cet effet, un titre
+  // long s'afficherait sur une seule ligne tant qu'on n'y a pas tape.
+  useEffect(() => { autoHauteur(titleInputRef.current) }, [task.id, title, titleInputRef])
+  const status = statusOf(task, today)
+  const images = imagesOf(task)
+  const deletable = canDeleteTask(task)
+  const dropped = task.status === 'dropped'
+  // Le titre suit EXACTEMENT le verrou d'engagement de la corbeille, pas une règle à lui : si une tâche
+  // de plus de quatre heures ne peut plus être supprimée, la renommer serait la même échappatoire par
+  // un autre chemin. En deçà, l'erreur de frappe se corrige librement.
+  const refuseTitle = () => {
+    const el = titleInputRef.current
+    if (!el || reducedMotion()) return
+    // ANIMATION PILOTÉE, PAS UNE CLASSE CSS. Rejouer une animation par ajout et retrait de classe
+    // demande de laisser passer une image entre les deux, donc un `requestAnimationFrame`, donc un
+    // état React et un minuteur à nettoyer : quatre pièces mobiles pour un clignotement. L'API
+    // d'animation le fait en un appel, et surtout elle se MESURE (`el.getAnimations()`), alors
+    // qu'une classe posée pendant une frame ne se vérifie pas.
+    // `cancel()` avant de rejouer : sans lui, un second refus pendant le clignotement ne produit
+    // rien du tout, et l'interface paraît morte au moment précis où elle doit répondre.
+    for (const a of el.getAnimations()) a.cancel()
+    el.animate(
+      [
+        { transform: 'translateX(0)', filter: 'none' },
+        { transform: 'translateX(-6px)', filter: 'brightness(1.22) saturate(1.2)', offset: .2 },
+        { transform: 'translateX(5px)', filter: 'brightness(.92)', offset: .4 },
+        { transform: 'translateX(-4px)', filter: 'brightness(1.16)', offset: .6 },
+        { transform: 'translateX(2px)', filter: 'none', offset: .8 },
+        { transform: 'translateX(0)', filter: 'none' },
+      ],
+      { duration: PLAN_UI.motion.refuse, easing: 'cubic-bezier(.16,1,.3,1)' },
+    )
+  }
+  return (
+    <>
+      <header className="zrp-detail-head">
+        {/* TITRE SUR PLUSIEURS LIGNES (2026-08-07). C'était un `<input>`, donc une ligne unique par
+            nature : un titre long se coupait en « Exposer quelque cho… » à l'ouverture même de la
+            tâche, précisément là où on veut le lire en entier. Un `<textarea>` enveloppe, et sa
+            hauteur suit le contenu (`autoHauteur`). Entrée VALIDE toujours au lieu d'insérer un
+            saut de ligne : un titre reste une seule phrase, il se contente d'être affiché sur
+            plusieurs lignes. Les tuiles du calendrier, elles, gardent leur troncature — Matthieu
+            l'a dit explicitement, « la vue est bonne, mais pas lorsque je déploie la capsule ». */}
+        <textarea ref={titleInputRef} className={`zrp-detail-title${deletable ? '' : ' zrp-locked-title'}`}
+          rows={1} value={title} aria-label="Task title" readOnly={!deletable}
+          title={deletable ? undefined : 'Locked — a goal older than 4h can’t be renamed'}
+          onMouseDown={deletable ? undefined : refuseTitle}
+          onChange={(e) => { if (deletable) { setTitle(e.target.value); autoHauteur(e.target) } }}
+          onBlur={deletable ? commitNow : undefined}
+          onKeyDown={(e) => { if (!deletable) { refuseTitle(); return } if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() } }} />
+        {/* QUATRE OUTILS SUR UNE SEULE RANGÉE (2026-08-07). L'abandon s'ajoute entre les images et la
+            corbeille : c'est le geste qui manquait entre « c'est fait » et « ça n'a jamais existé ».
+            Il n'est PAS soumis au verrou de quatre heures, et c'est le point : renoncer à une tâche
+            mal posée doit rester possible quand on s'en aperçoit, c'est-à-dire tard. */}
+        <div className="zrp-detail-tools">
+          <button type="button" className={`zrp-detail-icon${images.length ? ' zrp-active' : ''}`} title="Images" aria-label="Add images"
+            onClick={() => setPickerOpen((v) => !v)}><Icon name="photo" size={13} /></button>
+          <button type="button" className={`zrp-detail-icon${dropped ? ' zrp-active' : ''}`}
+            title={dropped ? 'Reprendre cette tâche' : 'Abandonner : la tâche reste, elle ne compte plus'}
+            aria-label={dropped ? 'Reprendre la tâche' : 'Abandonner la tâche'} aria-pressed={dropped}
+            onClick={onToggleDropped}><DroppedMark /></button>
+          {/* Verrou d'engagement : au-delà de 4h après création, la corbeille est grisée et inerte. */}
+          <button type="button" className={`zrp-detail-icon${deletable ? '' : ' zrp-locked'}`} disabled={!deletable}
+            title={deletable ? 'Delete task' : 'Locked — a goal older than 4h can’t be deleted'}
+            aria-label="Delete task" onClick={deletable ? onDelete : undefined}><Icon name="trash" size={13} /></button>
+          <button type="button" className="zrp-detail-icon" title="Close" aria-label="Close task detail" onClick={onClose}><Icon name="xmark" size={13} /></button>
+        </div>
+      </header>
+      <div className="zrp-detail-status">
+        <i className={`zrp-status-dot zrp-${status.tone}`} />
+        <span className="zrp-status-copy">{status.label}{task.overdueSince && status.key !== 'planned' ? ` · Missed ${fmtShortDate(task.overdueSince)}` : ''}{task.streakId ? ' · Streak' : ''}{task.publish ? ' · Publication' : ''}{task.firstMovement ? ' · First movement' : ''}</span>
+      </div>
+      {pickerOpen && <ImagePicker onPick={(url) => { onPatch({ images: [...images, url], image: null }) }} onClose={() => setPickerOpen(false)} />}
+      <textarea className="zrp-detail-note" placeholder="Write a short note…" aria-label="Task note" value={note}
+        onChange={(e) => setNote(e.target.value)} onBlur={commitNow} />
+      <PlanAttachments task={task} onPatch={onPatch} />
+      {images.length > 0 && (
+        <div className="zrp-images" role="list" aria-label="Task images">
+          {images.map((src, index) => (
+            <div key={`${index}:${src.slice(0, 32)}`} className="zrp-image" role="listitem" style={{ backgroundImage: `url(${src})` }}>
+              <button type="button" className="zrp-image-remove" title="Remove image" aria-label="Remove image"
+                onClick={() => onPatch({ images: images.filter((_, i) => i !== index), image: null })}><Icon name="xmark" size={10} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+      <footer className="zrp-detail-meta">
+        <button type="button" className={`zrp-meta-chip${editingMeta === 'date' ? ' zrp-active' : ''}`}
+          onClick={() => setEditingMeta((v) => v === 'date' ? null : 'date')}><strong>Date</strong>{fmtFullDate(task.date)}</button>
+        <button type="button" className={`zrp-meta-chip${editingMeta === 'start' ? ' zrp-active' : ''}`}
+          onClick={() => setEditingMeta((v) => v === 'start' ? null : 'start')}><strong>Start</strong>{fmt12(task.startTime)}</button>
+        <button type="button" className={`zrp-meta-chip${editingMeta === 'block' ? ' zrp-active' : ''}`}
+          onClick={() => setEditingMeta((v) => v === 'block' ? null : 'block')}><strong>Block</strong>{fmtDuration(task.durationMin || 0)}</button>
+      </footer>
+      {editingMeta === 'date' && (
+        <div className="zrp-meta-editor zrp-meta-editor-cal">
+          <MiniCalendar value={task.date} onSelect={(iso) => {
+            const nextSlot = nextAvailableSlot(allTasks, iso, task.durationMin || DUREE_DEFAUT)
+            onPatch({ date: iso, startTime: (!task.startTime || task.startTime === '09:00') ? nextSlot : task.startTime })
+            setEditingMeta(null)
+          }} />
+        </div>
+      )}
+      {editingMeta === 'start' && (
+        <div className="zrp-meta-editor zrp-meta-editor-cal">
+          <PlanTimePicker
+            value={task.startTime}
+            tasks={allTasks}
+            dateIso={task.date}
+            durationMin={task.durationMin || DUREE_DEFAUT}
+            onSelect={(time) => onPatch({ startTime: time })}
+            onClose={() => setEditingMeta(null)}
+          />
+        </div>
+      )}
+      {editingMeta === 'block' && (
+        <div className="zrp-meta-editor zrp-meta-editor-block">
+          {DURATION_PRESETS.map(({ minutes, label }) => (
+            <button key={minutes} type="button" className={`zrp-duration zrp-duration-sm${(task.durationMin || 0) === minutes ? ' zrp-active' : ''}`}
+              onClick={() => onPatch({ durationMin: minutes })}>{label}</button>
+          ))}
+          <input type="number" min={5} max={DUREE_MAX} step={5} value={task.durationMin || 0} aria-label="Custom minutes"
+            onChange={(e) => { const v = Math.max(5, Math.min(DUREE_MAX, Number(e.target.value) || 5)); onPatch({ durationMin: v }) }} />
+        </div>
+      )}
+    </>
+  )
+}
+
+function TaskTile({ task, today, onOpen, onToggleDone }) {
+  const status = statusOf(task, today)
+  const completed = status.key === 'done' || status.key === 'late-complete'
+  const tileRef = useRef(null)
+  const toggleDone = () => {
+    if (!completed && !reducedMotion()) {
+      for (const animation of tileRef.current?.getAnimations() || []) animation.cancel()
+      tileRef.current?.animate(
+        [
+          { transform: 'scale(1)', filter: 'brightness(1.06)' },
+          { transform: `scale(${PLAN_UI.motion.pressScale})`, filter: 'brightness(.96)', offset: .34 },
+          { transform: `scale(${PLAN_UI.motion.releaseScale})`, filter: 'brightness(1.16)', offset: .7 },
+          { transform: 'scale(1)', filter: 'brightness(1)' },
+        ],
+        { duration: PLAN_UI.motion.confirm, easing: 'cubic-bezier(.16,1,.3,1)' },
+      )
+    }
+    onToggleDone(task)
+  }
+  return (
+    // stopPropagation : bug réel corrigé le 2026-07-20 ("les tâches disparaissent immédiatement au
+    // clic") -- sans lui, le clic REMONTAIT jusqu'à la cellule du jour, dont le onClick appelle
+    // closePanel() : l'ouverture (requête posée par CE clic) était aussitôt écrasée par une demande de
+    // fermeture posée par LE MÊME clic, et la boucle d'animation ouvrait puis refermait le bloc dans la
+    // foulée. La référence évite ça avec un unique listener sur la grille (closest('.goal') -> return).
+    // LA TUILE N'EST PLUS UN <button> (bug réel corrigé le 2026-08-07 : « je dois m'y reprendre au
+    // moins 4 fois pour valider la tâche »). Elle en était un, et portait une case à cocher DEDANS —
+    // or le HTML interdit un élément interactif à l'intérieur d'un bouton. Les navigateurs réparent
+    // ce balisage chacun à leur façon, et le plus courant est d'attribuer le clic au BOUTON plutôt
+    // qu'à la case : on ouvrait la tâche au lieu de la cocher, d'où l'impression d'un clic ignoré
+    // qu'il fallait retenter. Un `div` avec le rôle et le clavier explicites rend la case légale, et
+    // le clic atterrit enfin là où on vise. La seconde moitié du défaut, une cible de seize pixels,
+    // se corrige dans PlanBoard.css (zone de clic élargie sans changer la taille dessinée).
+    <div ref={tileRef} role="button" tabIndex={0} className={`zrp-task${status.key === 'dropped' ? ' zrp-dropped' : ''}${status.key === 'done' ? ' zrp-done' : ''}${status.key === 'late-complete' ? ' zrp-late-complete' : ''}${status.key === 'late' && !task.publish ? ' zrp-late' : ''}${task.publish && status.key === 'planned' ? ' zrp-publish' : ''}${task.publish && status.key === 'late' ? ' zrp-publish-late' : ''}${task.publish && (status.key === 'done' || status.key === 'late-complete') ? ' zrp-publish-done' : ''}${imagesOf(task).length ? ' zrp-has-image' : ''}`}
+      onClick={(e) => { e.stopPropagation(); onOpen(task) }}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); onOpen(task) } }}
+      title={task.title}>
+      <input type="checkbox" checked={completed}
+        onClick={(e) => e.stopPropagation()} onChange={toggleDone} aria-label={`${task.title} done`} />
+      {/* L'HEURE NE S'AFFICHE PLUS SUR LA TUILE (2026-08-22, demande Matthieu). Elle reste STOCKÉE et
+          reste modifiable dans le panneau de détail : seul l'affichage disparaît de la grille, qui
+          gagne en calme quand une semaine chargée empile les tâches. La tuile redevient donc une
+          grille à deux enfants — case à cocher, titre — c'est-à-dire exactement ce que
+          `grid-template-columns: 15px minmax(0,1fr)` décrit, avec la pastille de validation centrée
+          verticalement et le titre sur la même ligne. La règle `:has(.zrp-task-time)` qui rendait le
+          titre pleine largeur devient sans objet et part avec, plutôt que de rester en dette. */}
+      <span className="zrp-task-body">{planTileTime(task) && <span className="zrp-task-time">{planTileTime(task)}</span>}<span className="zrp-task-title">{planTileBareTitle(task)}</span></span>
+      {imagesOf(task).length > 0 && <span className="zrp-task-image-badge"><Icon name="photo" size={10} /></span>}
+      {/* ABANDONNÉE : la marque se pose EN SURCOUCHE, semi-opaque, par-dessus toute la tuile — le
+          texte reste lisible dessous, ce qui est le but (on doit pouvoir relire ce qu'on a renoncé
+          à faire). `pointer-events: none` en CSS : elle ne doit jamais voler un clic. */}
+      {status.key === 'dropped' && <span className="zrp-dropped-overlay" aria-hidden="true"><DroppedMark /></span>}
+    </div>
+  )
+}
+
+function DollarScoreIcon() {
+  return (
+    <svg viewBox="0 0 30.8789 30.5508" aria-hidden="true">
+      <path fill="currentColor" d="M30.5273 15.2695C30.5273 23.6719 23.6719 30.5273 15.2578 30.5273C6.85547 30.5273 0 23.6719 0 15.2695C0 6.85547 6.85547 0 15.2578 0C23.6719 0 30.5273 6.85547 30.5273 15.2695ZM14.7891 7.05469L14.7891 8.39062C12.5625 8.56641 10.6172 9.89062 10.6172 12.0703C10.6172 14.3086 12.5156 15.1641 14.4141 15.6211L14.7891 15.7148L14.7891 20.5781C13.3594 20.4727 12.3047 19.8281 11.8828 18.4688C11.707 18.0352 11.4844 17.8594 11.1094 17.8594C10.6992 17.8594 10.3711 18.1289 10.3711 18.5859C10.3711 18.7266 10.3945 18.8789 10.4414 19.0312C10.957 20.918 12.8906 21.8086 14.7891 21.9375L14.7891 23.332C14.7891 23.5898 15 23.8008 15.2578 23.8008C15.5156 23.8008 15.7266 23.5898 15.7266 23.332L15.7266 21.9375C18.1055 21.8086 20.1562 20.6133 20.1562 18.1641C20.1562 15.9023 18.3281 15.0117 16.2188 14.5195L15.7266 14.4023L15.7266 9.77344C17.0508 9.87891 18.0469 10.5586 18.3984 11.7891C18.5273 12.2109 18.7969 12.4219 19.1719 12.4219C19.5352 12.4219 19.9219 12.1875 19.9219 11.7188C19.9219 9.94922 17.8359 8.56641 15.7266 8.39062L15.7266 7.05469C15.7266 6.80859 15.5156 6.59766 15.2578 6.59766C15 6.59766 14.7891 6.80859 14.7891 7.05469ZM15.9375 15.9844C17.3438 16.3242 18.6094 16.8398 18.6094 18.2812C18.6094 19.875 17.2266 20.4844 15.7266 20.5898L15.7266 15.9375ZM14.7891 14.1914L14.6602 14.1562C13.3711 13.8398 12.1641 13.2656 12.1641 11.9531C12.1641 10.5938 13.4648 9.91406 14.7891 9.77344Z" />
+    </svg>
+  )
+}
+
+function AnimatedDollar({ value }) {
+  const mountedRef = useRef(false)
+  useEffect(() => { mountedRef.current = true }, [])
+  return <span key={value} className={mountedRef.current ? 'zrp-score-icon-mark zrp-score-icon-mark-animated' : 'zrp-score-icon-mark'}><DollarScoreIcon /></span>
+}
+
+function AnimatedScore({ value }) {
+  const tweenRef = useRef({ current: value, from: value, to: value })
+  const [tween, setTween] = useState(tweenRef.current)
+
+  useEffect(() => {
+    const from = tweenRef.current.current
+    if (from === value) return undefined
+    if (reducedMotion()) {
+      const finalTween = { current: value, from: value, to: value }
+      tweenRef.current = finalTween
+      setTween(finalTween)
+      return undefined
+    }
+
+    let frameId
+    let startedAt
+    const draw = (now) => {
+      if (startedAt === undefined) startedAt = now
+      const progress = Math.min(1, (now - startedAt) / PLAN_UI.motion.panel)
+      const nextTween = { current: interpolatedScore(from, value, progress), from, to: value }
+      tweenRef.current = nextTween
+      setTween(nextTween)
+      if (progress < 1) frameId = window.requestAnimationFrame(draw)
+    }
+    frameId = window.requestAnimationFrame(draw)
+    return () => window.cancelAnimationFrame(frameId)
+  }, [value])
+
+  const direction = tween.to >= tween.from ? 'up' : 'down'
+  const currentInteger = direction === 'up' ? Math.floor(tween.current) : Math.ceil(tween.current)
+  const adjacentInteger = direction === 'up'
+    ? Math.min(currentInteger + 1, tween.to)
+    : Math.max(currentInteger - 1, tween.to)
+  const fraction = direction === 'up' ? tween.current - currentInteger : currentInteger - tween.current
+  const width = Math.max(String(Math.round(tween.from)).length, String(Math.round(tween.to)).length)
+  const currentDigits = String(Math.round(currentInteger)).padStart(width, '\u00a0')
+  const adjacentDigits = String(Math.round(adjacentInteger)).padStart(width, '\u00a0')
+  const trackTransform = direction === 'up'
+    ? `translateY(${-fraction}em)`
+    : `translateY(${-1 + fraction}em)`
+
+  return (
+    <span className="zrp-score-number" aria-label={String(value)}>
+      <span aria-hidden="true" className="zrp-score-digits">
+        {Array.from({ length: width }, (_, column) => {
+          const digits = direction === 'up'
+            ? [currentDigits[column], adjacentDigits[column]]
+            : [adjacentDigits[column], currentDigits[column]]
+          return (
+          <span className="zrp-score-digit" key={column}>
+            <span className="zrp-score-digit-track" style={{ transform: trackTransform }}>
+              {digits.map((digit, index) => <span key={index}>{digit}</span>)}
+            </span>
+          </span>
+          )
+        })}
+      </span>
+    </span>
+  )
+}
+
+export default function PlanBoard({ t, path }) {
+  // LE PLAN DEMANDE TOUTE LA LARGEUR, ET IL LE DIT LUI-MEME (2026-08-28, demande de Matthieu :
+  // « quand ZenRayPlan s'ouvre, le drawer se retracte »). Un calendrier de sept colonnes perd plus a
+  // etre serre qu'une page de texte, et c'est lui qui sait qu'il s'ouvre, pas la barre laterale.
+  //
+  // UN EVENEMENT PLUTOT QU'UNE PROPRIETE, parce que le plan s'ouvre par deux chemins distincts : la
+  // vue Plan de la navigation, et un fichier .plan ouvert depuis Create. Passer une propriete aurait
+  // demande de la brancher aux deux endroits, et le jour ou un troisieme chemin apparait, il
+  // l'oublierait. Le meme geste que `zr:open-page` et `zr:create-folder` ailleurs dans ce projet.
+  //
+  // AU MONTAGE SEULEMENT, donc une seule fois par ouverture : rouvrir la barre a la main tient
+  // ensuite, et rien ne la repliera tant qu'on ne rouvre pas un plan. On ne la RESTAURE pas non plus
+  // en partant, parce qu'on ne sait pas si l'etat d'avant etait un choix ou un hasard.
+  useEffect(() => { try { window.dispatchEvent(new CustomEvent('zr:plan-ouvert')) } catch {} }, [])
+
+  const [loading, setLoading] = useState(() => !readCachedPlan(path))
+  const [board, setBoard] = useState(() => readCachedPlan(path))
+  const saveSeqRef = useRef(0)
+  // ÉCRITURES NON CONFIRMÉES (2026-08-12, correctif de PERTE DE TÂCHES).
+  //
+  // Tant que ce compteur n'est pas à zéro, une écriture est en vol ou en cours de reprise : le
+  // rafraîchissement périodique ne doit PAS adopter la version distante, sans quoi il ramène un état
+  // antérieur à la tâche qu'on vient de poser et l'efface de l'écran comme du cache. C'est la moitié
+  // « lecture » du bug ; l'autre moitié (l'échec d'écriture avalé en silence) est traitée dans
+  // `persist` plus bas. Une ref et non un state : le poller doit lire la valeur FRAÎCHE, et cette
+  // valeur ne peint rien.
+  const pendingWritesRef = useRef(0)
+  // Miroir du board courant, lisible depuis les fonctions asynchrones du poller sans dépendre d'une
+  // closure figée au rendu où l'effet a été créé (l'effet ne se recrée qu'au changement de `path`).
+  const boardRef = useRef(null)
+  // FILIGRANE DE DERNIÈRE ÉCRITURE (2026-08-12) — voir `LATENCE_RAW_MS` juste au-dessus du composant.
+  // `{ at, json }` : quand on a écrit, et QUOI exactement. Tant que la relecture ne rend pas ce
+  // contenu-là, c'est que le CDN est en retard sur nous, et on refuse d'adopter sa réponse.
+  const derniereEcritureRef = useRef({ at: 0, json: null })
+  const today = todayIso()
+  // 2026-09-23 : Progress opens Plan on the day it shows (sessionStorage, read once). / FR : Progress ouvre Plan sur son jour.
+  const [cursor, setCursor] = useState(() => {
+    let d = new Date()
+    try {
+      const focus = sessionStorage.getItem(PROGRESS_LINKS.planFocusKey)
+      if (focus) { sessionStorage.removeItem(PROGRESS_LINKS.planFocusKey); const f = new Date(`${focus}T12:00:00`); if (!isNaN(f)) d = f }
+    } catch {}
+    return { year: d.getFullYear(), month: d.getMonth() }
+  })
+  const [selectedIso, setSelectedIso] = useState(today)
+  const selectedIsoRef = useRef(today)
+  const [dateDirection, setDateDirection] = useState('still')
+  const selectIso = (nextIso) => {
+    setDateDirection(planDateDirection(nextIso, selectedIsoRef.current))
+    selectedIsoRef.current = nextIso
+    setSelectedIso(nextIso)
+  }
+  const [composerOpen, setComposerOpen] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
+  // Sémantique de la RÉFÉRENCE : "Show completed" est un interrupteur ALLUMÉ par défaut (les terminées
+  // se voient) ; l'éteindre les masque. Pas un "Masquer les terminées" inversé.
+  const [showCompleted, setShowCompleted] = useState(true)
+  const [hideWeekends, setHideWeekends] = useState(false)
+  const [overdueOpen, setOverdueOpen] = useState(true)
+  // Légende repliée par défaut : elle sert une fois, quand on découvre le code couleur, et n'a pas
+  // à occuper le bas de la vue ensuite. Le triangle la rend visible sans la rendre encombrante.
+  const [legendOpen, setLegendOpen] = useState(false)
+  // Demande de focus sur le champ Outcome : le compteur ne sert qu'à déclencher l'effet, sa valeur
+  // n'a aucun sens en soi. Deux clics successifs sur la même habitude doivent refocaliser, d'où un
+  // compteur plutôt qu'un booléen, qui ne changerait pas la seconde fois.
+  const [focusTitre, setFocusTitre] = useState(0)
+  const champTitreRef = useRef(null)
+  useEffect(() => {
+    if (!focusTitre) return
+    const champ = champTitreRef.current
+    if (!champ) return
+    champ.focus()
+    champ.setSelectionRange(champ.value.length, champ.value.length)
+  }, [focusTitre])
+  const [draft, setDraft] = useState(() => newPlanDraft(today, []))
+  const [composerAttachmentBusy, setComposerAttachmentBusy] = useState(false)
+  const [composerSaving, setComposerSaving] = useState(false)
+  const [composerError, setComposerError] = useState('')
+  // Popovers des 3 champs date/heure du composer (Date / Start / Streak Ends) -- un seul ouvert à la
+  // fois, fermeture au clic ailleurs (même patron que editingMeta du DetailEditor).
+  const [composerPicker, setComposerPicker] = useState(null) // 'date' | 'start' | 'end' | null
+  // Clic droit sur une case du mois (demande du 2026-08-11 : remonter au bouton + à chaque tâche
+  // n'est pas pratique quand une case porte déjà plusieurs tâches). `composerAnchor` porte le point
+  // d'ouverture en coordonnées ÉCRAN ; `null` = comportement inchangé, popover ancré au bouton +.
+  // `composerPos` est la position CLAMPÉE après mesure réelle du popover (voir l'effet plus bas) --
+  // sans elle un clic près d'un bord ouvrirait un popover à moitié hors écran.
+  const [composerAnchor, setComposerAnchor] = useState(null) // { x, y } | null
+  const [composerPos, setComposerPos] = useState(null) // { top, left } | null
+  const composerRef = useRef(null) // le popover lui-même -- ancré OU porté, un seul rendu à la fois
+  const composerActionsRef = useRef(null) // le bouton + / ... : un clic dessus reste un TOGGLE, pas un "dehors"
+
+  // Bloc 2x2 : `renderedId` piloté aussi via ref (pas seulement state) -- la chorégraphie async
+  // (performOpen/performClose) doit toujours lire la valeur FRAÎCHE, jamais une closure figée au moment
+  // de l'await précédent.
+  const [renderedId, setRenderedIdState] = useState(null)
+  const renderedIdRef = useRef(null)
+  const setRenderedId = (id) => { renderedIdRef.current = id; setRenderedIdState(id) }
+  const [absorbedIsos, setAbsorbedIsos] = useState([])
+  const [panelGeometry, setPanelGeometry] = useState(null)
+  const [shellVisible, setShellVisible] = useState(false)
+  const [contentVisible, setContentVisible] = useState(false)
+  const motionRunningRef = useRef(false)
+  const requestedRef = useRef(undefined)
+  // Instantané de la tâche ouverte : permet à l'animation de FERMETURE de continuer à afficher le
+  // contenu même si la tâche vient d'être SUPPRIMÉE du board (sinon le bloc disparaissait brutalement
+  // et les cellules absorbées restaient invisibles pour toujours).
+  const renderedTaskRef = useRef(null)
+  const titleInputRef = useRef(null)
+  // UNE SEULE PISTE MONTÉE À LA FOIS, et c'est un correctif de PERTE DE DONNÉES.
+  //
+  // Le CSS masque `.zrp-calendar` sous 680 px et `.zrp-mobile-days` au-dessus, mais React montait les
+  // DEUX en permanence. `DetailEditor` existait donc en deux instances simultanées, chacune avec son
+  // propre `useState(task.title)`. On tapait dans celle qu'on voyait ; l'autre, invisible, gardait
+  // l'ancien titre. Au démontage, les deux nettoyages tiraient : celui de la piste visible ne faisait
+  // rien puisque son titre égalait désormais celui de la tâche, et celui de la piste FANTÔME comparait
+  // son ancien titre au nouveau, se croyait porteur d'une frappe en attente, et RÉÉCRIVAIT l'ancien.
+  //
+  // Le titre était donc bien enregistré, puis écrasé dans la milliseconde par un éditeur qu'on ne voit
+  // pas. La note subissait le même sort et `titleInputRef` était écrasé par le second montage.
+  // `display:none` cache un composant, il ne l'empêche ni de tenir un état ni de l'écrire.
+  const [isNarrow, setIsNarrow] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 680px)').matches)
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 680px)')
+    const onChange = (e) => setIsNarrow(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  // Piste mobile "un jour = un slot plein écran" (retour Matthieu 2026-07-20) : synchro bidirectionnelle
+  // avec selectedIso -- Today/‹ › (stepDay/goToday) scrollent la piste jusqu'au jour choisi (effet ci-
+  // dessous) ; le swipe manuel remonte l'info dans l'autre sens (onStripScroll, débattu 120ms pour ne
+  // lire la position qu'une fois le scroll-snap posé).
+  const mobileStripRef = useRef(null)
+  const stripSettleRef = useRef(null)
+  const mobileReadyRef = useRef(false)
+
+  useEffect(() => {
+    let live = true
+    let timer = null
+    let retryTimer = null
+    let inFlight = false
+    let echecs = 0
+    const cached = readCachedPlan(path)
+    boardRef.current = cached
+    setBoard(cached)
+    setLoading(!cached)
+
+    const refresh = async () => {
+      if (inFlight) return
+      // UNE ÉCRITURE EN ATTENTE INTERDIT D'ADOPTER LE DISTANT. Relire pendant qu'un enregistrement
+      // n'est pas confirmé ne peut que ramener un état plus ancien que l'écran : au mieux un
+      // clignotement, au pire l'effacement de la tâche qu'on vient d'ajouter.
+      if (pendingWritesRef.current > 0) return
+      inFlight = true
+      const saveSeq = saveSeqRef.current
+      const { status, board: fresh } = await readPlanState(path)
+      inFlight = false
+      if (!live || saveSeq !== saveSeqRef.current || pendingWritesRef.current > 0) return
+
+      // LECTURE EN ERREUR : on ne conclut RIEN. Ni board vide, ni adoption — le plan déjà affiché
+      // reste affiché. Avant ce correctif, un hoquet réseau au premier chargement peignait un
+      // calendrier VIDE à la place du plan (« parfois mon plan ne s'affiche pas »).
+      //
+      // S'il n'y a encore rien à montrer, on ne laisse pas non plus tourner le sablier 30 s : on
+      // retente vite (1 s, 2 s, 4 s… plafonné à 8 s), parce qu'un premier chargement raté est
+      // exactement le moment où l'utilisateur attend.
+      if (status === 'error') {
+        if (boardRef.current) { setLoading(false); return }
+        echecs += 1
+        if (retryTimer === null) {
+          retryTimer = setTimeout(() => { retryTimer = null; if (live) refresh() }, Math.min(8000, 1000 * 2 ** (echecs - 1)))
+        }
+        return
+      }
+      echecs = 0
+      if (status === 'missing') {
+        // Un « absent » juste après une écriture réussie est forcément le CDN en retard, jamais une
+        // vraie disparition : on ne remplace surtout pas le plan par un board vide.
+        const filigrane = derniereEcritureRef.current
+        if (filigrane.json && Date.now() - filigrane.at < LATENCE_RAW_MS) return
+        setBoard((current) => { const next = current || emptyBoard(); boardRef.current = next; return next })
+        setLoading(false)
+        return
+      }
+      // FILIGRANE : tant que la relecture ne rend pas exactement ce qu'on vient d'écrire, elle est en
+      // retard sur nous — l'adopter reviendrait à défaire l'enregistrement qui vient de réussir.
+      const filigrane = derniereEcritureRef.current
+      if (filigrane.json && Date.now() - filigrane.at < LATENCE_RAW_MS) {
+        if (JSON.stringify(fresh) !== filigrane.json) { setLoading(false); return }
+        derniereEcritureRef.current = { at: 0, json: null }   // le CDN nous a rattrapés
+      }
+      setBoard((current) => {
+        if (!shouldAdoptPlan(current, fresh)) return current
+        writeCachedPlan(path, fresh)
+        boardRef.current = fresh
+        return fresh
+      })
+      setLoading(false)
+    }
+    const stop = () => {
+      if (timer !== null) { clearInterval(timer); timer = null }
+      if (retryTimer !== null) { clearTimeout(retryTimer); retryTimer = null }
+    }
+    const start = () => {
+      refresh()
+      if (timer === null) timer = setInterval(refresh, PLAN_REFRESH_MS)
+    }
+    const onVisibility = () => { if (document.visibilityState === 'visible') start(); else stop() }
+    if (document.visibilityState === 'visible') start()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => { live = false; stop(); document.removeEventListener('visibilitychange', onVisibility) }
+  }, [path])
+
+  const cells = useMemo(() => buildMonthGrid(cursor.year, cursor.month), [cursor])
+  const score = useMemo(() => planScore(board?.tasks), [board])
+  const tasksByDate = useMemo(() => {
+    const map = new Map()
+    for (const task of (board?.tasks || [])) { if (!map.has(task.date)) map.set(task.date, []); map.get(task.date).push(task) }
+    // TRI PAR HEURE DE DÉBUT. Sans lui, les tâches d'un jour se rangeaient dans l'ordre de création :
+    // on posait une tâche à 19 h, elle s'affichait au-dessus de celle de 9 h, et l'heure choisie ne se
+    // voyait donc nulle part. Le symptôme se lisait « l'horaire n'est pas sauvegardé » alors qu'il
+    // l'était depuis le début ; il n'était ni affiché ni ordonnant. Les tâches sans heure ferment la
+    // journée : une tâche sans horaire n'a pas de place particulière, elle n'en a aucune.
+    for (const list of map.values()) {
+      list.sort((a, b) => (a.startTime || '99:99').localeCompare(b.startTime || '99:99'))
+    }
+    return map
+  }, [board])
+  // La pile Missed deadlines REPART À NEUF chaque mois (retour Matthieu 2026-07-20) : seules les
+  // échéances manquées du MOIS CALENDAIRE COURANT s'accumulent ici -- celles des mois précédents
+  // restent orange dans leurs cellules, mais ne hantent plus la boîte de réception indéfiniment.
+  const monthStartIso = `${today.slice(0, 7)}-01`
+  const overdueTasks = useMemo(() => (board?.tasks || []).filter((task) => statusOf(task, today).key === 'late' && task.date >= monthStartIso), [board, today, monthStartIso])
+
+  // Garde de séquence (2026-07-20, la moitié serveur du bug "l'écriture se désagrège") : le résultat
+  // d'un save GitHub (1-2 s de round-trip) ne ré-écrase le board QUE s'il est encore le plus récent --
+  // sinon un res.data périmé annulait les modifications faites pendant le vol (frappes, coche, rescue).
+  // JAMAIS D'ÉCHEC D'ÉCRITURE AVALÉ EN SILENCE (2026-08-12, correctif de PERTE DE TÂCHES).
+  //
+  // La version précédente n'examinait que `res.ok === true` et ne faisait rien du cas contraire. Une
+  // sauvegarde ratée (conflit épuisé, réseau, GitHub en erreur) laissait donc la tâche à l'écran,
+  // grâce à l'affichage optimiste et au cache local — puis le rafraîchissement périodique relisait le
+  // drive, n'y trouvait pas la tâche, et l'effaçait pour de bon. Matthieu voyait sa carte disparaître
+  // sans avoir jamais vu la moindre erreur : c'est le bug « les cartes ne sont pas sauvegardées ».
+  //
+  // Trois garanties désormais. On REJOUE la mutation sur échec, avec un court palier croissant, et
+  // comme `saveJsonWithRetry` réapplique toujours la mutation sur l'état FRAIS du drive, une reprise
+  // ne peut pas écraser le travail arrivé entre-temps. On BLOQUE l'adoption du distant tant qu'une
+  // écriture n'est pas confirmée (`pendingWritesRef`), donc le poller ne peut plus rien effacer. Et
+  // si tout échoue, on le DIT, avec le titre en clair — un échec visible vaut mieux qu'une perte
+  // silencieuse, et le cache local garde la tâche en attendant.
+  const persist = (mutateFn, libelle = null) => {
+    const mutatePlan = (cur) => mutateFn(cur && cur.type === 'plan' ? cur : emptyBoard())
+    setBoard((prev) => {
+      const next = mutatePlan(prev)
+      writeCachedPlan(path, next)
+      boardRef.current = next
+      return next
+    })
+    // Resolve only after the drive confirms the save; existing callers may ignore it. (19 October 2026, 00:49 Paris)
+    let finish
+    const completion = new Promise((resolve) => { finish = resolve })
+    const seq = ++saveSeqRef.current
+    pendingWritesRef.current += 1
+    const tenter = (restantes) => {
+      saveJsonWithRetry(path, mutatePlan).then((res) => {
+        if (res.ok) {
+          pendingWritesRef.current -= 1
+          // On note CE qu'on vient d'écrire et QUAND : le poller s'en sert pour reconnaître une
+          // relecture en retard et refuser de l'adopter (cf. LATENCE_RAW_MS).
+          derniereEcritureRef.current = { at: Date.now(), json: JSON.stringify(res.data) }
+          // La garde de séquence reste : le résultat d'une écriture dépassée par une plus récente ne
+          // doit pas repeindre l'écran avec un état antérieur.
+          if (seq === saveSeqRef.current) {
+            writeCachedPlan(path, res.data)
+            boardRef.current = res.data
+            setBoard(res.data)
+          }
+          finish(res)
+          return
+        }
+        if (restantes > 0) { setTimeout(() => tenter(restantes - 1), 1500 * (4 - restantes)); return }
+        pendingWritesRef.current -= 1
+        finish({ ok: false, error: res.error || 'save-failed' })
+        notify({
+          kind: 'error', label: 'Plan', title: 'Tâche non enregistrée',
+          body: `${libelle ? `« ${libelle} » : ` : ''}le drive n'a pas accepté l'écriture (${String(res.error || 'échec')}). Elle reste affichée ici, réessaie ou recharge la page.`,
+          ttl: 12000,
+        })
+      }).catch((err) => {
+        if (restantes > 0) { setTimeout(() => tenter(restantes - 1), 1500 * (4 - restantes)); return }
+        pendingWritesRef.current -= 1
+        finish({ ok: false, error: String(err?.message || err) })
+        notify({ kind: 'error', label: 'Plan', title: 'Tâche non enregistrée', body: String(err?.message || err), ttl: 12000 })
+      })
+    }
+    tenter(3)
+    return completion
+  }
+  const updateTask = (taskId, patch) => persist((cur) => ({ ...cur, tasks: cur.tasks.map((tk) => (tk.id === taskId ? { ...tk, ...patch } : tk)) }))
+
+  // ── Bloc de détail Lego Fusion 2x2 -- chorégraphie et timings EXACTS de la référence ──────────────
+  const performClose = async () => {
+    if (!renderedIdRef.current) return
+    setContentVisible(false)
+    await motionWait(Math.round(PLAN_UI.motion.panel * .26))
+    setShellVisible(false)
+    await motionWait(Math.round(PLAN_UI.motion.panel * .5))
+    setRenderedId(null)
+    setPanelGeometry(null)
+    setAbsorbedIsos([])
+    renderedTaskRef.current = null
+    await motionWait(Math.round(PLAN_UI.motion.panel * .24))
+  }
+  const performOpen = async ({ taskId, cellIndex, totalCells, cellsSnapshot }) => {
+    const task = (board?.tasks || []).find((tk) => tk.id === taskId)
+    if (!task) return
+    selectIso(task.date)
+    const placement = computePlacement(cellIndex, totalCells)
+    setAbsorbedIsos(absorbedIsosFor(cellsSnapshot, placement))
+    await motionWait(Math.round(PLAN_UI.motion.panel * .34))
+    renderedTaskRef.current = task
+    setPanelGeometry(placement)
+    setRenderedId(taskId)
+    await new Promise((resolve) => requestAnimationFrame(resolve))
+    setShellVisible(true)
+    await motionWait(Math.round(PLAN_UI.motion.panel * .2))
+    setContentVisible(true)
+    await motionWait(Math.round(PLAN_UI.motion.panel * .46))
+    titleInputRef.current?.focus({ preventScroll: true })
+  }
+  const runMotion = async () => {
+    if (motionRunningRef.current) return
+    motionRunningRef.current = true
+    try {
+      while (requestedRef.current !== undefined) {
+        const target = requestedRef.current
+        requestedRef.current = undefined
+        if (renderedIdRef.current) await performClose()
+        if (target) await performOpen(target)
+      }
+    } finally {
+      motionRunningRef.current = false
+    }
+  }
+  const requestPanel = (target) => {
+    requestedRef.current = (target && renderedIdRef.current === target.taskId) ? null : target
+    runMotion()
+  }
+  const openTaskAt = (task, cellIndex) => requestPanel({ taskId: task.id, cellIndex, totalCells: cells.length, cellsSnapshot: cells })
+  const closePanel = () => requestPanel(null)
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape' && renderedIdRef.current) closePanel() }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Lookup vivant d'abord (édition en direct), instantané en secours (fermeture après suppression).
+  const panelTask = (board && renderedId ? board.tasks.find((tk) => tk.id === renderedId) : null) || (renderedId ? renderedTaskRef.current : null)
+
+  // ── Navigation jour par jour (v14 remplace le mois-par-mois de v11) ───────────────────────────────
+  const selectDay = (cell) => { selectIso(cell.iso); closePanel() }
+  const stepDay = (delta) => {
+    const next = addDays(selectedIso, delta)
+    selectIso(next)
+    const d = parseIso(next)
+    if (d.getFullYear() !== cursor.year || d.getMonth() !== cursor.month) setCursor({ year: d.getFullYear(), month: d.getMonth() })
+    closePanel()
+  }
+  const goToday = () => {
+    selectIso(today)
+    const d = new Date()
+    setCursor({ year: d.getFullYear(), month: d.getMonth() })
+    closePanel()
+  }
+
+  // ── RETOUR AU JOUR COURANT (2026-08-22, demande Matthieu : « exactement comme sur ChatGPT ») ──────
+  //
+  // Sur un mois chargé, la case d'aujourd'hui sort de l'écran et rien ne dit dans QUEL sens elle est
+  // partie. Le bouton n'apparaît donc que lorsqu'elle est réellement hors de vue, et sa flèche pointe
+  // vers elle : vers le bas si on a défilé au-dessus d'elle, vers le haut si on est passé dessous.
+  // Une flèche qui pointerait toujours dans le même sens serait un demi-mensonge la moitié du temps.
+  //
+  // `IntersectionObserver` plutôt qu'un écouteur de `scroll` : le navigateur fait le calcul lui-même,
+  // hors du fil principal, au lieu de lire une position à chaque image pendant qu'on fait défiler une
+  // grille déjà lourde. `threshold: 0.35` — la case compte comme visible dès qu'un bon tiers se voit,
+  // sinon le bouton clignoterait en apparaissant pour une bande de trois pixels.
+  // ── UN SEUL ÉCOUTEUR POUR DEUX QUESTIONS (2026-08-22) ───────────────────────────────────────────
+  //
+  // Deux besoins, une même mesure : « la barre est-elle collée ? » (elle prend alors son verre, sinon
+  // elle garde l'ancien design transparent, demande de Matthieu) et « la case du jour est-elle hors de
+  // vue, et de quel côté ? » (le bouton de retour apparaît, flèche vers elle).
+  //
+  // ÉCRIT AVEC UN ÉCOUTEUR DE DÉFILEMENT PLUTÔT QU'UN INTERSECTIONOBSERVER, et ce n'est pas le choix
+  // que j'avais fait d'abord. L'observateur est plus élégant sur le papier, mais Chrome NE DÉLIVRE PAS
+  // ses rappels dans un onglet dont `document.visibilityState` vaut « hidden » : impossible de vérifier
+  // le comportement autrement qu'à l'œil, sur la foi du raisonnement. Une mesure directe se contrôle,
+  // elle, à tout moment et depuis n'importe quel contexte — et un correctif invérifiable n'en est pas un.
+  // Le coût est borné : deux lectures de rectangle, au plus une par image, et seulement pendant qu'on
+  // fait défiler (`requestAnimationFrame` sert de garde, `passive` laisse le défilement natif intact).
+  // LES BORNES HORIZONTALES DU PANNEAU (2026-08-27, retour de Matthieu : « la flèche doit être centrée
+  // par rapport au composant ZenRayPlan, pas par rapport au site »). Le bouton est en `position: fixed`,
+  // donc son repère naturel est la FENÊTRE : centré ainsi, il tombait au milieu de l'écran, c'est-à-dire
+  // décalé vers la gauche de la moitié de la barre latérale. Rien ne le disait, sinon l'œil.
+  //
+  // ON MESURE LE PANNEAU PLUTÔT QUE DE SOUSTRAIRE UNE LARGEUR DE BARRE. La barre se replie, passe en
+  // survol sur écran étroit, disparaît en mode immersif ; une soustraction serait juste dans une
+  // configuration et fausse dans les trois autres. Le panneau, lui, sait toujours où il commence.
+  const stageRef = useRef(null)
+  // Day focus (23 October 2026): double click a day, or open the Plan, to lift it into a centered widget. / mode Focus.
+  const focusRef = useRef(null)
+  const [bornesStage, setBornesStage] = useState(null)
+  // ANCRE DE LA BARRE D'ACTIONS. Le popover ouvert par le bouton « New goal » vivait DANS le flux de
+  // `.zrp-actions` ; il est desormais porté vers `<body>` comme celui du clic droit, donc il lui faut
+  // ses coordonnées absolues plutôt qu'un `top`/`right` relatifs à un parent qu'il a quitté.
+  const [ancreActions, setAncreActions] = useState(null)
+  const sentinelRef = useRef(null)
+  const todayCellRef = useRef(null)
+  const [toolbarColle, setToolbarColle] = useState(false)
+  const [todayHorsVue, setTodayHorsVue] = useState(null) // null = visible ; 'bas' | 'haut' = direction
+  // LA DERNIÈRE DIRECTION CONNUE, ET ELLE EST NÉCESSAIRE. Le bouton reste monté en permanence pour
+  // pouvoir s'effacer et pivoter en douceur ; sans mémoire, il reprendrait sa direction par défaut
+  // pendant qu'il disparaît, et l'on verrait la flèche se retourner au moment même où elle s'en va.
+  const [derniereDirection, setDerniereDirection] = useState('bas')
+  useEffect(() => { if (todayHorsVue) setDerniereDirection(todayHorsVue) }, [todayHorsVue])
+  useEffect(() => {
+    if (loading) return undefined
+    const sentinelle = sentinelRef.current
+    if (!sentinelle) return undefined
+    // Le conteneur défilant appartient à l'app, pas au Plan : on le retrouve plutôt que de le supposer,
+    // pour que ce code survive à un changement de mise en page au-dessus de lui.
+    let scroller = sentinelle.parentElement
+    while (scroller && getComputedStyle(scroller).overflowY !== 'auto' && scroller !== document.body) scroller = scroller.parentElement
+    if (!scroller) return undefined
+
+    const mesurer = () => {
+      // Les bornes se relèvent EN PREMIER, avant tout retour anticipé : le bouton doit être bien placé
+      // même les mois où la case du jour n'existe pas dans la grille.
+      const st = stageRef.current
+      if (st) {
+        const r = st.getBoundingClientRect()
+        // `left` et `right` plutôt qu'un centre et un `translateX(-50%)` : avec `margin-inline: auto`,
+        // ces deux bornes suffisent à centrer, et `transform` reste libre pour l'entrée, le survol et
+        // l'enfoncement, qui en ont tous besoin. Trois usages d'une même propriété s'écrasent.
+        setBornesStage({ gauche: Math.round(r.left), droite: Math.round(window.innerWidth - r.right) })
+      }
+      // COLLÉE : la sentinelle occupe la place NATURELLE de la barre. Dès qu'elle passe au-dessus du
+      // point d'ancrage, la barre a cessé de suivre le contenu — c'est la définition même du collage.
+      const s = sentinelle.getBoundingClientRect()
+      setToolbarColle(s.top <= ANCRAGE_BARRE)
+      // JOUR COURANT : visible dès qu'un tiers de la case se voit, sinon le bouton clignoterait pour
+      // une bande de quelques pixels. La flèche pointe vers là où la case se trouve réellement.
+      const cel = todayCellRef.current
+      if (!cel) { setTodayHorsVue(null); return }
+      const c = cel.getBoundingClientRect()
+      const hauteurVue = window.innerHeight
+      const visible = Math.min(c.bottom, hauteurVue) - Math.max(c.top, 0)
+      if (visible >= Math.min(c.height, hauteurVue) * 0.35) setTodayHorsVue(null)
+      else setTodayHorsVue(c.top < 0 ? 'haut' : 'bas')
+    }
+    // PAS DE `requestAnimationFrame` ICI, et c'est délibéré : il est SUSPENDU dans un onglet masqué,
+    // ce qui rendait le comportement invérifiable autrement qu'à l'œil sur un onglet actif. Le navigateur
+    // fusionne déjà les événements de défilement à un par image ; deux lectures de rectangle par
+    // événement coûtent moins que la machinerie qu'on ajouterait pour les espacer.
+    mesurer()   // état initial, sans attendre un premier défilement
+    scroller.addEventListener('scroll', mesurer, { passive: true })
+    window.addEventListener('resize', mesurer)
+    // Replier la barre latérale change la largeur du panneau SANS redimensionner la fenêtre : sans cet
+    // observateur, la flèche resterait centrée sur l'ancienne largeur jusqu'au prochain défilement.
+    let observateur = null
+    if (stageRef.current && typeof ResizeObserver !== 'undefined') {
+      observateur = new ResizeObserver(mesurer)
+      observateur.observe(stageRef.current)
+    }
+    return () => {
+      scroller.removeEventListener('scroll', mesurer)
+      window.removeEventListener('resize', mesurer)
+      observateur?.disconnect()
+    }
+  }, [loading, today, cursor.year, cursor.month, selectedIso])
+
+  // « L'animation de transition doit être pareille que quand tu appuies sur une lettre dans le drive
+  // Create » (Matthieu, 2026-08-27). Elle l'est désormais au sens strict : c'est LE MÊME CODE, sorti
+  // dans `lib/scrollAnime.js`, EaseOutExpo exact sur 300 ms.
+  //
+  // `scrollIntoView({ behavior: 'smooth' })` faisait le travail en une ligne mais ne laissait choisir ni
+  // la durée ni la courbe : le navigateur imposait la sienne, variable d'un navigateur à l'autre et
+  // dépendante de la distance. Deux gestes de la même application cessaient donc de se ressembler sans
+  // que personne l'ait décidé.
+  //
+  // Le rendu attend une image avant de mesurer : `goToday` peut changer de mois, et mesurer la case
+  // avant qu'elle soit à sa place viserait l'endroit qu'elle occupait juste avant.
+  const refScrollRaf = useRef(0)
+  useEffect(() => () => { if (refScrollRaf.current) cancelAnimationFrame(refScrollRaf.current) }, [])
+  useLayoutEffect(() => {
+    const maj = () => {
+      const el = composerActionsRef.current
+      if (!el) return
+      const r = el.getBoundingClientRect()
+      setAncreActions({ top: Math.round(r.bottom + 10), right: Math.round(window.innerWidth - r.right) })
+    }
+    maj()
+    window.addEventListener('resize', maj)
+    // `true` : la capture attrape le défilement de N'IMPORTE quel conteneur, et la barre d'actions vit
+    // dans un en-tête collant qui bouge avec la page.
+    window.addEventListener('scroll', maj, true)
+    return () => { window.removeEventListener('resize', maj); window.removeEventListener('scroll', maj, true) }
+  }, [])
+
+  const revenirAAujourdhui = () => {
+    goToday()
+    requestAnimationFrame(() => {
+      const cel = todayCellRef.current
+      const scroller = trouverScroller(cel)
+      if (!cel || !scroller) return
+      scrollAnimeVers(scroller, cibleCentree(scroller, cel), refScrollRaf)
+    })
+  }
+
+  // Piste mobile : scrolle jusqu'au jour sélectionné dès qu'il change (Today/‹ ›/tap sur une tâche
+  // d'un autre jour) -- no-op si l'utilisateur est déjà dessus (le swipe qui a POSÉ ce selectedIso).
+  useEffect(() => {
+    if (!isNarrow) { mobileReadyRef.current = false; return }
+    if (loading) return
+    const el = mobileStripRef.current
+    if (!el || !el.clientWidth) return
+    const index = cells.findIndex((c) => c.iso === selectedIso)
+    if (index < 0) return
+    const target = index * el.clientWidth
+    const behavior = reducedMotion() || !mobileReadyRef.current ? 'auto' : 'smooth'
+    if (Math.abs(el.scrollLeft - target) > 4) el.scrollTo({ left: target, behavior })
+    mobileReadyRef.current = true
+  }, [selectedIso, cells, isNarrow, loading])
+  const onStripScroll = () => {
+    const el = mobileStripRef.current
+    if (!el || !el.clientWidth) return
+    window.clearTimeout(stripSettleRef.current)
+    stripSettleRef.current = window.setTimeout(() => {
+      const index = Math.round(el.scrollLeft / el.clientWidth)
+      const cell = cells[index]
+      if (!cell || cell.iso === selectedIso) return
+      selectIso(cell.iso)
+      const d = parseIso(cell.iso)
+      if (d.getFullYear() !== cursor.year || d.getMonth() !== cursor.month) setCursor({ year: d.getFullYear(), month: d.getMonth() })
+      closePanel()
+    }, 120)
+  }
+
+  // ── Cycle de vie d'une tâche ───────────────────────────────────────────────────────────────────────
+  const toggleDone = (task) => {
+    persist((cur) => ({ ...cur, tasks: cur.tasks.map((tk) => {
+      if (tk.id !== task.id) return tk
+      const isDone = tk.status === 'done' || tk.status === 'late-complete'
+      if (isDone) return { ...tk, status: 'planned', doneAt: null } // décoche : redevient "en retard" si sa date est déjà passée
+      const nowLate = tk.date < today
+      return { ...tk, status: nowLate ? 'late-complete' : 'done', doneAt: new Date().toISOString(), overdueSince: nowLate ? (tk.overdueSince || tk.date) : tk.overdueSince }
+    }) }))
+  }
+  // ABANDONNER / REPRENDRE (2026-08-07). Bascule pure, réversible, qui ne supprime RIEN : la tâche
+  // garde son titre, sa note, ses images et sa date, elle cesse simplement de compter comme à faire.
+  // On mémorise `droppedAt` pour l'historique, et on efface `doneAt` — une tâche abandonnée n'a pas
+  // été terminée, mélanger les deux fausserait tout décompte ultérieur.
+  const toggleDropped = (task) => {
+    persist((cur) => ({ ...cur, tasks: cur.tasks.map((tk) => {
+      if (tk.id !== task.id) return tk
+      if (tk.status === 'dropped') return { ...tk, status: 'planned', droppedAt: null }
+      return { ...tk, status: 'dropped', droppedAt: new Date().toISOString(), doneAt: null }
+    }) }))
+  }
+  const rescueToday = (task) => {
+    persist((cur) => ({ ...cur, tasks: cur.tasks.map((tk) => (tk.id === task.id ? { ...tk, overdueSince: tk.overdueSince || tk.date, date: today } : tk)) }))
+  }
+  // Suppression (demande explicite 2026-07-20, absente de la référence-prototype) : la fermeture animée
+  // part D'ABORD (le bloc continue d'afficher l'instantané renderedTaskRef pendant qu'elle se joue),
+  // la donnée est retirée en parallèle. Récupérable via l'historique Git du .plan.json.
+  const deleteTask = (task) => {
+    if (!canDeleteTask(task)) return // verrou d'engagement 4h (l'UI grise déjà la corbeille)
+    closePanel()
+    persist((cur) => ({ ...cur, tasks: cur.tasks.filter((tk) => tk.id !== task.id) }))
+  }
+  const submitComposer = async () => {
+    if (composerAttachmentBusy || composerSaving) return
+    const title = draft.title.trim()
+    if (!title) return
+    const duration = Math.max(5, Math.min(240, draft.duration))
+    const baseTask = (date, streakId, id) => ({
+      id, title, date, startTime: draft.time || null, durationMin: duration,
+      status: 'planned', note: '', images: [], attachments: draft.attachments || [], overdueSince: null, doneAt: null,
+      createdAt: new Date().toISOString(), ...(streakId ? { streakId, streakEvery: draft.streakEvery } : {}),
+      ...(draft.publish ? { publish: true } : {}),
+      ...(draft.firstMovement ? { firstMovement: true } : {}),
+    })
+    // Streak task (retour Matthieu 2026-07-20) : une occurrence tous les N jours, de la date de départ
+    // jusqu'à la date d'arrêt incluse (plafond de sécurité STREAK_MAX_OCCURRENCES). Chaque occurrence
+    // est une tâche à part entière (cochable/manquable indépendamment), reliée par streakId.
+    setComposerSaving(true)
+    setComposerError('')
+    let result
+    if (draft.streak && draft.streakEnd && draft.streakEnd >= draft.date) {
+      const streakId = uid()
+      const occurrences = []
+      let iso = draft.date
+      while (iso <= draft.streakEnd && occurrences.length < STREAK_MAX_OCCURRENCES) {
+        occurrences.push(baseTask(iso, streakId, occurrences.length ? uid() : draft.id))
+        iso = addDays(iso, Math.max(1, draft.streakEvery))
+      }
+      result = await persist((cur) => ({ ...cur, tasks: [...cur.tasks.filter((task) => !occurrences.some((item) => item.id === task.id)), ...occurrences] }), title)
+    } else {
+      const task = baseTask(draft.date, null, draft.id)
+      result = await persist((cur) => ({ ...cur, tasks: [...cur.tasks.filter((item) => item.id !== task.id), task] }), title)
+    }
+    setComposerSaving(false)
+    if (result?.ok) setComposerOpen(false)
+    else setComposerError(result?.error || 'Task could not be saved. Your attachments are kept here.')
+  }
+  const openComposer = () => {
+    if (composerAttachmentBusy || composerSaving) return
+    setComposerError('')
+    setMenuOpen(false)
+    setComposerPicker(null)
+    setComposerAnchor(null)
+    setComposerPos(null)
+    setComposerOpen((v) => {
+      const next = !v
+      if (next) setDraft(newPlanDraft(selectedIso, board?.tasks || []))
+      return next
+    })
+  }
+  // Ouverture par clic droit sur une case du mois : même composer, même `draft` par défaut, mais la
+  // date part de la case cliquée (pas de `selectedIso`) et le popover s'ancre au point du clic plutôt
+  // qu'au bouton +. `x`/`y` viennent de `e.clientX/clientY`, donc déjà en coordonnées écran -- le
+  // rendu se fait via portail (voir plus bas), qui échappe à la grille et à ses transitions.
+  const openComposerAt = (iso, x, y) => {
+    if (composerAttachmentBusy || composerSaving) return
+    setComposerError('')
+    setMenuOpen(false)
+    setComposerPicker(null)
+    setComposerPos(null)
+    setComposerAnchor({ x, y })
+    setDraft(newPlanDraft(iso, board?.tasks || []))
+    setComposerOpen(true)
+  }
+  // Fermeture au clic ailleurs dans le popover (le composer lui-même se ferme déjà au clic à
+  // l'extérieur -- ce listener local ne gère QUE les 3 mini-widgets date/heure, plus précis).
+  useEffect(() => {
+    if (!composerPicker) return undefined
+    const close = () => setComposerPicker(null)
+    window.addEventListener('pointerdown', close)
+    return () => window.removeEventListener('pointerdown', close)
+  }, [composerPicker])
+  // CLAMPAGE APRÈS MESURE RÉELLE (pas une largeur/hauteur devinée) : le popover ancré au clic droit
+  // peut s'ouvrir près d'un bord de fenêtre ; on mesure sa vraie taille une fois monté et on recale
+  // seulement si elle déborde. Réévalué quand son contenu change de hauteur (streak, durée custom),
+  // sans quoi ouvrir "Streak" près du bas du grid pousserait le bloc de fréquence hors écran.
+  useLayoutEffect(() => {
+    if (!composerOpen || !composerAnchor || !composerRef.current) return
+    const pad = 12
+    const r = composerRef.current.getBoundingClientRect()
+    let left = composerAnchor.x
+    let top = composerAnchor.y
+    if (left + r.width + pad > window.innerWidth) left = window.innerWidth - r.width - pad
+    if (top + r.height + pad > window.innerHeight) top = window.innerHeight - r.height - pad
+    left = Math.max(pad, left)
+    top = Math.max(pad, top)
+    setComposerPos({ left, top })
+  }, [composerOpen, composerAnchor, draft.streak, draft.customOpen, draft.attachments?.length])
+  // Fermeture au clic EN DEHORS du composer (demande du 2026-08-11) -- "dehors" exclut le popover
+  // lui-même (`composerRef`, le même nœud que le popover soit ancré au bouton +, soit porté par clic
+  // droit) ET le cluster de boutons +/... (`composerActionsRef`) : sans cette exclusion, cliquer sur
+  // + pour refermer le popover le fermerait ici (pointerdown, avant le `click` du bouton) puis le
+  // `openComposer` du bouton le rouvrirait aussitôt (toggle lu sur l'état déjà fermé) -- un clic sur
+  // + aurait semblé ne plus rien faire.
+  useEffect(() => {
+    if (!composerOpen) return undefined
+    const onDown = (e) => {
+      const dansPopover = composerRef.current && composerRef.current.contains(e.target)
+      const dansActions = composerActionsRef.current && composerActionsRef.current.contains(e.target)
+      if (!dansPopover && !dansActions && !composerAttachmentBusy && !composerSaving) setComposerOpen(false)
+    }
+    window.addEventListener('pointerdown', onDown)
+    return () => window.removeEventListener('pointerdown', onDown)
+  }, [composerOpen, composerAttachmentBusy, composerSaving])
+
+  if (loading) return <div className={`zrp-shell${t.textPrimary === PALETTE.textPrimaryDark ? '' : ' zrp-light'}`} style={PLAN_CSS_VARIABLES}><div className="zrp-loading">Loading plan…</div></div>
+
+  const dark = t.textPrimary === PALETTE.textPrimaryDark
+  // ── LE PORTAIL, POUR TOUS LES POPOVERS ET SANS EXCEPTION (2026-08-27) ─────────────────────────
+  //
+  // « Je veux l'esthétique de ZenRayPlan, tout simplement, ça va juste au premier plan » (Matthieu).
+  // C'était la bonne réponse, et j'avais pris la mauvaise : devant un popover devenu transparent, j'ai
+  // conclu qu'il fallait renoncer au verre et fabriquer des gris opaques, alors qu'il suffisait de le
+  // sortir de là où le verre ne pouvait pas marcher.
+  //
+  // POURQUOI LE PORTAIL RÉSOUT LA COULEUR, ce qui n'a rien d'évident. `.zrp-stage` porte un
+  // `backdrop-filter`, ce qui en fait une RACINE DE FOND : le `backdrop-filter` d'un descendant n'y a
+  // plus rien à flouter, et un verre translucide y devient une simple vitre. Le popover ouvert par le
+  // bouton rendait DANS ce sous-arbre, celui du clic droit était déjà porté vers `<body>` : le même
+  // composant avait donc deux apparences selon la façon de l'ouvrir. Porté, il retrouve la fenêtre
+  // pour fond, le flou reprend son travail, et la recette commune du Plan rend enfin ce qu'elle rend
+  // partout ailleurs.
+  //
+  // Le sous-arbre `.zrp-shell` est reconstitué autour de lui, classe de thème ET variables : sans cela
+  // il perdrait `--zrp-rim` et compagnie, posées en style en ligne sur la coque, et retomberait sur ses
+  // valeurs par défaut (bug déjà remonté le 2026-08-11, « trop sombre, pas le même fond »).
+  const porterPopover = (contenu, style, refNoeud) => {
+    // IL NE PEUT PLUS DÉBORDER PAR LE BAS. Mesuré à l'instant du portage : le popover s'arrêtait 66
+    // pixels SOUS le bord de la fenêtre, et les boutons Add et Cancel se retrouvaient hors de l'écran,
+    // donc hors d'atteinte. Le défaut est ancien mais devient inévitable en `position: fixed`, où plus
+    // rien ne pousse le contenu : un popover ouvert bas dans la page n'a aucune raison de tenir.
+    // Un plafond de hauteur vaut mieux qu'un repositionnement, parce qu'il est vrai QUEL QUE SOIT le
+    // contenu : la mesure se fait dans le style, avant tout rendu, et non après coup.
+    const marge = 16
+    const haut = typeof style?.top === 'number' ? style.top : null
+    const plafond = haut == null ? null : { maxHeight: Math.max(180, window.innerHeight - haut - marge), overflowY: 'auto' }
+    return createPortal(
+      // `zr-dark` EST OBLIGATOIRE ICI, et c'est un défaut que le portage vient de rendre visible. Les
+      // jetons sombres `--g9-*` sont déclarés sous `.zr-dark`, une classe posée par l'application sur un
+      // conteneur INTERNE ; porté vers `<body>`, le popover passe à côté et résout les jetons CLAIRS,
+      // donc un verre blanc au milieu d'une application sombre. Le sous-arbre ne se reconstitue pas à
+      // moitié : il lui faut la classe du Plan, celle du thème, ET les variables en ligne.
+      <div className={`${dark ? 'zr-dark ' : ''}zrp-shell${dark ? '' : ' zrp-light'}`}
+        style={{ ...PLAN_CSS_VARIABLES, position: 'fixed', inset: 0, padding: 0, pointerEvents: 'none' }}>
+        <div className="zrp-popover" ref={refNoeud} style={{ position: 'fixed', pointerEvents: 'auto', ...plafond, ...style }}>
+          {contenu}
+        </div>
+      </div>,
+      document.body,
+    )
+  }
+
+  const selectedDayLabel = planDayLabel(selectedIso, today)
+
+  return (
+    <div className={`zrp-shell${dark ? '' : ' zrp-light'}`} style={PLAN_CSS_VARIABLES}>
+      <div className="zrp-stage" ref={stageRef}>
+        <div ref={sentinelRef} className="zrp-toolbar-sentinel" aria-hidden="true" />
+        <div className={`zrp-toolbar${toolbarColle ? ' zrp-stuck' : ''}`}>
+          <div className="zrp-brand-cluster">
+            <div className="zrp-score-capsule" aria-label={`Plan score ${score}`}>
+              <span className="zrp-score-icon" style={{ color: UI.yellow }}><AnimatedDollar value={score} /></span>
+              <span className="zrp-score-value"><AnimatedScore value={score} /></span>
+            </div>
+            <div className="zrp-brand">ZenRay Plan</div>
+          </div>
+          <div className="zrp-nav">
+            <button type="button" className="zrp-btn zrp-icon" aria-label="Previous day" onClick={() => stepDay(-1)}><Icon name="chevron.left" size={15} /></button>
+            <div className="zrp-date-capsule" data-direction={dateDirection}>
+              <button type="button" className="zrp-today-btn" onClick={goToday} title={selectedIso === today ? 'Today' : 'Back to Today'} aria-label={selectedIso === today ? 'Today' : 'Back to Today'}>
+                <span key={`day-${selectedIso}`} className="zrp-date-motion">{selectedDayLabel}</span>
+              </button>
+              <span className="zrp-selected-date"><span key={`date-${selectedIso}`} className="zrp-date-motion">{fmtFullDate(selectedIso)}</span></span>
+            </div>
+            <button type="button" className="zrp-btn zrp-icon" aria-label="Next day" onClick={() => stepDay(1)}><Icon name="chevron.right" size={15} /></button>
+          </div>
+          <div className="zrp-actions" ref={composerActionsRef} style={{ position: 'relative' }}>
+            <button type="button" className="zrp-btn zrp-primary zrp-new" title="New goal" aria-label="New goal" disabled={composerAttachmentBusy || composerSaving} onClick={openComposer}><Icon name="plus" size={18} weight={1.9} /></button>
+            <button type="button" className="zrp-btn zrp-icon" title="Options" disabled={composerAttachmentBusy || composerSaving} onClick={() => { setComposerOpen(false); setMenuOpen((v) => !v) }}><Icon name="ellipsis" size={17} /></button>
+            {composerOpen && (() => {
+              // Corps identique que le popover s'ouvre au bouton + (position CSS par défaut, dans le
+              // flux de `.zrp-actions`) ou par clic droit sur une case (portail vers <body>, position
+              // FIXED clampée à l'écran -- un portail évite tout piège d'empilement/`overflow` entre
+              // ici et la case cliquée, ailleurs dans la grille du mois).
+              const corps = (
+                <React.Fragment>
+                <header className="zrp-composer-head"><span>Enter to add</span></header>
+                <label className="zrp-field-label" htmlFor="zrp-title-input">Outcome</label>
+                <input id="zrp-title-input" ref={champTitreRef} className="zrp-input" placeholder="Plan…" autoFocus autoComplete="off" value={draft.title}
+                  onChange={(e) => setDraft((d) => ({ ...d, title: e.target.value }))}
+                  onKeyDown={(e) => { if (e.key === 'Enter') submitComposer(); if (e.key === 'Escape' && !composerAttachmentBusy && !composerSaving) setComposerOpen(false) }} />
+                <PlanAttachments task={draft} draftMode onBusyChange={setComposerAttachmentBusy}
+                  onPatch={(patch) => { setDraft((current) => ({ ...current, ...patch })); return { ok: true } }} />
+                <div className="zrp-schedule-row">
+                  <div className="zrp-field zrp-date-field" style={{ position: 'relative' }}><span>Date</span>
+                    {/* Widget maison (retour Matthieu 2026-07-20 : "je ne veux pas taper la date... un
+                        tableau/widget avec le bon liseré", le calendrier natif du navigateur est jugé
+                        "moche") -- plus d'<input type="date"> ni de showPicker(), un bouton texte ouvre
+                        MiniCalendar en popover, même recette glass/rim que le reste du Plan. */}
+                    <button type="button" className="zrp-field-value" onClick={(e) => { e.stopPropagation(); setComposerPicker((v) => v === 'date' ? null : 'date') }}>{fmtFullDate(draft.date)}</button>
+                    <button type="button" className="zrp-picker zrp-date-picker" aria-label="Select date" title="Select date" onClick={(e) => { e.stopPropagation(); setComposerPicker((v) => v === 'date' ? null : 'date') }}><Icon name="calendar" size={15} /></button>
+                    {composerPicker === 'date' && (
+                      <div className="zrp-field-popover" onClick={(e) => e.stopPropagation()}>
+                        <MiniCalendar value={draft.date} onSelect={(iso) => { setDraft((d) => ({ ...d, date: iso, time: nextAvailableSlot(board?.tasks || [], iso, d.duration || DUREE_DEFAUT), streakEnd: d.streakEnd && d.streakEnd < iso ? '' : d.streakEnd })); setComposerPicker(null) }} />
+                      </div>
+                    )}
+                  </div>
+                  <div className="zrp-field zrp-time-field" style={{ position: 'relative' }}><span>Start</span>
+                    <button type="button" className="zrp-field-value" onClick={(e) => { e.stopPropagation(); setComposerPicker((v) => v === 'start' ? null : 'start') }}>{fmt12(draft.time)}</button>
+                    <button type="button" className="zrp-picker zrp-time-picker" aria-label="Select custom start time" title="Select custom time" onClick={(e) => { e.stopPropagation(); setComposerPicker((v) => v === 'start' ? null : 'start') }}><Icon name="clock" size={15} /></button>
+                    <button type="button" className="zrp-now-btn" title="Start now" aria-label="Use current time" onClick={() => { const n = new Date(); setDraft((d) => ({ ...d, time: `${pad2(n.getHours())}:${pad2(n.getMinutes())}` })) }}><Icon name="clock.arrow.2.circlepath" size={16} /></button>
+                    {composerPicker === 'start' && (
+                      <div className="zrp-field-popover" onClick={(e) => e.stopPropagation()}>
+                        <PlanTimePicker
+                          value={draft.time}
+                          tasks={board?.tasks || []}
+                          dateIso={draft.date}
+                          durationMin={draft.duration || DUREE_DEFAUT}
+                          onSelect={(time) => setDraft((d) => ({ ...d, time }))}
+                          onClose={() => setComposerPicker(null)}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="zrp-duration-block">
+                  <div className="zrp-duration-head"><span>Time block</span><small>{draft.duration} min</small></div>
+                  <div className="zrp-duration-anneau">
+                    <AnneauDuree minutes={draft.duration}
+                      onChoisir={(m) => setDraft((d) => ({ ...d, duration: m, customOpen: false, title: majTitreHabitude(d.title, d.habit, m) }))} />
+                    <button type="button" className={`zrp-duration zrp-custom${draft.customOpen ? ' zrp-active' : ''}`} aria-label="Durée personnalisée" title="Durée personnalisée"
+                      onClick={() => setDraft((d) => ({ ...d, customOpen: true, duration: d.customMinutes, title: majTitreHabitude(d.title, d.habit, d.customMinutes) }))}>+</button>
+                  </div>
+                  {draft.customOpen && (
+                    <label className="zrp-custom-duration"><span>Custom</span>
+                      <input type="number" min={5} max={DUREE_MAX} step={5} value={draft.customMinutes}
+                        onChange={(e) => { const v = Math.max(5, Math.min(DUREE_MAX, Number(e.target.value) || 5)); setDraft((d) => ({ ...d, customMinutes: v, duration: v })) }} /><small>min</small>
+                    </label>
+                  )}
+                </div>
+                {/* UN SEUL BLOC D'OPTIONS, PAS TROIS SECTIONS EMPILÉES (refonte 2026-08-01, demande de
+                    Matthieu). Streak, Publication et First movement sont trois interrupteurs de même
+                    nature : ils qualifient la tâche sans rien exiger d'autre. Leur donner chacun un
+                    titre et une ligne allongeait le popover à chaque ajout, et la quatrième option
+                    aurait rendu le formulaire plus haut que l'écran. Une rangée de ronds les tient
+                    tous, et les réglages propres à l'un n'apparaissent QUE lorsqu'il est actif —
+                    ici la fréquence et la date de fin du streak.
+                    First movement reprend le vert vif de `src/config/colors.js` : c'est le premier
+                    geste posé dans la journée, celui qui décide du reste. */}
+                <div className="zrp-duration-block">
+                  <div className="zrp-duration-head"><span>Options</span><small>{[draft.streak && 'streak', draft.publish && 'publication', draft.firstMovement && 'first movement'].filter(Boolean).join(' · ') || 'off'}</small></div>
+                  <div className="zrp-duration-presets" role="group" aria-label="Options">
+                    <button type="button" className={`zrp-duration${draft.streak ? ' zrp-active' : ''}`} title="Streak task" aria-label="Toggle streak"
+                      onClick={() => setDraft((d) => ({ ...d, streak: !d.streak, streakEnd: d.streak ? d.streakEnd : (d.streakEnd || addDays(d.date, 30)) }))}><Icon name="chart.line.uptrend" size={15} /></button>
+                    <button type="button" className={`zrp-duration zrp-publish-toggle${draft.publish ? ' zrp-publish-on' : ''}`} title="Publication goal" aria-label="Toggle publication"
+                      onClick={() => setDraft((d) => ({ ...d, publish: !d.publish }))}>✦</button>
+                    <button type="button" className={`zrp-duration zrp-first-toggle${draft.firstMovement ? ' zrp-first-on' : ''}`} title="First movement" aria-label="Toggle first movement"
+                      style={draft.firstMovement ? { background: UI.green, color: '#0b1a0c' } : { color: UI.green }}
+                      onClick={() => setDraft((d) => ({ ...d, firstMovement: !d.firstMovement }))}><Icon name="figure.run" size={15} /></button>
+                  </div>
+                  {/* LES RÉGLAGES DU STREAK ONT LEUR PROPRE RANGÉE (2026-08-01). Empilés dans celle des
+                      interrupteurs, les quatre intervalles devenaient quatre ronds de plus au milieu de
+                      trois ronds qui, eux, basculent : plus rien ne distinguait ce qui active de ce qui
+                      règle, et la fonction paraissait cassée alors qu'elle marchait.
+                      La date de fin est PRÉ-REMPLIE à trente jours dès qu'on active le streak, parce que
+                      sans elle `submitComposer` retombait dans la branche normale et créait UNE tâche en
+                      silence : on croyait avoir posé une série, on avait posé une tâche isolée. */}
+                  {draft.streak && (
+                    <div className="zrp-duration-presets zrp-streak-row" role="group" aria-label="Repeat every">
+                      <span className="zrp-streak-label">Repeat every</span>
+                      {STREAK_PRESETS.map(({ days, label }) => (
+                        <button key={days} type="button" className={`zrp-duration${draft.streakEvery === days ? ' zrp-active' : ''}`}
+                          onClick={() => setDraft((d) => ({ ...d, streakEvery: days }))}>{label}</button>
+                      ))}
+                    </div>
+                  )}
+                  {draft.streak && (
+                    <div className="zrp-custom-duration" style={{ position: 'relative', cursor: 'pointer' }} onClick={(e) => { e.stopPropagation(); setComposerPicker((v) => v === 'end' ? null : 'end') }}>
+                      <span>Ends</span>
+                      <span className="zrp-field-value zrp-field-value-inline">{draft.streakEnd ? fmtFullDate(draft.streakEnd) : 'Pick a date'}</span>
+                      {composerPicker === 'end' && (
+                        <div className="zrp-field-popover" onClick={(e) => e.stopPropagation()}>
+                          <MiniCalendar value={draft.streakEnd || draft.date} min={draft.date} onSelect={(iso) => { setDraft((d) => ({ ...d, streakEnd: iso })); setComposerPicker(null) }} />
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+                {/* HABITUDES — sous les options, comme demandé. Le bouton prépare le titre et rend la main
+                    au clavier : il ne crée rien tout seul, puisque ce qui manque n'est jamais l'habitude
+                    mais ce qu'on y fait ce jour-là. Le curseur se pose en bout de ligne pour qu'on écrive
+                    la suite sans un geste de plus. */}
+                <div className="zrp-habits">
+                  <div className="zrp-duration-head"><span>Habits</span><small>{DUREE_DEFAUT} min par défaut</small></div>
+                  <div className="zrp-habits-row" role="group" aria-label="Habitudes">
+                    {HABITUDES.map((h) => (
+                      <button key={h} type="button" className={`zrp-habit${draft.habit === h ? ' zrp-active' : ''}`}
+                        onClick={() => {
+                          setDraft((d) => ({ ...d, habit: h, duration: DUREE_DEFAUT, customOpen: false, title: prefixeHabitude(h, DUREE_DEFAUT) }))
+                          // Le focus est DEMANDÉ, il n'est pas posé ici : viser le champ maintenant le
+                          // trouverait encore vide, React n'ayant pas rendu la nouvelle valeur. Un compteur
+                          // déclenche un effet, qui s'exécute lui APRÈS le rendu, toujours et partout —
+                          // `requestAnimationFrame` avait l'air équivalent mais il est suspendu dès que
+                          // l'onglet passe en arrière-plan, et le curseur restait alors au début.
+                          setFocusTitre((n) => n + 1)
+                        }}>{h}</button>
+                    ))}
+                  </div>
+                </div>
+                <div className="zrp-popover-row">
+                  <button type="button" className="zrp-btn zrp-primary zrp-add" disabled={composerAttachmentBusy || composerSaving} onClick={submitComposer}>{composerSaving ? 'Saving…' : 'Add'}</button>
+                  <button type="button" className="zrp-btn zrp-cancel" disabled={composerAttachmentBusy || composerSaving} onClick={() => setComposerOpen(false)}>Cancel</button>
+                  {composerError && <div role="alert">{composerError}</div>}
+                </div>
+                </React.Fragment>
+              )
+              if (composerAnchor) {
+                const pos = composerPos || { left: composerAnchor.x, top: composerAnchor.y }
+                // Le PORTAIL sort le popover du sous-arbre `.zrp-shell` : la sélection CSS
+                // `.zrp-shell.zrp-light .zrp-popover` (fond clair) ne matchait donc plus, et les
+                // variables `--zrp-rim`/`--zrp-shadow-a/-b` posées en style inline sur `.zrp-shell`
+                // n'étaient plus héritées -- le popover retombait sur son gris sombre par défaut
+                // quel que soit le thème réel de la page (bug remonté le 2026-08-11 : "trop sombre,
+                // pas le même fond"). On reconstitue ici exactement le même contexte -- classe de
+                // thème ET variables -- autour du popover porté, sans reprendre la mise en page de
+                // `.zrp-shell` (fixed/inset 0/sans padding, transparent, pointer-events désactivés
+                // sauf sur le popover lui-même).
+                return porterPopover(corps, { top: pos.top, left: pos.left, right: 'auto', transformOrigin: 'top left' }, composerRef)
+              }
+              // Ouvert par le bouton : porté lui aussi, ancré sous la barre d'actions et aligné à droite.
+              return porterPopover(corps, { top: ancreActions?.top ?? 96, right: ancreActions?.right ?? 26, transformOrigin: 'top right' }, composerRef)
+            })()}
+            {menuOpen && porterPopover(
+              <>
+                <button type="button" className={`zrp-menu-item${showCompleted ? ' zrp-on' : ''}`} onClick={() => setShowCompleted((v) => !v)}>Show completed<span className="zrp-switch" /></button>
+                <button type="button" className={`zrp-menu-item${hideWeekends ? ' zrp-on' : ''}`} onClick={() => setHideWeekends((v) => !v)}>Hide weekends<span className="zrp-switch" /></button>
+              </>,
+              { width: 250, top: ancreActions?.top ?? 96, right: ancreActions?.right ?? 26, transformOrigin: 'top right' },
+            )}
+          </div>
+        </div>
+
+        {!isNarrow && (
+        <div className="zrp-calendar">
+          <div className="zrp-weekdays">{WEEKDAYS.map((w) => <span key={w}>{w}</span>)}</div>
+          <div className="zrp-grid">
+            {cells.map((cell, index) => {
+              const col = (index % 7) + 1
+              const row = Math.floor(index / 7) + 1
+              const isWeekend = col === 6 || col === 7
+              const tasks = (tasksByDate.get(cell.iso) || []).filter((task) => showCompleted || !['done', 'late-complete', 'dropped'].includes(statusOf(task, today).key))
+              return (
+                // div role="button" (pas <button>) : chaque tâche est elle-même un VRAI <button> à
+                // l'intérieur -- un bouton ne peut pas en contenir un autre (HTML invalide).
+                <div key={cell.iso} role="button" tabIndex={0} data-iso={cell.iso}
+                  ref={cell.iso === today ? todayCellRef : undefined}
+                  className={`zrp-day${cell.outside ? ' zrp-outside' : ''}${cell.iso === today ? ' zrp-today' : ''}${cell.iso === selectedIso ? ' zrp-selected' : ''}${absorbedIsos.includes(cell.iso) ? ' zrp-absorbed' : ''}`}
+                  style={{ gridColumn: col, gridRow: row, opacity: hideWeekends && isWeekend ? 0.12 : undefined, pointerEvents: hideWeekends && isWeekend ? 'none' : undefined }}
+                  onClick={() => selectDay(cell)} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectDay(cell) } }}
+                  onContextMenu={(e) => { e.preventDefault(); openComposerAt(cell.iso, e.clientX, e.clientY) }}
+                  title={fmtFullDate(cell.iso)}>
+                  <span className="zrp-day-num">{cell.day}</span>
+                  <span className="zrp-day-tasks">
+                    {tasks.map((task) => <TaskTile key={task.id} task={task} today={today}
+                      onOpen={() => openTaskAt(task, index)} onToggleDone={toggleDone} />)}
+                  </span>
+                </div>
+              )
+            })}
+            {panelGeometry && panelTask && (
+              <section className={`zrp-detail${shellVisible ? ' zrp-visible' : ''}`}
+                style={{ gridColumn: `${panelGeometry.startCol} / span 2`, gridRow: `${panelGeometry.startRow} / span 2` }}
+                onClick={(e) => e.stopPropagation()}>
+                <div className={`zrp-detail-content${contentVisible ? ' zrp-visible' : ''}`}>
+                  {/* key={id} : buffer d'édition NEUF à chaque tâche ouverte ; l'unmount (fermeture,
+                      Escape, bascule vers une autre tâche) committe les frappes en attente. */}
+                  <DetailEditor key={panelTask.id} task={panelTask} today={today} allTasks={board?.tasks || []} titleInputRef={titleInputRef}
+                    onCommit={(patch) => updateTask(panelTask.id, patch)}
+                    onPatch={(patch) => updateTask(panelTask.id, patch)}
+                    onDelete={() => deleteTask(panelTask)} onToggleDropped={() => toggleDropped(panelTask)} onClose={closePanel} />
+                </div>
+              </section>
+            )}
+          </div>
+        </div>
+        )}
+
+        {/* Piste mobile "un jour = un slot plein écran" (<680px, voir PlanBoard.css) : même `cells`,
+            mêmes TaskTile/DetailEditor que la grille desktop -- seule la mise en page change (pas de
+            fusion 2x2 grille, le détail s'ouvre simplement en flux sous les tâches du jour).
+            Montée SEULEMENT sous 680 px : voir le commentaire de `isNarrow`, deux instances de
+            DetailEditor se battaient pour le même titre. */}
+        {isNarrow && (
+        <div className="zrp-mobile-days" ref={mobileStripRef} onScroll={onStripScroll}>
+          {cells.map((cell, index) => {
+            const tasks = (tasksByDate.get(cell.iso) || []).filter((task) => showCompleted || !['done', 'late-complete', 'dropped'].includes(statusOf(task, today).key))
+            const isOpenHere = panelTask && renderedId && cell.iso === panelTask.date
+            return (
+              <div key={cell.iso} className="zrp-mobile-day">
+                <header className="zrp-mobile-day-head">
+                  <span className="zrp-mobile-day-weekday">{WEEKDAYS[index % 7]}</span>
+                  <span className="zrp-mobile-day-date">{fmtFullDate(cell.iso)}</span>
+                  {cell.iso === today && <span className="zrp-mobile-today-badge">Today</span>}
+                </header>
+                <div className="zrp-mobile-day-tasks">
+                  {tasks.length
+                    ? tasks.map((task) => <TaskTile key={task.id} task={task} today={today}
+                        onOpen={() => openTaskAt(task, index)} onToggleDone={toggleDone} />)
+                    : <div className="zrp-mobile-day-empty">No goals planned.</div>}
+                </div>
+                {isOpenHere && (
+                  <section className={`zrp-detail zrp-mobile-detail${shellVisible ? ' zrp-visible' : ''}`} onClick={(e) => e.stopPropagation()}>
+                    <div className={`zrp-detail-content${contentVisible ? ' zrp-visible' : ''}`}>
+                      <DetailEditor key={panelTask.id} task={panelTask} today={today} allTasks={board?.tasks || []} titleInputRef={titleInputRef}
+                        onCommit={(patch) => updateTask(panelTask.id, patch)}
+                        onPatch={(patch) => updateTask(panelTask.id, patch)}
+                        onDelete={() => deleteTask(panelTask)} onToggleDropped={() => toggleDropped(panelTask)} onClose={closePanel} />
+                    </div>
+                  </section>
+                )}
+              </div>
+            )
+          })}
+        </div>
+        )}
+
+        {/* Zone Overdue -- boîte de réception des échéances manquées, repliable (demande explicite du
+            cahier des charges, absente telle quelle du fichier de référence). */}
+        <section className="zrp-overdue-dock" aria-label="Missed deadlines">
+          <button type="button" className="zrp-overdue-head" onClick={() => setOverdueOpen((v) => !v)}>
+            <span className="zrp-overdue-head-copy"><strong>Missed deadlines</strong><small>Unfinished goals accumulate here · resets each month</small></span>
+            <span className="zrp-overdue-count">{overdueTasks.length}</span>
+          </button>
+          {overdueOpen && (overdueTasks.length ? (
+            <div className="zrp-overdue-list">
+              {overdueTasks.map((task) => (
+                <article key={task.id} className="zrp-overdue-row">
+                  <span className="zrp-overdue-icon">!</span>
+                  <span className="zrp-overdue-copy"><strong>{task.title}</strong><small>Missed {fmtShortDate(task.date)} · {fmtDuration(task.durationMin || 0)}</small></span>
+                  <button type="button" className="zrp-btn zrp-rescue" onClick={() => rescueToday(task)}>Today</button>
+                </article>
+              ))}
+            </div>
+          ) : <div className="zrp-overdue-empty">Nothing overdue.</div>)}
+        </section>
+
+        {/* LÉGENDE (2026-08-01). Six teintes portent du sens dans cette vue et rien ne le disait :
+            il fallait ouvrir le CSS pour savoir qu'un violet vaut « terminé en retard ». La liste est
+            dérivée des variables réelles, jamais recopiée, donc elle ne peut pas mentir sur ce que
+            l'écran affiche — c'est le même raisonnement que la source unique des couleurs. */}
+        <section className="zrp-legend-dock" aria-label="Légende des couleurs">
+          <button type="button" className="zrp-legend-head" onClick={() => setLegendOpen((v) => !v)} aria-expanded={legendOpen}>
+            <Icon name="triangle.fill" size={9} style={{ transform: legendOpen ? 'rotate(90deg)' : 'none', transition: 'transform .16s ease' }} />
+            Legend
+          </button>
+          {legendOpen && (
+            <div className="zrp-legend">
+              {[
+                ['var(--g9-glass-a)', 'Planifiée'],
+                ['var(--zrp-green)', 'Terminée à temps'],
+                ['var(--zrp-violet)', 'Terminée en retard'],
+                ['var(--zrp-orange)', 'En retard'],
+                ['var(--zrp-pink)', 'Publication'],
+                ['var(--zrp-red)', 'Publication dépassée'],
+                [UI.green, 'First movement'],
+              ].map(([couleur, sens]) => (
+                <span key={sens} className="zrp-legend-item">
+                  <i className="zrp-legend-dot" style={{ background: couleur }} />{sens}
+                </span>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
+      {/* RETOUR AU JOUR COURANT — flottant, comme le bouton « descendre » de ChatGPT. Posé au niveau du
+          SHELL et non du stage : il doit rester à sa place à l'écran pendant que la grille défile, or
+          `.zrp-stage` porte un `backdrop-filter`, ce qui en fait un bloc conteneur pour tout `position:
+          fixed` descendant — un bouton fixe posé dedans se serait ancré au cadre au lieu de la fenêtre.
+          Il ne s'affiche QUE lorsque la case du jour est hors de vue : un bouton qui propose d'aller là
+          où l'on est déjà n'est que du bruit. */}
+      {/* IL RESTE MONTÉ EN PERMANENCE, et c'est ce qui rend l'orientation lisible. En le démontant dès
+          que la case du jour revenait en vue, la flèche ne pivotait jamais : elle disparaissait dans un
+          sens et reparaissait déjà tournée dans l'autre, si bien qu'on ne voyait pas un objet s'orienter
+          mais deux objets se succéder. Monté, il s'efface, pivote, revient, et l'on suit la même flèche.
+          Caché, il cesse d'être cliquable ET sort du parcours au clavier : un bouton invisible qui
+          répondrait encore à la tabulation est un piège pour qui ne voit pas l'écran. */}
+      {/* Day focus (23 October 2026): the real tiles in a centered widget; a click beside plays the motion backwards. */}
+      <PlanDayFocus ref={focusRef} rootRef={stageRef} path={path} dark={dark} enabled={!loading && !isNarrow} playOnOpen={PLAN_UI.focus.onOpen}
+        renderTasks={(iso, closeThen) => {
+          const index = cells.findIndex((c) => c.iso === iso)
+          const tasks = (tasksByDate.get(iso) || []).filter((task) => showCompleted || !['done', 'late-complete', 'dropped'].includes(statusOf(task, today).key))
+          return tasks.length
+            ? tasks.map((task) => <TaskTile key={task.id} task={task} today={today} onOpen={() => closeThen(() => openTaskAt(task, index))} onToggleDone={toggleDone} />)
+            : <div className="zrp-focus-empty">No goals planned.</div>
+        }}
+        onAdd={(iso, cell) => { const r = cell.getBoundingClientRect(); openComposerAt(iso, r.left + r.width / 2, r.top + 40) }} />
+      <button type="button"
+        className={`zrp-back-today${todayHorsVue ? ' zrp-back-visible' : ''}${derniereDirection === 'haut' ? ' zrp-back-haut' : ''}`}
+        style={bornesStage ? { left: bornesStage.gauche, right: bornesStage.droite } : undefined}
+        onClick={revenirAAujourdhui} tabIndex={todayHorsVue ? 0 : -1} aria-hidden={!todayHorsVue}
+        title="Revenir à aujourd'hui" aria-label="Revenir à aujourd'hui">
+        {/* UNE SEULE FLÈCHE QUI TOURNE, jamais deux icônes qui se remplacent : un échange d'icône est un
+            saut, une rotation est un mouvement, et c'est le mouvement qui dit « elle pointe par là ». */}
+        <span className="zrp-back-fleche"><Icon name="arrow.down" size={17} /></span>
+      </button>
+    </div>
+  )
+}

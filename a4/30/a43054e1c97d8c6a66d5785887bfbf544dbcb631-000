@@ -1,0 +1,117 @@
+// streamFiles.js (14 October 2026): the files a STREAMED film can give back, built from its HLS playlists and its manifest only.
+// Policy of 14 October 2026 (streaming only, no encrypted archive): video, each audio language and each subtitle are separate files.
+//   video     = init segment + media segments of the video rendition, concatenated  -> <name>.mp4   (valid fragmented MP4, no ffmpeg)
+//   audio     = same for each audio rendition, named after its language              -> <name> - 日本語.m4a
+//   subtitles = the track kept in the manifest (gzip + base64), in its own format    -> <name> - Français.ass
+// Pure functions, no DOM and no Node API, so the site (download button) and the scripts (round trip proof) share them.
+// FR : politique du 14 October 2026 (streaming seul) : video, chaque audio et chaque sous-titre sont des fichiers separes.
+
+// 14 October 2026: jsDelivr answers 403 ("Package size exceeded the configured limit of 50 MB") or 404 for a segment it has not served
+// yet from a large public repository, sometimes for minutes, while GitHub raw serves the same bytes at once. Same commit, same path.
+// FR : jsDelivr refuse parfois un segment jamais servi ; GitHub raw sert les memes octets (meme commit, meme chemin) tout de suite.
+export function rawFallbackUrl(url) {
+  const m = /^https:\/\/(?:cdn|fastly|gcore|testingcf)\.jsdelivr\.net\/gh\/([^/@]+)\/([^/@]+)@([0-9a-f]{7,40})\/(.+)$/.exec(String(url || ''))
+  return m ? `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}/${m[4]}` : null
+}
+
+const ATTR = /([A-Z0-9-]+)=("([^"]*)"|[^,]*)/g
+
+export function parseAttributes(line) {
+  const out = {}
+  for (const m of String(line).matchAll(ATTR)) out[m[1]] = m[3] !== undefined ? m[3] : m[2]
+  return out
+}
+
+/** Manifest path of a playlist URI written as /api/hls?path=<encoded> (or already a plain path). */
+export function playlistPathOf(uri) {
+  const text = String(uri || '')
+  const match = /[?&]path=([^&]+)/.exec(text)
+  return match ? decodeURIComponent(match[1]) : text
+}
+
+export function parseMaster(text) {
+  const audios = []
+  const videos = []
+  const lines = String(text).split(/\r?\n/)
+  lines.forEach((line, i) => {
+    if (line.startsWith('#EXT-X-MEDIA:')) {
+      const a = parseAttributes(line.slice('#EXT-X-MEDIA:'.length))
+      if (a.TYPE === 'AUDIO' && a.URI) audios.push({ name: a.NAME || a.LANGUAGE || `audio ${audios.length + 1}`, lang: a.LANGUAGE || '', uri: playlistPathOf(a.URI), default: a.DEFAULT === 'YES' })
+    } else if (line.startsWith('#EXT-X-STREAM-INF:')) {
+      const a = parseAttributes(line.slice('#EXT-X-STREAM-INF:'.length))
+      const uri = (lines[i + 1] || '').trim()
+      if (uri && !uri.startsWith('#')) videos.push({ uri: playlistPathOf(uri), bandwidth: Number(a.BANDWIDTH) || 0, resolution: a.RESOLUTION || '' })
+    }
+  })
+  videos.sort((x, y) => y.bandwidth - x.bandwidth)
+  return { audios, videos }
+}
+
+export function parseMedia(text) {
+  const lines = String(text).split(/\r?\n/)
+  const map = lines.find((l) => l.startsWith('#EXT-X-MAP:'))
+  const initUrl = map ? (parseAttributes(map.slice('#EXT-X-MAP:'.length)).URI || '') : ''
+  const segments = lines.filter((l) => l && !l.startsWith('#')).map((l) => l.trim())
+  return { initUrl, segments }
+}
+
+/** A file name that every system accepts: no path separators, no control characters, no trailing dots. */
+export function safeName(text, fallback = 'film') {
+  const cleaned = String(text || '').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().replace(/[. ]+$/, '')
+  return cleaned || fallback
+}
+
+export function baseNameOf(manifest, fallback = 'film') {
+  return safeName(String(manifest?.name || fallback).replace(/\.[A-Za-z0-9]{2,4}$/, ''), fallback)
+}
+
+const SUB_EXT = { ass: 'ass', ssa: 'ssa', srt: 'srt', vtt: 'vtt', subrip: 'srt', webvtt: 'vtt' }
+export const subtitleExtension = (format) => SUB_EXT[String(format || '').toLowerCase()] || 'srt'
+
+/**
+ * Plan of the files. `media` maps a playlist path (as written in the master) to its text.
+ * Returns { files: [{ kind, name, mime, urls | subtitle, lang, label, default }], problems: [] }.
+ * Never throws on a missing audio playlist: it is reported in `problems` so the caller can tell the user which language is absent.
+ */
+export function planStreamFiles({ manifest, masterText, media }) {
+  const base = baseNameOf(manifest)
+  const master = parseMaster(masterText)
+  const files = []
+  const problems = []
+  const video = master.videos[0]
+  if (!video) problems.push('no video rendition in the master playlist')
+  else if (!media[video.uri]) problems.push(`video playlist missing: ${video.uri}`)
+  else {
+    const m = parseMedia(media[video.uri])
+    files.push({ kind: 'video', name: `${base}.mp4`, mime: 'video/mp4', urls: [m.initUrl, ...m.segments].filter(Boolean), label: video.resolution || 'Vidéo' })
+  }
+  const used = new Map()
+  for (const audio of master.audios) {
+    if (!media[audio.uri]) { problems.push(`audio playlist missing: ${audio.name}`); continue }
+    const m = parseMedia(media[audio.uri])
+    const count = (used.get(audio.name) || 0) + 1
+    used.set(audio.name, count)
+    const label = count > 1 ? `${audio.name} ${count}` : audio.name
+    files.push({ kind: 'audio', name: `${base} - ${safeName(label)}.m4a`, mime: 'audio/mp4', urls: [m.initUrl, ...m.segments].filter(Boolean), lang: audio.lang, label, default: audio.default })
+  }
+  const subs = Array.isArray(manifest?.subtitles) ? manifest.subtitles : []
+  subs.forEach((s, i) => {
+    const label = s.label || s.lang || `sous-titres ${i + 1}`
+    files.push({ kind: 'subtitle', name: `${base} - ${safeName(label)}.${subtitleExtension(s.format)}`, mime: 'text/plain;charset=utf-8', subtitle: s, lang: s.lang || '', label })
+  })
+  return { files, problems }
+}
+
+/** gzip + base64 subtitle payload -> text. Works with DecompressionStream (browsers) or zlib (Node). */
+export async function decodeSubtitle(sub) {
+  const raw = String(sub?.data || '')
+  if (!raw) return ''
+  if (sub.encoding && !/gzip/i.test(sub.encoding)) return sub.encoding === 'base64' ? atob(raw) : raw
+  const binary = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0))
+  if (typeof DecompressionStream === 'function') {
+    const source = new ReadableStream({ start(controller) { controller.enqueue(binary); controller.close() } })
+    return new Response(source.pipeThrough(new DecompressionStream('gzip'))).text()
+  }
+  const { gunzipSync } = await import('node:zlib')
+  return gunzipSync(Buffer.from(binary)).toString('utf8')
+}

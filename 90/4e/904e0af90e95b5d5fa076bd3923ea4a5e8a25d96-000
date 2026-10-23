@@ -1,0 +1,81 @@
+// 16 October 2026: pure parts of the application loop (host routing, offer selection, timing summary, "sent" recording).
+import { describe, expect, it } from 'vitest'
+import { applySent, buildQueue, routeOf, selectOffers, summarise } from './ApplyLoop.mjs'
+import { verdictOf } from './ApplyRun.mjs'
+
+const hosts = { form: ['jobs.lever.co', 'jobs.smartrecruiters.com'], hop: ['gamesjobsindex.com'], login: ['jobs.ea.com'] }
+const studio = (id, name, url, score = 80, extra = {}) => ({ id, name, role: `Technical Artist ${id}`, status: 'to_contact', messages: [], history: [], link: url, createdAt: '2026-10-01', engine: { applyUrl: url, score, language: 'en', kind: 'offer', countryCode: 'FR', ...extra } })
+const today = '2026-10-16'
+
+describe('routeOf', () => {
+  it('classifies by host, subdomains included', () => {
+    expect(routeOf('https://jobs.lever.co/x/1/apply', hosts)).toBe('form')
+    expect(routeOf('https://gamesjobsindex.com/jobs/a.html', hosts)).toBe('hop')
+    expect(routeOf('https://jobs.ea.com/en_US/x', hosts)).toBe('login')
+    expect(routeOf('https://unknown.example/apply', hosts)).toBe('unknown')
+    expect(routeOf('not a url', hosts)).toBe('unknown')
+  })
+})
+
+describe('selectOffers and buildQueue', () => {
+  const store = { studios: [studio('job_a', 'Alpha', 'https://gamesjobsindex.com/a'), studio('job_b', 'Beta', 'https://jobs.lever.co/b/1/apply', 70), studio('job_c', 'Gamma', 'https://jobs.smartrecruiters.com/g/1', 60)] }
+  it('keeps the best N by score', () => {
+    const { picked } = selectOffers({ store, size: 2, today, minScore: 40, hosts })
+    expect(picked.map((s) => s.id)).toEqual(['job_a', 'job_b'])
+  })
+  it('forms-only skips aggregator and login links but still returns the best N forms', () => {
+    const { picked } = selectOffers({ store, size: 5, today, minScore: 40, hosts, formsOnly: true })
+    expect(picked.map((s) => s.id)).toEqual(['job_b', 'job_c'])
+  })
+  it('carries the exact letter, the profile and the route into the queue', () => {
+    const letters = { job_b: { v: 1, studioId: 'job_b', versions: [{ at: '2026-10-15', text: 'Exact letter text', by: 'engine' }] } }
+    const { items } = buildQueue({ store, letters, profile: { email: 'a@b.c' }, size: 2, today, minScore: 40, hosts })
+    const b = items.find((i) => i.id === 'job_b')
+    expect(b.letter).toBe('Exact letter text'); expect(b.route).toBe('form'); expect(b.profile.email).toBe('a@b.c')
+    expect(items.find((i) => i.id === 'job_a').letter).toBe('')
+  })
+})
+
+describe('summarise', () => {
+  const at = (s) => `2026-10-16T10:00:${String(s).padStart(2, '0')}.000Z`
+  it('times open to ready, counts blocked, projects the remaining', () => {
+    const out = summarise([
+      { at: at(0), id: 'a', phase: 'open', note: '' }, { at: at(10), id: 'a', phase: 'ready', note: 'ok' },
+      { at: at(0), id: 'b', phase: 'open', note: '' }, { at: at(30), id: 'b', phase: 'ready', note: 'ok' },
+      { at: at(0), id: 'c', phase: 'open', note: '' }, { at: at(5), id: 'c', phase: 'blocked', note: '403' },
+    ], 60)
+    expect(out.ready).toBe(2); expect(out.blocked).toBe(1); expect(out.averageSeconds).toBe(20)
+    expect(out.projectionMinutes).toBe(20)
+  })
+  it('an unfinished offer has no duration', () => {
+    expect(summarise([{ at: at(0), id: 'a', phase: 'open', note: '' }]).offers[0]).toMatchObject({ state: 'unfinished', seconds: null })
+  })
+})
+
+describe('applySent', () => {
+  const item = { id: 'job_b', applyUrl: 'https://jobs.lever.co/b/1/apply', letter: 'Exact letter text' }
+  it('moves to_contact to contacted and keeps the exact letter in a dated message', () => {
+    const store = { studios: [studio('job_b', 'Beta', item.applyUrl)] }
+    const next = applySent(store, item, today).studios[0]
+    expect(next.status).toBe('contacted'); expect(next.messages).toHaveLength(1)
+    expect(next.messages[0].text).toContain('Exact letter text'); expect(next.messages[0].at).toBe(today)
+  })
+  it('refuses an unknown studio and an empty letter', () => {
+    expect(() => applySent({ studios: [] }, item, today)).toThrow(/No studio/)
+    expect(() => applySent({ studios: [studio('job_b', 'Beta', item.applyUrl)] }, { ...item, letter: '' }, today)).toThrow(/No letter/)
+  })
+})
+
+describe('verdictOf', () => {
+  const report = { fields: 9, filled: ['email', 'letter'], filledCount: 2, needsYou: [], filesToAttach: ['resume: x'] }
+  it('walls are blocked, never worked around', () => {
+    expect(verdictOf(report, { status: 403 }).phase).toBe('blocked')
+    expect(verdictOf(report, { botWall: true }).note).toMatch(/bot wall/)
+    expect(verdictOf(report, { passwordField: true }).note).toMatch(/login wall/)
+    expect(verdictOf({ ...report, fields: 0 }, {}).phase).toBe('blocked')
+  })
+  it('a filled form is ready and says what is left for Matthieu', () => {
+    const out = verdictOf({ ...report, needsYou: ['Visa?'] }, { cvAttached: true })
+    expect(out.phase).toBe('ready'); expect(out.note).toContain('letter in'); expect(out.note).toContain('CV attached'); expect(out.note).toContain('1 for you')
+  })
+})

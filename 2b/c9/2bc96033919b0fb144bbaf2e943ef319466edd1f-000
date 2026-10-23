@@ -1,0 +1,111 @@
+// @vitest-environment node
+import { readFileSync } from 'node:fs'
+import nodePath from 'node:path'
+import { describe, expect, it } from 'vitest'
+import decodeWebp, { init as initDec } from '@jsquash/webp/decode.js'
+import encodeWebp, { init as initWebpEnc } from '@jsquash/webp/encode.js'
+import encodeJpeg, { init as initJpegEnc } from '@jsquash/jpeg/encode.js'
+import decodeJpeg, { init as initJpegDec } from '@jsquash/jpeg/decode.js'
+import { pickCandidates, coverTile, composeCover, COVER_SIDE, COVER_GUTTER, COVER_BACKGROUND } from './shareMosaic.js'
+import { buildDynamicCover, renderTile } from './share-cover.js'
+
+const wasm = (p) => WebAssembly.compile(readFileSync(nodePath.resolve(process.cwd(), 'node_modules', p)))
+const solid = (w, h, [r, g, b]) => { const data = new Uint8ClampedArray(w * h * 4); for (let i = 0; i < data.length; i += 4) { data[i] = r; data[i + 1] = g; data[i + 2] = b; data[i + 3] = 255 } return { data, width: w, height: h } }
+const px = (img, x, y) => { const i = (y * img.width + x) * 4; return [img.data[i], img.data[i + 1], img.data[i + 2]] }
+const near = (a, b, tol = 12) => a.every((v, i) => Math.abs(v - b[i]) <= tol)
+
+describe('pickCandidates : quelles images représentent la galerie', () => {
+  const noms = Array.from({ length: 100 }, (_, i) => `IMG_${String(i).padStart(3, '0')}`)
+  it('mode spread : quatre images réparties sur toute la liste, déterministes', () => {
+    const a = pickCandidates(noms, 4, 'spread'), b = pickCandidates(noms, 4, 'spread')
+    expect(a).toEqual(b); expect(a).toHaveLength(4)
+    expect(a[0]).toBe('IMG_012'); expect(a[3]).toBe('IMG_087')
+    expect(new Set(a).size).toBe(4)
+  })
+  it('mode first, et listes plus courtes que demandé', () => {
+    expect(pickCandidates(noms, 4, 'first')).toEqual(noms.slice(0, 4))
+    expect(pickCandidates(['a', 'b'], 4)).toEqual(['a', 'b'])
+  })
+})
+
+describe('coverTile : recadrage « cover » sans déformation', () => {
+  it('une source unie reste unie, une source large est recadrée au centre', () => {
+    const t = coverTile(solid(300, 100, [200, 40, 40]), 50)
+    expect(t).toHaveLength(50 * 50 * 4); expect([t[0], t[1], t[2]]).toEqual([200, 40, 40])
+    // left third red, right third blue, centre square green: the crop must keep only the green middle
+    const data = new Uint8ClampedArray(300 * 100 * 4)
+    for (let y = 0; y < 100; y++) for (let x = 0; x < 300; x++) { const i = (y * 300 + x) * 4; const c = x < 100 ? [255, 0, 0] : x < 200 ? [0, 255, 0] : [0, 0, 255]; data.set([...c, 255], i) }
+    const m = coverTile({ data, width: 300, height: 100 }, 40)
+    expect([m[0], m[1], m[2]]).toEqual([0, 255, 0])
+  })
+})
+
+describe('composeCover : la mosaïque 2x2, ou une seule image', () => {
+  const capture = () => { const box = {}; box.encode = async (img) => { box.img = img; return new Uint8Array([0xff, 0xd8, 0xff]) }; return box }
+  it('quatre images : quatre cases, un liséré, le fond sombre', async () => {
+    const box = capture()
+    const out = await composeCover([solid(80, 80, [255, 0, 0]), solid(80, 80, [0, 255, 0]), solid(80, 80, [0, 0, 255]), solid(80, 80, [255, 255, 0])], { encode: box.encode })
+    expect(out[0]).toBe(0xff)
+    const img = box.img, c = (COVER_SIDE - COVER_GUTTER) / 2
+    expect(img.width).toBe(COVER_SIDE)
+    expect(near(px(img, 10, 10), [255, 0, 0])).toBe(true)
+    expect(near(px(img, c + COVER_GUTTER + 10, 10), [0, 255, 0])).toBe(true)
+    expect(near(px(img, 10, c + COVER_GUTTER + 10), [0, 0, 255])).toBe(true)
+    expect(near(px(img, COVER_SIDE - 10, COVER_SIDE - 10), [255, 255, 0])).toBe(true)
+    expect(near(px(img, c + 1, 10), COVER_BACKGROUND, 2)).toBe(true) // the gutter
+  })
+  it('une à trois images : la première seule, plein cadre', async () => {
+    const box = capture()
+    await composeCover([solid(80, 80, [10, 200, 10]), solid(80, 80, [255, 0, 0])], { encode: box.encode })
+    expect(near(px(box.img, 3, 3), [10, 200, 10])).toBe(true)
+    expect(near(px(box.img, COVER_SIDE - 3, COVER_SIDE - 3), [10, 200, 10])).toBe(true)
+  })
+  it('rien à montrer : null', async () => { expect(await composeCover([], { encode: async () => new Uint8Array() })).toBeNull() })
+})
+
+describe('de bout en bout avec les VRAIS codecs WebAssembly, galerie de liens chiffrée', () => {
+  it('buildDynamicCover : liste, lien -> registre -> cible, vignette chiffrée -> mosaïque JPEG 600x600', async () => {
+    await Promise.all([
+      initDec(await wasm('@jsquash/webp/codec/dec/webp_dec.wasm')),
+      initWebpEnc(await wasm('@jsquash/webp/codec/enc/webp_enc.wasm')),
+      initJpegEnc(await wasm('@jsquash/jpeg/codec/enc/mozjpeg_enc.wasm')),
+      initJpegDec(await wasm('@jsquash/jpeg/codec/dec/mozjpeg_dec.wasm')),
+    ])
+    const couleurs = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
+    // media key + one encrypted thumbnail per source image
+    const rawKey = crypto.getRandomValues(new Uint8Array(32))
+    const keyB64 = btoa(String.fromCharCode(...rawKey))
+    const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt'])
+    const dir = 'pages/Photos/Galerie'
+    const files = {}
+    const thumbs = {}
+    const tree = []
+    for (let i = 0; i < couleurs.length; i++) {
+      const webp = new Uint8Array(await encodeWebp(solid(64, 64, couleurs[i]), { quality: 90 }))
+      const iv = crypto.getRandomValues(new Uint8Array(12))
+      const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, webp))
+      thumbs[`https://cdn.example/t${i}.webp`] = sealed
+      files[`pages/Photos/Mois/IMG_${i}.JPG.img.json`] = { type: 'image', resourceId: `zr_id${i}`, vis: 'public', thumb: `https://cdn.example/t${i}.webp`, thumbIv: btoa(String.fromCharCode(...iv)) }
+      files[`pages/.zr-resources/zr_id${i}.json`] = { resourceId: `zr_id${i}`, sourcePath: `pages/Photos/Mois/IMG_${i}.JPG.img.json`, placements: [] }
+      files[`${dir}/IMG_${i}.JPG.img.json`] = { v: 1, type: 'zenray-eagle-link/v1', resourceId: `zr_id${i}` }  // the gallery holds LINKS only
+      tree.push({ type: 'blob', path: `IMG_${i}.JPG.img.json` })
+    }
+    const fetchImpl = async (url) => {
+      const u = String(url)
+      if (u.includes('/git/trees/')) return new Response(JSON.stringify({ tree }), { status: 200 })
+      if (thumbs[u]) return new Response(thumbs[u], { status: 200 })
+      const path = decodeURIComponent((u.split('/main/')[1] || u.split('/contents/')[1] || '').split('?')[0])
+      return path in files ? new Response(JSON.stringify(files[path]), { status: 200 }) : new Response('nope', { status: 404 })
+    }
+    const codecs = { decode: decodeWebp, encode: encodeJpeg }
+    const tileFor = (path, size) => renderTile({ token: 'faux', path, size, codecs, fetchImpl, keyB64 }) // what /api/share-cover-tile does
+    const jpeg = await buildDynamicCover({ token: 'faux', dir, codecs, tileFor, fetchImpl })
+    expect(jpeg[0]).toBe(0xff); expect(jpeg[1]).toBe(0xd8)
+    const back = await decodeJpeg(jpeg.buffer.slice(jpeg.byteOffset, jpeg.byteOffset + jpeg.byteLength))
+    expect(back.width).toBe(COVER_SIDE); expect(back.height).toBe(COVER_SIDE)
+    // four distinct tiles, none of them the dark background
+    const tiles = [px(back, 40, 40), px(back, COVER_SIDE - 40, 40), px(back, 40, COVER_SIDE - 40), px(back, COVER_SIDE - 40, COVER_SIDE - 40)]
+    for (const tl of tiles) expect(tl.some((v) => v > 120)).toBe(true)
+    expect(new Set(tiles.map((tl) => tl.join(','))).size).toBe(4)
+  })
+})

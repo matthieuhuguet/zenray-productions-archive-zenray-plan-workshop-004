@@ -1,0 +1,140 @@
+// 3 October 2026, 04:24 CEST: executable fixtures prove success, failure, timeout and nonblocking serialized audits.
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createSceneAuditRunner } from './SceneAuditRunner.mjs'
+
+const evidence = { schemaVersion: 1, sceneSha256: 'a'.repeat(64), references: [], portabilityVerified: false }
+let directory
+beforeEach(async () => { directory = await mkdtemp(path.join(tmpdir(), 'scene-runner-test-')) })
+afterEach(async () => { await rm(directory, { recursive: true, force: true }) })
+const createFixture = async (body, timeoutMs = 2000) => {
+  const auditScriptPath = path.join(directory, 'audit script.mjs')
+  await writeFile(auditScriptPath, body)
+  return createSceneAuditRunner({ hythonPath: process.execPath, auditScriptPath, preparationScriptPath: auditScriptPath, timeoutMs })
+}
+
+describe('headless scene audit runner', () => {
+  it('runs separated arguments and reads actual JSON produced by a child executable', async () => {
+    const scenePath = path.join(directory, 'scene $(touch never-created).hiplc')
+    const run = await createFixture(`import { writeFile } from 'node:fs/promises';
+      if (process.argv[3] !== '--output') process.exit(3);
+      await writeFile(process.argv[4], JSON.stringify(${JSON.stringify(evidence)}));
+      await writeFile(${JSON.stringify(path.join(directory, 'arguments.json'))}, JSON.stringify(process.argv.slice(2)));`)
+    expect(await run(scenePath)).toEqual(evidence)
+    const args = JSON.parse(await readFile(path.join(directory, 'arguments.json'), 'utf8'))
+    expect(args[0]).toBe(scenePath)
+    expect(args[1]).toBe('--output')
+    await expect(readdir(path.dirname(args[2]))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readdir(directory)).not.toContain('never-created')
+  })
+
+  it('reports child stderr and nonzero exit without claiming success', async () => {
+    const run = await createFixture(`console.error('Houdini could not load scene'); process.exit(7);`)
+    await expect(run(path.join(directory, 'scene.hiplc'))).rejects.toThrow('exit 7: Houdini could not load scene')
+  })
+
+  it('terminates a stalled child with a bounded timeout', async () => {
+    const run = await createFixture('setTimeout(() => {}, 10000);', 80)
+    await expect(run(path.join(directory, 'scene.hiplc'))).rejects.toThrow('exceeded 80 ms')
+  })
+
+  it('aborts an active child independently of its timeout', async () => {
+    const controller = new AbortController()
+    const run = await createFixture('setTimeout(() => {}, 10000);', 5000)
+    const job = run(path.join(directory, 'scene.hiplc'), { signal: controller.signal })
+    const timer = setTimeout(() => controller.abort(), 50)
+    try { await expect(job).rejects.toThrow('Scene audit aborted') }
+    finally { clearTimeout(timer) }
+  })
+
+  it('does not launch an already aborted queued request', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const run = await createFixture('process.exit(7);')
+    await expect(run(path.join(directory, 'scene.hiplc'), { signal: controller.signal })).rejects.toThrow('aborted before launch')
+  })
+
+  it('rejects invalid JSON and invalid evidence shapes', async () => {
+    const run = await createFixture(`import { writeFile } from 'node:fs/promises'; await writeFile(process.argv[4], 'not JSON');`)
+    await expect(run(path.join(directory, 'scene.hiplc'))).rejects.toThrow('invalid JSON')
+    const invalid = await createFixture(`import { writeFile } from 'node:fs/promises'; await writeFile(process.argv[4], '{}');`)
+    await expect(invalid(path.join(directory, 'scene.hiplc'))).rejects.toThrow('invalid evidence shape')
+  })
+
+  it('serializes jobs, yields to the event loop and continues after failure', async () => {
+    const outputPaths = [], started = [], finished = []
+    let release
+    const blocked = new Promise((resolve) => { release = resolve })
+    const run = createSceneAuditRunner({ hythonPath: process.execPath, auditScriptPath: 'audit.py', timeoutMs: 2000 }, {
+      execFile: async (_executable, args) => {
+        started.push(args[1]); outputPaths.push(args[3])
+        if (started.length === 1) { await blocked; throw Object.assign(new Error('broken'), { code: 9 }) }
+        await writeFile(args[3], JSON.stringify(evidence)); finished.push(args[1])
+      },
+    })
+    const first = run('/first.hiplc')
+    const firstFailure = expect(first).rejects.toThrow('exit 9')
+    const second = run('/second.hiplc')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(started).toEqual(['/first.hiplc'])
+    release()
+    await firstFailure
+    expect(await second).toEqual(evidence)
+    expect(finished).toEqual(['/second.hiplc'])
+    for (const output of outputPaths) await expect(readdir(path.dirname(output))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('rejects invalid configuration and relative scene paths', async () => {
+    expect(() => createSceneAuditRunner({ hythonPath: process.execPath, auditScriptPath: 'audit.py', timeoutMs: 0 })).toThrow('positive timeout')
+    const run = await createFixture('process.exit(0);')
+    await expect(run('relative.hiplc')).rejects.toThrow('absolute scene path')
+  })
+})
+
+// 3 October 2026, 09:11 CEST: preparation uses private plan files, retains process diagnostics and shares the audit queue.
+describe('isolated scene preparation runner', () => {
+  const report = { schemaVersion: 1, sceneSha256: evidence.sceneSha256, sceneOpened: true, resourceBytesVerified: 0, reboundInputs: [], loadedLibraries: [], warnings: [], savedScene: false, portabilityVerified: false }
+  const plan = { schemaVersion: 1, scenePath: '/copies/Scene.hiplc', sceneSha256: evidence.sceneSha256, resources: [] }
+
+  it('passes a JSON plan as a separate argument, retains stderr and removes both temporary files', async () => {
+    const run = await createFixture(`import { readFile, writeFile } from 'node:fs/promises';
+      const plan = JSON.parse(await readFile(process.argv[2], 'utf8'));
+      if (plan.scenePath !== '/copies/Scene.hiplc') process.exit(9);
+      await writeFile(process.argv[4], JSON.stringify(${JSON.stringify(report)}));
+      await writeFile(${JSON.stringify(path.join(directory, 'paths.json'))}, JSON.stringify(process.argv.slice(2)));
+      console.error('Handle warning retained');`)
+    expect(await run.prepare(plan)).toEqual({ ...report, processDiagnostics: 'Handle warning retained' })
+    const [inputPath, flag, outputPath] = JSON.parse(await readFile(path.join(directory, 'paths.json'), 'utf8'))
+    expect(flag).toBe('--output')
+    expect(path.dirname(inputPath)).toBe(path.dirname(outputPath))
+    await expect(readdir(path.dirname(inputPath))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('refuses saved-scene claims, wrong fingerprints and incomplete resource evidence', async () => {
+    for (const invalid of [{ ...report, savedScene: true }, { ...report, sceneSha256: 'b'.repeat(64) }, { ...report, resourceBytesVerified: 1 }]) {
+      const run = await createFixture(`import { writeFile } from 'node:fs/promises'; await writeFile(process.argv[4], JSON.stringify(${JSON.stringify(invalid)}));`)
+      await expect(run.prepare(plan)).rejects.toThrow('Scene preparation JSON has an invalid evidence shape')
+    }
+  })
+
+  it('queues preparation behind an active audit without launching another child', async () => {
+    let release
+    const gate = new Promise((resolve) => { release = resolve })
+    const started = []
+    const run = createSceneAuditRunner({ hythonPath: process.execPath, auditScriptPath: 'audit.py', preparationScriptPath: 'prepare.py', timeoutMs: 2000 }, {
+      execFile: async (_executable, args) => {
+        started.push(args[0])
+        if (args[0] === 'audit.py') await gate
+        await writeFile(args[3], JSON.stringify(args[0] === 'audit.py' ? evidence : report))
+        return { stderr: '' }
+      },
+    })
+    const audit = run('/copies/Scene.hiplc'), preparation = run.prepare(plan)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(started).toEqual(['audit.py'])
+    release(); await audit; await preparation
+    expect(started).toEqual(['audit.py', 'prepare.py'])
+  })
+})

@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+// PackageMuxedFmp4.mjs (14 October 2026): FMP4-SINGLE experiment, one downloadable MP4 per film, tested end to end.
+//   node scripts/PackageMuxedFmp4.mjs --source <film.mkv> --work-dir <dir> [--push --repo <public repo>] [--verify-download]
+// Steps (each one writes <work-dir>/progress.json, read by the one minute monitor):
+//   1 subtitles   extract every text track, fill the gaps with empty cues
+//   2 mux         ONE fragmented MP4: video and audio copied, subtitles as mov_text (language kept)
+//   3 split       cut at fragment boundaries in parts below the CDN limit
+//   4 verify      join the parts, compare video and audio md5 and subtitle text and timestamps with the SOURCE
+//   5 push        public repository through the push batch policy (openVideoGitShard)
+//   6 download    fetch every part back from jsDelivr, join, compare the whole SHA-256 (the real "re-download")
+// Nothing here touches the manifest clone, the archive repositories or any production file.
+// FR : experience FMP4-SINGLE, un MP4 telechargeable par film, testee de bout en bout. Rien ne touche la production.
+import { spawnSync } from 'node:child_process'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+import {
+  FMP4, probeSource, extractSubtitles, muxSingleFmp4, splitFmp4, joinParts, verifyAgainstSource,
+} from './lib/fmp4-single.mjs'
+import { openVideoGitShard } from './lib/video-git-shard.mjs'
+
+const GH_OWNER = 'matthieuhuguet'
+
+function parseArgs(argv) {
+  const args = {}
+  for (let i = 2; i < argv.length; i += 1) {
+    if (!argv[i].startsWith('--')) continue
+    const key = argv[i].slice(2)
+    const next = argv[i + 1]
+    if (!next || next.startsWith('--')) args[key] = true
+    else { args[key] = next; i += 1 }
+  }
+  return args
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+async function fetchWithRetry(url, { attempts = 60, delayMs = 3000, maxDelayMs = 3000 } = {}) {
+  // jsDelivr can answer 403/404 for some seconds after a push (propagation). FR : propagation du CDN apres un push.
+  let last = ''
+  for (let n = 1; n <= attempts; n += 1) {
+    const res = await fetch(url)
+    if (res.ok) return Buffer.from(await res.arrayBuffer())
+    last = `HTTP ${res.status}`
+    await sleep(Math.min(maxDelayMs, delayMs * n))
+  }
+  throw new Error(`download failed for ${url}: ${last}`)
+}
+
+async function main() {
+  const args = parseArgs(process.argv)
+  const sourcePath = path.resolve(args.source || '')
+  if (!args.source || !fs.existsSync(sourcePath)) throw new Error('--source <file> is required and must exist')
+  const workDir = path.resolve(args['work-dir'] || '')
+  if (!args['work-dir']) throw new Error('--work-dir <dir> is required')
+  fs.mkdirSync(workDir, { recursive: true })
+  const progressPath = path.join(workDir, 'progress.json')
+  const started = Date.now()
+  const state = { source: path.basename(sourcePath), startedAt: new Date(started).toISOString(), steps: {} }
+  const write = (step, percent, extra = {}) => {
+    state.step = step
+    state.steps[step] = { percent, ...extra }
+    state.updatedAt = new Date().toISOString()
+    state.elapsedSeconds = Math.round((Date.now() - started) / 1000)
+    const tmp = `${progressPath}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2)); fs.renameSync(tmp, progressPath)
+  }
+  const limitBytes = args.limit ? Number(args.limit) : FMP4.partLimitBytes
+  const partsDir = path.join(workDir, 'parts')
+  const singlePath = path.join(workDir, 'single.mp4')
+
+  write('subtitles', 0)
+  const probe = probeSource(sourcePath)
+  const subtitleTracks = extractSubtitles(sourcePath, probe, workDir)
+  write('subtitles', 100, { tracks: subtitleTracks.length, languages: subtitleTracks.map((t) => t.lang) })
+
+  write('mux', 0)
+  const muxed = await muxSingleFmp4(sourcePath, probe, subtitleTracks, singlePath, { onProgress: (p) => write('mux', p) })
+  write('mux', 100, { bytes: muxed.bytes })
+
+  write('split', 0)
+  fs.rmSync(partsDir, { recursive: true, force: true })
+  const split = splitFmp4(singlePath, partsDir, { limitBytes })
+  write('split', 100, { parts: split.parts.length, bytes: split.bytes, sha256: split.sha256, largestPart: Math.max(...split.parts.map((p) => p.bytes)) })
+
+  write('verify', 0)
+  const joinedPath = path.join(workDir, 'joined-local.mp4')
+  const joinedLocal = joinParts(split.parts.map((p) => path.join(partsDir, p.name)), joinedPath)
+  const identical = joinedLocal.sha256 === split.sha256
+  const verification = verifyAgainstSource(sourcePath, joinedPath, probe, ({ name }) => write('verify', 50, { last: name }))
+  write('verify', 100, { joinIdentical: identical, ok: identical && verification.ok, checks: verification.checks })
+  fs.rmSync(joinedPath, { force: true })
+  if (!(identical && verification.ok)) throw new Error('local verification is RED, nothing is pushed')
+
+  const result = {
+    source: path.basename(sourcePath), bytes: split.bytes, sha256: split.sha256, parts: split.parts.map(({ name, bytes, sha256 }) => ({ name, bytes, sha256 })),
+    audioTracks: probe.audio.length, subtitleTracks: subtitleTracks.map((t) => t.lang), localVerification: verification.checks,
+  }
+
+  if (args.push) {
+    const repo = String(args.repo || '')
+    if (!repo) throw new Error('--repo <public repository> is required with --push')
+    const token = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8' }).stdout.trim()
+    if (!token) throw new Error('no GitHub token from gh auth token')
+    // Opaque id: a media name never appears in a path or a commit message of a public repository (rule of 1 June 2026).
+    // FR : identifiant opaque, jamais de nom de media dans un chemin ou un message de commit public.
+    const id = `f${crypto.createHash('sha1').update(path.basename(sourcePath)).digest('hex').slice(0, 12)}`
+    write('push', 0)
+    const shard = await openVideoGitShard({ owner: GH_OWNER, repo, token, workDir: path.join(workDir, 'shard') })
+    let commit
+    try {
+      const files = split.parts.map((p) => ({ path: `${id}/${p.name}`, sourcePath: path.join(partsDir, p.name), size: p.bytes }))
+      const pushed = await shard.pushFiles(files, { message: `fmp4-single(${id}): ${files.length} parts`, onProgress: (percent) => write('push', percent) })
+      commit = pushed.commit
+    } finally { fs.rmSync(shard.directory, { recursive: true, force: true }) }
+    write('push', 100, { commit })
+    result.repo = repo; result.commit = commit; result.id = id
+    result.baseUrl = `https://cdn.jsdelivr.net/gh/${GH_OWNER}/${repo}@${commit}/${id}/`
+
+    if (args['verify-download']) {
+      const downloadDir = path.join(workDir, 'download')
+      fs.rmSync(downloadDir, { recursive: true, force: true }); fs.mkdirSync(downloadDir, { recursive: true })
+      write('download', 0)
+      let done = 0
+      const paths = []
+      // 14 October 2026: 6 parts at a time and a constant 3 s retry. The first run (sequential, a delay growing by 5 s per attempt)
+      // took 632 s for 18 parts because jsDelivr answers 403/404 for a few seconds on a part it has never served; a part fetched
+      // warm takes 2 s (9 MB/s). FR : 6 parts en parallele, delai constant ; la lenteur venait des 403/404 a froid de jsDelivr.
+      const queue = [...split.parts]
+      const worker = async () => {
+        for (let p = queue.shift(); p; p = queue.shift()) {
+          const buffer = await fetchWithRetry(`${result.baseUrl}${p.name}`)
+          const target = path.join(downloadDir, p.name)
+          fs.writeFileSync(target, buffer); paths.push(target)
+          done += 1
+          write('download', Math.round((done / split.parts.length) * 100), { part: p.name })
+        }
+      }
+      await Promise.all(Array.from({ length: 6 }, worker))
+      paths.sort()
+      const rebuilt = path.join(workDir, 'redownloaded.mp4')
+      const joined = joinParts(paths, rebuilt)
+      const sameBytes = joined.sha256 === split.sha256
+      const finalCheck = verifyAgainstSource(sourcePath, rebuilt, probe)
+      write('download', 100, { sha256Identical: sameBytes, ok: sameBytes && finalCheck.ok })
+      result.redownload = { sha256Identical: sameBytes, checks: finalCheck.checks }
+      if (!(sameBytes && finalCheck.ok)) throw new Error('re-download verification is RED')
+      fs.rmSync(downloadDir, { recursive: true, force: true })
+    }
+  }
+
+  state.finished = true
+  write('done', 100)
+  fs.writeFileSync(path.join(workDir, 'result.json'), JSON.stringify(result, null, 2))
+  console.log(JSON.stringify({ ok: true, parts: result.parts.length, bytes: result.bytes, elapsedSeconds: state.elapsedSeconds }))
+}
+
+main().catch((error) => {
+  const out = process.argv.includes('--work-dir') ? path.resolve(process.argv[process.argv.indexOf('--work-dir') + 1]) : process.cwd()
+  try { fs.writeFileSync(path.join(out, 'error.json'), JSON.stringify({ error: String(error?.message || error), at: new Date().toISOString() })) } catch { /* nothing more to do */ }
+  console.error(error?.stack || error)
+  process.exit(1)
+})

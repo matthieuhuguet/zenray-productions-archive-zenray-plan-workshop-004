@@ -1,0 +1,72 @@
+// A SHARED FOLDER REACHES THE TARGETS OF THE LINKS PLACED INSIDE IT (2 October 2026).
+//
+// THE BUG. Matthieu shares a gallery folder made of Eagle links (« Afficher aussi dans… » / tri): every link file
+// lives INSIDE the shared folder, but the image it stands for lives OUTSIDE (the month folder). The share gate only
+// compared the requested path with the share root, so the canonical manifest and its image bytes were refused and
+// every tile of the public gallery stayed white. The folder listing worked, the thumbnails never did.
+//
+// THE RULE. A share root reaches a canonical LEAF manifest when the resource registry lists a placement of that
+// resource inside the root, and the registry points back at that manifest. Placements are only ever written by the
+// owner (create-eagle-link(s)-batch), so « the owner put a link to it in the shared folder » is exactly the consent
+// the owner gave by sharing the folder. FOLDER links keep their stricter rule in page.js: a public folder never
+// becomes a capability for a private bundle.
+// FR : un partage de dossier atteint la cible des liens posés dedans ; jamais un dossier privé lié.
+import { authorizeShareAccess, resolveShareToken, isCanonicalPagePath } from './share-token.js'
+import { memeChemin, sousLaRacine } from './sansAccent.js'
+
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+const LEAF_RE = /\.(img|media|file)\.json$/
+const RESOURCE_ID_RE = /^zr_[A-Za-z0-9]+$/
+const CACHE_MS = 60_000
+const CACHE_MAX = 4096
+const accepted = new Map() // `${token}|${path}` -> expiry; only POSITIVE answers are remembered, a refusal is always re-checked
+
+const insideShare = (share, path) => isCanonicalPagePath(path) && (share.kind === 'folder' ? sousLaRacine(path, share.path) : memeChemin(path, share.path))
+
+async function rawJson(path, { githubToken, fetchImpl }) {
+  const r = await fetchImpl(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${encodeURI(path.normalize('NFC'))}`, { cache: 'no-store', headers: { Authorization: `Bearer ${githubToken}`, 'User-Agent': 'zenray-progress' } })
+  return r.ok ? r.json() : null
+}
+
+function remember(key) {
+  accepted.delete(key); accepted.set(key, Date.now() + CACHE_MS)
+  while (accepted.size > CACHE_MAX) accepted.delete(accepted.keys().next().value)
+  return true
+}
+
+export async function authorizeShareReach(shareToken, requestedPath, options = {}) {
+  if (!shareToken || !isCanonicalPagePath(requestedPath)) return false
+  if (await authorizeShareAccess(shareToken, requestedPath, options)) return true
+  if (!LEAF_RE.test(requestedPath)) return false
+  const via = typeof options.via === 'string' ? options.via : ''
+  const key = `${shareToken}|${requestedPath}|${via}`
+  const hit = accepted.get(key)
+  if (hit && hit > Date.now()) return true
+  const githubToken = options.githubToken || process.env.GITHUB_TOKEN
+  const fetchImpl = options.fetchImpl || fetch
+  if (!githubToken) return false
+  try {
+    const share = await resolveShareToken(shareToken, options)
+    const manifest = await rawJson(requestedPath, { githubToken, fetchImpl })
+    const id = manifest && manifest.resourceId
+    if (typeof id !== 'string' || !RESOURCE_ID_RE.test(id)) return false
+    // PRIMARY PROOF, `via` = the link the visitor came from. It must sit INSIDE the share and carry the very same
+    // resourceId as the requested manifest. No registry involved: registry `placements` are synced in the background
+    // after a folder rename or move and are routinely stale (the gallery lived in a renamed folder), so they cannot be
+    // the authority. A link inside the root that names this resource is exactly the owner's consent.
+    if (via) {
+      if (!LEAF_RE.test(via) || !insideShare(share, via)) return false
+      const link = await rawJson(via, { githubToken, fetchImpl })
+      if (!link || link.type !== 'zenray-eagle-link/v1' || link.resourceId !== id) return false
+      return remember(key)
+    }
+    // FALLBACK without `via` (older clients): the registry lists a placement inside the root.
+    const registry = await rawJson(`pages/.zr-resources/${id}.json`, { githubToken, fetchImpl })
+    if (!registry || registry.resourceId !== id || typeof registry.sourcePath !== 'string' || !Array.isArray(registry.placements)) return false
+    if (!memeChemin(registry.sourcePath, requestedPath)) return false // the registry must point back at THIS manifest
+    if (!registry.placements.some((p) => p !== requestedPath && insideShare(share, p))) return false
+    return remember(key)
+  } catch { return false }
+}
+export const __resetShareReachCache = () => accepted.clear()

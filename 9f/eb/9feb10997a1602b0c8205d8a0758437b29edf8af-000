@@ -1,0 +1,133 @@
+// 2026-09-23 19:45 : parse the work journal (~/.claude/PROGRESS.md) into timeline entries.
+// Pure functions, no dependency: they run on the bytes the source just verified, at read time,
+// so nothing derived is ever stored (no second truth).
+// FR : lecture pure du journal, a la volee, sur les octets deja verifies ; rien n'est stocke.
+import { PROGRESS_DOMAINS, FALLBACK_DOMAIN, JOURNAL_CLOCK } from '../config/progressDomains.js'
+
+const STAMP = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})(?: ([+-])(\d{2}):(\d{2}))?[ \t]*$/
+const LEGACY = /^<!-- legacy-id:([a-f0-9]+) -->/
+const FIELD = /^- ([^\s:][^:]{0,40}?)[ \t]*:(?:[ \t]+(.*))?$/
+
+export const normalize = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+
+// Offset in minutes of `zone` at the given UTC instant. / FR : decalage du fuseau a cet instant.
+function zoneOffsetMin(utcMs, zone) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: zone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  }).formatToParts(new Date(utcMs)).map((x) => [x.type, x.value]))
+  return (Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute) - utcMs) / 60000
+}
+
+// Wall clock "Y-M-D h:m" in `zone` -> UTC ms. / FR : heure murale d'un fuseau vers un instant.
+export function wallToInstant(y, mo, d, h, mi, zone) {
+  const guess = Date.UTC(y, mo - 1, d, h, mi)
+  const off = zoneOffsetMin(guess, zone)
+  const t = guess - off * 60000
+  const off2 = zoneOffsetMin(t, zone)
+  return off2 === off ? t : guess - off2 * 60000
+}
+
+export function zoneFor(date, legacy, clock = JOURNAL_CLOCK) {
+  if (!legacy) return clock.scriptZone
+  return clock.legacyZones.find((z) => date < z.before).zone
+}
+
+export function parseJournal(text, clock = JOURNAL_CLOCK) {
+  const lines = String(text).split('\n')
+  const entries = []
+  let cur = null
+  let legacyId = null
+  let lastKey = null
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const lg = LEGACY.exec(line)
+    if (lg) { legacyId = lg[1]; continue }
+    const m = STAMP.exec(line)
+    if (m) {
+      const [, y, mo, d, h, mi, sign, oh, om] = m
+      const date = `${y}-${mo}-${d}`
+      let at
+      if (sign) at = Date.UTC(+y, +mo - 1, +d, +h, +mi) - (sign === '+' ? 1 : -1) * (+oh * 60 + +om) * 60000
+      else at = wallToInstant(+y, +mo, +d, +h, +mi, zoneFor(date, !!legacyId, clock))
+      cur = { index: entries.length, line: i + 1, at, stamp: line.trim(), explicitOffset: !!sign, legacy: !!legacyId, fields: {}, order: [] }
+      entries.push(cur)
+      legacyId = null
+      lastKey = null
+      continue
+    }
+    if (!cur) continue
+    const f = FIELD.exec(line)
+    if (f) {
+      lastKey = f[1].trim()
+      cur.fields[lastKey] = cur.fields[lastKey] ? `${cur.fields[lastKey]}\n${f[2] || ''}` : (f[2] || '')
+      cur.order.push(lastKey)
+    } else if (lastKey && line.trim()) {
+      cur.fields[lastKey] += `\n${line}`
+    }
+  }
+  for (const e of entries) {
+    e.agent = (e.fields.Agent || '').trim()
+    e.project = (e.fields.Projet || '').trim()
+    e.model = (e.fields['Modèle'] || '').split(' · ')[0].trim()
+    e.fait = (e.fields.Fait || '').trim()
+  }
+  return entries
+}
+
+function wordRegex(k) {
+  const esc = normalize(k).replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+  return new RegExp(`(^|[^a-z0-9])${esc}($|[^a-z0-9])`)
+}
+const COMPILED = new WeakMap()
+function compiled(domains) {
+  if (!COMPILED.has(domains)) COMPILED.set(domains, domains.map((d) => ({ d, kw: d.keywords.map(wordRegex) })))
+  return COMPILED.get(domains)
+}
+
+// Project rule first, keywords second. / FR : d'abord le projet, puis les mots-cles.
+export function classify(entry, domains = PROGRESS_DOMAINS) {
+  const project = entry.project && !/legacy/i.test(entry.project) ? entry.project : ''
+  if (project) {
+    const hit = domains.find((d) => d.project.test(project))
+    if (hit) return hit
+  }
+  const text = normalize(`${entry.project} ${entry.fields.Fait || ''} ${entry.fields['Décision'] || ''} ${entry.fields.Prochain || ''}`)
+  let best = null
+  for (const { d, kw } of compiled(domains)) {
+    const score = kw.reduce((n, r) => n + (r.test(text) ? 1 : 0), 0)
+    if (score && (!best || score > best.score)) best = { d, score }
+  }
+  return best ? best.d : FALLBACK_DOMAIN
+}
+
+export function localDay(ms) {
+  const d = new Date(ms)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// Sessions: same-domain entries closer than sessionGapMin, each worth at least minEntryMin.
+// Estimated time, never a measure. / FR : duree ESTIMEE par domaine et par jour.
+export function daySummary(entries, clock = JOURNAL_CLOCK) {
+  const byDomain = new Map()
+  const sorted = [...entries].sort((a, b) => a.at - b.at)
+  for (const e of sorted) {
+    const id = e.domain.id
+    const s = byDomain.get(id) || { domain: e.domain, minutes: 0, count: 0, first: e.at, last: e.at, entries: [] }
+    const gap = (e.at - s.last) / 60000
+    s.minutes += s.count === 0 ? clock.minEntryMin : (gap <= clock.sessionGapMin ? Math.max(gap, 0) : clock.minEntryMin)
+    s.count++; s.last = e.at; s.entries.push(e)
+    byDomain.set(id, s)
+  }
+  return [...byDomain.values()].sort((a, b) => b.minutes - a.minutes)
+}
+
+export function buildTimeline(text, domains = PROGRESS_DOMAINS) {
+  const entries = parseJournal(text)
+  for (const e of entries) { e.domain = classify(e, domains); e.day = localDay(e.at) }
+  const days = new Map()
+  for (const e of entries) {
+    if (!days.has(e.day)) days.set(e.day, [])
+    days.get(e.day).push(e)
+  }
+  return { entries, days }
+}

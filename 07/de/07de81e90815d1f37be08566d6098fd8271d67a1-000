@@ -1,0 +1,213 @@
+// 10 October 2026, 19:04 CEST: Prove an HLS batch reaches a Git remote without Raw GitHub or REST requests.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { randomBytes } from 'node:crypto'
+import { openVideoGitShard } from './video-git-shard.mjs'
+
+const execFileAsync = promisify(execFile)
+
+async function git(directory, args) {
+  return execFileAsync('git', ['-C', directory, ...args], { encoding: 'utf8' })
+}
+
+test('pushes hashed media through Git, keeps the remote tree and omits credentials from its URL', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zr-video-git-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const bare = path.join(root, 'remote.git')
+  const seed = path.join(root, 'seed')
+  const work = path.join(root, 'work')
+  const source = path.join(root, 'encrypted-segment.ts')
+  await fs.mkdir(seed)
+  await execFileAsync('git', ['init', '--bare', '--initial-branch=main', bare])
+  await execFileAsync('git', ['init', '--initial-branch=main', seed])
+  await git(seed, ['config', 'user.email', 'test@example.invalid'])
+  await git(seed, ['config', 'user.name', 'test'])
+  await fs.writeFile(path.join(seed, 'README.md'), 'existing data\n')
+  await git(seed, ['add', 'README.md'])
+  await git(seed, ['commit', '-m', 'init'])
+  await git(seed, ['remote', 'add', 'origin', bare])
+  await git(seed, ['push', '-u', 'origin', 'main'])
+  const bytes = Buffer.from('encrypted HLS bytes')
+  await fs.writeFile(source, bytes)
+
+  const shard = await openVideoGitShard({ owner: 'test-owner', repo: 'zenray-vid-public-01', workDir: work,
+    token: 'not-a-real-token', remoteUrl: bare, log: () => {} })
+  const result = await shard.pushFiles([{ path: 'ab/cd/opaque.ts', sourcePath: source, size: bytes.length }], { message: 'hls test' })
+  assert.match(result.commit, /^[a-f0-9]{40}$/)
+  assert.equal(result.bytes, bytes.length)
+  assert.deepEqual(result.files.map((file) => file.path), ['ab/cd/opaque.ts'])
+  assert.equal((await git(bare, ['show', `main:ab/cd/opaque.ts`])).stdout, bytes.toString())
+  assert.equal((await git(shard.directory, ['remote', 'get-url', 'origin'])).stdout.trim(), bare)
+  const rangeSource = path.join(root, 'download.mp4')
+  await fs.writeFile(rangeSource, 'abcdefghij')
+  const ranged = await shard.pushFiles([{ path: 'ef/gh/ranged.bin', sourcePath: rangeSource, offset: 3, size: 4 }], { message: 'stream range test' })
+  assert.equal((await git(bare, ['show', 'main:ef/gh/ranged.bin'])).stdout, 'defg')
+  assert.equal(ranged.bytes, 4)
+  const repeated = await shard.pushFiles([{ path: 'ab/cd/opaque.ts', sourcePath: source, size: bytes.length }])
+  assert.equal(repeated.bytes, 0)
+  assert.equal(repeated.commit, ranged.commit)
+})
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// 12 October 2026: pushFiles runs through the push batch policy. Real local bare repositories, a pre-receive hook that can refuse
+// a push for its size, fail it N times or refuse it for good. Files are 1 000 bytes, a "part" is 1 048 bytes, so 8 parts are 8 KiB.
+// FR : pushFiles suit la politique de lots ; depots nus locaux reels, hook qui refuse pour la taille, echoue N fois ou refuse.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+process.env.ZR_PUSH_TOKEN = '0'
+const { createPushController, loadPushPolicyConfig } = await import('./push-batch-policy.mjs')
+
+async function bareWithHook(root) {
+  const bare = path.join(root, 'remote.git')
+  const control = path.join(root, 'control')
+  const seed = path.join(root, 'seed')
+  await fs.mkdir(control)
+  await fs.mkdir(seed)
+  await execFileAsync('git', ['init', '--bare', '--initial-branch=main', bare])
+  await execFileAsync('git', ['init', '--initial-branch=main', seed])
+  await git(seed, ['config', 'user.email', 'test@example.invalid'])
+  await git(seed, ['config', 'user.name', 'test'])
+  await fs.writeFile(path.join(seed, 'README.md'), 'existing data\n')
+  await git(seed, ['add', 'README.md'])
+  await git(seed, ['commit', '-m', 'init'])
+  await git(seed, ['remote', 'add', 'origin', bare])
+  await git(seed, ['push', '-u', 'origin', 'main'])
+  const hook = `#!/bin/sh
+read_control() { if [ -f "${control}/$1" ]; then cat "${control}/$1"; else echo "$2"; fi; }
+echo push >> "${control}/pushes.log"
+limit=$(read_control size-limit-bytes 0)
+if [ "$limit" -gt 0 ]; then
+  size=$(find "$GIT_QUARANTINE_PATH" -type f -exec cat {} + | wc -c)
+  if [ "$size" -gt "$limit" ]; then echo "remote: fatal: pack exceeds maximum allowed size (2.00 GiB)" >&2; exit 1; fi
+fi
+if [ -f "${control}/permanent" ]; then echo "remote: error: GH013: Repository rule violations found for refs/heads/main." >&2; exit 1; fi
+n=$(read_control fail-count 0)
+if [ "$n" -gt 0 ]; then echo $((n-1)) > "${control}/fail-count"; echo "fatal: unable to access: Could not resolve host: github.com" >&2; exit 1; fi
+exit 0
+`
+  const hookFile = path.join(bare, 'hooks', 'pre-receive')
+  await fs.writeFile(hookFile, hook)
+  await fs.chmod(hookFile, 0o755)
+  return { bare, control }
+}
+
+async function sourceFiles(root, count, size = 1000) {
+  const files = []
+  for (let index = 0; index < count; index += 1) {
+    const source = path.join(root, `src-${index}.bin`)
+    const bytes = randomBytes(size) // incompressible, like AES-GCM output: the size seen by the remote is the real one
+    await fs.writeFile(source, bytes)
+    files.push({ path: `ab/cd/part-${String(index).padStart(3, '0')}.bin`, sourcePath: source, size, bytes })
+  }
+  return files
+}
+
+const smallPolicy = (overrides = {}) => createPushController(loadPushPolicyConfig({}, {
+  partMiB: 1000 / (1024 * 1024), gcmTagBytes: 48, targetMiB: 0.025, hardLimitMiB: 0.03, packFixedOverheadKiB: 1,
+  backoffBaseMs: 1, backoffMaxMs: 2, ...overrides,
+}))
+
+async function remoteCount(bare) { return Number((await git(bare, ['rev-list', '--count', 'main'])).stdout.trim()) }
+async function remoteHas(bare, files) {
+  for (const file of files) assert.equal((await execFileAsync('git', ['-C', bare, 'show', `main:${file.path}`], { encoding: 'buffer', maxBuffer: 1 << 20 })).stdout.compare(file.bytes), 0)
+}
+
+test('splits a whole list by bytes: 8 parts first, then the rest, one commit per batch, every file online', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zr-shard-policy-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const { bare } = await bareWithHook(root)
+  const files = await sourceFiles(root, 20)
+  const policy = smallPolicy()
+  const shard = await openVideoGitShard({ owner: 'test-owner', repo: 'zenray-vid-public-02', workDir: path.join(root, 'work'),
+    token: 'not-a-real-token', remoteUrl: bare, pushController: policy })
+  const progress = []
+  const result = await shard.pushFiles(files.map(({ path: p, sourcePath, size }) => ({ path: p, sourcePath, size })), { message: 'policy test', onProgress: (pct) => progress.push(pct) })
+  assert.equal(result.bytes, 20000)
+  assert.equal(result.batches, 3) // 8 + 8 + 4
+  assert.equal(await remoteCount(bare), 1 + 3)
+  await remoteHas(bare, files)
+  assert.ok(progress.length > 0 && progress.every((value, index) => index === 0 || value >= progress[index - 1] - 100))
+  assert.equal(progress.at(-1), 100)
+  assert.equal(result.commit, (await git(bare, ['rev-parse', 'main'])).stdout.trim())
+})
+
+test('retries one failure with the same batch, and falls back to 2 parts at the third failure of that batch', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zr-shard-policy-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const { bare, control } = await bareWithHook(root)
+  const files = await sourceFiles(root, 6)
+  const policy = smallPolicy()
+  const shard = await openVideoGitShard({ owner: 'test-owner', repo: 'zenray-vid-public-03', workDir: path.join(root, 'work'),
+    token: 'not-a-real-token', remoteUrl: bare, pushController: policy })
+  await fs.writeFile(path.join(control, 'fail-count'), '1')
+  const first = await shard.pushFiles(files.slice(0, 3).map(({ path: p, sourcePath, size }) => ({ path: p, sourcePath, size })), { message: 'one failure' })
+  assert.equal(first.batches, 1)
+  assert.equal(policy.state().mode, 'ramp') // one failure changes nothing
+  assert.equal(policy.metrics.summary().failedAttempts, 1)
+  await fs.writeFile(path.join(control, 'fail-count'), '3')
+  const second = await shard.pushFiles(files.slice(3).map(({ path: p, sourcePath, size }) => ({ path: p, sourcePath, size })), { message: 'three failures' })
+  assert.equal(policy.metrics.summary().fallbacks, 1)
+  assert.equal(second.batches, 2) // 3 files, level 2 parts: 2 + 1
+  await remoteHas(bare, files)
+  // nothing of the failed 3 file commit was pushed: README + 1 batch + 2 batches
+  assert.equal(await remoteCount(bare), 1 + 1 + 2)
+})
+
+test('shrinks the batch after a refusal for size and delivers every file (no data loss)', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zr-shard-policy-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const { bare, control } = await bareWithHook(root)
+  const files = await sourceFiles(root, 16)
+  const policy = smallPolicy({ rampStartParts: 20 })
+  const shard = await openVideoGitShard({ owner: 'test-owner', repo: 'zenray-vid-public-04', workDir: path.join(root, 'work'),
+    token: 'not-a-real-token', remoteUrl: bare, pushController: policy })
+  await fs.writeFile(path.join(control, 'size-limit-bytes'), '10000') // 16 and 12 files of 1 000 bytes cannot pass, 8 files can
+  const result = await shard.pushFiles(files.map(({ path: p, sourcePath, size }) => ({ path: p, sourcePath, size })), { message: 'size' })
+  assert.equal(result.bytes, 16000)
+  assert.ok(policy.metrics.summary().sizeFailures >= 2)
+  await remoteHas(bare, files)
+  for (const file of files) await fs.access(file.sourcePath) // the sources are untouched
+})
+
+test('RED: a permanent refusal fails cleanly, marks the error, and puts nothing of the batch online', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zr-shard-policy-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const { bare, control } = await bareWithHook(root)
+  const files = await sourceFiles(root, 4)
+  const shard = await openVideoGitShard({ owner: 'test-owner', repo: 'zenray-vid-public-05', workDir: path.join(root, 'work'),
+    token: 'not-a-real-token', remoteUrl: bare, pushController: smallPolicy() })
+  await fs.writeFile(path.join(control, 'permanent'), '1')
+  await assert.rejects(
+    shard.pushFiles(files.map(({ path: p, sourcePath, size }) => ({ path: p, sourcePath, size })), { message: 'refused' }),
+    (error) => error.permanent === true && /Video shard Git push failed/.test(error.message),
+  )
+  assert.equal(await remoteCount(bare), 1)
+  for (const file of files) await fs.access(file.sourcePath)
+  // and the same shard works again once the refusal is gone: the files were never dropped from the caller
+  await fs.rm(path.join(control, 'permanent'))
+  const retry = await shard.pushFiles(files.map(({ path: p, sourcePath, size }) => ({ path: p, sourcePath, size })), { message: 'after' })
+  assert.equal(retry.bytes, 4000)
+  await remoteHas(bare, files)
+})
+
+test('two pushFiles calls on one shard never run at the same time', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zr-shard-policy-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const { bare, control } = await bareWithHook(root)
+  const files = await sourceFiles(root, 10)
+  const shard = await openVideoGitShard({ owner: 'test-owner', repo: 'zenray-vid-public-06', workDir: path.join(root, 'work'),
+    token: 'not-a-real-token', remoteUrl: bare, pushController: smallPolicy() })
+  const strip = ({ path: p, sourcePath, size }) => ({ path: p, sourcePath, size })
+  const [one, two] = await Promise.all([
+    shard.pushFiles(files.slice(0, 5).map(strip), { message: 'first call' }),
+    shard.pushFiles(files.slice(5).map(strip), { message: 'second call' }),
+  ])
+  assert.equal(one.bytes + two.bytes, 10000)
+  await remoteHas(bare, files)
+  assert.equal(await remoteCount(bare), 1 + 2) // each call is one batch of 5 files (below 8 parts), applied in order
+  assert.ok((await fs.readFile(path.join(control, 'pushes.log'), 'utf8')).trim().split('\n').length >= 2)
+})

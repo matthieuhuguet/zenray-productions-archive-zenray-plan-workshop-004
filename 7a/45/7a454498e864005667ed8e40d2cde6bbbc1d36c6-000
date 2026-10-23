@@ -1,0 +1,149 @@
+// upload-vidraw-all.mjs — uploade TOUTES les vidéos d'une arbo (récursif) via la pipeline VIDÉO BRUTE.
+// Le dest de chaque vidéo MIROIR son chemin : <DJI>/16 Juin 2026/BestOf/Videos/X.mp4 -> pages/Photos/DJI/16 Juin
+// 2026/BestOf/Videos/X.mp4.media.json. Saute celles DÉJÀ en ligne (manifeste présent). EN PARALLÈLE (pool de N
+// workers, voir ZR_PARALLEL plus bas), triées du plus COURT au plus long et distribuées en file partagée.
+// Imprime un TABLEAU par dossier au démarrage. Logue "✓ EN LIGNE" par vidéo + "BATCH ALL COMPLET".
+//
+// PARALLÉLISME (2026-07-01) : chaque worker i a son PROPRE dossier WORK (~/.zr-archive-work-vidraw-wI) et sa
+// PROPRE plage de shards (startShard = baseStartShard + i*1000, jamais recoupée même après plusieurs rollovers
+// à 4 Go) — voir makeVidRawShardCtx (video-raw-lib.mjs) : un ctx avec startShard>1 crée un shard NEUF sans clone,
+// donc N workers = N clones git INDÉPENDANTS, aucun git add/commit/push partagé -> zéro corruption d'index.
+// pushBlobs (manifestes .media.json sur zenray-data) est déjà safe en concurrence : il pousse via l'API Git Data
+// (pas de clone local) avec retry fast-forward sur la ref, donc plusieurs workers peuvent committer en même temps.
+//
+// Usage : GITHUB_TOKEN=.. ZR_PARALLEL=5 node Scripts/upload-vidraw-all.mjs "<racine locale>" "<préfixe dest>"
+//   ex : ... "/Users/zenray/Downloads/DJI" "pages/Photos/DJI"
+
+import { makeVidRawShardCtx, ingestVideoRaw } from './video-raw-lib.mjs'
+import { pushBlobs } from './video-mse-lib.mjs'
+import { loadZenrayDataInventory } from './lib/zenray-data-inventory.mjs'
+import { execFile } from 'node:child_process'
+import { stat, readdir } from 'node:fs/promises'
+import path from 'node:path'
+import { promisify } from 'node:util'
+import crypto from 'node:crypto'
+const execFileP = promisify(execFile)
+
+const token = process.env.GITHUB_TOKEN
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const DATA = 'zenray-data'
+const ROOT = process.argv[2]
+const DESTPREFIX = (process.argv[3] || 'pages/Photos/DJI').replace(/\/+$/, '')
+if (!token || !ROOT) { console.error('usage: GITHUB_TOKEN=.. node upload-vidraw-all.mjs <racine> [destPrefix]'); process.exit(1) }
+
+const VIDEXT = /\.(mp4|mov|m4v|avi|mkv)$/i
+const baseOf = (f) => path.basename(f).replace(/\.[^.]+$/, '')
+const extOf = (f) => path.basename(f).split('.').pop().toLowerCase()
+const relOf = (f) => path.relative(ROOT, f)
+const destOf = (f) => `${DESTPREFIX}/${path.dirname(relOf(f))}`.replace(/\/\.$/, '')
+const manifestPathOf = (f) => `${destOf(f)}/${baseOf(f)}.${extOf(f)}.media.json`
+const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`
+
+async function walk(dir) {
+  const out = []
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (e.name.startsWith('.')) continue
+    const p = path.join(dir, e.name)
+    if (e.isDirectory()) out.push(...await walk(p))
+    else if (VIDEXT.test(e.name)) out.push(p)
+  }
+  return out
+}
+async function durationOf(f) { try { const { stdout } = await execFileP('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f], { timeout: 30000 }); return parseFloat(stdout.trim()) || 0 } catch { return 0 } }
+// 1) inventaire + tableau
+const all = (await walk(ROOT)).sort()
+const byTop = {}
+for (const f of all) { const top = relOf(f).split('/')[0]; (byTop[top] ||= []).push(f) }
+console.log(`\n=== TABLEAU VIDÉOS DJI (racine ${ROOT}) ===`)
+let totN = 0, totSz = 0
+for (const top of Object.keys(byTop).sort()) {
+  let sz = 0; for (const f of byTop[top]) { try { sz += (await stat(f)).size } catch {} }
+  console.log(`  ${top.padEnd(16)} ${String(byTop[top].length).padStart(3)} vidéos  ${(sz / 1073741824).toFixed(1)} Go`)
+  totN += byTop[top].length; totSz += sz
+}
+console.log(`  ${'TOTAL'.padEnd(16)} ${String(totN).padStart(3)} vidéos  ${(totSz / 1073741824).toFixed(1)} Go`)
+
+// 2) filtrer déjà en ligne via UNE synchro Git + durée + tri court->long
+console.log('\nInventaire Git zenray-data (une synchro, puis skips locaux)…')
+const online = await loadZenrayDataInventory({ token, owner: OWNER, repo: DATA, prefix: DESTPREFIX })
+const cand = []
+for (const f of all) {
+  if (online.has(manifestPathOf(f))) { console.log(`  ⏭  déjà en ligne : ${relOf(f)}`); continue }
+  cand.push({ f, dur: await durationOf(f), size: (await stat(f)).size })
+}
+cand.sort((a, b) => a.dur - b.dur)
+console.log(`\n=== À UPLOADER : ${cand.length} vidéo(s), du plus court au plus long ===`)
+cand.forEach((c, i) => console.log(`  ${String(i + 1).padStart(3)}. ${fmt(c.dur).padStart(5)}  ${(c.size / 1048576).toFixed(0).padStart(5)} Mo  ${relOf(c.f)}`))
+console.log('')
+if (!cand.length) { console.log('rien à uploader (tout déjà en ligne), aucun shard créé.'); process.exit(0) }
+
+// 3) upload EN PARALLÈLE — pool de N workers, chacun avec son propre WORK dir + sa propre plage de shards.
+// N est déterminé par un TEST DE CONNEXION RÉEL à chaque lancement (pas un chiffre codé en dur) : la bande
+// passante change selon où tourne le script (fibre à la maison, 4G, wifi d'hôtel au Japon…). ZR_PARALLEL force
+// une valeur explicite et saute le test (utile en reprise rapide ou si networkQuality est indisponible).
+async function measureParallelism() {
+  if (process.env.ZR_PARALLEL) return Math.max(1, parseInt(process.env.ZR_PARALLEL))
+  // a) capacité uplink théorique (macOS uniquement, ~5-10s). Absent/échec -> repli sur une mesure single-stream seule.
+  let capacityMbps = null
+  try {
+    const { stdout } = await execFileP('networkQuality', ['-v'], { timeout: 20000 })
+    const m = /Uplink capacity:\s*([\d.]+)\s*Mbps/.exec(stdout)
+    if (m) capacityMbps = parseFloat(m[1])
+  } catch {}
+  // b) débit réel d'UN flux vers GitHub (upload d'un petit blob de test via l'API Git Data — c'est la VRAIE
+  // cible, pas un serveur de test générique). ~5 Mo, quelques secondes.
+  let singleMbps = null
+  try {
+    const buf = Buffer.alloc(5 * 1024 * 1024, 0)
+    crypto.randomFillSync(buf)
+    const t0 = Date.now()
+    const r = await fetch(`https://api.github.com/repos/${OWNER}/${DATA}/git/blobs`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'zr' },
+      body: JSON.stringify({ content: buf.toString('base64'), encoding: 'base64' }),
+    })
+    if (r.ok) { const dt = (Date.now() - t0) / 1000; singleMbps = (buf.length * 8) / dt / 1e6 }
+  } catch {}
+  if (!capacityMbps && !singleMbps) { console.log('  (test de connexion indisponible -> parallélisme par défaut 5)'); return 5 }
+  if (!capacityMbps) { console.log(`  connexion mesurée: ${singleMbps.toFixed(0)} Mbps (1 flux, pas de mesure de capacité totale) -> parallélisme 4`); return 4 }
+  if (!singleMbps) singleMbps = capacityMbps / 2.5 // repli raisonnable si le test single-stream a échoué
+  // ratio capacité/flux-unique = marge de parallélisation ; plusieurs connexions TCP distinctes montent en débit
+  // plus vite qu'une seule (slow-start par connexion), donc le gain réel dépasse souvent ce ratio brut -> +1.
+  const n = Math.round(capacityMbps / singleMbps) + 1
+  console.log(`  connexion mesurée: capacité ${capacityMbps.toFixed(0)} Mbps, 1 flux ${singleMbps.toFixed(0)} Mbps -> parallélisme ${Math.min(8, Math.max(2, n))}`)
+  return Math.min(8, Math.max(2, n)) // borné [2,8] : au-delà, la contention (retries git) coûte plus qu'elle ne rapporte
+}
+const N = await measureParallelism()
+// MODÈLE 2026-07-05 : chaque worker crée ses repos NEUFS zenrayshards-vid-<hex12> (nom aléatoire) —
+// plus AUCUNE découverte de numéro de shard, plus aucune plage à réserver, zéro requête de listing.
+console.log(`\n=== UPLOAD PARALLÈLE : ${N} worker(s), repos neufs zenrayshards-vid-<hex> par worker ===`)
+
+const queue = cand.slice() // file partagée, triée court->long ; chaque worker fait shift() -> round-robin naturel
+let done = 0, failed = 0
+const total = queue.length
+
+async function runWorker(i) {
+  const vctx = makeVidRawShardCtx({
+    token,
+    work: `${process.env.HOME}/.zr-archive-work-vidraw-w${i}`,
+    type: 'vid', vis: 'private', // repo neuf aléatoire par worker (hex) -> jamais de collision entre workers
+    log: (...a) => console.log(`  [w${i}]`, ...a),
+  })
+  while (queue.length) {
+    const c = queue.shift()
+    if (!c) break
+    const t0 = Date.now()
+    try {
+      const dest = destOf(c.f), base = baseOf(c.f)
+      const { manifestPath, manifest } = await ingestVideoRaw(c.f, { dest, base, vctx, workDir: `/tmp/zr_vidraw_run_w${i}`, log: (...a) => console.log(`  [w${i}]`, ...a) })
+      await pushBlobs(token, DATA, [{ path: manifestPath, content: JSON.stringify(manifest), encoding: 'utf-8' }], `vidraw ${base}`, () => {})
+      done++
+      console.log(`✓ EN LIGNE [w${i}] [${done}/${total}] ${relOf(c.f)} · ${fmt(c.dur)} · ${manifest.parts.length} parts · ${((Date.now() - t0) / 1000).toFixed(0)}s`)
+    } catch (e) {
+      failed++
+      console.log(`✗ ÉCHEC [w${i}] ${relOf(c.f)} : ${(e && e.message || e).toString().slice(0, 160)}`)
+    }
+  }
+}
+
+await Promise.all(Array.from({ length: Math.min(N, total || 1) }, (_, i) => runWorker(i)))
+console.log(`\n✓✓ BATCH ALL COMPLET — ${done}/${total} vidéos uploadées (${failed} échec(s), le reste était déjà en ligne).`)

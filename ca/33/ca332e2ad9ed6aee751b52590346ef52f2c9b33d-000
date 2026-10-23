@@ -1,0 +1,71 @@
+import { describe, expect, it, vi } from 'vitest'
+import { dataUrlByteLength, EDITOR_IMAGE_ATTEMPTS, EDITOR_IMAGE_MAX_BYTES, persistEditorImage, prepareEditorImage } from './editorImageUpload.js'
+
+const dataUrlForBytes = (bytes) => `data:image/webp;base64,${Buffer.alloc(bytes).toString('base64')}`
+
+describe('editor image upload', () => {
+  it('mesure le payload binaire plutôt que la chaîne base64', () => {
+    expect(dataUrlByteLength(dataUrlForBytes(7))).toBe(7)
+    expect(dataUrlByteLength('not-a-data-url')).toBe(0)
+  })
+
+  it('préserve la meilleure qualité qui respecte la limite puis réduit progressivement', async () => {
+    const convert = vi.fn()
+      .mockResolvedValueOnce(dataUrlForBytes(EDITOR_IMAGE_MAX_BYTES + 1))
+      .mockResolvedValueOnce(dataUrlForBytes(512))
+    const prepared = await prepareEditorImage({ name: '4k.png' }, convert)
+
+    expect(convert).toHaveBeenNthCalledWith(1, expect.anything(), EDITOR_IMAGE_ATTEMPTS[0].quality, EDITOR_IMAGE_ATTEMPTS[0].max)
+    expect(convert).toHaveBeenNthCalledWith(2, expect.anything(), EDITOR_IMAGE_ATTEMPTS[1].quality, EDITOR_IMAGE_ATTEMPTS[1].max)
+    expect(prepared).toMatchObject({ bytes: 512, quality: EDITOR_IMAGE_ATTEMPTS[1].quality, max: EDITOR_IMAGE_ATTEMPTS[1].max })
+  })
+
+  it('refuse l’image si aucune variante sûre ne tient dans la requête', async () => {
+    const convert = vi.fn(async () => dataUrlForBytes(EDITOR_IMAGE_MAX_BYTES + 1))
+    expect(await prepareEditorImage({}, convert)).toBeNull()
+    expect(convert).toHaveBeenCalledTimes(EDITOR_IMAGE_ATTEMPTS.length)
+  })
+
+  it('n’accepte jamais un upload HTTP incomplet comme URL de repli', async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 413, json: async () => ({ error: 'too large' }) }))
+    await expect(persistEditorImage(dataUrlForBytes(12), fetchImpl)).rejects.toMatchObject({ status: 413 })
+  })
+})
+
+describe('persistEditorImage, reessai', () => {
+  const okJson = { url: '/api/img?path=uploads/a.webp', path: 'uploads/a.webp' }
+  const sansAttente = { attente: () => 0 }
+
+  it('reessaie une panne GitHub passagere et rend l’URL au second essai', async () => {
+    let n = 0
+    const fetchImpl = vi.fn(async () => (++n < 2
+      ? { ok: true, status: 200, json: async () => ({ url: null, error: 'github' }) }
+      : { ok: true, status: 200, json: async () => okJson }))
+    await expect(persistEditorImage('data:image/webp;base64,AA==', fetchImpl, sansAttente)).resolves.toMatchObject(okJson)
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
+  it('reessaie une coupure reseau', async () => {
+    let n = 0
+    const fetchImpl = vi.fn(async () => { if (++n < 3) throw new Error('Failed to fetch'); return { ok: true, status: 200, json: async () => okJson } })
+    await expect(persistEditorImage('data:image/webp;base64,AA==', fetchImpl, sansAttente)).resolves.toMatchObject(okJson)
+    expect(fetchImpl).toHaveBeenCalledTimes(3)
+  })
+
+  it('NE reessaie PAS un refus definitif', async () => {
+    for (const status of [400, 413, 422]) {
+      const fetchImpl = vi.fn(async () => ({ ok: false, status, json: async () => ({ error: 'nope' }) }))
+      await expect(persistEditorImage('data:image/webp;base64,AA==', fetchImpl, sansAttente)).rejects.toMatchObject({ status })
+      expect(fetchImpl, `statut ${status}`).toHaveBeenCalledTimes(1)
+    }
+    const sansJeton = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ url: null, error: 'no-token' }) }))
+    await expect(persistEditorImage('data:image/webp;base64,AA==', sansJeton, sansAttente)).rejects.toThrow('no-token')
+    expect(sansJeton).toHaveBeenCalledTimes(1)
+  })
+
+  it('abandonne apres toutes les tentatives et remonte la derniere erreur', async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ url: null, error: 'github' }) }))
+    await expect(persistEditorImage('data:image/webp;base64,AA==', fetchImpl, { ...sansAttente, tentatives: 3 })).rejects.toThrow('github')
+    expect(fetchImpl).toHaveBeenCalledTimes(3)
+  })
+})

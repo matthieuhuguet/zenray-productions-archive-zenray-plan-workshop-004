@@ -1,0 +1,51 @@
+#!/usr/bin/env node
+// 2 October 2026, 15:25 CEST: exercise real cloud recovery using a witness and an isolated managed workspace.
+import { readFile, mkdir, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import path from 'node:path'
+import { createAssetsService, hashLocalFile } from '../AssetsService.mjs'
+
+const config = JSON.parse(await readFile(new URL('../AssetsConfig.json', import.meta.url), 'utf8'))
+const editWorkingCopy = process.argv.includes('--edit')
+const runId = randomUUID()
+const evidenceRoot = path.join(config.roots.tmp, 'tmp-zenray-assets-v2', 'LifecycleVerification', runId)
+await mkdir(evidenceRoot, { recursive: true })
+const verificationRoot = path.join(config.storage.stateDir, 'verification', runId)
+const live = JSON.parse(await readFile(path.join(config.storage.stateDir, 'Project-zenray-assets-v2.json'), 'utf8'))
+const proof = Object.values(live.backups).find((file) => file.relativePath === 'TrackingWitness.txt')
+if (!proof) throw new Error('The archived witness is missing; no production file will be removed')
+config.storage.stateDir = path.join(verificationRoot, 'state')
+config.storage.workspaceDir = path.join(verificationRoot, 'workspaces')
+config.projects = []
+if (editWorkingCopy) config.storage.cloudRoot = 'pages/ZenRayAssets/zenray-assets-v2/verification'
+const service = await createAssetsService({ config })
+const signal = new AbortController().signal
+try {
+  await service.register({ id: 'lifecycle-witness', name: 'Lifecycle verification', sources: [{ id: proof.sourceId, namespace: 'tmp', localPath: path.join(config.roots.tmp, 'tmp-zenray-assets-v2'), include: editWorkingCopy ? ['TrackingWitness.txt', 'AddedWorkingNote.md'] : ['TrackingWitness.txt'] }] })
+  const state = service.state('lifecycle-witness')
+  // 10 October 2026, 12:35 CEST: pin identical witness bytes despite different tokens in the production and LOAD copies.
+  const witness = state.inventory.localFiles.find((file) => file.id === proof.id)
+  if (!witness || await hashLocalFile(witness.localPath, witness.changeToken) !== proof.sha256) throw new Error('Local witness differs from the exact archive proof')
+  state.backups[proof.id] = { ...proof, changeToken: witness.changeToken, mtimeMs: witness.mtimeMs }
+  await service.inventory('lifecycle-witness')
+  const loaded = { id: 'load' }
+  await service.restoreNow('lifecycle-witness', [proof.id], loaded, signal)
+  const loadedHash = await hashLocalFile(loaded.loaded[0].path)
+  if (editWorkingCopy) {
+    await writeFile(loaded.loaded[0].path, (await readFile(loaded.loaded[0].path, 'utf8')) + '\nWorking copy edit verification (2 October 2026)\n')
+    await writeFile(path.join(path.dirname(loaded.loaded[0].path), 'AddedWorkingNote.md'), 'New file from a loaded workspace (2 October 2026)\n')
+    await service.archiveNow('lifecycle-witness', null, { id: 'save-working-copy' }, signal)
+  }
+  const expectedHash = state.backups[proof.id].sha256
+  const released = { id: 'unload' }
+  await service.unloadNow('lifecycle-witness', null, released, signal)
+  const recovered = { id: 'recover' }
+  await service.recoverNow('lifecycle-witness', recovered, signal)
+  const recoveredHash = await hashLocalFile(recovered.loaded.find((file) => file.id === proof.id).path)
+  const original = path.join(config.roots.tmp, 'tmp-zenray-assets-v2', 'TrackingWitness.txt')
+  const originalHash = await hashLocalFile(original)
+  if (loadedHash !== proof.sha256 || originalHash !== proof.sha256 || recoveredHash !== expectedHash) throw new Error('Witness content differs')
+  const result = { runId, count: released.count, sourceBytes: proof.size, removedAllocatedBytes: released.freedBytes, sha256: expectedHash, originalSha256: originalHash, editedWorkingCopy: editWorkingCopy, recoveredFiles: recovered.loaded.length, originalRetained: true, recoveryVerified: true }
+  await writeFile(path.join(evidenceRoot, 'Evidence.json'), JSON.stringify(result, null, 2))
+  console.log(JSON.stringify({ ...result, evidenceRoot }))
+} finally { await service.close() }

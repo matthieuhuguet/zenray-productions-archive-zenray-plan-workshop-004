@@ -1,0 +1,75 @@
+// 4 October 2026: stores the Claude token from the clipboard, checks that it really works, then empties the clipboard.
+// Copy the token printed by `claude setup-token` (select it, Cmd+C), then run this once; nothing needs restarting afterwards.
+// FR : range le jeton Claude depuis le presse-papiers, verifie qu'il fonctionne, puis vide le presse-papiers. Copier le jeton
+// affiche par `claude setup-token`, lancer ceci une fois ; rien n'est a redemarrer ensuite.
+import { execFile, spawn } from 'node:child_process'
+import { promisify } from 'node:util'
+import { readFile, writeFile, mkdir, rename, chmod, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { runtimeDirectory } from './Main.mjs'
+import { findClaude } from './Hooks.mjs'
+import { extractToken } from './TokenCapture.mjs'
+
+const run = promisify(execFile)
+const config = JSON.parse(await readFile(new URL('./FreelanceConfig.json', import.meta.url), 'utf8'))
+const KEY = config.letters.claude.tokenEnv
+const fail = (message) => { console.error(message); process.exit(1) }
+
+const binary = await findClaude({ configured: config.letters.claude.binary || '' })
+if (!binary) fail('Claude Code est introuvable : ouvre l’application Claude une fois, puis relance.')
+
+// 1. a token already on the clipboard; 2. otherwise the sign-in is run here and its token is captured, nothing to copy.
+// FR : 1. un jeton deja dans le presse-papiers ; 2. sinon la connexion est lancee ici et son jeton est capture, rien a copier.
+const clipboard = (await run('pbpaste').catch(() => ({ stdout: '' }))).stdout
+let token = clipboard.replace(/\s+/g, '')
+if (!/^sk-ant-oat01-[A-Za-z0-9_-]{60,}$/.test(token)) {
+  console.log('Aucun jeton dans le presse-papiers : la connexion à ton abonnement Claude s’ouvre, valide-la dans le navigateur.\n')
+  const log = path.join(os.tmpdir(), `zrf-setup-${process.pid}.log`)
+  try {
+    await writeFile(log, '', { mode: 0o600 })
+    await new Promise((resolve) => spawn('script', ['-q', log, binary, 'setup-token'], { stdio: 'inherit' }).on('exit', resolve))
+    token = extractToken(await readFile(log, 'utf8').catch(() => ''))
+  } finally { await rm(log, { force: true }) }
+  if (!token) fail('\nLe jeton n’a pas été trouvé dans la réponse de la connexion (connexion annulée ?). Relance la commande. Rien n’a été écrit.')
+}
+
+// The test never hides the real reason: a failing `claude -p` still prints a JSON answer, which is read from its output.
+// FR : le test ne cache jamais la vraie raison : un `claude -p` qui echoue ecrit quand meme une reponse JSON, lue dans sa sortie.
+const attempts = [
+  { label: `modèle ${config.letters.claude.model}, effort ${config.letters.claude.effort}`, args: ['--model', config.letters.claude.model, '--effort', config.letters.claude.effort] },
+  { label: `modèle ${config.letters.claude.model}`, args: ['--model', config.letters.claude.model] },
+  { label: 'modèle par défaut du compte', args: [] },
+]
+async function ask(extra) {
+  try {
+    const { stdout } = await run(binary, ['-p', '--no-session-persistence', ...extra, '--tools', '', '--disable-slash-commands', '--output-format', 'json', '--system-prompt', 'Reply with the single word OK.', 'ping'], { env: { ...process.env, [KEY]: token }, timeout: 120000, cwd: '/tmp' })
+    return JSON.parse(stdout)
+  } catch (error) {
+    let answer = null
+    try { answer = JSON.parse(error.stdout) } catch {}
+    return answer || { is_error: true, result: String(error.stderr || error.message).trim().split('\n').slice(0, 3).join(' | ').slice(0, 300) }
+  }
+}
+const reasons = []
+let working = null
+for (const attempt of attempts) {
+  const answer = await ask(attempt.args)
+  if (!answer.is_error) { working = attempt; break }
+  reasons.push(`${attempt.label} : ${String(answer.result).slice(0, 200)}`)
+  if (/401|authenticate|invalid|OAuth/i.test(String(answer.result))) break
+}
+if (!working) fail(`Le test du jeton a échoué. Réponses du modèle :\n- ${reasons.join('\n- ')}\nRien n’a été écrit. Copie ce message à Claude.`)
+if (working !== attempts[0]) console.log(`Attention : seul « ${working.label} » fonctionne avec ton compte. Réglage du moteur à ajuster : ${reasons[0]}`)
+
+const directory = runtimeDirectory()
+const file = path.join(directory, '.env')
+await mkdir(directory, { recursive: true })
+let kept = ''
+try { kept = (await readFile(file, 'utf8')).split('\n').filter((line) => line.trim() && !line.startsWith(`${KEY}=`)).join('\n') } catch {}
+const temporary = `${file}.${process.pid}.tmp`
+await writeFile(temporary, `${kept ? kept + '\n' : ''}${KEY}=${token}\n`, { mode: 0o600 })
+await chmod(temporary, 0o600)
+await rename(temporary, file)
+await run('pbcopy', [], { input: '' }).catch(() => {})
+console.log(`Jeton enregistré dans ${file} (droits 600) et vérifié : le modèle a répondu. Le presse-papiers est vidé. Aucun redémarrage n'est nécessaire : le service relit ce fichier avant chaque passe.`)

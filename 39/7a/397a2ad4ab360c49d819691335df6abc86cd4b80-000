@@ -1,0 +1,222 @@
+// SPORT (16 October 2026, demande de Matthieu) : base d'exercices en tuiles, réglage en un tap, une seule carte Plan par jour.
+// EN: tiles = image + name only; every control lives in ONE sheet (tile « C », compact form). Each save writes the day's Plan card
+// and rewrites the Sport block of the day note, with a notification for each. The day is editable to log a past session.
+// FR : la maquette validée (zenray-edit/designs, rondes 5 à 9) ; les règles de données sont dans sportPlan.js et dayNote.js.
+import React from 'react'
+import { createPortal } from 'react-dom'
+import { SPORT, SPORT_GROUPS } from '../config/sport.js'
+import { UI } from '../config/colors.js'
+import { notify } from '../components/Notifications.jsx'
+import { readPlanState } from '../create/planCache.js'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+import { apiPost } from '../lib/apiPost.js'
+import { entriesOf, upsertEntry, removeEntry, lastPerformance, resolvePlanPath, summary } from './sportPlan.js'
+import { writeDayNote } from './dayNote.js'
+import EXERCISES from './exercises.json'
+import './sport.css'
+
+const pad = (n) => String(n).padStart(2, '0')
+const localIso = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+const nowHm = () => { const d = new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}` }
+const longDate = (iso) => new Date(`${iso}T12:00:00`).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+const weekday = (iso) => new Date(`${iso}T12:00:00`).toLocaleDateString('en-GB', { weekday: 'long' })
+const readJsonKey = (key) => { try { return JSON.parse(localStorage.getItem(key)) } catch { return null } }
+const initials = (name) => name.split(' ').slice(0, 2).map((w) => w[0]).join('')
+const tintOf = (group) => UI[SPORT.groupTint[group]] || UI.gray
+
+function Tile({ ex, entry, onOpen, selected }) {
+  return (
+    <button type="button" className={`zrs-tile${selected ? ' is-sel' : ''}`} onClick={() => onOpen(ex.id)} style={{ '--zrs-tint': tintOf(ex.group) }}>
+      {ex.image ? <img className={ex.variants && ex.variants.length > 1 ? "is-stack" : ""} src={ex.image} alt="" loading="lazy" /> : <span className="zrs-ph">{initials(ex.name)}</span>}
+      {entry && <span className="zrs-badge">{summary(entry)}</span>}
+      <span className="zrs-cap">{ex.name}</span>
+    </button>
+  )
+}
+
+// One setting = one bordered line, label inside, cells split by hairlines (tile « C »).
+function PresetRow({ label, value, presets, onChange }) {
+  const custom = !presets.includes(value)
+  return (
+    <div className="zrs-seg">
+      <label>{label}</label>
+      {presets.map((n) => <button type="button" key={n} className={value === n ? 'is-on' : ''} onClick={() => onChange(n)}>{n}</button>)}
+      <input type="number" min="1" inputMode="numeric" placeholder="…" className={custom ? 'is-on' : ''} defaultValue={custom ? value : ''} key={`${label}-${custom ? value : 'p'}`}
+        onBlur={(e) => { const n = Math.max(1, Number(e.target.value) || 0); if (e.target.value !== '' && n !== value) onChange(n) }}
+        onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur() }} />
+    </div>
+  )
+}
+
+function Sheet({ ex, entry, vals, onVals, onSave, onRemove, onClose, desc, onDesc, last, isDark }) {
+  const content = (
+    <div className={`zrs zrs-portal ${isDark ? 'zr-dark' : ''}`} style={{ '--e0': SPORT.space.e0, '--e1': SPORT.space.e1, '--e2': SPORT.space.e2, '--e3': SPORT.space.e3, '--e4': SPORT.space.e4, '--zr-accent': UI.blue, '--zr-accent-soft': 'rgba(66, 149, 247, 0.16)', '--zrs-green': UI.green }}>
+      <div className="zrs-shade" onClick={onClose} />
+      <aside className="zrs-sheet" role="dialog" aria-label={ex.name}>
+        <div className="zrs-sheet-top">
+          <div className="zrs-thumb" style={{ '--zrs-tint': tintOf(ex.group) }}>
+            {ex.image ? <img className={ex.variants && ex.variants.length > 1 ? "is-stack" : ""} src={ex.image} alt="" /> : <span className="zrs-ph">{initials(ex.name)}</span>}
+          </div>
+          <div className="zrs-tt">
+            <h2>{ex.name}</h2>
+            <small className={entry ? 'is-done' : ''}>{entry ? `✓ dans la séance · ${summary(entry)}` : last ? `dernière fois : ${summary(last)} · ${longDate(last.date)}` : ex.group}</small>
+          </div>
+          <button type="button" className={`zrs-ib${desc ? ' is-on' : ''}`} title="Description" onClick={onDesc}>ⓘ</button>
+          <button type="button" className="zrs-ib" onClick={onClose} aria-label="Fermer">×</button>
+        </div>
+        <div className="zrs-form">
+          <PresetRow label="Séries" value={vals.sets} presets={SPORT.presets.sets} onChange={(n) => onVals({ sets: n })} />
+          <PresetRow label="Reps" value={vals.reps} presets={SPORT.presets.reps} onChange={(n) => onVals({ reps: n })} />
+          <div className="zrs-seg">
+            <label>Charge</label>
+            <button type="button" onClick={() => onVals({ kg: Math.max(0, +(vals.kg - SPORT.kgStep).toFixed(1)) })}>−</button>
+            <span>{vals.kg} kg</span>
+            <button type="button" onClick={() => onVals({ kg: +(vals.kg + SPORT.kgStep).toFixed(1) })}>+</button>
+          </div>
+        </div>
+        {desc && <div className="zrs-info">{ex.purpose && <b>{ex.purpose}</b>}<span>{ex.desc}</span></div>}
+        <div className={`zrs-act${entry ? '' : ' is-solo'}`}>
+          {entry && <button type="button" className="is-ghost" onClick={onRemove}>Retirer</button>}
+          <button type="button" onClick={onSave}>{entry ? 'Mettre à jour' : 'Ajouter à la séance'}</button>
+        </div>
+      </aside>
+    </div>
+  )
+  return typeof document !== 'undefined' ? createPortal(content, document.body) : content
+}
+
+function DayCard({ date, entries, today }) {
+  const sets = entries.reduce((n, e) => n + e.sets, 0)
+  return (
+    <aside className="zrs-plan">
+      <div className="zrs-ph-head"><h3>Plan</h3><small>{date === today ? 'Today' : weekday(date)} · {longDate(date)}</small>{entries.length > 0 && <span className="zrs-count">{entries.length}</span>}</div>
+      {entries.length === 0 ? <p className="zrs-hint">Rien d’envoyé pour ce jour.<br />Chaque exercice ajouté apparaît ici, dans une seule carte de ton Plan.</p> : (
+        <div className="zrs-card">
+          <span className="zrs-time">{entries[0]?.at || ''}</span>
+          <div className="zrs-card-body">
+            <b>Sport · Séance du jour</b>
+            <small>{entries.length} exercice{entries.length > 1 ? 's' : ''} · {sets} séries</small>
+            <ul>{entries.map((e) => <li key={e.ex}><span>{e.name}</span><small>{summary(e)}</small></li>)}</ul>
+          </div>
+          <span className="zrs-check">✓</span>
+        </div>
+      )}
+    </aside>
+  )
+}
+
+export default function SportView({ t } = {}) {
+  const isDark = (t && t.mode === 'dark') || (t && t.textPrimary === '#ffffff') || (typeof document !== 'undefined' && (document.documentElement.classList.contains('zr-dark') || !!document.querySelector('.zr-dark')))
+  const today = localIso()
+  const [date, setDate] = React.useState(today)
+  const [board, setBoard] = React.useState(null)
+  const [state, setState] = React.useState('loading')     // loading | ok | missing | error
+  const [saving, setSaving] = React.useState(false)
+  const [tab, setTab] = React.useState('session')         // session | plan | goal
+  const [group, setGroup] = React.useState('Tous')
+  const [q, setQ] = React.useState('')
+  const [sel, setSel] = React.useState(null)
+  const [desc, setDesc] = React.useState(false)
+  const [vals, setVals] = React.useState({})
+  const [lightbox, setLightbox] = React.useState(null)
+  const planPath = React.useMemo(() => resolvePlanPath({ override: localStorage.getItem(SPORT.plan.overridePathKey), pinned: readJsonKey('zr:plan:pinned') || [], cached: readJsonKey('zr:plan:paths') || [] }), [])
+
+  const load = React.useCallback(async () => {
+    const r = await readPlanState(planPath)
+    if (r.status === 'ok') { setBoard(r.board); setState('ok') } else setState(r.status)   // missing and error are NEVER treated as an empty plan
+  }, [planPath])
+  React.useEffect(() => { load() }, [load])
+
+  const entries = board ? entriesOf(board, date) : []
+  const byEx = React.useMemo(() => new Map(entries.map((e) => [e.ex, e])), [entries])
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean)
+  const shown = EXERCISES.filter((e) => (group === 'Tous' || (group === 'Programme' ? !!e.program : e.group === group)) && words.every((w) => `${e.name} ${e.group} ${e.desc} ${e.purpose || ''}`.toLowerCase().includes(w)))
+  const ex = sel && EXERCISES.find((e) => e.id === sel)
+  const entry = ex && byEx.get(ex.id)
+  const cur = ex && (vals[ex.id] || (entry ? { sets: entry.sets, reps: entry.reps, kg: entry.kg } : { sets: ex.sets ?? SPORT.defaults.sets, reps: ex.reps ?? SPORT.defaults.reps, kg: ex.kg ?? SPORT.defaults.kg }))
+
+  // Writes the Plan card (fresh read, sha-checked, retried), then the day note; one notification each. FR : une notification chacune.
+  const commit = async (mutate, label) => {
+    setSaving(true)
+    try {
+      const res = await saveJsonWithRetry(planPath, mutate)
+      if (!res.ok) throw new Error(res.error || 'écriture Plan refusée')
+      setBoard(res.data)
+      const tag = date === today ? '' : ` · ${longDate(date)}`
+      notify({ title: 'Plan · séance mise à jour', body: `${label}${tag}`, icon: 'calendar', tint: UI.blue, kind: 'success' })
+      try {
+        await writeDayNote(date, entriesOf(res.data, date), { apiPost })
+        notify({ title: date === today ? 'Note du jour' : `Note du ${longDate(date)}`, body: label, icon: 'note.text', tint: UI.orange, kind: 'page' })
+      } catch (e) { notify({ title: 'Note du jour non écrite', body: String(e.message || e), icon: 'exclamationmark.triangle', tint: UI.red }) }
+    } catch (e) { notify({ title: 'Sport non enregistré', body: String(e.message || e), icon: 'exclamationmark.triangle', tint: UI.red }) }
+    finally { setSaving(false) }
+  }
+  const save = () => { const v = cur; setSel(null); setDesc(false); commit((b) => upsertEntry(b, date, { ex: ex.id, name: ex.name, ...v, at: nowHm() }), `+ ${ex.name} ${summary(v)}`) }
+  const remove = () => { const id = ex.id, name = ex.name; setSel(null); setDesc(false); commit((b) => removeEntry(b, date, id), `${name} retiré`) }
+  const close = () => { setSel(null); setDesc(false) }
+
+  // Verrouille le défilement de l'arrière-plan et écoute Escape pour fermer
+  React.useEffect(() => {
+    if (!sel && !lightbox) return
+    const prev = typeof document !== 'undefined' ? document.body.style.overflow : ''
+    if (typeof document !== 'undefined') document.body.style.overflow = 'hidden'
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        if (lightbox) setLightbox(null)
+        else if (sel) close()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      if (typeof document !== 'undefined') document.body.style.overflow = prev
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [sel, lightbox])
+
+  if (state === 'loading') return <div className="zrs zrs-state">chargement…</div>
+  if (state !== 'ok') return <div className="zrs zrs-state"><p>{state === 'missing' ? 'Plan introuvable' : 'Plan illisible'} : <code>{planPath}</code></p><p className="zrs-hint">Rien n’a été écrit. Épingle ton plan dans Plan (clic droit, Épingler à Plan) ou règle le chemin dans <code>{SPORT.plan.overridePathKey}</code>.</p><button type="button" className="zrs-retry" onClick={load}>Réessayer</button></div>
+  return (
+    <div className={`zrs zrs-tab-${tab}`} style={{ '--e0': SPORT.space.e0, '--e1': SPORT.space.e1, '--e2': SPORT.space.e2, '--e3': SPORT.space.e3, '--e4': SPORT.space.e4, '--zr-accent': UI.blue, '--zr-accent-soft': 'rgba(66, 149, 247, 0.16)', '--zrs-green': UI.green }}>
+      <header className="zrs-head">
+        <div>
+          <h1>Sport</h1>
+          <label className={`zrs-date${date !== today ? ' is-past' : ''}`}>{weekday(date)} · {longDate(date)}<span className="zrs-chev">⌄</span>{date !== today && <span className="zrs-pastb">séance passée</span>}
+            <input type="date" value={date} max={today} onChange={(e) => { if (e.target.value) { setDate(e.target.value); setVals({}); close() } }} /></label>
+        </div>
+        <div className="zrs-segctl">
+          <button type="button" className={tab === 'session' ? 'is-on' : ''} onClick={() => setTab('session')}>Séance</button>
+          <button type="button" className={`zrs-only-narrow${tab === 'plan' ? ' is-on' : ''}`} onClick={() => setTab('plan')}>Plan{entries.length > 0 ? ` · ${entries.length}` : ''}</button>
+          <button type="button" className={tab === 'goal' ? 'is-on' : ''} onClick={() => setTab('goal')}>Objectif visuel</button>
+        </div>
+      </header>
+      <div className="zrs-body">
+        <section className="zrs-main">
+          {tab === 'goal' ? (
+            <div className="zrs-goal">
+              {SPORT.goalPhotos.map((p) => <button type="button" className="zrs-gt" key={p.src} onClick={() => setLightbox(p.src)}><img src={p.src} alt={p.title} loading="lazy" /><span>{p.title}</span></button>)}
+            </div>
+          ) : (
+            <>
+              <div className="zrs-find">
+                <input className="zrs-search" placeholder="Chercher dans toute la base d’exercices…" value={q} onChange={(e) => setQ(e.target.value)} />
+                <div className="zrs-chips">{SPORT_GROUPS.map((g) => <button type="button" key={g} className={group === g ? 'is-on' : ''} onClick={() => setGroup(g)}>{g}</button>)}</div>
+              </div>
+              <div className="zrs-grid">{shown.length ? shown.map((e) => <Tile key={e.id} ex={e} entry={byEx.get(e.id)} selected={sel === e.id} onOpen={(id) => { setSel(id); setDesc(false) }} />) : <p className="zrs-hint">Aucun exercice ne correspond.</p>}</div>
+            </>
+          )}
+        </section>
+        <DayCard date={date} entries={entries} today={today} />
+      </div>
+      {ex && <Sheet ex={ex} entry={entry} vals={cur} onVals={(p) => setVals((v) => ({ ...v, [ex.id]: { ...cur, ...p } }))} onSave={save} onRemove={remove} onClose={close} desc={desc} onDesc={() => setDesc((d) => !d)} last={lastPerformance(board, ex.id, date)} isDark={isDark} />}
+      {saving && <div className="zrs-saving">enregistrement…</div>}
+      {lightbox && typeof document !== 'undefined' && createPortal(
+        <div className={`zrs zrs-portal ${isDark ? 'zr-dark' : ''}`} style={{ '--e0': SPORT.space.e0, '--e1': SPORT.space.e1, '--e2': SPORT.space.e2, '--e3': SPORT.space.e3, '--e4': SPORT.space.e4 }}>
+          <div className="zrs-lb" onClick={() => setLightbox(null)}>
+            <img src={lightbox} alt="" />
+          </div>
+        </div>,
+        document.body
+      )}
+    </div>
+  )
+}

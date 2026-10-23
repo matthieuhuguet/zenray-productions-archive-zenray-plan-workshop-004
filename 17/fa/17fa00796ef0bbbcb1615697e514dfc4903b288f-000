@@ -1,0 +1,112 @@
+// 4 October 2026: Claude may write one paragraph, only about the role and the CV; anything else is refused and the letter keeps its own.
+import { describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import config from './FreelanceConfig.json'
+import { buildPrompt, createHookWriter, validateHook } from './Hooks.mjs'
+import { loadEnvFile } from './Env.mjs'
+
+const cv = { skills: [{ name: 'Houdini', level: 5, tags: ['VEX', 'HDAs'] }, { name: 'Unreal Engine 5', level: 5, tags: ['PCG'] }, { name: 'Python', level: 4, tags: [] }], experiences: [{ title: 'Technical Artist', company: 'ZenRay', period: '2025', highlights: ['Systèmes procéduraux via Houdini HDAs.'], highlightsEn: ['Procedural systems via Houdini HDAs.'] }], projects: [{ id: 1, title: 'Ceramic Tiles', url: 'u', description: { en: 'A tile material in Copernicus.', fr: 'Un matériau.' } }], pdf: {}, fingerprint: 'f' }
+const good = 'Votre poste demande des outils Houdini et un pipeline Unreal Engine solides. Mes HDA procéduraux et mon travail récent sur Ceramic Tiles répondent à ce besoin.'
+
+describe('validateHook', () => {
+  const context = { cv, offerSkills: ['Houdini', 'Unreal Engine', 'Unity'], offerText: 'Houdini, Unreal Engine, Unity' }
+  it('accepts a grounded paragraph', () => { expect(validateHook(good, context)).toEqual({ ok: true }) })
+  it('refuses a claimed taste, a play, a study, a link, a long dash, a second paragraph, a skill the CV lacks', () => {
+    expect(validateHook('J’ai évidemment joué à votre dernier jeu et je l’ai trouvé superbe, avec une direction artistique remarquable.', context).reason).toMatch(/taste or a play/)
+    expect(validateHook('I admire your studio and the work you ship, which fits my Houdini and Unreal Engine pipeline experience very well.', context).reason).toMatch(/taste/)
+    expect(validateHook(`${good} https://x.example`, context).reason).toMatch(/link/)
+    expect(validateHook(good.replace('Mes HDA', 'Mes HDA \u2014 oui'), context).reason).toMatch(/dash/)
+    expect(validateHook(`${good}\n\nEncore un paragraphe.`, context).reason).toMatch(/paragraph/)
+    expect(validateHook('Votre poste demande Houdini et Blender, et je maîtrise parfaitement ces deux outils au quotidien depuis longtemps.', context).reason).toMatch(/Blender/)
+    expect(validateHook('Trop court.', context).reason).toBe('too short')
+    expect(validateHook(Array.from({ length: 80 }, () => 'Houdini').join(' '), context).reason).toBe('too long')
+    expect(validateHook('', context).reason).toBe('empty')
+  })
+})
+
+describe('createHookWriter', () => {
+  const env = { CLAUDE_CODE_OAUTH_TOKEN: 'tok' }
+  const studio = { name: 'Studio', role: 'Technical Artist' }
+  const ask = (exec, over = {}) => createHookWriter({ config, exec, env, find: async () => '/bin/claude', tmp: '/tmp', ...over }).write({ studio, offerText: 'Houdini and Unreal Engine pipeline', cv, language: 'fr', offerSkills: ['Houdini', 'Unreal Engine'] })
+  it('runs the model headless with the token, no tools and no saved session, and returns its paragraph', async () => {
+    const exec = vi.fn().mockResolvedValue({ stdout: JSON.stringify({ is_error: false, result: good }) })
+    expect(await ask(exec)).toEqual({ text: good, source: 'claude' })
+    const [binary, args, options] = exec.mock.calls[0]
+    expect(binary).toBe('/bin/claude')
+    expect(args).toEqual(expect.arrayContaining(['-p', '--no-session-persistence', '--disable-slash-commands', '--model', 'claude-sonnet-5-5', '--effort', 'medium', '--tools', '']))
+    expect(options.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok')
+    expect(args.join(' ')).toMatch(/Never claim that he played/)
+  })
+  it('skips when neither a token nor a CLI sign-in exists, and never asks the model', async () => {
+    const exec = vi.fn().mockResolvedValue({ stdout: JSON.stringify({ loggedIn: false, authMethod: 'none' }) })
+    expect(await ask(exec, { env: {} })).toEqual({ skipped: 'not-signed-in' })
+    expect(exec.mock.calls.every(([, args]) => args[0] === 'auth')).toBe(true)
+    expect(await createHookWriter({ config, env: {}, exec, find: async () => '/bin/claude' }).available()).toBe(false)
+  })
+  it('uses the CLI sign-in when there is no token, with the token variable emptied so nothing overrides it', async () => {
+    const exec = vi.fn(async (binary, args) => (args[0] === 'auth' ? { stdout: JSON.stringify({ loggedIn: true }) } : { stdout: JSON.stringify({ is_error: false, result: good }) }))
+    const writer = createHookWriter({ config, exec, env: { CLAUDE_CODE_OAUTH_TOKEN: '' }, find: async () => '/bin/claude', tmp: '/tmp' })
+    expect(await writer.via()).toBe('login')
+    expect(await writer.write({ studio, offerText: 'Houdini and Unreal Engine pipeline', cv, language: 'fr', offerSkills: ['Houdini', 'Unreal Engine'] })).toEqual({ text: good, source: 'claude' })
+    const call = exec.mock.calls.find(([, args]) => args[0] === '-p')
+    expect(call[2].env.CLAUDE_CODE_OAUTH_TOKEN).toBe('')
+  })
+  it('notices a sign-in made after a failed check within thirty seconds', async () => {
+    let t = 0, signed = false
+    const exec = vi.fn(async () => ({ stdout: JSON.stringify({ loggedIn: signed }) }))
+    const writer = createHookWriter({ config, exec, env: {}, find: async () => '/bin/claude', now: () => t })
+    expect(await writer.available()).toBe(false)
+    signed = true; t += 10 * 1000
+    expect(await writer.available()).toBe(false)
+    t += 25 * 1000
+    expect(await writer.available()).toBe(true)
+  })
+  it('asks the CLI about its sign-in only once every five minutes', async () => {
+    let t = 0
+    const exec = vi.fn().mockResolvedValue({ stdout: JSON.stringify({ loggedIn: true }) })
+    const writer = createHookWriter({ config, exec, env: {}, find: async () => '/bin/claude', now: () => t })
+    await writer.available(); await writer.available()
+    expect(exec).toHaveBeenCalledTimes(1)
+    t += 6 * 60 * 1000; await writer.available()
+    expect(exec).toHaveBeenCalledTimes(2)
+  })
+  it('falls back, with a reason, on an invalid token, a refused answer, a crash or a missing binary', async () => {
+    expect((await ask(vi.fn().mockResolvedValue({ stdout: JSON.stringify({ is_error: true, result: 'OAuth access token is invalid.' }) }))).skipped).toMatch(/model: OAuth/)
+    expect((await ask(vi.fn().mockResolvedValue({ stdout: JSON.stringify({ is_error: false, result: 'J’ai adoré votre dernier jeu et je rêve de rejoindre votre équipe depuis des années.' }) }))).skipped).toMatch(/rejected/)
+    expect((await ask(vi.fn().mockRejectedValue(new Error('timeout')))).skipped).toMatch(/error: timeout/)
+    const failing = Object.assign(new Error('Command failed: claude'), { stdout: JSON.stringify({ is_error: true, result: 'Model not available for this account' }) })
+    expect((await ask(vi.fn().mockRejectedValue(failing))).skipped).toBe('error: Model not available for this account')
+    expect(await ask(vi.fn(), { find: async () => null })).toEqual({ skipped: 'claude-not-found' })
+  })
+  it('puts only the CV facts and the offer in the prompt', () => {
+    const { user } = buildPrompt({ studio, offerText: '<p>Houdini role</p>', cv, language: 'en' })
+    expect(user).toContain('Houdini (5/5: VEX, HDAs)')
+    expect(user).toContain('Procedural systems via Houdini HDAs.')
+    expect(user).toContain('Ceramic Tiles: A tile material in Copernicus.')
+    expect(user).toContain('Houdini role')
+  })
+})
+
+describe('loadEnvFile', () => {
+  const FULL = `sk-ant-oat01-${'aB3_-'.repeat(15)}ZZ`
+  it('ignores a truncated token out loud, so it never overrides the CLI sign-in', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'zrf-env-'))
+    writeFileSync(path.join(dir, '.env'), 'CLAUDE_CODE_OAUTH_TOKEN=abcd\n', { mode: 0o600 })
+    const log = vi.fn()
+    expect(await loadEnvFile(dir, { log })).toEqual({})
+    expect(log.mock.calls[0][0]).toMatch(/not a complete token/)
+  })
+  it('reads allowed keys from a private file and refuses a shared one', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'zrf-env-'))
+    writeFileSync(path.join(dir, '.env'), `CLAUDE_CODE_OAUTH_TOKEN="${FULL}"\nOTHER=nope\n`)
+    chmodSync(path.join(dir, '.env'), 0o644)
+    const log = vi.fn()
+    expect(await loadEnvFile(dir, { log })).toEqual({})
+    expect(log.mock.calls[0][0]).toMatch(/chmod 600/)
+    chmodSync(path.join(dir, '.env'), 0o600)
+    expect(await loadEnvFile(dir)).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: FULL })
+    expect(await loadEnvFile(path.join(dir, 'missing'))).toEqual({})
+  })
+})

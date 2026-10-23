@@ -1,0 +1,141 @@
+// fix-thumb-manifests.mjs — RÉCUPÉRATION après le bug du run bulk du 2026-07-13 (regen-thumbs-bulk.mjs) :
+// les 2552 vignettes 1080p ont bien été générées ET poussées sur GitHub (shard zenrayshards-img-0b3c4b555907,
+// commit 31cfd5f), mais le patch des manifestes a échoué à 100% (chemin "pages/pages/..." doublé -> 404
+// systématique). Corrigé dans regen-thumbs-bulk.mjs pour les prochains runs ; CE script répare celui-ci SANS
+// re-pousser les 1,1 Go déjà en ligne : le chiffrement est DÉTERMINISTE (même fichier source + mêmes réglages
+// -> mêmes octets -> même hash -> même chemin), vérifié empiriquement (curl 200 sur un chemin recalculé) avant
+// d'écrire ce script. On recalcule donc juste hash/chemin EN LOCAL et on pointe les manifestes vers le shard
+// déjà existant.
+//
+// PARALLÉLISÉ (2026-07-13, v2) : la v1 tournait en séquentiel (une image à la fois, magick + 1 requête réseau
+// par image) — beaucoup trop lent (≈2,2 s/image, ~93 min pour 2552). Ici : execFile ASYNC (pas execFileSync)
+// pour que plusieurs process magick/cwebp tournent EN VRAI PARALLÈLE (pas juste des promesses qui se
+// partagent un seul thread bloquant), + fetch réseau lui aussi concurrent. CONCURRENCY=14 (18 coeurs Mac M5
+// Max, marge pour le reste de la machine). Copie locale de la logique de resize (pas touché à img-ingest.mjs
+// partagé par le pipeline de production, pour zéro risque de régression ailleurs).
+import { sha256Hex, encryptDeterministic, loadMasterKey, shardPathFor, jsDelivrUrl } from './lib/img-pipeline.mjs'
+import { pushBlobs } from './video-mse-lib.mjs'
+import { readFileSync } from 'node:fs'
+import { readFile as readFileP, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execFileP = promisify(execFile)
+const token = process.env.GITHUB_TOKEN
+const OWNER = 'matthieuhuguet'
+const DATA = 'zenray-data'
+const REPO_ROOT = '/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress'
+const KNOWN_REPO = 'zenrayshards-img-0b3c4b555907'
+const KNOWN_COMMIT = '31cfd5f5d46b93b2b501dcea86e8251bbbf2c6fe'
+const MAX_SHORT = 1080, QUALITY = 60
+const CONCURRENCY = 14
+const PROGRESS_FILE = '/Users/zenray/.zr-thumb-bulk/fix-progress.json'
+if (!token) { console.error('usage: GITHUB_TOKEN=.. node fix-thumb-manifests.mjs'); process.exit(1) }
+
+const key = loadMasterKey(REPO_ROOT, { readFileSync })
+const table = JSON.parse(await readFileP('/Users/zenray/.zr-thumb-bulk/thumb-assoc-table.json', 'utf8'))
+console.log(`\n=== RÉCUPÉRATION (parallèle, x${CONCURRENCY}) — ${table.associated.length} manifeste(s) à repointer vers ${KNOWN_REPO}@${KNOWN_COMMIT.slice(0, 7)} ===`)
+
+// resize async (execFile, pas execFileSync) : identique à makeThumbAt (img-ingest.mjs) mais NON-BLOQUANT,
+// pour que plusieurs images se traitent en vrai parallèle. Repli cwebp direct si magick échoue (même logique).
+async function imageDimsAsync(abs) {
+  try {
+    const { stdout } = await execFileP('/usr/bin/sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', abs], { timeout: 30000 })
+    const w = (stdout.match(/pixelWidth:\s*(\d+)/) || [])[1]
+    const h = (stdout.match(/pixelHeight:\s*(\d+)/) || [])[1]
+    if (w && h) return { w: parseInt(w, 10), h: parseInt(h, 10) }
+  } catch {}
+  return { w: 0, h: 0 }
+}
+async function makeThumbAtAsync(abs, maxShort, quality) {
+  const { w, h } = await imageDimsAsync(abs)
+  const short = Math.min(w, h) || 0
+  const scale = short > 0 ? Math.min(1, maxShort / short) : 1
+  const neww = w ? Math.max(1, Math.round(w * scale)) : maxShort
+  const newh = h ? Math.max(1, Math.round(h * scale)) : maxShort
+  const geom = `${neww}x${newh}!`
+  try {
+    const { stdout } = await execFileP('magick', [abs, '-auto-orient', '-resize', geom, '-quality', String(quality), '-strip', 'webp:-'], { timeout: 60000, maxBuffer: 1 << 27, encoding: 'buffer' })
+    if (stdout && stdout.length) return { buf: stdout, w: neww, h: newh }
+  } catch {}
+  try {
+    const { stdout } = await execFileP('/opt/homebrew/bin/cwebp', ['-quiet', '-q', String(quality), '-resize', String(neww), String(newh), abs, '-o', '-'], { timeout: 60000, maxBuffer: 1 << 27, encoding: 'buffer' })
+    if (stdout && stdout.length) return { buf: stdout, w: neww, h: newh }
+  } catch {}
+  return null
+}
+// BUG TROUVÉ EN PROD (2026-07-13) : sans distinction, un 403 quota épuisé (X-RateLimit-Remaining: 0) était
+// traité EXACTEMENT comme un vrai 404 -> des centaines d'images auraient été classées à tort "manifeste
+// introuvable" au lieu d'être réessayées. Ici : on distingue via l'en-tête, on ATTEND le reset (ou 30s par
+// défaut) et on retente, jusqu'à 3 fois — un vrai 404 (fichier déplacé/supprimé) reste immédiat, lui.
+async function fetchManifest(mp) {
+  const enc = encodeURIComponent(mp).replace(/%2F/g, '/')
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await fetch(`https://api.github.com/repos/${OWNER}/${DATA}/contents/${enc}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zr' } })
+    if (r.status === 200) { try { return JSON.parse(await r.text()) } catch { return null } }
+    const remaining = r.headers.get('x-ratelimit-remaining')
+    const isRateLimited = r.status === 403 && remaining === '0'
+    if (r.status === 429 || isRateLimited) {
+      const resetAt = parseInt(r.headers.get('x-ratelimit-reset') || '0', 10) * 1000
+      const waitMs = resetAt ? Math.max(1000, resetAt - Date.now() + 2000) : 30000
+      console.log(`  ⏳ quota GitHub épuisé, attente ${Math.round(waitMs / 1000)}s avant de réessayer...`)
+      await new Promise((res) => setTimeout(res, waitMs))
+      continue
+    }
+    return null // vrai 404/erreur non liée au quota
+  }
+  return null
+}
+
+let idx = 0, done = 0, recomputed = 0, manifestGone = 0, failed = 0, alreadyDone = 0
+const results = []
+async function worker() {
+  while (true) {
+    const i = idx++
+    if (i >= table.associated.length) return
+    const item = table.associated[i]
+    try {
+      const t = await makeThumbAtAsync(item.localPath, MAX_SHORT, QUALITY)
+      if (!t) { failed++; continue }
+      const tHash = sha256Hex(t.buf)
+      const enc = encryptDeterministic(t.buf, key, tHash)
+      const thumbPath = shardPathFor(tHash, 'webp')
+      recomputed++
+      const mp = `${item.sitePath}.img.json` // sitePath porte DÉJÀ "pages/" — pas de second préfixe (le bug corrigé)
+      const m = await fetchManifest(mp)
+      if (!m) { manifestGone++; continue }
+      // idempotent (2026-07-13, après un 1er push interrompu par la limite secondaire GitHub) : déjà patché
+      // avec CES dimensions -> on saute, ça permet de relancer ce script sans re-pousser ce qui l'a déjà été.
+      if (m.thumbW === t.w && m.thumbH === t.h) { alreadyDone++; continue }
+      m.thumb = jsDelivrUrl(OWNER, KNOWN_REPO, KNOWN_COMMIT, thumbPath)
+      m.thumbIv = enc.iv; m.thumbW = t.w; m.thumbH = t.h
+      results.push({ path: mp, content: JSON.stringify(m) })
+    } catch (e) { failed++ }
+    done++
+    if (done % 50 === 0) {
+      console.log(`  ${done}/${table.associated.length} traités — ${results.length} prêt(s), ${manifestGone} introuvable(s), ${failed} échec(s)`)
+      await writeFile(PROGRESS_FILE, JSON.stringify({ done, total: table.associated.length, ready: results.length, manifestGone, failed }))
+    }
+  }
+}
+await Promise.all(Array.from({ length: CONCURRENCY }, worker))
+console.log(`\nrecalculés : ${recomputed} — déjà patchés (sautés) : ${alreadyDone} — manifestes prêts à patcher : ${results.length} — introuvables : ${manifestGone} — échecs : ${failed}`)
+
+if (results.length) {
+  const sample = JSON.parse(results[0].content)
+  const check = await fetch(sample.thumb).then((r) => r.status).catch(() => 0)
+  console.log(`vérif échantillon (${sample.thumb.slice(-40)}) : HTTP ${check}`)
+  if (check !== 200) { console.error('ARRÊT : l\'échantillon ne répond pas 200, ne pas committer en masse sans revérifier.'); process.exit(1) }
+}
+
+// lots réduits (50, pas 150) + pause entre lots (2026-07-13) : le 1er essai a déclenché la LIMITE SECONDAIRE
+// GitHub (403, trop de requêtes en rafale — pushBlobs crée les blobs d'un lot en parallèle en interne) après
+// ~1 lot. Lots plus petits + pause laissent le temps au compteur de rafale de retomber entre deux lots.
+for (let i = 0; i < results.length; i += 50) {
+  const batch = results.slice(i, i + 50)
+  await pushBlobs(token, DATA, batch, `fix thumb HD manifests (${batch.length})`, () => {})
+  console.log(`  lot poussé : ${Math.min(i + 50, results.length)}/${results.length}`)
+  if (i + 50 < results.length) await new Promise((r) => setTimeout(r, 3000))
+}
+console.log(`\n✓✓ RÉPARATION COMPLÈTE — ${results.length}/${table.associated.length} manifestes repointés vers les vignettes 1080p déjà en ligne.`)
+process.exit(0)

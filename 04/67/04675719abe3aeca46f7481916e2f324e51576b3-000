@@ -1,0 +1,692 @@
+// 12 October 2026: "Tube" layout of ZenRay Assets, the default view (Classic stays one click away).
+// A project is a cover + title + one line; a file is a thumbnail + title. The thumbnail shape carries the type.
+// The project page is: storage ring + bar on top, Finder sidebar of sources, Finder views, download sheet.
+// FR : disposition « Tube », vue par défaut de ZenRay Assets. Un projet = couverture + titre + une ligne ;
+// un fichier = miniature + titre. Page projet : anneau et barre d'espace, barre latérale des sources, vues Finder, feuille de téléchargement.
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { bindingsByProject } from '../../lib/assetsBindings.js'
+import { createPortal } from 'react-dom'
+import Icon from '../Icon.jsx'
+import { compareProjectsByDateDesc, projectActivityTime, readableSize } from '../../lib/assetsProjects.js'
+import { isImageFile } from '../../lib/assetsProjectCover.js'
+import { fileDate } from '../../lib/assetsFileQuery.js'
+import { ConversationBadge } from './ConversationView.jsx'
+import { drawCoverCanvas } from '../../lib/coverThumbnail.js'
+import { resolveEntryBytes } from '../../lib/bulkZip.js'
+import './AssetsTube.css'
+
+// File kind -> shape family. One table, read everywhere.
+const SHAPES = {
+  image: 'image', 'image-lib': 'image',
+  video: 'video',
+  audio: 'audio',
+  '3d-lib': '3d', houdini: '3d', bgeo: '3d', 'bgeo.sc': '3d',
+  text: 'doc', pdf: 'doc', 'doc-lib': 'doc', 'sheet-lib': 'doc', 'slides-lib': 'doc', 'epub-lib': 'doc',
+}
+const SHAPE_ICONS = { image: 'photo', video: 'film', audio: 'music.note', '3d': 'square.grid.3x3', doc: 'doc.text', other: 'doc' }
+export const shapeOf = (file) => SHAPES[file?.kind] || 'other'
+
+// The source locations a file can live in. Technical names are the only view.
+export const SOURCE_DEFS = [
+  { id: 'tmp', label: 'tmp', plain: 'tmp', what: 'Travail en cours, essais et captures' },
+  { id: 'memory', label: 'Memory', plain: 'Memory', what: 'Suivi, décisions et règles du projet' },
+  { id: 'houdini', label: 'Houdini', plain: 'Houdini', what: 'Scènes, outils et rendus' },
+  { id: 'unreal', label: 'Unreal', plain: 'Unreal', what: 'Projet et contenu du jeu' },
+  { id: 'cloud', label: 'Cloud', plain: 'Cloud', what: 'Sauvegardé dans le cloud, absent des dossiers reliés' },
+]
+const SOURCE_BY_ID = Object.fromEntries(SOURCE_DEFS.map((definition) => [definition.id, definition]))
+export const sourceIdOf = (file, sources = []) => {
+  const source = sources.find((item) => item.id && item.id === file.sourceId)
+  const id = source?.namespace || file.namespace
+  return SOURCE_BY_ID[id] ? id : 'cloud'
+}
+const VIEW_KEY = 'assets.tubeView'
+const readSetting = (key, allowed, fallback) => { try { const value = localStorage.getItem(key); return allowed.includes(value) ? value : fallback } catch { return fallback } }
+const writeSetting = (key, value) => { try { localStorage.setItem(key, value) } catch { /* storage may be blocked */ } }
+
+const number = new Intl.NumberFormat('fr-FR')
+const shortDate = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short' })
+const dateOf = (value) => { const time = typeof value === 'number' ? value : Date.parse(value); return Number.isFinite(time) ? shortDate.format(time) : null }
+const hasThumbnail = (file) => Boolean(file && (file.thumbnailUrl || file.coverUrl || ((file.contentPath || file.cloudPath || file.present) && ['image', 'video'].includes(shapeOf(file)))))
+const notInCloud = (file) => ['local-only', 'pending', 'modified', 'error'].includes(file?.status)
+const isDownloadable = (file) => file.downloadable !== false && Boolean(file.contentPath || file.cloudPath)
+const bytesOf = (files) => files.reduce((sum, file) => sum + (Number.isFinite(file.size) && file.size > 0 ? file.size : 0), 0)
+const sizeText = (bytes, count = 1) => bytes > 0 ? readableSize(bytes) : count ? '-' : '0 Ko'
+const naturalOrder = (a, b) => String(a).localeCompare(String(b), 'fr', { numeric: true })
+// Source folders keep the sidebar order (Brouillons, Notes, Scènes Houdini, Jeu, Archive); other folders are alphabetical.
+const sourceRank = (key) => { const index = SOURCE_DEFS.findIndex((definition) => definition.id === key); return index < 0 ? SOURCE_DEFS.length : index }
+const rootOrder = (a, b) => sourceRank(a) - sourceRank(b) || naturalOrder(a, b)
+
+// Apple-style spinner, painted UNDER the image: visible until the thumbnail paints over it, never an empty box.
+export function TubeSpinner() {
+  return <span className="tube-spinner" aria-hidden="true">{Array.from({ length: 12 }, (_, index) => <i key={index} style={{ transform: `rotate(${index * 30}deg)`, animationDelay: `${(index - 12) / 12}s` }} />)}</span>
+}
+
+// Stable pastel from a text, for projects that have no image at all.
+const hueOf = (text) => { let hash = 0; for (const character of String(text)) hash = (hash * 31 + character.charCodeAt(0)) % 360; return hash }
+const initialsOf = (name) => String(name || '?').split(/[\s_-]+/).filter(Boolean).slice(0, 2).map((word) => word[0].toUpperCase()).join('')
+
+function Thumb({ file, shape, renderThumbnail, coverUrl, dot, size = 720, placeholder }) {
+  // An image failing anywhere inside (404 from the Mac bridge, broken CDN link) turns the box into its type glyph.
+  // Error events do not bubble, so they are caught in the capture phase on the wrapper.
+  const [node, setNode] = useState(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => { setFailed(false) }, [file?.id, coverUrl])
+  useEffect(() => {
+    if (!node) return undefined
+    const onError = (event) => { if (event.target?.tagName === 'IMG') setFailed(true) }
+    node.addEventListener('error', onError, true)
+    return () => node.removeEventListener('error', onError, true)
+  }, [node])
+  // The shared renderer only mounts when the tile is near the viewport: 120 tiles must not fire 120 manifest reads.
+  const [seen, setSeen] = useState(() => typeof IntersectionObserver === 'undefined')
+  useEffect(() => {
+    if (seen || !node) return undefined
+    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) { setSeen(true); observer.disconnect() } }, { rootMargin: '320px' })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [seen, node])
+  const direct = coverUrl || file?.thumbnailUrl
+  // An archived image can have no preview at all (raw file, no thumbnail in its manifest): after a short wait the
+  // spinner gives way to the type glyph instead of turning forever. A late image still paints over the glyph.
+  const [gaveUp, setGaveUp] = useState(false)
+  useEffect(() => {
+    if (!seen || direct || gaveUp || !node) return undefined
+    const timer = setTimeout(() => {
+      const painted = [...node.querySelectorAll('img, canvas')].some((element) => element.tagName === 'CANVAS' || element.naturalWidth > 0)
+      if (!painted) setGaveUp(true)
+    }, 3500)
+    return () => clearTimeout(timer)
+  }, [seen, direct, gaveUp, node])
+  const loads = !failed && (Boolean(direct) || hasThumbnail(file))
+  const extension = String(file?.name || '').includes('.') ? String(file.name).split('.').pop().slice(0, 5).toUpperCase() : ''
+  return <span className="tube-thumb" data-shape={shape} data-placeholder={!loads && placeholder ? '' : undefined} ref={setNode} style={!loads && placeholder ? { '--tube-ph-hue': hueOf(placeholder) } : undefined}>
+    {(!loads || gaveUp) && !placeholder && <span className="tube-glyph"><Icon name={SHAPE_ICONS[shape] || 'doc'} size={28} />{extension && shape !== 'cover' && <span className="tube-ext">{extension}</span>}</span>}
+    {loads && !direct && !gaveUp && <TubeSpinner />}
+    {direct && !failed ? <img src={direct} alt="" loading="lazy" decoding="async" /> : loads && seen && renderThumbnail ? renderThumbnail(file, { size, cover: true }) : null}
+    {!loads && placeholder && <span className="tube-initials" aria-hidden="true">{initialsOf(placeholder)}</span>}
+    {dot && <span className="tube-dot" title="Pas encore dans le cloud" />}
+  </span>
+}
+
+function projectCount(project) {
+  return Number(project.fileCount ?? project.inventory?.fileCount ?? project.counts?.files ?? project.files?.length ?? 0)
+}
+
+// ---------------------------------------------------------------- home
+
+export function TubeHome({ projects, conversations = [], onSelect, onConversation, onLinkProject, onAdjustCover, renderThumbnail, loading }) {
+  const [collection, setCollection] = useState('projects')
+  const [search, setSearch] = useState('')
+  const query = search.trim().toLocaleLowerCase('fr')
+  const hasCover = (project) => Boolean(project.coverFile || project.coverUrl)
+  const projectList = useMemo(() => projects.filter((project) => collection === 'nocover' ? project.category !== 'Conversations' : (project.category === 'Conversations') === (collection === 'conversations'))
+    .filter((project) => collection !== 'nocover' || (project.category !== 'Conversations' && !(project.coverFile || project.coverUrl)))
+    .filter((project) => !query || `${project.name} ${project.category || ''} ${project.summary || ''}`.toLocaleLowerCase('fr').includes(query))
+    .sort(compareProjectsByDateDesc), [projects, collection, query])
+  const conversationList = useMemo(() => collection !== 'conversations' ? [] : [...conversations]
+    .filter((item) => !query || `${item.title} ${item.provider}`.toLowerCase().includes(query))
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)), [conversations, collection, query])
+  const bindings = useMemo(() => bindingsByProject(projects.filter((project) => project.category !== 'Conversations'), conversations), [projects, conversations])
+  const counts = { projects: projects.filter((project) => project.category !== 'Conversations').length, conversations: conversations.length || projects.filter((project) => project.category === 'Conversations').length, nocover: projects.filter((project) => project.category !== 'Conversations' && !hasCover(project)).length, bindings: bindings.rows.length }
+  return <section className="tube-home" aria-label="Projets">
+    <div className="tube-bar">
+      <label className="tube-search"><Icon name="magnifyingglass" size={16} /><input aria-label="Rechercher" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={collection === 'conversations' ? 'Rechercher une conversation' : 'Rechercher un projet'} />{search && <button type="button" aria-label="Effacer" onClick={() => setSearch('')}><Icon name="xmark" size={13} /></button>}</label>
+      {onLinkProject && <button type="button" className="tube-round" title="Relier un projet" aria-label="Relier un projet" onClick={onLinkProject}><Icon name="plus" size={16} /></button>}
+    </div>
+    <div className="tube-chips" role="group" aria-label="Collections">{[['projects', 'Projets'], ['conversations', 'Conversations'], ['bindings', 'Liens projets'], ...(counts.nocover ? [['nocover', 'Sans miniature']] : [])].map(([id, label]) => <button type="button" key={id} className="tube-chip" aria-pressed={collection === id} onClick={() => setCollection(id)}>{label} <span className="assets-number">{number.format(counts[id])}</span></button>)}</div>
+    {collection === 'bindings' && <div className="tube-bindings" role="list" aria-label="Projets et conversations liées">
+      {bindings.rows.filter((row) => !query || `${row.name} ${row.conversations.map((item) => item.title).join(' ')}`.toLocaleLowerCase('fr').includes(query)).map((row) => <details className="tube-binding" key={row.projectId} role="listitem">
+        <summary>
+          <span className="tube-binding-name">{row.known ? <button type="button" onClick={(event) => { event.preventDefault(); onSelect(row.projectId) }}>{row.name}</button> : <span title="Projet absent de la liste">{row.name}</span>}</span>
+          <span className="tube-binding-providers">{Object.entries(row.providers).map(([provider, count]) => <span key={provider} className="tube-binding-provider"><ConversationBadge provider={provider} /><span className="assets-number">{count}</span></span>)}</span>
+          <span className="tube-meta assets-number">{number.format(row.conversations.length)} · {dateOf(row.lastAt)}</span>
+        </summary>
+        <ul>{row.conversations.map((item) => <li key={item.id}><button type="button" onClick={() => onConversation?.(item)}><ConversationBadge provider={item.provider} /><span>{item.title}</span><span className="tube-meta assets-number">{dateOf(item.updatedAt)}</span></button></li>)}</ul>
+      </details>)}
+      <p className="tube-meta">{number.format(bindings.boundConversations)} conversations liées à {number.format(bindings.rows.length)} projets · {number.format(bindings.unbound)} sans projet</p>
+    </div>}
+    <div className="tube-grid">
+      {projectList.map((project) => {
+        const date = dateOf(projectActivityTime(project) || project.date || project.updatedAt)
+        return <button type="button" className="tube-card" key={project.id} onClick={() => onSelect(project.id)} onContextMenu={(event) => { event.preventDefault(); onAdjustCover?.(project) }} title="Clic droit pour modifier la miniature">
+          <Thumb file={project.coverFile} shape="cover" coverUrl={project.coverUrl || project.coverFile?.thumbnailUrl} renderThumbnail={renderThumbnail} dot={project.sync?.pendingCount > 0} placeholder={project.name} size={720} />
+          <span className="tube-title">{project.name}</span>
+          <span className="tube-meta"><span className="assets-number">{number.format(projectCount(project))}</span>{date && <> · <span className="assets-number">{date}</span></>}</span>
+        </button>
+      })}
+      {conversationList.map((item) => <button type="button" className="tube-card tube-card-text" key={item.id} onClick={() => onConversation?.(item)}>
+        <span className="tube-thumb" data-shape="cover"><span className="tube-glyph"><ConversationBadge provider={item.provider} /></span></span>
+        <span className="tube-title">{item.title}</span>
+        <span className="tube-meta assets-number">{dateOf(item.updatedAt)}</span>
+      </button>)}
+      {/* While the catalogue is still arriving, placeholder cards say "more is coming" instead of an empty end. */}
+      {loading && Array.from({ length: projectList.length ? 4 : 8 }, (_, index) => <div className="tube-card" key={`loading-${index}`} aria-hidden="true"><span className="tube-thumb" data-shape="cover"><TubeSpinner /></span><span className="tube-skeleton" /></div>)}
+    </div>
+    {!loading && collection !== 'bindings' && !projectList.length && !conversationList.length && <p className="tube-empty">{projects.length ? 'Rien ne correspond.' : 'Votre premier projet apparaît ici.'}</p>}
+  </section>
+}
+
+// ---------------------------------------------------------------- project
+
+const VIEWS = [
+  { id: 'icons', label: 'Icônes', svg: <><rect x="1" y="1" width="6" height="6" rx="1.5" /><rect x="9" y="1" width="6" height="6" rx="1.5" /><rect x="1" y="9" width="6" height="6" rx="1.5" /><rect x="9" y="9" width="6" height="6" rx="1.5" /></> },
+  { id: 'list', label: 'Liste', svg: <><rect x="1" y="2" width="14" height="2" rx="1" /><rect x="1" y="7" width="14" height="2" rx="1" /><rect x="1" y="12" width="14" height="2" rx="1" /></> },
+  { id: 'columns', label: 'Colonnes', svg: <path d="M2.5 2h11A1.5 1.5 0 0 1 15 3.5v9a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9A1.5 1.5 0 0 1 2.5 2zM6 2v12M10.5 2v12" fill="none" stroke="currentColor" strokeWidth="1.6" /> },
+  { id: 'gallery', label: 'Galerie', svg: <><rect x="1" y="1" width="14" height="9" rx="1.5" /><rect x="1" y="12" width="4" height="3" rx="1" /><rect x="6" y="12" width="4" height="3" rx="1" /><rect x="11" y="12" width="4" height="3" rx="1" /></> },
+]
+
+function Ring({ groups, total }) {
+  let offset = 0
+  return <svg className="tube-ring" viewBox="0 0 36 36" aria-hidden="true">
+    <circle r="15.9" cx="18" cy="18" fill="none" strokeWidth="5" style={{ stroke: 'var(--assets-hover)' }} />
+    {groups.map((group) => {
+      const percent = total ? group.bytes / total * 100 : 0
+      const dash = Math.max(percent - .8, 0)
+      const segment = <circle key={group.id} r="15.9" cx="18" cy="18" fill="none" strokeWidth="5" pathLength="100" strokeDasharray={`${dash} ${100 - dash}`} strokeDashoffset={-offset} transform="rotate(-90 18 18)" style={{ stroke: `var(--tube-src-${group.id})` }} />
+      offset += percent
+      return segment
+    })}
+  </svg>
+}
+
+function Storage({ groups, total, count, side, onSide, nameOf }) {
+  return <div className="tube-storage">
+    <span className="tube-ring-wrap" tabIndex={0} aria-label={`${sizeText(total, count)} au total`}>
+      <Ring groups={groups} total={total} />
+      <span className="assets-number">{sizeText(total, count)}</span>
+      <span className="tube-ring-pop" role="tooltip">{groups.map((group) => <span className="tube-ring-row" key={group.id}><i className="tube-src-dot" data-src={group.id} /><span>{nameOf(group.id)} <small className="assets-number">{number.format(group.files.length)}</small></span><span className="assets-number">{sizeText(group.bytes, group.files.length)}</span><span className="tube-ring-meter"><i style={{ width: `${total ? group.bytes / total * 100 : 0}%`, background: `var(--tube-src-${group.id})` }} /></span></span>)}</span>
+    </span>
+    <div className="tube-bar-wrap">
+      <div className="tube-stbar" role="group" aria-label="Répartition de l’espace">{groups.map((group) => <button type="button" key={group.id} style={{ flex: Math.max(group.bytes, total / 200 || 1), background: `var(--tube-src-${group.id})`, opacity: side === 'all' || side === group.id ? 1 : .3 }} title={`${nameOf(group.id)} · ${sizeText(group.bytes, group.files.length)}`} aria-label={`${nameOf(group.id)}, ${sizeText(group.bytes, group.files.length)}`} aria-pressed={side === group.id} onClick={() => onSide(side === group.id ? 'all' : group.id)} />)}</div>
+      <div className="tube-legend">{groups.map((group) => <button type="button" key={group.id} onClick={() => onSide(side === group.id ? 'all' : group.id)}><i className="tube-src-dot" data-src={group.id} />{nameOf(group.id)} <span className="assets-number">{sizeText(group.bytes, group.files.length)}</span></button>)}</div>
+    </div>
+  </div>
+}
+
+// Right click on an image opens this small menu: it sets (or removes) the thumbnail of the project, or adjusts framing.
+function CoverMenu({ menu, isCover, themeVars, onSet, onClear, onAdjust, onClose }) {
+  useEffect(() => {
+    const close = () => onClose()
+    const key = (event) => { if (event.key === 'Escape') onClose() }
+    window.addEventListener('keydown', key); window.addEventListener('blur', close); window.addEventListener('resize', close)
+    return () => { window.removeEventListener('keydown', key); window.removeEventListener('blur', close); window.removeEventListener('resize', close) }
+  }, [onClose])
+  const left = Math.max(8, Math.min(menu.x, (typeof window === 'undefined' ? menu.x : window.innerWidth) - 270))
+  const top = Math.max(8, Math.min(menu.y, (typeof window === 'undefined' ? menu.y : window.innerHeight) - 150))
+  return createPortal(<div className="tube-menu-root" style={themeVars} onClick={onClose} onContextMenu={(event) => { event.preventDefault(); onClose() }}>
+    <div className="tube-menu" style={{ left, top }} role="menu" aria-label={`Actions pour ${menu.file.name}`}>
+      <button type="button" role="menuitem" onClick={() => onSet(menu.file)}><Icon name="photo" size={14} />Définir comme miniature du projet</button>
+      {onAdjust && <button type="button" role="menuitem" onClick={() => onAdjust(menu.file)}><Icon name="slider.horizontal.3" size={14} />Ajuster le cadrage…</button>}
+      {isCover && <button type="button" role="menuitem" onClick={onClear}><Icon name="xmark" size={14} />Retirer cette miniature</button>}
+    </div>
+  </div>, document.body)
+}
+
+function FileTile({ file, selected, onToggle, onOpen, onMenu, isCover, renderThumbnail }) {
+  const shape = shapeOf(file)
+  return <div className="tube-file" data-selected={selected} data-shape={shape} data-cover={isCover || undefined} onContextMenu={(event) => onMenu?.(event, file)}>
+    {isCover && <span className="tube-cover-badge">Miniature</span>}
+    <button type="button" className="tube-file-open" title={file.relativePath} onClick={(event) => (event.metaKey || event.shiftKey) ? onToggle(file, event) : onOpen(file)}>
+      <Thumb file={file} shape={shape} renderThumbnail={renderThumbnail} dot={notInCloud(file)} />
+      <span className="tube-title">{file.name}</span>
+    </button>
+    <label className="tube-check" title="Sélectionner"><input type="checkbox" aria-label={`Sélectionner ${file.name}`} checked={selected} onChange={(event) => onToggle(file, event.nativeEvent)} /></label>
+  </div>
+}
+
+function FileList({ files, selected, onToggle, onOpen, onMenu, coverId, renderThumbnail, srcOf, nameOf, sort, direction, onSort }) {
+  const head = (key, label) => <button type="button" className="tube-lr-head" onClick={() => onSort?.(key)}>{label}{sort === key && <Icon name="chevron.down" size={10} style={{ transform: direction === 'asc' ? 'rotate(180deg)' : undefined }} />}</button>
+  return <div className="tube-list" role="table" aria-label="Liste des fichiers">
+    <div className="tube-lr tube-lr-h" role="row"><span /><span>{head('name', 'Nom')}</span><span>Emplacement</span><span>{head('date', 'Modifié')}</span><span>{head('size', 'Taille')}</span></div>
+    {files.map((file) => {
+      const shape = shapeOf(file), date = fileDate(file)
+      return <div className="tube-lr" role="row" key={file.id} data-selected={selected.has(file.id)} onContextMenu={(event) => onMenu?.(event, file)}>
+        <label className="tube-lr-check"><input type="checkbox" aria-label={`Sélectionner ${file.name}`} checked={selected.has(file.id)} onChange={(event) => onToggle(file, event.nativeEvent)} /></label>
+        <button type="button" className="tube-lr-open" title={file.relativePath} onClick={() => onOpen(file)}><span className="tube-mini"><Thumb file={file} shape={shape} renderThumbnail={renderThumbnail} size={64} /></span><span className="tube-lr-name">{file.name}</span>{file.id === coverId && <span className="tube-cover-badge tube-cover-badge-inline">Miniature</span>}</button>
+        <span className="tube-lr-loc"><i className="tube-src-dot" data-src={srcOf.get(file.id)} />{nameOf(srcOf.get(file.id))}</span>
+        <span className="assets-number">{date != null ? dateOf(date) || '—' : '—'}</span>
+        <span className="assets-number">{Number.isFinite(file.size) ? sizeText(file.size) : '—'}</span>
+      </div>
+    })}
+  </div>
+}
+
+// Folder tree of a file list. `rootKey(file)` gives the top level; the rest comes from the relative path.
+function treeOf(files, prefix) {
+  const root = { name: '', folders: new Map(), files: [] }
+  for (const file of files) {
+    const parts = [...prefix(file), ...String(file.relativePath || file.name).split('/').filter(Boolean)]
+    parts.pop()
+    let node = root
+    for (const part of parts) {
+      if (!node.folders.has(part)) node.folders.set(part, { name: part, folders: new Map(), files: [] })
+      node = node.folders.get(part)
+    }
+    node.files.push(file)
+  }
+  return root
+}
+const subtreeFiles = (node) => [...node.files, ...[...node.folders.values()].flatMap(subtreeFiles)]
+
+function Columns({ tree, path, onPath, fileId, onFile, onOpen, nameOf, renderThumbnail }) {
+  const nodes = [tree]
+  for (const key of path) { const next = nodes[nodes.length - 1].folders.get(key); if (!next) break; nodes.push(next) }
+  const last = nodes[nodes.length - 1]
+  const chosen = last.files.find((file) => file.id === fileId)
+  return <div className="tube-columns">
+    {nodes.map((node, depth) => <div className="tube-col" key={depth}>
+      {[...node.folders.keys()].sort(depth === 0 ? rootOrder : naturalOrder).map((key) => <button type="button" key={`d:${key}`} className="tube-ci" data-on={path[depth] === key} onClick={() => { onPath([...path.slice(0, depth), key]); onFile(null) }}><Icon name="folder" size={14} /><span>{depth === 0 ? nameOf(key) : key}</span><Icon name="chevron.right" size={11} /></button>)}
+      {[...node.files].sort((a, b) => naturalOrder(a.name, b.name)).map((file) => <button type="button" key={file.id} className="tube-ci" data-on={depth === nodes.length - 1 && fileId === file.id} onClick={() => { onPath(path.slice(0, depth)); onFile(file.id) }}><span>{file.name}</span></button>)}
+    </div>)}
+    <div className="tube-col-preview">{chosen
+      ? <><button type="button" className="tube-preview-thumb" onClick={() => onOpen(chosen)}><Thumb file={chosen} shape={shapeOf(chosen)} renderThumbnail={renderThumbnail} size={360} /></button><strong>{chosen.name}</strong><span className="assets-number">{Number.isFinite(chosen.size) ? sizeText(chosen.size) : '—'}</span></>
+      : <span>Choisissez un fichier</span>}</div>
+  </div>
+}
+
+// The filmstrip mounts only a window around the focused file: a project can hold thousands of files.
+const STRIP_RADIUS = 30
+function Gallery({ files, focusId, onFocus, onOpen, onMenu, renderThumbnail, srcOf, nameOf }) {
+  const index = Math.max(0, files.findIndex((file) => file.id === focusId))
+  const focus = files[index]
+  const move = (delta) => { const next = files[Math.max(0, Math.min(files.length - 1, index + delta))]; if (next) onFocus(next.id) }
+  if (!focus) return null
+  return <div className="tube-gallery" tabIndex={0} onKeyDown={(event) => { if (event.key === 'ArrowRight') { event.preventDefault(); move(1) } else if (event.key === 'ArrowLeft') { event.preventDefault(); move(-1) } }}>
+    <button type="button" className="tube-stage" onClick={() => onOpen(focus)} onContextMenu={(event) => onMenu?.(event, focus)} aria-label={`Aperçu de ${focus.name}`}><Thumb file={focus} shape={shapeOf(focus)} renderThumbnail={renderThumbnail} size={900} /></button>
+    <div className="tube-stage-cap"><span>{focus.name}</span><span><i className="tube-src-dot" data-src={srcOf.get(focus.id)} /> {nameOf(srcOf.get(focus.id))} · <span className="assets-number">{Number.isFinite(focus.size) ? sizeText(focus.size) : '—'}</span></span></div>
+    <div className="tube-strip">{files.slice(Math.max(0, index - STRIP_RADIUS), index + STRIP_RADIUS + 1).map((file) => <button type="button" key={file.id} data-on={file.id === focus.id} aria-label={file.name} title={file.name} onClick={() => onFocus(file.id)}><Thumb file={file} shape="image" renderThumbnail={renderThumbnail} size={96} /></button>)}</div>
+  </div>
+}
+
+// The download sheet mirrors what the ZIP really contains: namespace / sourceId / relative path.
+function SheetTree({ node, depth, nameOf }) {
+  return <>
+    {[...node.folders.entries()].sort(([a], [b]) => naturalOrder(a, b)).map(([key, child]) => {
+      const inside = subtreeFiles(child)
+      return <details className="tube-tr" key={key} open={depth < 1}>
+        <summary><Icon name="folder" size={14} /><span className="tube-tr-name">{depth === 0 ? nameOf(key) : key}</span><span className="tube-tr-sz"><span className="assets-number">{number.format(inside.length)}</span> · <span className="assets-number">{sizeText(bytesOf(inside), inside.length)}</span></span></summary>
+        <div className="tube-tr-kids"><SheetTree node={child} depth={depth + 1} nameOf={nameOf} /></div>
+      </details>
+    })}
+    {[...node.files].sort((a, b) => naturalOrder(a.name, b.name)).map((file) => <div className="tube-tr-file" key={file.id}><span className="tube-tr-name">{file.name}</span><span className="tube-tr-sz assets-number">{Number.isFinite(file.size) ? sizeText(file.size) : '—'}</span></div>)}
+  </>
+}
+
+function DownloadSheet({ project, files, selectionCount, nameOf, themeVars, onClose, onConfirm, disabled }) {
+  useEffect(() => {
+    const close = (event) => { if (event.key === 'Escape') onClose() }
+    window.addEventListener('keydown', close)
+    return () => window.removeEventListener('keydown', close)
+  }, [onClose])
+  const tree = useMemo(() => treeOf(files, (file) => [file.namespace || 'cloud', file.sourceId || 'archive']), [files])
+  const folderName = `tmp-${project.id}`
+  const top = [...tree.folders.entries()].sort(([a], [b]) => naturalOrder(a, b))
+  return createPortal(<div className="tube-sheet-root" style={themeVars}>
+    <div className="tube-sheet-back" onClick={onClose} />
+    <section className="tube-sheet" role="dialog" aria-modal="true" aria-label="Télécharger le dossier">
+      <button type="button" className="tube-sheet-close" onClick={onClose} aria-label="Fermer"><Icon name="xmark" size={14} /></button>
+      <div className="tube-zip">
+        <span className="tube-zip-icon" aria-hidden="true"><i /><i /><i /></span>
+        <div>
+          <h2 className="tube-zip-name">{folderName}</h2>
+          <p className="tube-meta"><span className="assets-number">{number.format(files.length)}</span> {selectionCount ? 'fichiers sélectionnés' : 'fichiers'} · <span className="assets-number">{sizeText(bytesOf(files), files.length)}</span> · ZIP dans Téléchargements</p>
+          <div className="tube-zip-subs">{top.map(([key, node]) => { const inside = subtreeFiles(node); return <span className="tube-zip-sub" key={key}><strong>{nameOf(key)}</strong><small><span className="assets-number">{number.format(inside.length)}</span> · <span className="assets-number">{sizeText(bytesOf(inside), inside.length)}</span></small></span> })}</div>
+          <button type="button" className="tube-primary" disabled={disabled || !files.length} onClick={onConfirm}><Icon name="arrow.down" size={14} /> Télécharger le dossier</button>
+        </div>
+      </div>
+      <div className="tube-tree" aria-label="Contenu du dossier"><div className="tube-tr-root"><Icon name="folder" size={15} /><span className="tube-tr-name">{folderName}</span></div><SheetTree node={tree} depth={0} nameOf={nameOf} /></div>
+      <p className="tube-meta">Les noms affichés suivent votre choix « Noms » ; les dossiers du ZIP portent leur nom technique.</p>
+    </section>
+  </div>, document.body)
+}
+
+export function TubeProject({ project, files, visible, sources, selected, onToggle, onPreview, onDownload, offline, renderThumbnail, themeVars, coverId, onSetCover, onClearCover, onAdjustCover, search, onSearch, sort, direction, onSort }) {
+  const [side, setSide] = useState('all')
+  const [view, setViewState] = useState(() => readSetting(VIEW_KEY, VIEWS.map((item) => item.id), 'icons'))
+  const [limit, setLimit] = useState(120)
+  const [sheet, setSheet] = useState(false)
+  const [colPath, setColPath] = useState([])
+  const [colFile, setColFile] = useState(null)
+  const [focusId, setFocusId] = useState(null)
+  const [menu, setMenu] = useState(null)
+  const [toast, setToast] = useState('')
+  useEffect(() => { if (!toast) return undefined; const timer = setTimeout(() => setToast(''), 2800); return () => clearTimeout(timer) }, [toast])
+  const openMenu = (event, file) => {
+    if (!onSetCover || !isImageFile(file)) return
+    event.preventDefault()
+    setMenu({ x: event.clientX, y: event.clientY, file })
+  }
+  const setView = (value) => { setViewState(value); writeSetting(VIEW_KEY, value) }
+  const nameOf = (id) => SOURCE_BY_ID[id]?.label || id
+  useEffect(() => { setSide('all'); setLimit(120); setColPath([]); setColFile(null); setFocusId(null); setSheet(false) }, [project.id])
+  useEffect(() => { setLimit(120) }, [side, search, view])
+
+  const srcOf = useMemo(() => new Map(files.map((file) => [file.id, sourceIdOf(file, sources)])), [files, sources])
+  const groups = useMemo(() => SOURCE_DEFS.map((definition) => {
+    const list = files.filter((file) => srcOf.get(file.id) === definition.id)
+    return { ...definition, files: list, bytes: bytesOf(list) }
+  }).filter((group) => group.files.length), [files, srcOf])
+  // Legacy registry projects list no per-file sizes but do carry per-source bytes: use them rather than showing nothing.
+  const sourceBytes = sources.reduce((sum, source) => sum + (Number.isFinite(source.bytes) && source.bytes > 0 ? source.bytes : 0), 0)
+  const fileBytes = groups.reduce((sum, group) => sum + group.bytes, 0)
+  const borrowed = fileBytes === 0 && sourceBytes > 0 && groups.length === 1
+  if (borrowed) groups[0] = { ...groups[0], bytes: sourceBytes }
+  const total = borrowed ? sourceBytes : fileBytes
+  useEffect(() => { if (side !== 'all' && !groups.some((group) => group.id === side)) setSide('all') }, [groups, side])
+  const scoped = useMemo(() => side === 'all' ? visible : visible.filter((file) => srcOf.get(file.id) === side), [visible, side, srcOf])
+  const shown = scoped.slice(0, limit)
+  const tree = useMemo(() => view === 'columns' ? treeOf(scoped, (file) => [srcOf.get(file.id)]) : null, [view, scoped, srcOf])
+  useEffect(() => { if (tree && !colPath.length && tree.folders.size) setColPath([[...tree.folders.keys()].sort(rootOrder)[0]]) }, [tree, colPath.length])
+  const selection = files.filter((file) => selected.has(file.id))
+  const scopeCandidates = selection.length ? selection : scoped
+  const downloadFiles = scopeCandidates.filter(isDownloadable)
+  const open = (file) => { setFocusId(file.id); onPreview?.(file) }
+  const confirm = async () => { await onDownload?.(downloadFiles); setSheet(false) }
+
+  return <section className="tube-project" aria-label="Fichiers du projet">
+    <Storage groups={groups} total={total} count={files.length} side={side} onSide={setSide} nameOf={nameOf} />
+    <div className="tube-split">
+      <aside className="tube-side" aria-label="Emplacements">
+        <div className="tube-side-label">Emplacements</div>
+        <button type="button" data-on={side === 'all'} onClick={() => setSide('all')}><Icon name="externaldrive" size={14} />Tout<span className="assets-number">{number.format(files.length)}</span></button>
+        {SOURCE_DEFS.filter((d) => d.id !== 'cloud').map((definition) => {
+          const count = groups.find((group) => group.id === definition.id)?.files.length || 0
+          return <button type="button" key={definition.id} data-on={side === definition.id} disabled={!count} title={`${definition.label} : ${definition.what}`} onClick={() => setSide(definition.id)}><i className="tube-src-dot" data-src={definition.id} />{nameOf(definition.id)}<span className="assets-number">{count ? number.format(count) : ''}</span></button>
+        })}
+      </aside>
+      <div className="tube-main">
+        <div className="tube-toolbar">
+          <label className="tube-search"><Icon name="magnifyingglass" size={15} /><input aria-label="Rechercher un fichier" value={search} onChange={(event) => onSearch(event.target.value)} placeholder="Rechercher un fichier" />{search && <button type="button" aria-label="Effacer" onClick={() => onSearch('')}><Icon name="xmark" size={13} /></button>}</label>
+          <div className="tube-seg" role="group" aria-label="Présentation des fichiers">{VIEWS.map((item) => <button type="button" key={item.id} aria-label={item.label} title={item.label} aria-pressed={view === item.id} onClick={() => setView(item.id)}><svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">{item.svg}</svg></button>)}</div>
+          {project.folder && <button type="button" className="tube-download" title="Ouvre le dossier cloud de ce projet dans Create" onClick={() => window.dispatchEvent(new CustomEvent('zr:create-folder', { detail: { path: project.folder } }))}><Icon name="arrow.up.right" size={14} />Ouvrir dans Create</button>}
+          {onDownload && <button type="button" className="tube-download" disabled={offline || !downloadFiles.length} onClick={() => setSheet(true)}><Icon name="arrow.down" size={14} />Télécharger{selection.length > 0 && <> <span className="assets-number">{number.format(selection.length)}</span></>}</button>}
+        </div>
+        {!scoped.length ? <p className="tube-empty">{files.length ? 'Aucun fichier ne correspond.' : 'Ce projet ne contient encore aucun fichier.'}</p>
+          : view === 'list' ? <FileList files={shown} selected={selected} onToggle={onToggle} onOpen={open} onMenu={openMenu} coverId={coverId} renderThumbnail={renderThumbnail} srcOf={srcOf} nameOf={nameOf} sort={sort} direction={direction} onSort={onSort} />
+          : view === 'columns' ? <Columns tree={tree} path={colPath} onPath={setColPath} fileId={colFile} onFile={setColFile} onOpen={open} nameOf={nameOf} renderThumbnail={renderThumbnail} />
+          : view === 'gallery' ? <Gallery files={scoped} focusId={focusId} onFocus={setFocusId} onOpen={open} onMenu={openMenu} renderThumbnail={renderThumbnail} srcOf={srcOf} nameOf={nameOf} />
+          : <div className="tube-file-grid">{shown.map((file) => <FileTile key={file.id} file={file} selected={selected.has(file.id)} onToggle={onToggle} onOpen={open} onMenu={openMenu} isCover={file.id === coverId} renderThumbnail={renderThumbnail} />)}</div>}
+        {view !== 'columns' && view !== 'gallery' && shown.length < scoped.length && <button type="button" className="tube-more" onClick={() => setLimit(limit + 120)}>Afficher plus <span className="assets-number">{number.format(scoped.length - shown.length)}</span></button>}
+      </div>
+    </div>
+    {menu && <CoverMenu menu={menu} isCover={menu.file.id === coverId} themeVars={themeVars} onClose={() => setMenu(null)}
+      onSet={async (file) => { setMenu(null); setToast(`Miniature du projet : ${file.name}`); const result = await onSetCover?.(file); if (result && result.ok === false) setToast('Miniature gardée sur cet appareil, sauvegarde cloud impossible') }}
+      onAdjust={(file) => { setMenu(null); onAdjustCover?.(file) }}
+      onClear={async () => { setMenu(null); setToast('Miniature retirée'); await onClearCover?.() }} />}
+    {toast && <div className="tube-toast" role="status">{toast}</div>}
+    {sheet && <DownloadSheet project={project} files={downloadFiles} selectionCount={selection.length} nameOf={nameOf} themeVars={themeVars} onClose={() => setSheet(false)} onConfirm={confirm} disabled={offline} />}
+  </section>
+}
+
+export function TubeLayoutSwitch({ layout, onChange }) {
+  return <div className="tube-layout-switch" role="group" aria-label="Disposition">{[['classic', 'Classique'], ['tube', 'Tube']].map(([id, label]) => <button type="button" key={id} aria-pressed={layout === id} onClick={() => onChange(id)}>{label}</button>)}</div>
+}
+
+// 20 October 2026: interactive adjustment modal for project thumbnails.
+// Allows real-time X/Y repositioning (mouse drag), zoom and dezoom (wheel and slider),
+// black letterbox/pillarbox bands when dezoomed or contained, preset framing modes,
+// and fluid one-click WebP saving at 720x406 Retina resolution.
+export function CoverAdjustModal({ project, file, themeVars, onClose, onSave }) {
+  const initialFile = file || project?.coverFile || (project?.coverUrl ? { thumbnailUrl: project.coverUrl, name: `${project.name} cover` } : null)
+  const meta = initialFile?.adjustMeta || {}
+  const [panX, setPanX] = useState(meta.panX || 0)
+  const [panY, setPanY] = useState(meta.panY || 0)
+  const [zoom, setZoom] = useState(meta.zoom || 1)
+  const [fitMode, setFitMode] = useState(meta.fitMode || 'cover')
+  const [loadedImage, setLoadedImage] = useState(null)
+  const [imageLoading, setImageLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const [isDragging, setIsDragging] = useState(false)
+
+  const canvasRef = useRef(null)
+  const dragStartRef = useRef({ mouseX: 0, mouseY: 0, panX: 0, panY: 0 })
+
+  useEffect(() => {
+    const key = (e) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', key)
+    return () => window.removeEventListener('keydown', key)
+  }, [onClose])
+
+  useEffect(() => {
+    let cancelled = false
+    let blobUrl = null
+    ;(async () => {
+      setImageLoading(true)
+      setError(null)
+      try {
+        let src = initialFile?.thumbnailUrl || project?.coverUrl
+        if (initialFile?.contentPath) {
+          try {
+            const entry = await resolveEntryBytes({ contentPath: initialFile.contentPath, name: initialFile.name })
+            if (entry?.bytes && !cancelled) {
+              const blob = new Blob([entry.bytes])
+              blobUrl = URL.createObjectURL(blob)
+              src = blobUrl
+            }
+          } catch { /* fallback to src */ }
+        }
+        if (!src && initialFile?.cloudPath) {
+          src = initialFile.cloudPath
+        }
+        if (!src) throw new Error('Aucune image disponible à cadrer.')
+        const img = new Image()
+        img.crossOrigin = 'anonymous'
+        img.onload = () => {
+          if (!cancelled) {
+            setLoadedImage(img)
+            setImageLoading(false)
+          }
+        }
+        img.onerror = () => {
+          if (!cancelled) {
+            setError('Impossible de charger l’image source')
+            setImageLoading(false)
+          }
+        }
+        img.src = src
+      } catch (err) {
+        if (!cancelled) {
+          setError(err.message || 'Erreur de chargement')
+          setImageLoading(false)
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+      if (blobUrl) URL.revokeObjectURL(blobUrl)
+    }
+  }, [initialFile, project])
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas || !loadedImage) return
+    drawCoverCanvas(canvas, loadedImage, { panX, panY, zoom, fitMode, width: 720, height: 406 })
+  }, [loadedImage, panX, panY, zoom, fitMode])
+
+  const handleMouseDown = (e) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    setIsDragging(true)
+    dragStartRef.current = {
+      mouseX: e.clientX,
+      mouseY: e.clientY,
+      panX,
+      panY,
+    }
+  }
+
+  useEffect(() => {
+    if (!isDragging) return
+    const handleMouseMove = (e) => {
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const rect = canvas.getBoundingClientRect()
+      const scaleFactor = 720 / (rect.width || 720)
+      const dx = (e.clientX - dragStartRef.current.mouseX) * scaleFactor
+      const dy = (e.clientY - dragStartRef.current.mouseY) * scaleFactor
+      setPanX(Math.round(dragStartRef.current.panX + dx))
+      setPanY(Math.round(dragStartRef.current.panY + dy))
+    }
+    const handleMouseUp = () => setIsDragging(false)
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isDragging])
+
+  const handleWheel = (e) => {
+    e.preventDefault()
+    const factor = e.deltaY < 0 ? 1.08 : 0.92
+    setZoom((current) => Math.max(0.1, Math.min(5, Number((current * factor).toFixed(3)))))
+  }
+
+  const handleSave = async () => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    setSaving(true)
+    try {
+      const dataUri = canvas.toDataURL('image/webp', 0.85)
+      await onSave?.(dataUri, { panX, panY, zoom, fitMode })
+      onClose()
+    } catch (err) {
+      console.error('Save cover failed', err)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const resetAll = () => {
+    setPanX(0)
+    setPanY(0)
+    setZoom(1)
+    setFitMode('cover')
+  }
+
+  const containWithBlackBands = () => {
+    setFitMode('contain')
+    setZoom(1)
+    setPanX(0)
+    setPanY(0)
+  }
+
+  const fillCover = () => {
+    setFitMode('cover')
+    setZoom(1)
+    setPanX(0)
+    setPanY(0)
+  }
+
+  return createPortal(
+    <div className="tube-adjust-overlay" style={themeVars} onClick={onClose}>
+      <div className="tube-adjust-modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Ajuster la miniature">
+        <header className="tube-adjust-header">
+          <div className="tube-adjust-title-group">
+            <h3>Cadrer la miniature</h3>
+            <span className="tube-adjust-sub">{project?.name || initialFile?.name || 'Projet'}</span>
+          </div>
+          <button type="button" className="tube-adjust-close" aria-label="Fermer" onClick={onClose}>
+            <Icon name="xmark" size={14} />
+          </button>
+        </header>
+
+        <div className="tube-adjust-viewport-wrap">
+          <div className="tube-adjust-viewport">
+            {imageLoading && <div className="tube-adjust-loading"><TubeSpinner /><p>Chargement de l’image…</p></div>}
+            {error && <div className="tube-adjust-error"><Icon name="xmark" size={20} /><p>{error}</p></div>}
+            <canvas
+              ref={canvasRef}
+              width={720}
+              height={406}
+              className={`tube-adjust-canvas ${isDragging ? 'is-dragging' : ''}`}
+              onMouseDown={handleMouseDown}
+              onWheel={handleWheel}
+              style={{ display: imageLoading || error ? 'none' : 'block' }}
+            />
+          </div>
+          <div className="tube-adjust-hint">
+            <span>Glissez pour déplacer (X/Y) · Molette pour zoomer / dézoomer · Bandes noires automatiques</span>
+          </div>
+        </div>
+
+        <div className="tube-adjust-controls">
+          <div className="tube-adjust-presets">
+            <span className="tube-adjust-label">Modes rapides</span>
+            <div className="tube-adjust-btn-group">
+              <button type="button" className={`tube-chip ${fitMode === 'contain' ? 'is-active' : ''}`} onClick={containWithBlackBands}>
+                Adapter (Bandes noires)
+              </button>
+              <button type="button" className={`tube-chip ${fitMode === 'cover' ? 'is-active' : ''}`} onClick={fillCover}>
+                Remplir (Plein écran)
+              </button>
+              <button type="button" className="tube-chip" onClick={() => { setPanX(0); setPanY(0) }}>
+                Centrer
+              </button>
+              <button type="button" className="tube-chip" onClick={resetAll} title="Réinitialiser tous les réglages">
+                Réinitialiser
+              </button>
+            </div>
+          </div>
+
+          <div className="tube-adjust-sliders">
+            <div className="tube-adjust-row">
+              <span className="tube-adjust-slider-label">Zoom : <strong className="assets-number">{Math.round(zoom * 100)}%</strong></span>
+              <button type="button" className="tube-adjust-step-btn" onClick={() => setZoom(z => Math.max(0.1, Number((z - 0.1).toFixed(2))))}>-</button>
+              <input
+                type="range"
+                min="0.1"
+                max="3"
+                step="0.01"
+                value={zoom}
+                onChange={(e) => setZoom(Number(e.target.value))}
+                aria-label="Zoom"
+              />
+              <button type="button" className="tube-adjust-step-btn" onClick={() => setZoom(z => Math.min(3, Number((z + 0.1).toFixed(2))))}>+</button>
+            </div>
+
+            <div className="tube-adjust-row">
+              <span className="tube-adjust-slider-label">Position X : <strong className="assets-number">{panX}px</strong></span>
+              <input
+                type="range"
+                min="-720"
+                max="720"
+                step="2"
+                value={panX}
+                onChange={(e) => setPanX(Number(e.target.value))}
+                aria-label="Position horizontale"
+              />
+              <button type="button" className="tube-adjust-zero-btn" onClick={() => setPanX(0)}>0</button>
+            </div>
+
+            <div className="tube-adjust-row">
+              <span className="tube-adjust-slider-label">Position Y : <strong className="assets-number">{panY}px</strong></span>
+              <input
+                type="range"
+                min="-406"
+                max="406"
+                step="2"
+                value={panY}
+                onChange={(e) => setPanY(Number(e.target.value))}
+                aria-label="Position verticale"
+              />
+              <button type="button" className="tube-adjust-zero-btn" onClick={() => setPanY(0)}>0</button>
+            </div>
+          </div>
+        </div>
+
+        <footer className="tube-adjust-footer">
+          <button type="button" className="tube-adjust-cancel" onClick={onClose} disabled={saving}>
+            Annuler
+          </button>
+          <button type="button" className="tube-adjust-save" onClick={handleSave} disabled={saving || imageLoading || Boolean(error)}>
+            {saving ? 'Enregistrement…' : 'Enregistrer la miniature'}
+          </button>
+        </footer>
+      </div>
+    </div>,
+    document.body
+  )
+}

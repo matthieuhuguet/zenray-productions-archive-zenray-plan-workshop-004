@@ -1,0 +1,328 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+
+// ═══ LE BUDGET DE SOUS-REQUÊTES D'UN WORKER, TENU PAR UN TEST ═══════════════════════════════════
+//
+// CE QUE CE TEST AURAIT ÉVITÉ, et il n'existait pas : le 2026-08-31 à 03h39, « Aucun élément créé ·
+// inconnu ». Le Worker mourait avant de répondre parce qu'un lot dépassait sa limite de sous-requêtes.
+// Rien dans la suite ne pouvait le voir : le code était correct, il était seulement trop bavard.
+//
+// UN WORKER CLOUDFLARE A ENVIRON CINQUANTE SOUS-REQUÊTES par invocation sur le plan gratuit. C'est
+// une limite DURE : au-delà, l'invocation est tuée, sans réponse ni message. Le seul moyen de s'en
+// protéger est de compter, et de compter sur le VRAI code plutôt que sur une estimation.
+//
+// MÉTHODE : on remplace `fetch` par un compteur qui rend des réponses plausibles, on appelle le
+// handler comme le ferait le client, et on compte. Aucun octet ne part sur le réseau, aucune donnée
+// de Matthieu n'est touchée.
+
+const LIMITE_WORKER = 50
+
+let appels
+let fetchOriginal
+
+// Faux GitHub : répond comme le vrai, en comptant. Les 404 sont le cas NORMAL et massif — les sondes
+// `.zreagle-folder.json` sur chaque ancêtre n'existent jamais.
+function installerFauxReseau({ manifestes = {}, arbres = {} } = {}) {
+  appels = { total: 0, raw: 0, api: 0, parUrl: [] }
+  fetchOriginal = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const u = String(url)
+    appels.total++
+    appels.parUrl.push(u.replace(/https:\/\/[^/]+/, ''))
+    if (u.includes('raw.githubusercontent.com')) appels.raw++
+    else if (u.includes('api.github.com')) appels.api++
+
+    const chemin = decodeURIComponent(u.split('/main/')[1] || u.split('?')[0])
+    for (const [c, v] of Object.entries(manifestes)) {
+      if (chemin.includes(c)) return new Response(JSON.stringify(v), { status: 200 })
+    }
+    for (const [c, v] of Object.entries(arbres)) {
+      if (u.includes(encodeURIComponent(c)) || u.includes(c)) {
+        return new Response(JSON.stringify({ tree: v, truncated: false }), { status: 200 })
+      }
+    }
+    // ═══ LE CHEMIN DE SUCCES, ajoute le 2026-08-31 ══════════════════════════════════════════
+    //
+    // Ce faux reseau ne savait pas commiter : le lot echouait toujours, et le test mesurait donc
+    // le cout du chemin d ECHEC, qui est le moins cher. Or c est le SUCCES qui coute le plus, et
+    // c est lui qui tue la Function quand il depasse le budget. Le constat #17 de l audit le
+    // relevait, et il avait raison.
+    //
+    // Les quatre appels ci-dessous sont ceux que git exige pour ecrire quoi que ce soit : creer
+    // un blob, lire la reference de la branche, creer un arbre, creer un commit, deplacer la
+    // reference. Ils comptent dans le budget au meme titre que les lectures.
+    if (u.includes('git/blobs') && !u.match(/git\/blobs\/[0-9a-f]/)) return new Response(JSON.stringify({ sha: 'blob-neuf' }), { status: 201 })
+    if (u.includes('git/ref/heads') || u.includes('git/refs/heads')) return new Response(JSON.stringify({ object: { sha: 'commit-parent' } }), { status: 200 })
+    if (u.includes('git/trees')) return new Response(JSON.stringify({ sha: 'arbre-neuf', tree: [], truncated: false }), { status: 201 })
+    // 2 October 2026: reading an existing commit must answer with its tree, otherwise the commit step throws and
+    // the « success path » measured here silently stopped at the first commit read.
+    if (/git\/commits\/[^/?]+$/.test(u) && !(init && init.method === 'POST')) return new Response(JSON.stringify({ sha: 'commit-parent', tree: { sha: 'arbre-base' } }), { status: 200 })
+    if (u.includes('git/commits')) return new Response(JSON.stringify({ sha: 'commit-neuf' }), { status: 201 })
+
+    return new Response('Not Found', { status: 404 })
+  }
+}
+
+beforeEach(() => { process.env.GITHUB_TOKEN = 'faux-jeton-de-test' })
+afterEach(() => { if (fetchOriginal) globalThis.fetch = fetchOriginal })
+
+// Réponse minimale façon Express, pour lire ce que le handler rend.
+function fausseReponse() {
+  const r = { code: 0, corps: null }
+  r.status = (c) => { r.code = c; return r }
+  r.json = (j) => { r.corps = j; return r }
+  r.setHeader = () => r
+  r.end = (v) => { r.corps = v; return r }
+  return r
+}
+
+const MANIFESTE_IMAGE = {
+  type: 'image', v: 1, name: 'IMG.jpeg', vis: 'public',
+  cdnRepo: 'zenrayshards-img-x', cdnCommit: 'abc', cdnChunks: ['a'],
+  thumb: 'https://cdn.jsdelivr.net/x.webp', thumbIv: 'iv', iv: 'iv', alg: 'AES-GCM',
+  resourceId: 'zr_test',
+}
+
+describe('budget de sous-requêtes : un lot ne doit jamais tuer le Worker', () => {
+  it('un lot de 13 fichiers reste sous la limite de 50 sous-requêtes', async () => {
+    // C'est exactement le lot de Matthieu : treize photos d'un même dossier vers un espace de tri.
+    // Sans la mémoïsation des sondes d'ancêtres, il en coûtait 169 — le Worker mourait.
+    const dossier = 'pages/Photos/DJI/29 Aout 2026/Photos'
+    const noms = Array.from({ length: 13 }, (_, i) => `IMG_${5500 + i}.jpeg.img.json`)
+    installerFauxReseau({
+      manifestes: Object.fromEntries(noms.map((n) => [n, MANIFESTE_IMAGE])),
+      arbres: { [`${dossier}/tmp-img-selection1`]: [{ type: 'blob', path: '.zrfolder.json' }] },
+    })
+
+    const { default: handler } = await import('./page.js')
+    const res = fausseReponse()
+    await handler({
+      method: 'POST',
+      query: {},
+      headers: { 'x-zr-auth': 'x' },
+      body: {
+        action: 'create-eagle-links-batch',
+        items: noms.map((n) => ({
+          kind: 'leaf',
+          sourcePath: `${dossier}/${n}`,
+          targetPath: `${dossier}/tmp-img-selection1/${n}`,
+          title: n,
+        })),
+      },
+    }, res)
+
+    // LE CHEMIN DE SUCCES EST MESURE DEPUIS LE 2026-08-31. Le faux réseau sait commiter, donc ce
+    // chiffre est bien celui du cas qui coûte le plus cher — c'est lui qui tue la Function quand il
+    // dépasse le budget, jamais le cas d'échec, qui s'arrête plus tôt.
+    expect(appels.total, `un lot de 13 a coûté ${appels.total} sous-requêtes, la limite est ${LIMITE_WORKER}.\nAppels : ${appels.parUrl.slice(0, 20).join('\n')}`)
+      .toBeLessThanOrEqual(LIMITE_WORKER)
+  })
+
+  it('les sondes d’ancêtres ne se refont pas pour chaque fichier du même dossier', async () => {
+    // Treize fichiers du même dossier sondent les mêmes cinq ancêtres. Sans mémoire : 65 appels pour
+    // 5 réponses. C'est ce qui faisait exploser le budget.
+    const dossier = 'pages/A/B/C'
+    installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } })
+    const { default: handler } = await import('./page.js')
+    await handler({
+      method: 'POST', query: {}, headers: { 'x-zr-auth': 'x' },
+      body: {
+        action: 'create-eagle-links-batch',
+        items: Array.from({ length: 6 }, (_, i) => ({
+          kind: 'leaf',
+          sourcePath: `${dossier}/f${i}.img.json`,
+          targetPath: `${dossier}/tri/f${i}.img.json`,
+          title: `f${i}`,
+        })),
+      },
+    }, fausseReponse())
+
+    // La même sonde ne doit apparaître qu'une fois dans le journal des appels.
+    const sondes = appels.parUrl.filter((u) => u.includes('zreagle-folder'))
+    const uniques = new Set(sondes)
+    if (sondes.length !== uniques.size) {
+      const compte = {}
+      for (const u of sondes) compte[u] = (compte[u] || 0) + 1
+      console.log('  SONDES REPETEES :', Object.entries(compte).filter(([, n]) => n > 1))
+    }
+    expect(sondes.length, `${sondes.length} sondes pour ${uniques.size} chemins distincts : la mémoïsation ne fonctionne plus`)
+      .toBe(uniques.size)
+  })
+})
+
+describe('les lectures chaudes passent par raw, jamais par l’API à quota', () => {
+  it('resolve-link ne touche PAS au quota REST', async () => {
+    // Cette route est appelée pour CHAQUE raccourci affiché dans une grille. Elle brûlait deux
+    // requêtes de quota par lien : un dossier de treize en coûtait vingt-six, et Matthieu s'est
+    // retrouvé à 3000 sur 5000 en une soirée de tri.
+    installerFauxReseau({
+      manifestes: {
+        'lien.img.json': { v: 1, type: 'zenray-eagle-link/v1', resourceId: 'zr_abc', title: 'x' },
+        'zr_abc.json': { resourceId: 'zr_abc', sourcePath: 'pages/A/vrai.img.json' },
+        'vrai.img.json': MANIFESTE_IMAGE,
+      },
+    })
+    const { default: handler } = await import('./page.js')
+    await handler({
+      method: 'GET',
+      query: { action: 'resolve-link', path: 'pages/A/tri/lien.img.json' },
+      headers: { 'x-zr-auth': 'x' },
+    }, fausseReponse())
+
+    expect(appels.api, `resolve-link a fait ${appels.api} appel(s) à api.github.com — ils doivent tous passer par raw`)
+      .toBe(0)
+    expect(appels.raw).toBeGreaterThan(0)
+  })
+})
+
+describe('le chemin de SUCCÈS reste sous le budget, et c’est celui qui compte', () => {
+  it('un lot de 13 fichiers commité coûte moins de 50 sous-requêtes', async () => {
+    // Le constat #17 de l'audit : « le lot de 13 liens coûte 61 sous-requêtes quand le commit
+    // RÉUSSIT, et le test qui le garde ne mesure que le chemin d'échec ». Il avait raison, et ce
+    // cas ferme le trou.
+    const dossier = 'pages/A/B/C'
+    installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } })
+    const { default: handler, oublierMemoireDossiers } = await import('./page.js')
+    oublierMemoireDossiers()
+    await handler({
+      method: 'POST', query: {}, headers: { 'x-zr-auth': 'x' },
+      body: {
+        action: 'create-eagle-links-batch',
+        items: Array.from({ length: 13 }, (_, i) => ({
+          kind: 'leaf', sourcePath: `${dossier}/f${i}.img.json`,
+          targetPath: `${dossier}/tri/f${i}.img.json`, title: `f${i}`,
+        })),
+      },
+    }, fausseReponse())
+    expect(appels.total, `${appels.total} sous-requêtes pour 13 fichiers — la Function meurt au-delà d'une cinquantaine`).toBeLessThan(50)
+  })
+
+  it('le coût croît LENTEMENT avec la taille du lot : les ancêtres sont partagés', async () => {
+    const mesurer = async (combien) => {
+      installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } })
+      const { default: handler, oublierMemoireDossiers } = await import('./page.js')
+      oublierMemoireDossiers()
+      await handler({
+        method: 'POST', query: {}, headers: { 'x-zr-auth': 'x' },
+        body: {
+          action: 'create-eagle-links-batch',
+          items: Array.from({ length: combien }, (_, i) => ({
+            kind: 'leaf', sourcePath: `pages/A/B/C/f${i}.img.json`,
+            targetPath: `pages/A/B/C/tri/f${i}.img.json`, title: `f${i}`,
+          })),
+        },
+      }, fausseReponse())
+      return appels.total
+    }
+    const petit = await mesurer(3)
+    const grand = await mesurer(13)
+    // Si les sondes d'ancêtres n'étaient pas partagées, dix fichiers de plus coûteraient dix fois
+    // cinq sondes. Le surcoût doit rester proche d'une requête par fichier.
+    expect(grand - petit, `+10 fichiers ont coûté ${grand - petit} sous-requêtes de plus`).toBeLessThan(22)
+  })
+})
+
+describe('la mémoire de résolution ne survit PAS à la requête', () => {
+  // Régression du 2026-08-31, introduite la nuit précédente en posant la mémoïsation. Elle vivait
+  // dans `globalThis`, et une isolate Cloudflare est réutilisée entre requêtes : une résolution
+  // mémorisée AVANT la création d'un dossier survivait APRÈS, et le serveur répondait « ce dossier
+  // n'existe pas » à propos d'un dossier qui venait d'être créé.
+  //
+  // Symptôme rapporté : « créer des dossiers, le temps de la notif parfois ils disparaissent ».
+  // L'intermittence venait du recyclage de l'isolate : le même geste marchait une fois sur deux.
+
+  const unLot = (handler) => handler({
+    method: 'POST', query: {}, headers: { 'x-zr-auth': 'x' },
+    body: {
+      action: 'create-eagle-links-batch',
+      items: [{ kind: 'leaf', sourcePath: 'pages/A/B/C/f0.img.json', targetPath: 'pages/A/B/C/tri/f0.img.json', title: 'f0' }],
+    },
+  }, fausseReponse())
+
+  it('LE BUG : une seconde requête resonde, elle ne rejoue pas une mémoire périmée', async () => {
+    const { default: handler } = await import('./page.js')
+    installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } })
+    await unLot(handler)
+    const premiere = appels.parUrl.filter((u) => u.includes('zreagle-folder')).length
+    expect(premiere, 'la première requête doit sonder').toBeGreaterThan(0)
+
+    // Seconde requête, SANS vider quoi que ce soit à la main : c'est le handler qui doit le faire.
+    installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } })
+    await unLot(handler)
+    const seconde = appels.parUrl.filter((u) => u.includes('zreagle-folder')).length
+    expect(seconde, 'la seconde requête a rejoué une mémoire périmée : un dossier créé entre-temps resterait invisible').toBeGreaterThan(0)
+  })
+
+  it('mais DANS une même requête, la mémoire déduplique toujours', async () => {
+    // Les deux moitiés comptent : sans la mémoire, un lot de treize sondait cinq ancêtres treize
+    // fois, soit 169 sous-requêtes. Le gain doit rester intact.
+    installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } })
+    const { default: handler } = await import('./page.js')
+    await handler({
+      method: 'POST', query: {}, headers: { 'x-zr-auth': 'x' },
+      body: {
+        action: 'create-eagle-links-batch',
+        items: Array.from({ length: 13 }, (_, i) => ({
+          kind: 'leaf', sourcePath: `pages/A/B/C/f${i}.img.json`,
+          targetPath: `pages/A/B/C/tri/f${i}.img.json`, title: `f${i}`,
+        })),
+      },
+    }, fausseReponse())
+    const sondes = appels.parUrl.filter((u) => u.includes('zreagle-folder'))
+    expect(sondes.length, `${sondes.length} sondes pour 13 fichiers : la mémoïsation intra-requête est perdue`).toBe(new Set(sondes).size)
+  })
+})
+
+describe('2 October 2026 : l’indexation sort de la création de liens', () => {
+  const lot = (extra = {}) => ({
+    method: 'POST', query: {}, headers: { 'x-zr-auth': 'x' },
+    body: {
+      action: 'create-eagle-links-batch', ...extra,
+      items: Array.from({ length: 1 }, (_, i) => ({ kind: 'leaf', sourcePath: `pages/A/B/C/f${i}.img.json`, targetPath: `pages/A/B/C/tri/f${i}.img.json`, title: `f${i}` })),
+    },
+  })
+
+  it('skipIndex : aucune requête vers le dépôt d’index, et les paires sont rendues au client', async () => {
+    installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } })
+    const { default: handler, oublierMemoireDossiers } = await import('./page.js')
+    oublierMemoireDossiers()
+    const res = fausseReponse()
+    await handler(lot({ skipIndex: true }), res)
+    expect(res.corps.ok, JSON.stringify(res.corps) + '\n' + appels.parUrl.join('\n')).toBe(true)
+    expect(appels.parUrl.filter((u) => u.includes('zenray-index-public')), 'le delta d’index ne doit plus être touché par la création').toHaveLength(0)
+    expect(res.corps.indexPairs).toEqual([['pages/A/B/C/tri/f0.img.json', 'pages/A/B/C/f0.img.json']])
+  })
+
+  it('skipIndex coûte nettement moins de sous-requêtes que l’ancien chemin', async () => {
+    const mesurer = async (extra) => {
+      installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } })
+      const { default: handler, oublierMemoireDossiers } = await import('./page.js')
+      oublierMemoireDossiers()
+      await handler(lot(extra), fausseReponse())
+      return appels.total
+    }
+    const ancien = await mesurer({})
+    const nouveau = await mesurer({ skipIndex: true })
+    expect(nouveau, `ancien ${ancien}, nouveau ${nouveau}`).toBeLessThan(ancien)
+  })
+
+  it('un manifeste source qui porte déjà son identité n’est pas réécrit', async () => {
+    installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } }) // resourceId: 'zr_test' déjà présent
+    const ecritures = []
+    const base = globalThis.fetch
+    globalThis.fetch = async (url, init) => { if (init && init.method === 'POST' && String(url).includes('git/trees')) ecritures.push(JSON.parse(init.body)); return base(url, init) }
+    const { default: handler, oublierMemoireDossiers } = await import('./page.js')
+    oublierMemoireDossiers()
+    await handler(lot({ skipIndex: true }), fausseReponse())
+    const chemins = (ecritures[0]?.tree || []).map((e) => e.path)
+    expect(chemins, chemins.join(', ')).not.toContain('pages/A/B/C/f0.img.json')
+    expect(chemins).toContain('pages/A/B/C/tri/f0.img.json')
+  })
+
+  it('index-links : indexe des paires cible/source en une requête séparée', async () => {
+    installerFauxReseau({ manifestes: { '.img.json': MANIFESTE_IMAGE } })
+    const { default: handler } = await import('./page.js')
+    const res = fausseReponse()
+    await handler({ method: 'POST', query: {}, headers: { 'x-zr-auth': 'x' }, body: { action: 'index-links', pairs: [['pages/A/tri/f0.img.json', 'pages/A/f0.img.json']] } }, res)
+    expect(res.corps.ok).toBe(true); expect(res.corps.added).toBe(1)
+  })
+})

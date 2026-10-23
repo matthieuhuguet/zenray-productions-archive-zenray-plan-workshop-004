@@ -1,0 +1,86 @@
+// youtubeLink.js — création de nœuds .media.json {type:'youtube'} à partir de liens YouTube (non répertoriés
+// ou publics). Décision de Matthieu (2026-07-02) : ses futurs clips (notamment DJI) passeront directement par
+// YouTube en non-répertorié plutôt que par le pipeline ZenRayShards — YouTube s'occupe déjà du transcodage
+// adaptatif et de l'hébergement du streaming, ZenRay n'a donc plus qu'à RÉFÉRENCER le lien : zéro octet stocké
+// côté ZenRayShards, zéro upload, zéro transcodage local, zéro coût de shard.
+//
+// ARCHITECTURE (la partie « par rapport à l'existant ») : le nœud reste un .media.json ORDINAIRE, PAS un
+// nouveau type de fichier. C'est le même contrat que les 3 variantes vidéo déjà en place (video-raw / dash /
+// hls legacy), juste un 4e discriminant `type:'youtube'`. Conséquence directe : la tuile Finder
+// (VideoMediaTile), la page de partage publique (/watch), et les commentaires par vidéo fonctionnent TOUS
+// SANS AUCUN changement — ils lisent déjà un .media.json générique par son `type`. Inventer une nouvelle
+// extension (.youtube.json) aurait dupliqué tout ce dispatch pour un gain nul.
+import { parseYouTube } from '../ref/embed.js'
+import { saveJson } from '../ref/content.js'
+
+const sanitize = (s = '') => (s || 'video').replace(/[/\\]/g, '_').replace(/[^\w.\- ]+/g, '').trim().slice(0, 80) || 'video'
+const rand = () => Math.random().toString(36).slice(2, 8)
+
+// oEmbed YouTube : endpoint PUBLIC, sans clé API, CORS ouvert -> titre + auteur (nom de chaîne) + vignette.
+// Best-effort : si ça échoue (vidéo privée/supprimée, réseau), on retombe sur des valeurs dérivées de l'ID —
+// jamais un échec bloquant, la vidéo reste utilisable avec un titre générique (le vrai titre reste éditable
+// dans le lecteur, comme pour n'importe quelle autre vidéo).
+async function fetchOEmbed(url) {
+  try {
+    const r = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`)
+    if (!r.ok) return null
+    return await r.json()
+  } catch { return null }
+}
+
+// Construit le manifest .media.json {type:'youtube'} pour UNE vidéo. Ne fait AUCUNE écriture (pur, testable).
+// NB durée : l'oEmbed YouTube ne fournit pas la durée (limitation connue de l'API officielle sans clé) ->
+// duration:0, donc pas de badge durée sur la tuile Finder pour ces vidéos. Acceptable (cosmétique mineur) ;
+// on évite ainsi d'exiger une clé API YouTube Data v3 juste pour ce détail.
+// `opts.audioOnly` (2026-07-04) : Matthieu reposte aussi des pistes AUDIO sur YouTube (non répertorié) plutôt
+// que de les stocker dans ZenRayShards. Même manifest {type:'youtube'}, juste un discriminant en plus —
+// AUCUN nouveau type, AUCUN nouveau dispatch ailleurs (tuile/lecteur/partage) : ils lisent déjà `m.type` et le
+// lecteur (VideoPlayer2) regarde `manifest.audioOnly` pour choisir sa mise en page (widget compact vs 16:9).
+export async function buildYoutubeManifest(rawUrl, opts = {}) {
+  const parsed = parseYouTube(rawUrl)
+  if (!parsed) return null
+  const { providerId: videoId, start } = parsed
+  const canonicalUrl = `https://youtu.be/${videoId}`
+  const oembed = await fetchOEmbed(canonicalUrl)
+  return {
+    type: 'youtube', v: 1,
+    videoId, url: canonicalUrl, start: start || 0,
+    name: (oembed && oembed.title) || videoId,
+    title: (oembed && oembed.title) || videoId,
+    author: (oembed && oembed.author_name) || 'YouTube',
+    poster: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    mime: 'video/youtube',
+    duration: 0,
+    addedAt: new Date().toISOString(),
+    ...(opts && opts.audioOnly ? { audioOnly: true } : {}),
+  }
+}
+
+// Crée le nœud .media.json dans `folder`. Renvoie {ok, name, nodePath} ou {ok:false, error, url}.
+export async function createYoutubeLinkNode(rawUrl, folder, opts = {}) {
+  const m = await buildYoutubeManifest(rawUrl, opts)
+  if (!m) return { ok: false, error: 'lien YouTube non reconnu', url: rawUrl }
+  const dest = String(folder || 'pages').replace(/\/$/, '')
+  const nodePath = `${dest}/${sanitize(m.name)}.${rand()}.media.json`
+  const res = await saveJson(nodePath, m)
+  if (!res.ok) return { ok: false, error: res.error || "échec d'écriture", url: rawUrl }
+  return { ok: true, name: m.name, nodePath }
+}
+
+// BATCH (Matthieu : « je te donnerai les batchs de liens à l'avenir ») : un lien par ligne. Séquentiel (pas de
+// parallélisme ici : oEmbed + save par vidéo est déjà rapide, et ça évite de bombarder l'API oEmbed publique).
+// `opts.audioOnly` propagé tel quel à chaque nœud du lot (un batch = un seul mode, audio OU vidéo).
+export async function createYoutubeLinkNodesBatch(text, folder, onProgress, opts = {}) {
+  const urls = String(text || '').split('\n').map((s) => s.trim()).filter(Boolean)
+  const results = []
+  for (let i = 0; i < urls.length; i++) {
+    results.push(await createYoutubeLinkNode(urls[i], folder, opts))
+    onProgress && onProgress((i + 1) / urls.length)
+  }
+  // Index de recherche : même geste que captureFiles (1 commit pour tout le lot, best-effort).
+  const nodePaths = results.filter((r) => r.ok).map((r) => r.nodePath)
+  if (nodePaths.length) {
+    try { await fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'index-add', paths: nodePaths }) }) } catch {}
+  }
+  return results
+}

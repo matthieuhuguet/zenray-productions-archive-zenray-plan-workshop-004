@@ -1,0 +1,216 @@
+// 8 October 2026, 11:15 CEST: publish the shared registry through a sparse local clone when REST bodies exceed GitHub limits.
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { assertWorkspaceId } from '../src/lib/projectWorkspace.js'
+import { LEGACY_WORKSPACE_REGISTRY_PATH, WORKSPACE_CATALOGUE_PATH } from '../src/lib/assetsWorkspaceCatalogue.js'
+
+const run = promisify(execFile)
+const registryPath = LEGACY_WORKSPACE_REGISTRY_PATH
+const commandEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+// 8 October 2026, 12:58 CEST: allow the same sparse writer to update exact project metadata paths.
+function assertWritablePath(value = registryPath) {
+  if (value === registryPath || value === WORKSPACE_CATALOGUE_PATH) return value
+  const match = /^pages\/ZenRayAssets\/([^/]+)\/(?:\.workspace\.json|\.context\.md)$/.exec(value)
+  if (!match) throw new Error(`Assets Git writer cannot update path: ${value}`)
+  assertWorkspaceId(match[1], 'project id')
+  return value
+}
+
+export function createAssetsCloudGitWriter({ repositoryPath, remoteUrl, branch = 'main', exec = run,
+  authorName = 'ZenRay Assets', authorEmail = 'assets@zenray.local' } = {}) {
+  if (!repositoryPath || !remoteUrl) throw new Error('Assets Git writer requires a repository path and remote URL')
+  const directory = path.resolve(repositoryPath)
+  // 8 October 2026, 16:51 CEST: prevent detached maintenance from piling up beside serialized registry writes.
+  // 21 October 2026: a publication spent 16 s in this writer and no step was known to be slow; any command above the threshold now says so.
+  const slowMs = Number(process.env.ZR_GIT_WRITER_SLOW_MS) || 1500
+  const git = async (args, options = {}) => {
+    const startedAt = Date.now()
+    try {
+      return (await exec('git', ['-c', 'maintenance.auto=false', '-C', directory, ...args], { encoding: 'utf8', timeout: 300000,
+        maxBuffer: 16 * 1024 * 1024, env: commandEnv, ...options })).stdout.trim()
+    } catch (error) {
+      const detail = String(error.stderr || error.message || 'git command failed').trim().split('\n').slice(-2).join(' ').slice(0, 300)
+      throw new Error(`git ${args[0]} failed: ${detail}`)
+    } finally {
+      const elapsed = Date.now() - startedAt
+      if (elapsed >= slowMs) console.log(`[assets-git-writer] slow git ${args.slice(0, 3).join(' ')}: ${elapsed} ms`)
+    }
+  }
+  let tail = Promise.resolve()
+
+  // 14 October 2026: what was already verified in this process (valid clone, right remote, right sparse set) is not verified again on
+  // every read and write. A publication used to spend about 40 git commands re-checking the same clone three times.
+  let ensuredKey = null
+  async function ensureClone(requestedPath = registryPath, extraPaths = []) {
+    const filePath = assertWritablePath(requestedPath)
+    // 9 October 2026, 09:56 CEST: Keep the old 44 MB registry out of routine sparse checkouts.
+    const sparsePaths = [...new Set([WORKSPACE_CATALOGUE_PATH, filePath, ...extraPaths.map(assertWritablePath)])]
+    const key = sparsePaths.join('|')
+    if (ensuredKey === key) return
+    ensuredKey = null
+    try {
+      await git(['rev-parse', '--is-inside-work-tree'])
+    } catch (error) {
+      try { await stat(directory); throw new Error(`Assets Git cache exists but is not a valid clone: ${directory}`) }
+      catch (statError) { if (statError.code !== 'ENOENT') throw statError }
+      await mkdir(path.dirname(directory), { recursive: true })
+      const temporary = `${directory}.initializing-${process.pid}`
+      await rm(temporary, { recursive: true, force: true })
+      try {
+        await exec('git', ['-c', 'maintenance.auto=false', 'clone', '--quiet', '--filter=blob:none', '--no-checkout', '--branch', branch, remoteUrl, temporary],
+          { encoding: 'utf8', timeout: 300000, maxBuffer: 16 * 1024 * 1024, env: commandEnv })
+        const temporaryGit = async (args) => exec('git', ['-c', 'maintenance.auto=false', '-C', temporary, ...args],
+          { encoding: 'utf8', timeout: 300000, maxBuffer: 16 * 1024 * 1024, env: commandEnv })
+        await temporaryGit(['sparse-checkout', 'init', '--no-cone'])
+        await temporaryGit(['sparse-checkout', 'set', '--no-cone', ...sparsePaths])
+        await temporaryGit(['checkout', '--quiet', branch])
+        await temporaryGit(['config', 'user.name', authorName])
+        await temporaryGit(['config', 'user.email', authorEmail])
+        await rename(temporary, directory)
+      } catch (cloneError) {
+        await rm(temporary, { recursive: true, force: true })
+        throw new Error(`Assets registry clone failed: ${String(cloneError.stderr || cloneError.message || cloneError).trim().split('\n').slice(-2).join(' ').slice(0, 300)}`)
+      }
+    }
+    const currentRemote = await git(['remote', 'get-url', 'origin'])
+    if (currentRemote !== remoteUrl) throw new Error('Assets Git cache points to a different remote repository')
+    await git(['sparse-checkout', 'init', '--no-cone'])
+    await git(['sparse-checkout', 'set', '--no-cone', ...sparsePaths])
+    ensuredKey = key
+  }
+
+  async function blobSha(ref, filePath = registryPath) {
+    const entry = await git(['ls-tree', '-z', ref, '--', assertWritablePath(filePath)])
+    const match = entry.match(/\bblob ([0-9a-f]+)\t/)
+    return match ? match[1] : null
+  }
+
+  async function sync(filePath = registryPath) {
+    filePath = assertWritablePath(filePath)
+    await ensureClone(filePath)
+    try {
+      await git(['fetch', '--quiet', 'origin', branch])
+      await git(['reset', '--quiet', '--hard', `origin/${branch}`])
+    } catch (error) { ensuredKey = null; throw error }
+    const head = await git(['rev-parse', 'HEAD'])
+    return { head, sha: await blobSha('HEAD', filePath) }
+  }
+
+  // 8 October 2026, 11:24 CEST: read large registry bytes from the sparse clone after matching GitHub's expected SHA.
+  async function readOne({ path: requestedPath = registryPath, expectedSha }) {
+    const filePath = assertWritablePath(requestedPath)
+    const current = await sync(filePath)
+    // 8 October 2026, 13:05 CEST: compare a SHA only when the caller supplied a concurrency snapshot.
+    if (expectedSha !== undefined && current.sha !== (expectedSha || null)) return { ok: false, conflict: true }
+    try { return { ok: true, sha: current.sha, markdown: await readFile(path.join(directory, filePath), 'utf8') } }
+    catch (error) { if (error.code === 'ENOENT' && current.sha === null) return { ok: true, sha: null, markdown: '' }; throw error }
+  }
+
+  async function saveOne({ path: requestedPath = registryPath, markdown, expectedSha, message = 'Assets workspace registry save' }) {
+    const filePath = assertWritablePath(requestedPath)
+    const current = await sync(filePath)
+    const expected = expectedSha || null
+    if (current.sha !== expected) return { ok: false, conflict: true }
+    const target = path.join(directory, filePath)
+    let existing = null
+    try { existing = await readFile(target, 'utf8') }
+    catch (error) { if (error.code !== 'ENOENT') throw error }
+    const content = String(markdown ?? '')
+    if (existing === content) return { ok: true, sha: current.sha }
+    await mkdir(path.dirname(target), { recursive: true })
+    const temporaryFile = `${target}.${process.pid}.tmp`
+    await writeFile(temporaryFile, content, 'utf8')
+    await rename(temporaryFile, target)
+    await git(['add', '--', filePath])
+    if (!(await git(['status', '--porcelain', '--', filePath]))) return { ok: true, sha: current.sha }
+    await git(['-c', `user.name=${authorName}`, '-c', `user.email=${authorEmail}`, 'commit', '--quiet', '-m', message])
+    try {
+      await git(['push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`])
+      return { ok: true, sha: await blobSha('HEAD', filePath) }
+    } catch (pushError) {
+      try {
+        await git(['fetch', '--quiet', 'origin', branch])
+        const remoteHead = await git(['rev-parse', `origin/${branch}`])
+        if (remoteHead !== current.head) {
+          await git(['reset', '--quiet', '--hard', remoteHead])
+          return { ok: false, conflict: true }
+        }
+      } catch (fetchError) {
+        return { ok: false, error: `git push failed and remote state could not be checked: ${String(fetchError.message || fetchError).slice(0, 300)}` }
+      }
+      return { ok: false, error: String(pushError.message || pushError).slice(0, 300) }
+    }
+  }
+
+  // 14 October 2026: one publication = one fetch, one commit, one push for every document it touches. `build` receives a reader of the
+  // current texts and returns the new text of each path it wants changed. A push refused because the remote moved reports a conflict
+  // (the caller rebuilds from the fresh state); nothing is ever forced.
+  async function transactionOne({ paths, build, message = 'Assets metadata save' }) {
+    const list = [...new Set(paths.map(assertWritablePath))]
+    if (!list.length) throw new Error('Assets Git transaction needs at least one path')
+    await ensureClone(list[0], list)
+    await git(['fetch', '--quiet', 'origin', branch])
+    await git(['reset', '--quiet', '--hard', `origin/${branch}`])
+    const head = await git(['rev-parse', 'HEAD'])
+    const current = {}
+    for (const filePath of list) {
+      try { current[filePath] = await readFile(path.join(directory, filePath), 'utf8') }
+      catch (error) { if (error.code !== 'ENOENT') throw error; current[filePath] = null }
+    }
+    const next = await build((filePath) => current[assertWritablePath(filePath)] ?? null)
+    const changed = []
+    for (const [filePath, markdown] of Object.entries(next || {})) {
+      if (!list.includes(assertWritablePath(filePath))) throw new Error(`Assets Git transaction cannot write ${filePath}`)
+      const content = String(markdown ?? '')
+      if (current[filePath] === content) continue
+      const target = path.join(directory, filePath)
+      await mkdir(path.dirname(target), { recursive: true })
+      const temporaryFile = `${target}.${process.pid}.tmp`
+      await writeFile(temporaryFile, content, 'utf8')
+      await rename(temporaryFile, target)
+      changed.push(filePath)
+    }
+    if (!changed.length) return { ok: true, changed: [], head }
+    await git(['add', '--', ...changed])
+    if (!(await git(['status', '--porcelain', '--', ...changed]))) return { ok: true, changed: [], head }
+    await git(['-c', `user.name=${authorName}`, '-c', `user.email=${authorEmail}`, 'commit', '--quiet', '-m', message])
+    try {
+      await git(['push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`])
+      return { ok: true, changed, head: await git(['rev-parse', 'HEAD']) }
+    } catch (pushError) {
+      try {
+        await git(['fetch', '--quiet', 'origin', branch])
+        const remoteHead = await git(['rev-parse', `origin/${branch}`])
+        if (remoteHead !== head) {
+          await git(['reset', '--quiet', '--hard', remoteHead])
+          return { ok: false, conflict: true }
+        }
+      } catch (fetchError) {
+        ensuredKey = null
+        return { ok: false, error: `git push failed and remote state could not be checked: ${String(fetchError.message || fetchError).slice(0, 300)}` }
+      }
+      return { ok: false, error: String(pushError.message || pushError).slice(0, 300) }
+    }
+  }
+
+  return {
+    transaction(input) {
+      const task = tail.then(() => transactionOne(input), () => transactionOne(input))
+      tail = task.catch(() => {})
+      return task
+    },
+    read(input) {
+      const task = tail.then(() => readOne(input), () => readOne(input))
+      tail = task.catch(() => {})
+      return task
+    },
+    save(input) {
+      const task = tail.then(() => saveOne(input), () => saveOne(input))
+      tail = task.catch(() => {})
+      return task
+    },
+    directory,
+  }
+}

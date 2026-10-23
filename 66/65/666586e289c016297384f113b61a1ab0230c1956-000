@@ -1,0 +1,131 @@
+// build-shelf-books.mjs — génère public/shelf/books.json (nouvelle section "Books" de Shelf) depuis la
+// SOURCE UNIQUE : Memory/Culture/Culture1.md, section "## 1. Livres" (export Notion déjà dédupliqué,
+// 213 livres). On lit le tableau markdown DIRECTEMENT (jamais de retranscription manuelle -> zéro risque
+// d'erreur de copie, toujours en phase avec la source si elle est mise à jour).
+//
+// Schéma de sortie IDENTIQUE aux autres catégories Shelf (games/anime-manga/movies), voir Shelf.jsx :
+//   { v:1, category:'books', label:'Books', items:[{id,name,score,status,tags,extra,image,notes,...}] }
+//
+// IMAGES (2026-07-08, demande Matthieu « avec Images si possible ») : Open Library Search API (PUBLIQUE,
+// sans clé, sans quota constaté) — https://openlibrary.org/search.json?q=<titre> <auteur> — cover_i du
+// premier résultat -> https://covers.openlibrary.org/b/id/<cover_i>-L.jpg. ESSAYÉ D'ABORD Google Books
+// (même principe, gratuit sans clé en théorie) : quota épuisé pour ce réseau (429 RESOURCE_EXHAUSTED,
+// quota_limit_value:0 — partagé par IP, hors de notre contrôle), d'où le repli sur Open Library qui
+// fonctionne de façon fiable et sans clé. Best-effort : un livre sans résultat reste sans image (fallback
+// dégradé déjà géré par Shelf.jsx, comme pour toute œuvre sans poster).
+//
+// Usage : node scripts/build-shelf-books.mjs
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import path from 'node:path'
+import { createHash } from 'node:crypto'
+
+const CULTURE_MD = '/Users/zenray/Create/Build/Memory/Culture/Culture1.md'
+const OUT = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'public', 'shelf', 'books.json')
+
+const STATUS_MAP = { Done: 'done', InProgress: 'in_progress', Backlog: 'backlog', Dropped: 'dropped' }
+
+function parseTable(md) {
+  const start = md.indexOf('## 1. Livres')
+  const end = md.indexOf('## 2. Écran', start)
+  const section = md.slice(start, end)
+  const lines = section.split('\n').filter((l) => l.trim().startsWith('|') && !/^\|\s*---/.test(l.trim()))
+  // 1re ligne = en-tête (Titre|Auteur|Année|Statut|Langue|Note|Thème|Synopsis|Commentaire) -> on la saute.
+  const rows = lines.slice(1)
+  return rows.map((line) => {
+    const cells = line.split('|').slice(1, -1).map((c) => c.trim())
+    const [titre, auteur, annee, statut, , note, theme, synopsis, commentaire] = cells
+    return { titre, auteur, annee, statut, note, theme, synopsis, commentaire }
+  }).filter((r) => r.titre)
+}
+
+const clean = (v) => (v && v !== '—' ? v : null)
+const slugify = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 48) || 'item'
+const identityOf = (title, author) => `${String(title || '').normalize('NFKC').trim().toLocaleLowerCase('fr')}\u0000${String(author || '').normalize('NFKC').trim().toLocaleLowerCase('fr')}`
+const stableId = (title, author) => `${slugify(title)}-${createHash('sha256').update(identityOf(title, author)).digest('hex').slice(0, 10)}`
+
+async function readPreviousBooks() {
+  try {
+    const parsed = JSON.parse(await readFile(OUT, 'utf8'))
+    const items = Array.isArray(parsed?.items) ? parsed.items : []
+    return new Map(items.map((item) => [identityOf(item.name, item.extra?.author), item]))
+  } catch {
+    return new Map()
+  }
+}
+
+async function openLibraryThumb(title, author) {
+  const q = author ? `${title} ${author}` : title
+  try {
+    const r = await fetch(`https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=1&fields=cover_i,title`)
+    if (!r.ok) return null
+    const j = await r.json()
+    const doc = j.docs && j.docs[0]
+    return doc && doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg` : null
+  } catch { return null }
+}
+
+async function runPool(items, limit, fn) {
+  let i = 0
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) { const idx = i++; await fn(items[idx], idx) }
+  }))
+}
+
+async function main() {
+  const NOW = new Date().toISOString()
+  const md = await readFile(CULTURE_MD, 'utf8')
+  const rows = parseTable(md)
+  const previous = await readPreviousBooks()
+  const sourceIdentities = new Set()
+  console.log(`${rows.length} livres trouvés dans Culture1.md`)
+
+  const items = rows.map((r) => {
+    const identity = identityOf(r.titre, clean(r.auteur))
+    if (sourceIdentities.has(identity)) throw new Error(`Livre dupliqué dans Culture1.md : ${r.titre} — ${r.auteur || 'auteur inconnu'}`)
+    sourceIdentities.add(identity)
+    const old = previous.get(identity)
+    const tags = clean(r.theme) ? r.theme.split(',').map((s) => s.trim()).filter(Boolean) : []
+    const notesParts = [clean(r.synopsis), clean(r.commentaire)].filter(Boolean)
+    const generated = {
+      id: old?.id || stableId(r.titre, clean(r.auteur)),
+      name: r.titre,
+      score: r.note && /^\d+$/.test(r.note) ? parseInt(r.note, 10) : null,
+      status: STATUS_MAP[r.statut] || 'backlog',
+      tags,
+      extra: { author: clean(r.auteur), year: clean(r.annee) },
+      image: null,
+      notes: notesParts.length ? notesParts.join('\n\n') : null,
+      createdAt: old?.createdAt || NOW,
+      updatedAt: old?.updatedAt || NOW,
+      _title: r.titre, _author: clean(r.auteur), // temporaires, retirés avant écriture
+    }
+    if (!old) return generated
+    // Les champs éditables dans Shelf gagnent sur la régénération. Le nom/auteur/année continuent de suivre
+    // Culture1.md, tandis que score/statut/notes/tags/pochette et champs futurs saisis dans l'app survivent.
+    return {
+      ...generated,
+      ...old,
+      id: old.id || generated.id,
+      name: generated.name,
+      extra: { ...(old.extra || {}), ...generated.extra },
+      image: old.image || generated.image,
+      _title: generated._title,
+      _author: generated._author,
+    }
+  })
+
+  console.log('Récupération des couvertures (Open Library, sans clé)…')
+  let found = 0
+  await runPool(items.filter((it) => !it.image), 6, async (it) => {
+    const thumb = await openLibraryThumb(it._title, it._author)
+    if (thumb) { it.image = { kind: 'url', ref: thumb }; found++ }
+  })
+  console.log(`${found}/${items.length} couvertures trouvées`)
+
+  const clean_items = items.map(({ _title, _author, ...rest }) => rest)
+  await mkdir(path.dirname(OUT), { recursive: true })
+  await writeFile(OUT, JSON.stringify({ v: 1, category: 'books', label: 'Books', items: clean_items }, null, 2))
+  console.log(`écrit -> ${OUT}`)
+}
+
+main().catch((e) => { console.error(e); process.exit(1) })

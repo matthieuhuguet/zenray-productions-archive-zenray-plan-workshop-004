@@ -1,0 +1,77 @@
+import { describe, expect, it, vi } from 'vitest'
+import { readCachedPlan, readPlanFresh, readPlanState, shouldAdoptPlan, writeCachedPlan } from './planCache.js'
+
+const memoryStorage = () => {
+  const values = new Map()
+  return {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+  }
+}
+
+describe('cache ZenRay Plan', () => {
+  it('rend immédiatement le dernier plan valide', () => {
+    const storage = memoryStorage()
+    const board = { type: 'plan', tasks: [{ id: '1' }] }
+    expect(writeCachedPlan('pages/a.plan.json', board, storage)).toBe(true)
+    expect(readCachedPlan('pages/a.plan.json', storage)).toEqual(board)
+  })
+
+  it('revalide par la lecture raw hors quota GitHub', async () => {
+    const board = { type: 'plan', tasks: [] }
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ markdown: JSON.stringify(board) }) }))
+    await expect(readPlanFresh('pages/a.plan.json', fetchImpl)).resolves.toEqual(board)
+    expect(fetchImpl).toHaveBeenCalledWith('/api/page?action=read&raw=1&fresh=1&path=pages%2Fa.plan.json', { cache: 'no-store' })
+  })
+
+  it('ne repeint que si la version fraîche diffère', () => {
+    const current = { type: 'plan', tasks: [{ id: '1' }] }
+    expect(shouldAdoptPlan(current, current)).toBe(false)
+    expect(shouldAdoptPlan(current, { type: 'plan', tasks: [{ id: '1' }, { id: '2' }] })).toBe(true)
+  })
+
+  // LE CŒUR DU CORRECTIF DU 2026-08-12 : une lecture ratée ne doit JAMAIS se lire comme un plan
+  // absent, sans quoi l'appelant peint un calendrier vide à la place du plan de Matthieu.
+  describe('readPlanState distingue absence et erreur', () => {
+    const board = { type: 'plan', tasks: [{ id: '1' }] }
+
+    it('ok quand le plan est lisible', async () => {
+      const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ markdown: JSON.stringify(board) }) }))
+      await expect(readPlanState('p.plan.json', fetchImpl)).resolves.toEqual({ status: 'ok', board })
+    })
+
+    it('missing seulement sur le 404 explicite du serveur', async () => {
+      const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ markdown: '', missing: true }) }))
+      await expect(readPlanState('p.plan.json', fetchImpl)).resolves.toEqual({ status: 'missing' })
+    })
+
+    it('error sur réponse HTTP en échec', async () => {
+      const fetchImpl = vi.fn(async () => ({ ok: false, json: async () => ({}) }))
+      await expect(readPlanState('p.plan.json', fetchImpl)).resolves.toEqual({ status: 'error' })
+    })
+
+    it('error sur réseau coupé', async () => {
+      const fetchImpl = vi.fn(async () => { throw new Error('offline') })
+      await expect(readPlanState('p.plan.json', fetchImpl)).resolves.toEqual({ status: 'error' })
+    })
+
+    it('error sur erreur applicative renvoyée en 200', async () => {
+      const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ error: 'github' }) }))
+      await expect(readPlanState('p.plan.json', fetchImpl)).resolves.toEqual({ status: 'error' })
+    })
+
+    it('error sur JSON illisible ou non-plan, jamais missing', async () => {
+      const casse = vi.fn(async () => ({ ok: true, json: async () => ({ markdown: '{tronqué' }) }))
+      await expect(readPlanState('p.plan.json', casse)).resolves.toEqual({ status: 'error' })
+      const autre = vi.fn(async () => ({ ok: true, json: async () => ({ markdown: '{"type":"autre"}' }) }))
+      await expect(readPlanState('p.plan.json', autre)).resolves.toEqual({ status: 'error' })
+    })
+
+    it('readPlanFresh reste compatible : board ou null', async () => {
+      const ok = vi.fn(async () => ({ ok: true, json: async () => ({ markdown: JSON.stringify(board) }) }))
+      await expect(readPlanFresh('p.plan.json', ok)).resolves.toEqual(board)
+      const ko = vi.fn(async () => ({ ok: false, json: async () => ({}) }))
+      await expect(readPlanFresh('p.plan.json', ko)).resolves.toBeNull()
+    })
+  })
+})

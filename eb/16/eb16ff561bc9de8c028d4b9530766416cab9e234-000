@@ -1,0 +1,99 @@
+// 21 October 2026: a warm zenray-data clone must reuse its slot, equal a fresh clone, and never share a slot between two runs.
+import { afterEach, expect, it } from 'vitest'
+import { execFileSync } from 'node:child_process'
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { claimDataClone } from './warm-data-clone.mjs'
+
+const roots = []
+const sh = (args) => execFileSync('git', ['-c', 'maintenance.auto=false', ...args], { encoding: 'utf8' }).trim()
+const gitIn = (dir, ...args) => sh(['-C', dir, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args])
+afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))) })
+
+async function fixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'warm-clone-'))
+  roots.push(root)
+  const remote = path.join(root, 'remote.git')
+  const seed = path.join(root, 'seed')
+  sh(['init', '--bare', '--quiet', '--initial-branch=main', remote])
+  sh(['clone', '--quiet', remote, seed])
+  await mkdir(path.join(seed, 'pages/Dest'), { recursive: true })
+  await writeFile(path.join(seed, 'pages/Dest/a.file.json'), '{"v":1}')
+  gitIn(seed, 'add', '--', '.')
+  gitIn(seed, 'commit', '--quiet', '-m', 'first')
+  gitIn(seed, 'push', '--quiet', 'origin', 'HEAD:main')
+  const push = async (name, body) => {
+    await writeFile(path.join(seed, 'pages/Dest', name), body)
+    gitIn(seed, 'add', '--', '.')
+    gitIn(seed, 'commit', '--quiet', '-m', `add ${name}`)
+    gitIn(seed, 'push', '--quiet', 'origin', 'HEAD:main')
+  }
+  const options = { slotsRoot: path.join(root, 'slots'), fallbackDir: path.join(root, 'fallback'), url: remote, destination: 'pages/Dest', env: process.env }
+  return { root, remote, push, options }
+}
+
+it('builds a slot once, then refreshes it in place with the new commits', async () => {
+  const { push, options } = await fixture()
+  const first = await claimDataClone(options)
+  expect(first.mode).toBe('cold')
+  expect(await readFile(path.join(first.dir, 'pages/Dest/a.file.json'), 'utf8')).toBe('{"v":1}')
+  await first.release()
+
+  await push('b.file.json', '{"v":2}')
+  const second = await claimDataClone(options)
+  expect(second.mode).toBe('warm')
+  expect(second.dir).toBe(first.dir)
+  expect(await readFile(path.join(second.dir, 'pages/Dest/b.file.json'), 'utf8')).toBe('{"v":2}')
+  await second.release()
+})
+
+it('hands a busy slot to nobody: a second run gets its own slot, and a full house gets a fresh clone', async () => {
+  const { options } = await fixture()
+  const one = await claimDataClone({ ...options, maxSlots: 2 })
+  const two = await claimDataClone({ ...options, maxSlots: 2 })
+  const three = await claimDataClone({ ...options, maxSlots: 2 })
+  expect(new Set([one.dir, two.dir]).size).toBe(2)
+  expect(three.mode).toBe('fresh')
+  expect(three.dir).toBe(options.fallbackDir)
+  await one.release(); await two.release(); await three.release()
+})
+
+it('discards what a dead run left uncommitted, so the next commit carries only its own manifests', async () => {
+  const { options } = await fixture()
+  const first = await claimDataClone(options)
+  await writeFile(path.join(first.dir, 'pages/Dest/orphan.file.json'), '{"orphan":true}')
+  await writeFile(path.join(first.dir, 'pages/Dest/a.file.json'), '{"v":"edited"}')
+  await first.release()
+
+  const second = await claimDataClone(options)
+  expect(second.mode).toBe('warm')
+  await expect(access(path.join(second.dir, 'pages/Dest/orphan.file.json'))).rejects.toThrow()
+  expect(await readFile(path.join(second.dir, 'pages/Dest/a.file.json'), 'utf8')).toBe('{"v":1}')
+  expect(gitIn(second.dir, 'status', '--porcelain')).toBe('')
+  await second.release()
+})
+
+it('rebuilds a slot that is corrupt or points at another remote instead of trusting it', async () => {
+  const { options } = await fixture()
+  const first = await claimDataClone(options)
+  gitIn(first.dir, 'remote', 'set-url', 'origin', '/nonexistent/other.git')
+  await first.release()
+  const second = await claimDataClone(options)
+  expect(second.mode).toBe('cold')
+  expect(gitIn(second.dir, 'remote', 'get-url', 'origin')).toBe(options.url)
+  await second.release()
+
+  await rm(path.join(second.dir, '.git', 'HEAD'))
+  const third = await claimDataClone(options)
+  expect(third.mode).toBe('cold')
+  expect(await readFile(path.join(third.dir, 'pages/Dest/a.file.json'), 'utf8')).toBe('{"v":1}')
+  await third.release()
+})
+
+it('behaves like the old engine when the warm path is switched off', async () => {
+  const { options } = await fixture()
+  const claim = await claimDataClone({ ...options, enabled: false })
+  expect(claim.mode).toBe('fresh')
+  expect(await readFile(path.join(claim.dir, 'pages/Dest/a.file.json'), 'utf8')).toBe('{"v":1}')
+})

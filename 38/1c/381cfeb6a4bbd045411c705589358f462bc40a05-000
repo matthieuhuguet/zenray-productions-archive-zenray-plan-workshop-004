@@ -1,0 +1,213 @@
+#!/usr/bin/env node
+// RepairFilmPosters.mjs (11 October 2026): moves every film poster served through /api/raw-proxy (private shard,
+// needs ZENRAY_RAW_TOKEN which production does not have) to a clear jsDelivr URL, then rewrites the manifests.
+// FR : repare les miniatures noires. Le jpg est lu par Git (zero quota REST) dans le shard prive, pousse dans un shard
+// public, verifie sur le CDN, PUIS seulement reecrit le .media.json.
+//   node scripts/RepairFilmPosters.mjs --manifests <dir containing pages/> [--dry] [--parallel 6] [--work-root <dir>]
+//        [--only <manifest.media.json>]... [--source <local video>]   (14 October 2026: the worker repairs ONE film before its proof)
+// FR : --only limite a un ou plusieurs manifestes ; --source donne l'original local pour sortir une image quand aucune n'existe.
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { execFile, execFileSync, spawnSync } from 'node:child_process'
+import { promisify } from 'node:util'
+import { openVideoGitShard } from './lib/video-git-shard.mjs'
+import { withCloneLock } from './lib/clone-lock.mjs'
+import { videoGitAuthEnvironment } from './video-raw-lib.mjs'
+import { ensurePublicShardRepo, resolveToken, PUBLIC_SHARD } from './lib/public-shard.mjs'
+import { FILM_POSTER, isProxiedPoster, makeFilmPoster, parseProxiedPoster, publicPosterUrl, verifyPublicPoster } from './lib/film-poster.mjs'
+
+const execFileAsync = promisify(execFile)
+const REPAIR = { parallel: 6, cloneTimeoutMs: 120000, commitRetries: 4, branch: 'main', streamFractions: [0.25, 0.5, 0.75], defaultDurationSec: 120 }
+
+function parseArgs(argv) {
+  const args = {}
+  for (let i = 2; i < argv.length; i += 1) {
+    if (!argv[i].startsWith('--')) continue
+    const next = argv[i + 1]
+    const key = argv[i].slice(2)
+    const value = (!next || next.startsWith('--')) ? true : next
+    if (value !== true) i += 1
+    // --only may be repeated: every value is kept. FR : --only peut se repeter.
+    if (key === 'only') args.only = [...(args.only || []), value]
+    else args[key] = value
+  }
+  return args
+}
+
+function listManifests(root) {
+  const out = []
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) { if (entry.name !== '.git') walk(full) } else if (entry.name.endsWith('.media.json')) out.push(full)
+    }
+  }
+  walk(path.join(root, 'pages'))
+  return out
+}
+
+// Reads one poster blob from a private shard through Git (promisor fetch of that single object, no REST call).
+async function readPosterBlob({ owner, repo, path: posterPath }, token, workDir) {
+  const dir = path.join(workDir, `clone-${crypto.randomBytes(5).toString('hex')}`)
+  const env = videoGitAuthEnvironment(process.env, token)
+  try {
+    await execFileAsync('git', ['clone', '-q', '--filter=blob:none', '--no-checkout', '--depth', '1', '--single-branch', '--branch', REPAIR.branch,
+      `https://github.com/${owner}/${repo}.git`, dir], { env, timeout: REPAIR.cloneTimeoutMs, maxBuffer: 2 * 1024 * 1024 })
+    const { stdout } = await execFileAsync('git', ['-C', dir, 'cat-file', 'blob', `HEAD:${posterPath}`],
+      { env, timeout: REPAIR.cloneTimeoutMs, maxBuffer: FILM_POSTER.maxBytes, encoding: 'buffer' })
+    return Buffer.from(stdout)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+}
+
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length)
+  let next = 0
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) { const i = next; next += 1; results[i] = await fn(items[i], i) }
+  }))
+  return results
+}
+
+async function main() {
+  const args = parseArgs(process.argv)
+  const root = path.resolve(args.manifests || '')
+  if (!args.manifests || !fs.existsSync(path.join(root, 'pages'))) throw new Error('--manifests must point to a directory containing pages/')
+  const dry = Boolean(args.dry)
+  const parallel = Number(args.parallel) || REPAIR.parallel
+  const workDir = path.resolve(args['work-root'] || fs.mkdtempSync(path.join(os.tmpdir(), 'film-posters-')))
+  fs.mkdirSync(workDir, { recursive: true })
+  const token = resolveToken()
+
+  // 1. what is broken
+  const targets = []
+  const only = new Set((args.only || []).map((p) => path.resolve(String(p))))
+  const sourceFile = args.source ? path.resolve(String(args.source)) : ''
+  for (const file of (only.size ? [...only].filter((f) => fs.existsSync(f)) : listManifests(root))) {
+    let manifest
+    try { manifest = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { continue }
+    if (isProxiedPoster(manifest.poster)) {
+      const parsed = parseProxiedPoster(manifest.poster)
+      if (parsed) targets.push({ file, parsed, key: `${parsed.repo}/${parsed.commit}/${parsed.path}` })
+    } else if (!manifest.poster && (manifest.master || sourceFile)) {
+      // a film with a stream but no poster at all: its frame comes from the stream itself, or from the local original (--source)
+      targets.push({ file, parsed: null, key: `stream:${path.relative(root, file)}` })
+    }
+  }
+  const unique = new Map()
+  for (const target of targets) if (target.parsed) unique.set(target.key, target.parsed)
+  console.log(`broken manifests: ${targets.length}, distinct posters: ${unique.size}`)
+  if (dry) { console.log(JSON.stringify({ dry: true, manifests: targets.length, posters: unique.size })); return }
+  if (!targets.length) { console.log(JSON.stringify({ ok: true, rewritten: 0, failed: [], nothingToDo: true })); return }
+
+  // 2. read every poster from its private shard (Git, parallel)
+  const stage = path.join(workDir, 'stage', FILM_POSTER.repairDir)
+  fs.mkdirSync(stage, { recursive: true })
+  const byKey = new Map()
+  const failed = []
+  await mapLimit([...unique.entries()], parallel, async ([key, parsed]) => {
+    try {
+      const bytes = await readPosterBlob(parsed, token, workDir)
+      if (bytes.length < FILM_POSTER.minBytes || bytes.length > FILM_POSTER.maxBytes) throw new Error(`unexpected size ${bytes.length}`)
+      const sha = crypto.createHash('sha256').update(bytes).digest('hex')
+      const relPath = `${FILM_POSTER.repairDir}/${sha}.jpg`
+      fs.writeFileSync(path.join(stage, `${sha}.jpg`), bytes)
+      byKey.set(key, { relPath, size: bytes.length })
+    } catch (error) { failed.push({ key, reason: String(error?.message || error).slice(0, 160) }) }
+  })
+  // 2b. a poster that could not be read (too small = black frame) or never existed: take a frame from the film's own
+  // HLS stream (segments are public on jsDelivr), at 25 %, 50 % then 75 % of the duration until one is a real image.
+  const missingKeys = new Set([...failed.map((f) => f.key), ...targets.filter((t) => !t.parsed).map((t) => t.key)])
+  for (const target of targets.filter((t) => missingKeys.has(t.key))) {
+    const manifest = JSON.parse(fs.readFileSync(target.file, 'utf8'))
+    if (sourceFile && fs.existsSync(sourceFile)) {
+      const localFrame = path.join(workDir, `frame-${crypto.randomBytes(4).toString('hex')}.jpg`)
+      const duration = Number(manifest.duration || manifest.probe?.duration) || REPAIR.defaultDurationSec
+      if (REPAIR.streamFractions.some((fraction) => makeFilmPoster(sourceFile, localFrame, duration * fraction))) {
+        const bytes = fs.readFileSync(localFrame)
+        fs.rmSync(localFrame, { force: true })
+        const sha = crypto.createHash('sha256').update(bytes).digest('hex')
+        const relPath = `${FILM_POSTER.repairDir}/${sha}.jpg`
+        fs.writeFileSync(path.join(stage, `${sha}.jpg`), bytes)
+        byKey.set(target.key, { relPath, size: bytes.length })
+        const at = failed.findIndex((f) => f.key === target.key)
+        if (at >= 0) failed.splice(at, 1)
+        continue
+      }
+    }
+    // master.m3u8 points at the app's /api/hls proxy; the media playlists next to it hold the public jsDelivr segment URLs.
+    const streamDir = manifest.master ? path.dirname(path.join(root, manifest.master)) : ''
+    const playlists = streamDir && fs.existsSync(streamDir)
+      ? fs.readdirSync(streamDir).filter((n) => /^media_\d+\.m3u8$/.test(n)).sort().map((n) => path.join(streamDir, n)) : []
+    if (!playlists.length) continue
+    const duration = Number(manifest.duration || manifest.probe?.duration) || REPAIR.defaultDurationSec
+    const probeFile = path.join(workDir, `frame-${crypto.randomBytes(4).toString('hex')}.jpg`)
+    const ok = playlists.some((playlist) => REPAIR.streamFractions.some((fraction) => makeFilmPoster(playlist, probeFile, duration * fraction * 2)))
+    if (!ok) continue
+    const bytes = fs.readFileSync(probeFile)
+    fs.rmSync(probeFile, { force: true })
+    const sha = crypto.createHash('sha256').update(bytes).digest('hex')
+    const relPath = `${FILM_POSTER.repairDir}/${sha}.jpg`
+    fs.writeFileSync(path.join(stage, `${sha}.jpg`), bytes)
+    byKey.set(target.key, { relPath, size: bytes.length })
+    const at = failed.findIndex((f) => f.key === target.key)
+    if (at >= 0) failed.splice(at, 1)
+  }
+  console.log(`posters read: ${byKey.size}, failed: ${failed.length}`)
+
+  // 3. one push into the dedicated public poster repo (content-addressed, so a rerun adds nothing)
+  await ensurePublicShardRepo(token, FILM_POSTER.repairRepo, { description: 'ZenRay public film posters (11 October 2026)' })
+  const shard = await openVideoGitShard({ owner: PUBLIC_SHARD.owner, repo: FILM_POSTER.repairRepo, token, workDir: path.join(workDir, 'shard') })
+  let commit
+  try {
+    const files = [...new Set([...byKey.values()].map((v) => v.relPath))].map((relPath) => {
+      const sourcePath = path.join(workDir, 'stage', relPath)
+      return { path: relPath, sourcePath, size: fs.statSync(sourcePath).size }
+    })
+    commit = (await shard.pushFiles(files, { message: `film posters: ${files.length}` })).commit
+  } finally { fs.rmSync(shard.directory, { recursive: true, force: true }) }
+  console.log(`pushed to ${FILM_POSTER.repairRepo}@${commit}`)
+
+  // 4. verify on the CDN, then rewrite ONLY the manifests whose poster answered
+  const verified = new Map()
+  await mapLimit([...new Set([...byKey.values()].map((v) => v.relPath))], 8, async (relPath) => {
+    const url = publicPosterUrl({ owner: PUBLIC_SHARD.owner, repo: FILM_POSTER.repairRepo, commit, relPath })
+    const check = await verifyPublicPoster(url)
+    if (check.ok) verified.set(relPath, url); else failed.push({ key: relPath, reason: check.reason })
+  })
+  let rewritten = 0
+  const written = []
+  // 14 October 2026: ONE Git writer at a time on the shared clone (the worker packages and uploads films at the same time).
+  // FR : un seul ecrivain Git a la fois sur le clone partage.
+  await withCloneLock(root, 'film poster repair', async () => {
+  for (const { file, key } of targets) {
+    const hit = byKey.get(key)
+    const url = hit && verified.get(hit.relPath)
+    if (!url) continue
+    const manifest = JSON.parse(fs.readFileSync(file, 'utf8'))
+    manifest.poster = url
+    fs.writeFileSync(file, JSON.stringify(manifest, null, 2) + '\n')
+    written.push(path.relative(root, file)); rewritten += 1
+  }
+
+  // 5. commit + push the manifests (rebase when the remote moved)
+  if (written.length) {
+    const git = (...a) => spawnSync('git', ['-C', root, ...a], { encoding: 'utf8', env: videoGitAuthEnvironment(process.env, token) })
+    for (let i = 0; i < written.length; i += 200) git('add', '--', ...written.slice(i, i + 200))
+    const c = git('-c', 'user.email=bot@zenray', '-c', 'user.name=zenray-bot', 'commit', '-q', '-m', `film posters: ${rewritten} posters served by jsDelivr (11 October 2026)`)
+    if (c.status !== 0) throw new Error(`commit failed: ${c.stderr || c.stdout}`)
+    for (let attempt = 0; attempt < REPAIR.commitRetries; attempt += 1) {
+      const push = git('push', 'origin', `HEAD:${REPAIR.branch}`)
+      if (push.status === 0) break
+      if (attempt === REPAIR.commitRetries - 1) throw new Error(`push failed: ${push.stderr || push.stdout}`)
+      const pull = git('pull', '--rebase', 'origin', REPAIR.branch)
+      if (pull.status !== 0) throw new Error(`rebase failed: ${pull.stderr || pull.stdout}`)
+    }
+  }
+  })
+  console.log(JSON.stringify({ ok: failed.length === 0, rewritten, failed, posterRepo: FILM_POSTER.repairRepo, commit }, null, 2))
+  if (failed.length) process.exitCode = 2
+}
+
+main().catch((error) => { console.error(error?.stack || error?.message || String(error)); process.exit(1) })

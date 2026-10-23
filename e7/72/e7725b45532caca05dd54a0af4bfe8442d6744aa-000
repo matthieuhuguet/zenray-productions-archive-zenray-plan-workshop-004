@@ -1,0 +1,131 @@
+// RECHERCHE DE POSTERS via API média, par catégorie. Renvoie une liste de candidats {title, year, image}
+// que l'utilisateur PICK dans l'app ; l'image choisie est ensuite ingérée (server/shelf-img.js) vers le repo
+// public jsDelivr. Clés via ENV (jamais commitées) : RAWG_API_KEY (jeux), TMDB_API_KEY (films/séries/anime).
+// AniList = GraphQL public, aucune clé. Résilient : une source sans clé est simplement ignorée (résultats []).
+const RAWG_KEY = process.env.RAWG_API_KEY || process.env.RAWG_KEY || ''
+const TMDB_KEY = process.env.TMDB_API_KEY || process.env.TMDB_KEY || ''
+
+const jget = (u, init) => fetch(u, init).then((r) => (r.ok ? r.json() : null)).catch(() => null)
+
+// — Recherche d'images WEB. Deux moteurs, dans l'ordre :
+//   1) GOOGLE Custom Search JSON API (officiel, gratuit 100 req/jour). Marche DEPUIS N'IMPORTE QUELLE IP
+//      (datacenter inclus) car c'est une API authentifiée -> c'est LE moteur qui marche en PROD. Activé dès que
+//      GOOGLE_CSE_KEY + GOOGLE_CSE_ID sont en env.
+//   2) DUCKDUCKGO keyless (fallback). Marche en local (IP résidentielle) mais bloqué depuis les IP datacenter
+//      (Vercel/AWS) -> inutile en prod. Sert de filet quand Google n'est pas configuré.
+const GCSE_KEY = process.env.GOOGLE_CSE_KEY || ''
+const GCSE_ID = process.env.GOOGLE_CSE_ID || ''
+const DDG_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+
+async function googleImages(q) {
+  if (!GCSE_KEY || !GCSE_ID) return null // non configuré -> signal pour basculer sur DDG
+  const j = await jget(`https://www.googleapis.com/customsearch/v1?key=${GCSE_KEY}&cx=${GCSE_ID}&searchType=image&num=10&safe=off&q=${encodeURIComponent(q)}`)
+  if (!j) return []
+  return ((j.items) || []).filter((i) => i.link).map((i) => ({ title: i.title || q, year: '', image: i.link, source: 'google' }))
+}
+async function ddgImages(q) {
+  try {
+    const page = await fetch(`https://duckduckgo.com/?q=${encodeURIComponent(q)}&iax=images&ia=images`, { headers: { 'User-Agent': DDG_UA } }).then((r) => r.text())
+    const m = page.match(/vqd=["']?([\d-]+)["']?/)
+    if (!m) return []
+    const j = await fetch(`https://duckduckgo.com/i.js?l=us-en&o=json&q=${encodeURIComponent(q)}&vqd=${m[1]}&f=,,,&p=1`, { headers: { 'User-Agent': DDG_UA, Referer: 'https://duckduckgo.com/' } }).then((r) => r.json()).catch(() => null)
+    return ((j && j.results) || []).filter((r) => r.image).map((r) => ({ title: r.title || q, year: '', image: r.image, source: 'web' }))
+  } catch { return [] }
+}
+async function webImages(q) {
+  const g = await googleImages(q)
+  if (g !== null) return g // Google configuré -> source de vérité en prod (même si 0 résultat)
+  return ddgImages(q) // sinon fallback keyless (local)
+}
+
+// — RAWG (jeux) : background_image = art paysage du jeu.
+async function rawg(q) {
+  if (!RAWG_KEY) return []
+  const j = await jget(`https://api.rawg.io/api/games?key=${RAWG_KEY}&search=${encodeURIComponent(q)}&page_size=8`)
+  return ((j && j.results) || []).filter((g) => g.background_image).map((g) => ({ title: g.name, year: (g.released || '').slice(0, 4), image: g.background_image, source: 'rawg' }))
+}
+
+// — TMDB (films / séries / docs / anime) : poster_path -> CDN image.tmdb.org (w500).
+async function tmdb(q) {
+  if (!TMDB_KEY) return []
+  const j = await jget(`https://api.themoviedb.org/3/search/multi?api_key=${TMDB_KEY}&query=${encodeURIComponent(q)}&include_adult=false`)
+  return ((j && j.results) || []).filter((m) => m.poster_path).map((m) => ({
+    title: m.title || m.name || q,
+    year: ((m.release_date || m.first_air_date || '')).slice(0, 4),
+    image: `https://image.tmdb.org/t/p/w500${m.poster_path}`, source: 'tmdb',
+  }))
+}
+
+// — Open Library (livres, SANS clé, aucun quota constaté) : couverture du 1er résultat de recherche.
+// Ajouté 2026-07-08 pour la catégorie "books" (Shelf) — Google Books, testé en premier, est bloqué par un
+// quota partagé par IP (429 RESOURCE_EXHAUSTED) hors de notre contrôle ; Open Library est fiable et gratuit.
+async function openLibrary(q) {
+  const j = await jget(`https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=8&fields=title,author_name,first_publish_year,cover_i`)
+  return ((j && j.docs) || []).filter((d) => d.cover_i).map((d) => ({
+    title: d.title || q,
+    year: d.first_publish_year ? String(d.first_publish_year) : '',
+    image: `https://covers.openlibrary.org/b/id/${d.cover_i}-L.jpg`, source: 'openlibrary',
+  }))
+}
+
+// — Jikan (MyAnimeList, SANS clé) : jaquettes anime ET manga. Marche en prod (API keyless mais hébergée, pas
+// bloquée par IP datacenter). Complète AniList (couvre mieux le manga). Limite Jikan ~3 req/s : 2 appels/recherche.
+async function jikan(q) {
+  const map = (j, src) => ((j && j.data) || []).filter((x) => x.images && x.images.jpg && x.images.jpg.large_image_url).map((x) => ({ title: x.title || q, year: (x.year ? String(x.year) : ''), image: x.images.jpg.large_image_url, source: src }))
+  const [a, m] = await Promise.all([
+    jget(`https://api.jikan.moe/v4/anime?q=${encodeURIComponent(q)}&limit=6&sfw`),
+    jget(`https://api.jikan.moe/v4/manga?q=${encodeURIComponent(q)}&limit=6&sfw`),
+  ])
+  return [...map(a, 'mal'), ...map(m, 'mal')]
+}
+
+// — AniList (anime & manga) : GraphQL public, coverImage.extraLarge (jaquette portrait).
+async function anilist(q) {
+  const query = `query($s:String){ Page(perPage:8){ media(search:$s, sort:SEARCH_MATCH){ title{romaji english} startDate{year} coverImage{extraLarge large} } } }`
+  const j = await jget('https://graphql.anilist.co', {
+    method: 'POST', headers: { 'content-type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ query, variables: { s: q } }),
+  })
+  const media = (j && j.data && j.data.Page && j.data.Page.media) || []
+  return media.filter((m) => m.coverImage && (m.coverImage.extraLarge || m.coverImage.large)).map((m) => ({
+    title: (m.title && (m.title.english || m.title.romaji)) || q,
+    year: (m.startDate && m.startDate.year) ? String(m.startDate.year) : '',
+    image: m.coverImage.extraLarge || m.coverImage.large, source: 'anilist',
+  }))
+}
+
+// Indice de catégorie ajouté à la requête web pour de meilleurs résultats (jaquette/affiche pertinente).
+const WEB_HINT = { games: 'game cover', 'anime-manga': 'anime poster', movies: 'movie poster', books: 'book cover' }
+
+export default async function handler(req, res) {
+  const q = ((req.query && req.query.q) || '').toString().trim()
+  const cat = ((req.query && req.query.cat) || '').toString()
+  const mode = ((req.query && req.query.mode) || '').toString()
+  if (!q) return res.status(200).json({ ok: false, error: 'no-query', results: [] })
+
+  // Recherche média par catégorie (RAWG/TMDB/AniList/Open Library).
+  const media = async () => {
+    if (cat === 'games') return rawg(q)
+    if (cat === 'anime-manga') { const [a, j, t] = await Promise.all([anilist(q), jikan(q), tmdb(q)]); return [...a, ...j, ...t] }
+    if (cat === 'movies') return tmdb(q)
+    if (cat === 'books') return openLibrary(q)
+    const [g, t, a, j] = await Promise.all([rawg(q), tmdb(q), anilist(q), jikan(q)]); return [...g, ...t, ...a, ...j]
+  }
+  let results = []
+  try {
+    if (mode === 'web') {
+      results = await webImages(`${q} ${WEB_HINT[cat] || ''}`.trim())
+    } else {
+      // DÉFAUT = on GARDE l'ancien système (API média) ET on AJOUTE la recherche web : média d'abord (jaquettes
+      // propres), puis web en complément. Le web peut échouer (IP datacenter bloquée) -> on a quand même le média.
+      const [m, w] = await Promise.all([media(), webImages(`${q} ${WEB_HINT[cat] || ''}`.trim())])
+      results = [...m, ...w]
+    }
+  } catch (e) { return res.status(200).json({ ok: false, error: 'search-exception', detail: e && e.message, results: [] }) }
+
+  // Dédupe par URL, borne à 30 (le picker en montre 3 à la fois + refresh).
+  const seen = new Set(); const out = []
+  for (const r of results) { if (!r.image || seen.has(r.image)) continue; seen.add(r.image); out.push(r); if (out.length >= 30) break }
+  res.setHeader('Cache-Control', 'public, max-age=600')
+  return res.status(200).json({ ok: true, results: out })
+}

@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+// Ajoute 12 jeux à la Shelf (Games, backlog).
+// Télécharge images via RAWG, convertit en webp, pousse sur zenray-shelf-img, met à jour manifest.
+import { execSync } from 'node:child_process'
+import { readFile, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+
+const RAWG_KEY = process.env.RAWG_KEY
+if (!RAWG_KEY) { console.error('RAWG_KEY manquant'); process.exit(1) }
+
+const games = [
+  'Resident Evil Veronica',
+  'Fable',
+  'Final Fantasy VII Rebellion',
+  'God of War Laufey',
+  'Control',
+  'Resonant',
+  'Stellar Blade Blood Rain',
+  'Persona 6 Resonance',
+  'A Plague Tale Legacy',
+  'Stranger Than Heaven',
+  'Persona 4 Revival',
+  'No Rest for the Wicked'
+]
+
+const SHELF_IMG_REPO = '/tmp/zenray-shelf-img'
+const PROJECT_ROOT = new URL('../', import.meta.url).pathname
+const GAMES_MANIFEST = join(PROJECT_ROOT, 'public/shelf/games.json')
+
+// UUID-like ID (4 hex chars)
+const uid = () => Math.random().toString(16).slice(2, 6)
+
+// Clean game name pour RAWG search
+const clean = (s) => String(s).replace(/\s*\(\d{4}\)\s*$/, '').replace(/\s*[:\-–]\s*$/, '').trim()
+
+// Récupère l'image RAWG
+async function fetchFromRawg(name) {
+  const url = `https://api.rawg.io/api/games?key=${RAWG_KEY}&search=${encodeURIComponent(clean(name))}&page_size=1&search_precise=true`
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const res = await fetch(url)
+      if (res.status === 429) {
+        if (attempt === 5) return null
+        await new Promise((resolve) => setTimeout(resolve, Math.min(12000, 750 * (2 ** (attempt - 1)))))
+        continue
+      }
+      if (!res.ok) return null
+      const data = await res.json()
+      return data?.results?.[0]?.background_image || null
+    } catch (e) {
+      if (attempt === 5) console.error(`  ✗ ${name}: ${e.message}`)
+      else await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+    }
+  }
+  return null
+}
+
+// Télécharge une image en JPG (format actuel du repo zenray-shelf-img)
+async function downloadImage(url, outPath) {
+  try {
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const buf = await res.arrayBuffer()
+    await writeFile(outPath, Buffer.from(buf))
+    return true
+  } catch (e) {
+    console.error(`  ✗ download: ${e.message}`)
+    return false
+  }
+}
+
+async function main() {
+  console.log('🎮 Ajout de jeux Backlog à la Shelf\n')
+
+  // Clone / pull zenray-shelf-img
+  console.log('📦 Repo zenray-shelf-img...')
+  if (!existsSync(SHELF_IMG_REPO)) {
+    execSync(`git clone https://github.com/matthieuhuguet/zenray-shelf-img.git "${SHELF_IMG_REPO}"`, { stdio: 'inherit' })
+  } else {
+    execSync(`cd "${SHELF_IMG_REPO}" && git pull`, { stdio: 'inherit' })
+  }
+
+  // Charge manifest courant
+  const manifest = JSON.parse(await readFile(GAMES_MANIFEST, 'utf8'))
+  const existingIds = new Set(manifest.items.map(it => it.id))
+
+  // Traite chaque jeu
+  let added = 0
+  const newItems = []
+
+  for (const gameName of games) {
+    process.stdout.write(`  ${gameName}... `)
+
+    // ID unique
+    let id = null
+    for (let i = 0; i < 100; i++) {
+      const candidate = `${gameName.toLowerCase().replace(/\s+/g, '-')}-${uid()}`
+      if (!existingIds.has(candidate)) { id = candidate; break }
+    }
+    if (!id) { console.log('✗ ID collision'); continue }
+    existingIds.add(id)
+
+    // Récupère image RAWG
+    const imgUrl = await fetchFromRawg(gameName)
+    if (!imgUrl) { console.log('✗ pas d\'image RAWG'); continue }
+
+    // Télécharge image JPG
+    const jpgPath = join(SHELF_IMG_REPO, `${id}.jpg`)
+    const ok = await downloadImage(imgUrl, jpgPath)
+    if (!ok) { console.log('✗ download'); continue }
+
+    // jsDelivr ref (sera mis à jour après push)
+    const jsDelivrRef = `https://cdn.jsdelivr.net/gh/matthieuhuguet/zenray-shelf-img@COMMIT_SHA/${id}.jpg`
+
+    newItems.push({
+      id,
+      name: gameName,
+      score: null,
+      status: 'backlog',
+      tags: [],
+      extra: { exclusivity: null, criticElements: '' },
+      image: { kind: 'url', ref: jsDelivrRef },
+      notes: null
+    })
+
+    console.log('✓')
+    added++
+  }
+
+  if (added === 0) { console.log('\n⚠ Aucun jeu ajouté'); process.exit(1) }
+
+  // Ajoute les items au manifest
+  console.log(`\n📝 Manifest (+${added} items)...`)
+  manifest.items.push(...newItems)
+  await writeFile(GAMES_MANIFEST, JSON.stringify(manifest, null, 2))
+
+  // Push zenray-shelf-img
+  console.log('🚀 Push images vers zenray-shelf-img...')
+  execSync(`cd "${SHELF_IMG_REPO}" && git add . && git commit -m "Add ${added} game posters for Shelf backlog" && git push origin main`, { stdio: 'inherit' })
+
+  // Get new commit SHA
+  const newSha = execSync(`cd "${SHELF_IMG_REPO}" && git rev-parse HEAD`, { encoding: 'utf8' }).trim().slice(0, 40)
+  console.log(`Commit: ${newSha}`)
+
+  // Repoint les URLs dans le manifest
+  console.log('🔗 Repoint jsDelivr...')
+  manifest.items.forEach(it => {
+    if (it.image?.ref?.includes('COMMIT_SHA')) {
+      it.image.ref = it.image.ref.replace('COMMIT_SHA', newSha)
+    }
+  })
+  await writeFile(GAMES_MANIFEST, JSON.stringify(manifest, null, 2))
+
+  // Commit dans ZenRayProgress
+  console.log('✅ Commit ZenRayProgress...')
+  execSync(`cd "${PROJECT_ROOT}" && git add public/shelf/games.json && git commit -m "Shelf: add ${added} games to backlog"`, { stdio: 'inherit' })
+  execSync(`cd "${PROJECT_ROOT}" && git push origin main`, { stdio: 'inherit' })
+
+  console.log(`\n✨ Done! +${added} jeux ajoutés à Backlog.`)
+}
+
+main().catch(e => { console.error(e); process.exit(1) })

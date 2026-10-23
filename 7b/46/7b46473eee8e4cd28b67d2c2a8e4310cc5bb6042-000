@@ -1,0 +1,97 @@
+// 12 October 2026 17:40 CEST: user-visible retries, explicit search and stale response protection.
+import React from 'react'
+import { createHash, webcrypto } from 'node:crypto'
+import { canonicalLessonContent } from './japaneseCorpusModel.js'
+import { describe, expect, it, vi } from 'vitest'
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
+import JapaneseCorpus, { readCorpusJson } from './JapaneseCorpus.jsx'
+
+Object.defineProperty(globalThis, 'crypto', { value: webcrypto, configurable: true })
+// 13 October 2026 00:07 CEST: synthetic approvals are test fixtures only, never corpus data.
+function approveFixture(record) {
+  const content = { ...record, lessonContentVersion: '1' }
+  delete content.lessonValidation; delete content.lessonContentHash
+  const lessonContentHash = createHash('sha256').update(canonicalLessonContent(content)).digest('hex')
+  return { ...content, lessonContentHash, lessonValidation: { status: 'approved', contentVersion: '1', contentHash: lessonContentHash, reviewerIds: ['synthetic-a', 'synthetic-b'], evidenceUrls: ['https://example.org/synthetic-review'], unresolvedFindings: [] } }
+}
+const record = approveFixture( { id: 'test-card', title: 'Une fiche', domain: 'grammar', level: 'N4', explanationFr: 'Une règle sourcée.', status: 'reviewed', examples: [{ ja: '雨です。', reading: 'あめです。', fr: 'Il pleut.', origin: 'Original example' }], sources: [] })
+const catalogue = { schemaVersion: 1, basePath: 'release/test', cards: [record], counts: { grammar: 1, dictionary: 10 }, notice: 'Corpus documentaire', lesson: { minutes: 15, pauseMinutes: 2, maxNewItems: 1, maxDrills: 3, script: 'reading', mode: 'oral' }, learner: approveFixture({ retestItems: [{ fr: 'Que dit-on pour hier ?', ja: '昨日。' }] }) }
+
+describe('corpus UI', () => {
+  it('surfaces HTTP and missing payload failures instead of interpreting them as empty results', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce({ ok: false, status: 503 }).mockResolvedValueOnce({ ok: true, json: async () => ({ missing: true }) }))
+    await expect(readCorpusJson('x')).rejects.toThrow('503')
+    await expect(readCorpusJson('x')).rejects.toThrow('indisponible')
+    vi.unstubAllGlobals()
+  })
+  it('waits for submit and ignores an in-flight search after returning to browsing', async () => {
+    let resolveSearch
+    const client = { getCatalogue: vi.fn(async () => catalogue), search: vi.fn(() => new Promise((resolve) => { resolveSearch = resolve })), getRecord: vi.fn() }
+    render(<JapaneseCorpus client={client} />)
+    await screen.findByText('Une fiche')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '雨' } })
+    expect(client.search).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Rechercher' }))
+    await waitFor(() => expect(client.search).toHaveBeenCalledWith('雨', { domain: '', level: '' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Parcourir les fiches' }))
+    resolveSearch([{ ...record, id: 'late', title: 'Résultat périmé' }])
+    await waitFor(() => expect(screen.queryByText('Résultat périmé')).not.toBeInTheDocument())
+    expect(screen.getByText('Une fiche')).toBeInTheDocument()
+    cleanup()
+  })
+  it('retries a failed catalogue and makes a lesson with closed answer details', async () => {
+    const client = { getCatalogue: vi.fn().mockRejectedValueOnce(new Error('Panne temporaire')).mockResolvedValue(catalogue), search: vi.fn(), getRecord: vi.fn() }
+    render(<JapaneseCorpus client={client} />)
+    await screen.findByRole('alert')
+    fireEvent.click(screen.getByRole('button', { name: 'Réessayer' }))
+    fireEvent.click(await screen.findByText('Une fiche'))
+    fireEvent.click(screen.getByRole('button', { name: 'Ajouter à la leçon' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Préparer la leçon' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Préparer la leçon' }))
+    await screen.findByText('Que dit-on pour hier ?')
+    expect(screen.getByText('Que dit-on pour hier ?')).toBeInTheDocument()
+    expect(screen.getByText('Réponse du retest').parentElement).not.toHaveAttribute('open')
+    expect(screen.getByText('Réponse de référence').parentElement).not.toHaveAttribute('open')
+    cleanup()
+  })
+  it('makes catalogue cards after the first 40 accessible and resets pagination on filter changes', async () => {
+    const cards = Array.from({ length: 45 }, (_, index) => ({ ...record, id: `card-${index}`, title: `Fiche ${index}` }))
+    render(<JapaneseCorpus client={{ getCatalogue: async () => ({ ...catalogue, cards }), search: vi.fn(), getRecord: vi.fn() }} />)
+    await screen.findByText('Fiche 0')
+    expect(screen.queryByText('Fiche 44')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Suivant' }))
+    expect(screen.getByText('Fiche 44')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Niveau'), { target: { value: 'N4' } })
+    expect(screen.getByText('Fiche 0')).toBeInTheDocument()
+    cleanup()
+  })
+})
+
+describe('visible approval blocking', () => {
+  it.each(['record', 'retest', 'changed'])('blocks preparing and downloading for %s', async (kind) => {
+    const blocked = kind === 'record' ? { ...record, lessonValidation: undefined } : kind === 'changed' ? { ...record, explanationFr: 'Changed' } : record
+    const head = { ...catalogue, cards: [blocked], learner: kind === 'retest' ? { retestItems: catalogue.learner.retestItems } : catalogue.learner }
+    render(<JapaneseCorpus client={{ getCatalogue: async () => head }} />)
+    fireEvent.click(await screen.findByText('Une fiche'))
+    fireEvent.click(screen.getByRole('button', { name: 'Ajouter à la leçon' }))
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Leçon bloquée'))
+    expect(screen.getByRole('button', { name: 'Préparer la leçon' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Télécharger la leçon Markdown' })).not.toBeInTheDocument()
+    cleanup()
+  })
+})
+
+it('rechecks actual content before downloading a previously prepared lesson', async () => {
+  const mutable = structuredClone(record)
+  render(<JapaneseCorpus client={{ getCatalogue: async () => ({ ...catalogue, cards: [mutable] }) }} />)
+  fireEvent.click(await screen.findByText('Une fiche'))
+  fireEvent.click(screen.getByRole('button', { name: 'Ajouter à la leçon' }))
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Préparer la leçon' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: 'Préparer la leçon' }))
+  const download = await screen.findByRole('button', { name: 'Télécharger la leçon Markdown' })
+  mutable.examples[0].fr = 'Changed after preparation'
+  fireEvent.click(download)
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Télécharger la leçon Markdown' })).not.toBeInTheDocument())
+  expect(screen.getByRole('status')).toHaveTextContent('Contenu modifié')
+  cleanup()
+})

@@ -1,0 +1,167 @@
+// LOT IMAGES — cache image en mémoire (RAM) à éviction LRU.
+//
+// EN CLAIR POUR TOUS : quand une vignette a déjà été chargée une fois, on la garde "en tête"
+// (en mémoire vive du navigateur) pour qu'elle réapparaisse INSTANTANÉMENT au scroll, sans la
+// re-télécharger ni la re-décoder. Comme Eagle : tu remontes dans une grille de 5000 images,
+// celles déjà vues sont là tout de suite.
+//
+// TECHNIQUE : un Map sert de file LRU (Least Recently Used = "le moins récemment utilisé").
+// Quand on dépasse la limite, on jette les plus vieilles entrées. On stocke des objets décodés
+// (ImageBitmap quand possible, sinon un HTMLImageElement déjà chargé) plus un compteur d'octets
+// approximatif pour borner la RAM (pas démesuré, mais agressif : ~512 Mo de pixels par défaut).
+//
+// On NE stocke PAS de Blob/ObjectURL ici (le cache HTTP du navigateur s'occupe déjà des octets
+// bruts) : on stocke le résultat DÉCODÉ, l'étape coûteuse en CPU qu'on veut éviter de refaire.
+
+import { idbGet, idbPut, persistUrl } from './imageCacheIDB.js'
+
+// Caps relevés pour 10k–1M items sur Mac M5 Max (RAM large). 3 Gio desktop laissent environ
+// 388 vignettes 1920×1080 décodées ; la fenêtre Quick Look 96+96 en consomme au pire ~1,5 Gio.
+// Sur écran tactile/mobile, le même composant garde un plafond prudent pour éviter que WebKit tue l'onglet.
+const IS_MOBILE_MEMORY = typeof window !== 'undefined' && (
+  window.matchMedia?.('(pointer: coarse)').matches || window.innerWidth < 760
+)
+const DEFAULT_MAX_BYTES = (IS_MOBILE_MEMORY ? 512 : 3072) * 1024 * 1024
+const DEFAULT_MAX_ENTRIES = 12000            // garde-fou en nombre d'items
+
+// estimation grossière du poids décodé : largeur * hauteur * 4 octets (RGBA)
+function bytesOf(bmp) {
+  const w = (bmp && (bmp.width || bmp.naturalWidth)) || 256
+  const h = (bmp && (bmp.height || bmp.naturalHeight)) || 256
+  return w * h * 4
+}
+
+class LRUImageCache {
+  constructor({ maxBytes = DEFAULT_MAX_BYTES, maxEntries = DEFAULT_MAX_ENTRIES } = {}) {
+    this.maxBytes = maxBytes
+    this.maxEntries = maxEntries
+    this.map = new Map() // url -> { bmp, bytes }
+    this.bytes = 0
+    this.inflight = new Map() // url -> Promise (dédoublonne les décodages concurrents)
+  }
+
+  has(url) { return this.map.has(url) }
+
+  // touch = remettre l'entrée en queue (la plus récemment utilisée)
+  get(url) {
+    const e = this.map.get(url)
+    if (!e) return null
+    this.map.delete(url); this.map.set(url, e)
+    return e.bmp
+  }
+
+  set(url, bmp) {
+    if (!url || !bmp) return
+    const bytes = bytesOf(bmp)
+    const prev = this.map.get(url)
+    if (prev) { this.bytes -= prev.bytes; this.map.delete(url) }
+    this.map.set(url, { bmp, bytes })
+    this.bytes += bytes
+    this._evict()
+  }
+
+  _evict() {
+    // éviction par les plus vieux jusqu'à repasser sous les deux limites
+    while ((this.bytes > this.maxBytes || this.map.size > this.maxEntries) && this.map.size > 0) {
+      const oldestKey = this.map.keys().next().value
+      const e = this.map.get(oldestKey)
+      this.map.delete(oldestKey)
+      this.bytes -= e ? e.bytes : 0
+      if (e && e.bmp && typeof e.bmp.close === 'function') {
+        try { e.bmp.close() } catch { /* ImageBitmap.close best-effort */ }
+      }
+    }
+  }
+
+  clear() {
+    for (const e of this.map.values()) {
+      if (e.bmp && typeof e.bmp.close === 'function') { try { e.bmp.close() } catch {} }
+    }
+    this.map.clear(); this.bytes = 0
+  }
+
+  // Charge + décode une URL et la met en cache. Dédoublonne les appels concurrents sur la même URL.
+  // Retourne un ImageBitmap (préféré) ou un HTMLImageElement déjà décodé.
+  async load(url, { signal } = {}) {
+    if (!url) return null
+    const cached = this.get(url)
+    if (cached) return cached
+    if (this.inflight.has(url)) return this.inflight.get(url)
+
+    const p = (async () => {
+      try {
+        // Les vignettes publiques chiffrées arrivent ici sous forme d'objectURL clair. Garder le
+        // HTMLImageElement lui-même dans le LRU conserve exactement la ressource décodée que les
+        // futurs <img src="blob:…"> réutilisent ; un ImageBitmap séparé ne garantissait pas cette réutilisation.
+        if (url.startsWith('blob:')) {
+          const img = new Image()
+          img.decoding = 'async'
+          img.src = url
+          if (typeof img.decode === 'function') await img.decode()
+          else await new Promise((r, j) => { img.onload = r; img.onerror = j })
+          if (signal && signal.aborted) return null
+          this.set(url, img)
+          return img
+        }
+        // Voie rapide : RAM (déjà testée) -> IndexedDB (persistant, survit au reload) -> RÉSEAU.
+        if (typeof createImageBitmap === 'function') {
+          // 1) IndexedDB : si on a déjà vu cette URL dans une session passée, on décode sans réseau.
+          try {
+            // Un objectURL `blob:` est déjà un clair RAM éphémère (vignette chiffrée décryptée) : le
+            // persister sous cette clé inutilisable après reload remplirait IndexedDB pour rien.
+            const cachedBlob = url.startsWith('blob:') ? null : await idbGet(url)
+            if (cachedBlob) { const bmp = await createImageBitmap(cachedBlob); this.set(url, bmp); return bmp }
+          } catch { /* AVIF parfois non décodable depuis Blob selon navigateur -> on retombe sur le réseau */ }
+          // 2) Réseau : fetch + décodage, puis on PERSISTE le Blob dans IndexedDB (fire-and-forget).
+          if (typeof fetch === 'function') {
+            const res = await fetch(url, { signal })
+            if (res.ok) {
+              const blob = await res.blob()
+              const bmp = await createImageBitmap(blob)
+              this.set(url, bmp)
+              if (!url.startsWith('blob:')) idbPut(url, blob)
+              return bmp
+            }
+          }
+        }
+      } catch { /* repli sur HTMLImageElement ci-dessous */ }
+      if (signal && signal.aborted) return null
+      // Repli : HTMLImageElement + .decode() (toujours dispo, marche pour AVIF natif aussi).
+      try {
+        const img = new Image()
+        img.decoding = 'async'
+        img.src = url
+        if (typeof img.decode === 'function') { await img.decode() }
+        else { await new Promise((r, j) => { img.onload = r; img.onerror = j }) }
+        this.set(url, img)
+        // Trou C : ce chemin (AVIF non décodable en Blob, ou fetch direct par <img>) n'a JAMAIS
+        // écrit en IndexedDB. On persiste les octets pour que la vignette survive au reload.
+        if (!url.startsWith('blob:')) persistUrl(url)
+        return img
+      } catch { return null }
+    })()
+
+    this.inflight.set(url, p)
+    try { return await p } finally { this.inflight.delete(url) }
+  }
+}
+
+// Singleton partagé par toute l'app (une seule RAM pour vignettes + plein format).
+export const imageCache = new LRUImageCache()
+
+// Peint un ImageBitmap/HTMLImageElement décodé dans un <canvas> (objectFit cover).
+// Sert à afficher INSTANTANÉMENT une vignette déjà décodée sans re-passer par le réseau.
+export function paintCover(canvas, bmp) {
+  if (!canvas || !bmp) return false
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return false
+  const cw = canvas.width, ch = canvas.height
+  const iw = bmp.width || bmp.naturalWidth, ih = bmp.height || bmp.naturalHeight
+  if (!iw || !ih) return false
+  const scale = Math.max(cw / iw, ch / ih)
+  const dw = iw * scale, dh = ih * scale
+  const dx = (cw - dw) / 2, dy = (ch - dh) / 2
+  ctx.clearRect(0, 0, cw, ch)
+  ctx.drawImage(bmp, dx, dy, dw, dh)
+  return true
+}

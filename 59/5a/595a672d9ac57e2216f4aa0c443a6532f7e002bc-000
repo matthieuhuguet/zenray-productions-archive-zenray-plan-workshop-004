@@ -1,0 +1,53 @@
+# 14 October 2026: the finish steps (subtitles, proof, unload) of a streaming batch run several films at once and every film still ends
+# unloaded; a red proof of one film neither blocks nor changes the others.
+import importlib.util, json, os, pathlib, sys, tempfile, threading, time
+
+os.environ['ZR_FINISH_FLOWS'] = '3'
+HERE = pathlib.Path(__file__).resolve()
+spec = importlib.util.spec_from_file_location('worker', HERE.parents[1] / 'ProcessFilmsSequentially.py')
+w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
+
+tmp = pathlib.Path(tempfile.mkdtemp())
+w.BASE = tmp
+w.CLONE = tmp / 'clone'; w.CLONE.mkdir()
+w.RECOVERY_DIR = tmp / 'rec'; w.RECOVERY_DIR.mkdir()
+w.UNLOAD_DIR = tmp / 'unload'; w.UNLOAD_DIR.mkdir()
+logs = []
+w.log = lambda message: logs.append(message)
+real_sleep = time.sleep
+w.time.sleep = lambda seconds: real_sleep(min(seconds, 0.01))
+w.ensure_manifest_online = lambda manifest, name: None
+
+class Result:
+    def __init__(self, stdout='', code=0, stderr=''):
+        self.returncode = code; self.stdout = stdout; self.stderr = stderr
+
+names = [f'Film {i}.mkv' for i in range(7)]
+lock = threading.Lock(); running = 0; peak = 0
+def fake_run(command, **kwargs):
+    global running, peak
+    script = pathlib.Path(command[1]).name
+    if script == 'PublishStagedBatch.mjs':
+        plan = json.loads(pathlib.Path(command[3]).read_text())
+        return Result('{\n  "results": ' + json.dumps([{'name': item['name'], 'ok': True} for item in plan]) + '\n}')
+    if script == 'VerifyStreamingCloud.mjs':
+        with lock:
+            running += 1; peak = max(peak, running)
+        real_sleep(0.15)
+        with lock:
+            running -= 1
+        if 'Film 3' in command[2]:
+            return Result('', 1, 'RED every audio track is kept')
+        return Result('ok')
+    return Result('ok')
+w.subprocess.run = fake_run
+
+tasks = [{'source': str(tmp / name), 'name': name, 'dest': 'Anime/Test', 'unload': True} for name in names]
+os.environ['ZR_BATCH_FILMS'] = '3'
+w.run_stream_batch(tasks)
+status = json.loads((tmp / 'StreamBatchStatus.json').read_text())['films']
+assert all(status[n]['status'] == 'unloaded' for n in names if n != 'Film 3.mkv'), status
+assert status['Film 3.mkv']['status'] == 'proof-red', status['Film 3.mkv']
+assert 2 <= peak <= 3, f'finish steps must overlap but stay within the pool, peak={peak}'
+assert any('stream batch done' in line for line in logs)
+print('ok peak', peak)

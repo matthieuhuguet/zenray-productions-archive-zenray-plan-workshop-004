@@ -1,0 +1,142 @@
+// 16 October 2026: runs the application loop for a packed queue in a private Chromium (never Matthieu's own browser), N pages at once:
+// open the apply page, pre-fill what the profile covers, attach the CV, screenshot, stamp the timings. It NEVER submits and never
+// creates an account; a login wall, a 403 or a sensitive question is reported, not worked around.
+// FR : lance la boucle sur une file préparée dans un Chromium privé, N pages à la fois : ouvre, pré-remplit, joint le CV, capture, chronomètre. N'envoie jamais.
+//
+//   node scripts/Freelance/ApplyRun.mjs --run <dir> [--concurrency 6] [--headed --keep] [--ready-only] [--timeout 25]
+import path from 'node:path'
+import { createWriteStream, existsSync } from 'node:fs'
+import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises'
+import os from 'node:os'
+import { chromium } from 'playwright'
+import { parseArgs } from './RecordEmail.mjs'
+import { runtimeDirectory } from './Main.mjs'
+import { summarise } from './ApplyLoop.mjs'
+
+const readJson = async (file) => JSON.parse(await readFile(file, 'utf8'))
+const here = (name) => new URL(name, import.meta.url)
+
+/** Pure: a verdict for one page from the filler's report and what the page itself showed. */
+const BOT_WALL = /access (is )?temporarily restricted|unusual activity|verify you are (a )?human|are you a robot|just a moment|attention required/i
+
+export function verdictOf(report, page) {
+  if (page.status && page.status >= 400) return { phase: 'blocked', note: `HTTP ${page.status}` }
+  if (page.botWall) return { phase: 'blocked', note: 'bot wall (not bypassed): open this one by hand' }
+  if (page.passwordField) return { phase: 'blocked', note: 'login wall (account needed, never created)' }
+  if (report && report.fields > 0 && !report.filled.includes('email')) return { phase: 'blocked', note: `no application form recognised (${report.fields} fields, no email field)` }
+  if (!report || report.fields === 0) return { phase: 'blocked', note: 'no form on this page (employer link one click further)' }
+  const parts = [`${report.filledCount} filled${report.filled.includes('letter') ? ' (letter in)' : page.letterAttached ? ' (letter attached as PDF)' : ' (no letter box)'}`]
+  if (page.cvAttached) parts.push('CV attached')
+  else if (report.filesToAttach.length) parts.push('CV to attach')
+  if (report.needsYou.length) parts.push(`${report.needsYou.length} for you: ${report.needsYou.slice(0, 3).join(' / ')}`)
+  return { phase: 'ready', note: parts.join(', ') }
+}
+
+/** Newest Chromium already on disk (Playwright's own cache, an isolated profile); avoids a download when the library and cache versions differ. */
+async function findChromium(headless) {
+  const cache = path.join(os.homedir(), 'Library/Caches/ms-playwright')
+  const prefix = headless ? 'chromium_headless_shell-' : 'chromium-'
+  const dirs = (await readdir(cache).catch(() => [])).filter((d) => d.startsWith(prefix)).sort((a, b) => Number(b.slice(prefix.length)) - Number(a.slice(prefix.length)))
+  for (const dir of dirs) {
+    const base = path.join(cache, dir)
+    for (const sub of await readdir(base).catch(() => [])) {
+      const exe = headless ? path.join(base, sub, 'chrome-headless-shell') : path.join(base, sub, 'Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing')
+      if (existsSync(exe)) return exe
+    }
+  }
+  return undefined
+}
+
+async function downloadCv(runDir, cv) {
+  const files = {}
+  for (const lang of ['fr', 'en']) {
+    const url = cv?.pdf?.[lang]; if (!url) continue
+    const target = path.join(runDir, `cv-${lang}.pdf`)
+    if (!existsSync(target)) { const response = await fetch(url); if (response.ok) await writeFile(target, Buffer.from(await response.arrayBuffer())) }
+    if (existsSync(target)) files[lang] = target
+  }
+  return files
+}
+
+async function processItem(context, item, ctx) {
+  const t0 = Date.now(); const stamps = [{ at: new Date().toISOString(), id: item.id, phase: 'open', note: '' }]
+  const page = await context.newPage(); let status = 0
+  page.on('response', (response) => { if (response.request().isNavigationRequest() && response.frame() === page.mainFrame() && !status) status = response.status() })
+  let result
+  try {
+    await page.goto(item.applyUrl, { waitUntil: 'domcontentloaded', timeout: ctx.timeoutMs })
+    await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => {})
+    // 16 October 2026: single-page forms (SmartRecruiters, Workable) draw their fields after load, some inside shadow roots: wait for a field, at most 8 s.
+    await page.waitForFunction(() => { const walk = (root) => [...root.querySelectorAll('*')].some((n) => (n.matches('input:not([type=hidden]), textarea') && n.offsetParent !== null) || (n.shadowRoot && walk(n.shadowRoot))); return walk(document) }, null, { timeout: 8000 }).catch(() => {})
+    const report = await page.evaluate(`${ctx.filler}\n;window.__zrFill(${JSON.stringify(item.profile)}, ${JSON.stringify(item.letter)}, ${JSON.stringify(ctx.map)})`)
+    const passwordField = await page.evaluate(() => !!document.querySelector('input[type=password]'))
+    // The wall text can sit in a frame (SmartRecruiters), so read every frame, not just the main document.
+    const texts = await Promise.all(page.frames().map((frame) => frame.evaluate(() => document.body?.innerText.slice(0, 1500) || '').catch(() => '')))
+    const botWall = BOT_WALL.test(texts.join(' '))
+    let cvAttached = false, letterAttached = false
+    const cv = ctx.cv[item.language === 'fr' ? 'fr' : 'en'] || ctx.cv.en || ctx.cv.fr
+    const attach = async (kind, file) => {
+      const input = page.locator(`input[type=file][data-zr-file=${kind}]`).first()
+      if (!file || !(await input.count())) return false
+      const ok = await input.setInputFiles(file).then(() => true).catch(() => false)
+      if (ok) await page.waitForTimeout(500)
+      // The widget may replace the input after an upload (then the read-back finds nothing): success of setInputFiles is the proof, the read-back only vetoes a visible empty input.
+      return ok && (await input.evaluate((el) => el.files.length > 0, null, { timeout: 800 }).catch(() => true))
+    }
+    cvAttached = await attach('resume', cv)
+    if (!report.filled.includes('letter')) letterAttached = await attach('cover', await ctx.letterPdf(item))
+    const verdict = verdictOf(report, { status, passwordField, cvAttached, letterAttached, botWall })
+    await page.screenshot({ path: path.join(ctx.runDir, `shot-${item.id}.png`), fullPage: true }).catch(() => {})
+    result = { id: item.id, studio: item.studio, ...verdict, report, seconds: (Date.now() - t0) / 1000 }
+  } catch (error) {
+    result = { id: item.id, studio: item.studio, phase: 'blocked', note: `error: ${String(error.message).split('\n')[0].slice(0, 120)}`, seconds: (Date.now() - t0) / 1000 }
+  }
+  stamps.push({ at: new Date().toISOString(), id: item.id, phase: result.phase, note: result.note })
+  if (!ctx.keep) await page.close().catch(() => {})
+  return { result, stamps }
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2))
+  if (!args.run) throw new Error('Usage: ApplyRun.mjs --run <dir> [--concurrency 6] [--headed --keep] [--ready-only] [--timeout 25]')
+  const runDir = path.resolve(args.run)
+  const queue = await readJson(path.join(runDir, 'queue.json'))
+  const engine = await readJson(path.join(runtimeDirectory(), 'DataClone/freelance/engine.json')).catch(() => ({}))
+  const map = await readJson(here('./apply/FieldMap.json')); delete map._note
+  const filler = await readFile(here('./apply/FillForm.js'), 'utf8')
+  const cv = await downloadCv(runDir, engine.cv)
+  const t0 = Date.now()
+  const browser = await chromium.launch({ headless: !args.headed, executablePath: await findChromium(!args.headed) })
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: 'en-US' })
+  const ctx = { runDir, map, filler, cv, keep: Boolean(args.keep), timeoutMs: Number(args.timeout || 25) * 1000 }
+  // The exact letter as a one-page-flow PDF, for forms whose "cover letter" is a file field (Greenhouse, Lever).
+  ctx.letterPdf = async (item) => {
+    if (!item.letter) return null
+    const slug = String(item.studio).normalize('NFD').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    const file = path.join(runDir, 'letters', `Matthieu-Huguet-Cover-Letter-${slug}-${item.id.slice(4, 10)}.pdf`)
+    await mkdir(path.dirname(file), { recursive: true })
+    if (!existsSync(file)) {
+      const sheet = await context.newPage()
+      const escaped = item.letter.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '<br>')
+      await sheet.setContent(`<html><body style="font:12pt Georgia,serif;line-height:1.5;margin:2.2cm;max-width:16cm">${escaped}</body></html>`)
+      await sheet.pdf({ path: file, format: 'A4' }); await sheet.close()
+    }
+    return file
+  }
+  const limit = Math.max(1, Math.min(Number(args.concurrency || 6), 12))
+  // 16 October 2026: --ready-only reopens just the pages a previous run left ready (to review and send them), and leaves that run's timings untouched.
+  const earlier = args['ready-only'] ? new Set((await readJson(path.join(runDir, 'results.json'))).results.filter((r) => r.phase === 'ready').map((r) => r.id)) : null
+  const items = queue.items.filter((i) => i.applyUrl && (!earlier || earlier.has(i.id))); const results = []; const stamps = []; let next = 0
+  await Promise.all(Array.from({ length: limit }, async () => {
+    while (next < items.length) { const item = items[next++]; const out = await processItem(context, item, ctx); results.push(out.result); stamps.push(...out.stamps); console.error(`${out.result.phase.padEnd(7)} ${String(out.result.seconds.toFixed(1)).padStart(5)}s  ${item.studio}: ${out.result.note}`) }
+  }))
+  const totalSeconds = (Date.now() - t0) / 1000
+  if (!earlier) await writeFile(path.join(runDir, 'timings.jsonl'), stamps.sort((a, b) => a.at.localeCompare(b.at)).map((s) => JSON.stringify(s)).join('\n') + '\n')
+  if (!earlier) await writeFile(path.join(runDir, 'results.json'), JSON.stringify({ totalSeconds, concurrency: limit, results }, null, 1) + '\n')
+  const ready = results.filter((r) => r.phase === 'ready').length
+  console.log(JSON.stringify({ pages: results.length, ready, blocked: results.length - ready, totalSeconds: Math.round(totalSeconds * 10) / 10, secondsPerPageWall: Math.round((totalSeconds / Math.max(1, results.length)) * 10) / 10, summary: summarise(stamps, 0).averageSeconds }, null, 2))
+  if (args.keep && args.headed) { console.error('Pages left open for review. Close the window when done.'); await new Promise((resolve) => browser.on('disconnected', resolve)) }
+  else await browser.close()
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) main().catch((error) => { console.error(`ApplyRun failed: ${error.message}`); process.exitCode = 1 })

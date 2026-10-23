@@ -1,0 +1,100 @@
+// upload-vidraw-list.mjs — uploade une LISTE de vidéos via la pipeline VIDÉO BRUTE (chunks 95 Mo raw.github,
+// zéro réencodage, faststart). UNE PAR UNE, du plus COURT au plus long. Saute celles déjà en ligne (.media.json
+// existant). Logue "✓ EN LIGNE" par vidéo (pour notif) + "BATCH VIDRAW COMPLET" à la fin.
+//
+// Usage : GITHUB_TOKEN=... node Scripts/upload-vidraw-list.mjs "<dest>" "<file1>" "<file2>" ...
+//   dest = dossier Create cible (ex. "pages/Photos/DJI/29 Juin 2026/Videos")
+
+import { makeVidRawShardCtx, ingestVideoRaw } from './video-raw-lib.mjs'
+import { pushBlobs } from './video-mse-lib.mjs'
+import { loadZenrayDataInventory } from './lib/zenray-data-inventory.mjs'
+import { appendPublicDelta, thumbsForPaths } from '../server/page.js'
+import { execFile } from 'node:child_process'
+import { stat, rm } from 'node:fs/promises'
+import path from 'node:path'
+import { promisify } from 'node:util'
+const execFileP = promisify(execFile)
+
+const token = process.env.GITHUB_TOKEN
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const DATA = 'zenray-data'
+const dest = process.argv[2]
+const files = process.argv.slice(3)
+if (!token || !dest || !files.length) { console.error('usage: GITHUB_TOKEN=.. node upload-vidraw-list.mjs <dest> <file...>'); process.exit(1) }
+
+const baseOf = (f) => path.basename(f).replace(/\.[^.]+$/, '')
+const extOf = (f) => path.basename(f).split('.').pop().toLowerCase()
+const manifestPathOf = (f) => `${dest}/${baseOf(f)}.${extOf(f)}.media.json`
+
+async function durationOf(f) {
+  try { const { stdout } = await execFileP('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f], { timeout: 30000 }); return parseFloat(stdout.trim()) || 0 } catch { return 0 }
+}
+const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`
+
+// 1) une synchro Git, puis skip local exact + durée + tri court->long.
+// Échec fermé : si l'inventaire ne se rafraîchit pas, on abandonne AVANT de créer un shard au lieu de
+// supposer les manifestes absents et de produire des doublons.
+console.log('Inventaire Git zenray-data (une synchro, puis skips locaux)…')
+const online = await loadZenrayDataInventory({ token, owner: OWNER, repo: DATA, prefix: dest })
+const cand = []
+for (const f of files) {
+  try { await stat(f) } catch { console.log(`  ⚠ introuvable, ignoré: ${f}`); continue }
+  if (online.has(manifestPathOf(f))) { console.log(`  ⏭  déjà en ligne, sauté: ${baseOf(f)}`); continue }
+  cand.push({ f, dur: await durationOf(f), size: (await stat(f)).size })
+}
+cand.sort((a, b) => a.dur - b.dur)
+console.log(`\n=== À UPLOADER : ${cand.length} vidéo(s), du plus court au plus long ===`)
+cand.forEach((c, i) => console.log(`  ${i + 1}. ${fmt(c.dur)}  ${(c.size / 1048576).toFixed(0)} Mo  ${baseOf(c.f)}`))
+console.log('')
+// Rien à faire -> ne PAS créer de repo GitHub vide pour rien (même garde que upload-img-list.mjs, 2026-07-11).
+if (!cand.length) { console.log('rien à uploader (tout déjà en ligne).'); process.exit(0) }
+
+// 2) upload séquentiel — MODÈLE 2026-07-05 : repo NEUF par lot (zenrayshards-vid-<hex12>, PRIVÉ),
+// zéro clone, zéro check distant. Le lot se découpe tout seul en plusieurs repos neufs si besoin
+// (compteur local anticipé avant chaque part). Chaque vidéo reste visible dès son "✓ EN LIGNE".
+// Un espace propre par invocation évite les collisions entre deux lots et permet de supprimer TOUS
+// les repos locaux créés par les rollovers, pas seulement le dernier ctx.dir.
+const runWork = path.join(process.env.HOME, '.zr-archive-work-vidraw', `run-${process.pid}-${Date.now().toString(36)}`)
+const vctx = makeVidRawShardCtx({ token, work: runWork, log: (...a) => console.log('   ', ...a), type: 'vid', vis: 'private' })
+let done = 0
+const indexedPaths = [] // manifestes committés -> index-add en fin de batch (2026-07-14)
+try {
+  for (const c of cand) {
+    const t0 = Date.now()
+    try {
+      const base = baseOf(c.f)
+      const { manifestPath, manifest } = await ingestVideoRaw(c.f, { dest, base, vctx, workDir: path.join(runWork, 'remux'), log: (...a) => console.log('   ', ...a) })
+      await pushBlobs(token, DATA, [{ path: manifestPath, content: JSON.stringify(manifest), encoding: 'utf-8' }], `vidraw ${base}`, () => {})
+      indexedPaths.push(manifestPath)
+      done++
+      console.log(`✓ EN LIGNE [${done}/${cand.length}] ${base} · ${fmt(c.dur)} · ${manifest.parts.length} parts · ${((Date.now() - t0) / 1000).toFixed(0)}s`)
+    } catch (e) {
+      console.log(`✗ ÉCHEC ${baseOf(c.f)} : ${(e && e.message || e).toString().slice(0, 160)}`)
+    }
+  }
+} finally {
+  await rm(runWork, { recursive: true, force: true }).catch(() => {})
+}
+
+// INDEX-ADD (2026-07-14, même correctif que côté image) : sans ça, une vidéo uploadée en CLI reste
+// invisible en recherche jusqu'au prochain rebuild manuel. thumbsForPaths ne résout rien pour .media.json
+// (filtre .img.json only) -> vignette générique jusqu'au rebuild complet, mais le CHEMIN devient cherchable
+// tout de suite, best-effort, jamais fatal pour l'upload.
+// PIÈGE CORRIGÉ (2026-07-14) : plusieurs appendPublicDelta séquentiels rapprochés (un par lot de 200)
+// s'écrasent via le cache ~5 min de raw.githubusercontent — UN SEUL appel final avec la liste complète.
+if (indexedPaths.length) {
+  try {
+    const allThumbs = {}
+    for (let i = 0; i < indexedPaths.length; i += 200) {
+      Object.assign(allThumbs, await thumbsForPaths(token, indexedPaths.slice(i, i + 200)))
+    }
+    const idxOk = await appendPublicDelta(token, indexedPaths, allThumbs)
+    console.log(`  index-add : ${idxOk ? indexedPaths.length : 0}/${indexedPaths.length} chemins ajoutés au delta public (cherchables immédiatement)`)
+  } catch (e) { console.log(`  ⚠ index-add échoué (rattrapable par scripts/index-add-paths.mjs) : ${(e && e.message || e).toString().slice(0, 120)}`) }
+}
+
+console.log(`\n✓✓ BATCH VIDRAW COMPLET — ${done}/${cand.length} vidéos en ligne.`)
+// BUG TROUVÉ EN PROD (2026-07-11) : sans sortie explicite, les sockets HTTPS keep-alive (fetch/undici vers
+// api.github.com) laissent le process VIVANT indéfiniment après la fin du travail -> un wrapper séquentiel
+// (`node a.mjs && node b.mjs`) ne lance jamais l'étape suivante. Voir upload-img-list.mjs pour le détail.
+process.exit(0)

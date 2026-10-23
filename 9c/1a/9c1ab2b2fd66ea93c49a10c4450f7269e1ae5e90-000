@@ -1,0 +1,86 @@
+#!/usr/bin/env node
+// Point d'entrée CLI unique du pipeline MSE. Toute la logique sensible (probe,
+// fragments, chunks hashés et Git Data API batchée) vit dans video-mse-lib.mjs.
+
+import path from 'node:path'
+import { readdir, rm, stat } from 'node:fs/promises'
+import { transcodeOne, pushToShard } from './video-mse-lib.mjs'
+
+const VIDEO_RE = /\.(mkv|mp4|webm|avi|mov|m4v|ts|flv|wmv)$/i
+const args = process.argv.slice(2)
+const valueAfter = (flag, fallback = null) => {
+  const index = args.indexOf(flag)
+  return index >= 0 && args[index + 1] ? args[index + 1] : fallback
+}
+const values = new Set(['--dest', '--api', '--content-repo', '--crf', '--t'])
+const positional = args.filter((arg, index) => !arg.startsWith('--') && !values.has(args[index - 1]))
+const input = positional[0]
+const dest = String(valueAfter('--dest', 'pages/Videos')).replace(/\/$/, '')
+const apiBase = String(valueAfter('--api', 'http://localhost:3000')).replace(/\/$/, '')
+const contentRepo = valueAfter('--content-repo', 'zenray-data')
+const crf = valueAfter('--crf', '21')
+const sampleSec = valueAfter('--t', null)
+const shouldPush = args.includes('--push')
+const token = process.env.GITHUB_TOKEN
+
+if (!input) {
+  console.error('usage: node scripts/video-mse.mjs <fichier|dossier> [--dest pages/Videos] [--push] [--api http://localhost:3000] [--crf 21] [--t 90]')
+  process.exit(1)
+}
+if (shouldPush && !token) {
+  console.error('GITHUB_TOKEN absent. Lancer avec GITHUB_TOKEN=$(gh auth token).')
+  process.exit(1)
+}
+
+async function collectVideos(entry) {
+  const absolute = path.resolve(entry)
+  const info = await stat(absolute)
+  if (info.isFile()) return VIDEO_RE.test(absolute) ? [absolute] : []
+  if (!info.isDirectory()) return []
+  const found = []
+  for (const item of await readdir(absolute, { withFileTypes: true })) {
+    const child = path.join(absolute, item.name)
+    if (item.isDirectory()) found.push(...await collectVideos(child))
+    else if (item.isFile() && VIDEO_RE.test(item.name)) found.push(child)
+  }
+  return found.sort((a, b) => a.localeCompare(b, 'fr', { numeric: true }))
+}
+
+const files = await collectVideos(input)
+if (!files.length) {
+  console.error(`Aucune vidéo reconnue dans ${input}`)
+  process.exit(1)
+}
+
+let failures = 0
+for (const file of files) {
+  let result = null
+  try {
+    console.log(`\n→ ${file}`)
+    result = await transcodeOne(file, {
+      dest,
+      crf,
+      sampleSec,
+      log: (...parts) => console.log(...parts),
+      onProgress: (stage, percent) => console.log(`ZR_PROGRESS ${JSON.stringify({ stage, percent: Math.round(percent) })}`),
+    })
+    if (!shouldPush) {
+      console.log(`✓ sortie locale conservée : ${result.outDir}`)
+      continue
+    }
+    const pushed = await pushToShard(token, result, {
+      apiBase,
+      contentRepo,
+      log: (...parts) => console.log(...parts),
+      onProgress: (stage, percent) => console.log(`ZR_PROGRESS ${JSON.stringify({ stage, percent: Math.round(percent) })}`),
+    })
+    console.log(`✓ ${pushed.manifestPath} · shard ${pushed.repo} · commit ${pushed.commitContent.slice(0, 7)}`)
+    await rm(result.outDir, { recursive: true, force: true })
+  } catch (error) {
+    failures += 1
+    console.error(`✗ ${file}: ${String(error?.message || error).slice(0, 500)}`)
+    if (result?.outDir) console.error(`  sortie conservée pour diagnostic/reprise : ${result.outDir}`)
+  }
+}
+
+if (failures) process.exitCode = 1

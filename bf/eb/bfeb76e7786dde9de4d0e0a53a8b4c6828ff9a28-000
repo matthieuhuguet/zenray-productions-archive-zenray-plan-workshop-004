@@ -1,0 +1,352 @@
+#!/usr/bin/env node
+/**
+ * import-shelf.mjs — Import Notion exports (ZIP-in-ZIP) into ZenRayProgress shelf manifests.
+ *
+ * Goal: 0 oeuvre perdue. Reads the Notion `_all.csv` exports (full schema), normalizes
+ * each row into a Shelf Item, and writes 3 manifests to public/shelf/.
+ *
+ * Reusable: point SOURCES at the extracted CSVs (env override below) and re-run.
+ *   node Scripts/import-shelf.mjs
+ *
+ * Manifest schema (per category):
+ *   { v:1, category, label, items:[ Item ] }
+ * Item:
+ *   { id: slug(name)+'-'+hash4(name), name, score:number|null (int 0-100),
+ *     status:'in_progress'|'backlog'|'done'|'dropped', tags:[], extra:{...}, image:null, notes:null }
+ */
+
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(__dirname, '..');
+const OUT_DIR = resolve(REPO_ROOT, 'public', 'shelf');
+
+// ---------------------------------------------------------------------------
+// Source CSVs. Override the temp base via SHELF_SRC_DIR env if re-extracting.
+// Each entry can list multiple CSVs that merge into one category (Games + Untitled).
+// ---------------------------------------------------------------------------
+const SRC_BASE = process.env.SHELF_SRC_DIR || '/tmp/notion-import.iAMVaa';
+
+const SOURCES = {
+  games: {
+    label: 'Games',
+    files: [
+      {
+        path: `${SRC_BASE}/games/inner/Games/Database_Games dd945eaac0e1424090d062f1b15d02db_all.csv`,
+        defaultStatusOnEmpty: 'backlog',
+      },
+      {
+        // Tiny "Untitled" DB reversed into Games: status backlog, no score, tags from Tags.
+        path: `${SRC_BASE}/games/inner/Games/Untitled 20dd4ee179c3809a9c2fcdc75a5c4809_all.csv`,
+        forceStatus: 'backlog',
+        forceScoreNull: true,
+      },
+    ],
+  },
+  'anime-manga': {
+    label: 'Anime & Manga',
+    files: [
+      {
+        path: `${SRC_BASE}/anime/inner/Anime Manga/Japanese Animation 8a1ffc987bbf49eb81f927981a50d8bf_all.csv`,
+        defaultStatusOnEmpty: 'backlog',
+      },
+    ],
+  },
+  movies: {
+    label: 'Movies, Series & Docs',
+    files: [
+      {
+        path: `${SRC_BASE}/movies/inner/Movies Series Documentaries/Movies Watched f131d9e8d92c44d5bef179be3ac8f478_all.csv`,
+        defaultStatusOnEmpty: 'backlog',
+      },
+    ],
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Robust CSV parser (RFC 4180): handles quoted fields, embedded commas,
+// embedded newlines, and escaped double-quotes ("").  Strips a leading BOM.
+// Returns array of rows, each row an array of string cells.
+// ---------------------------------------------------------------------------
+function parseCSV(text) {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // strip BOM
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  let i = 0;
+  const n = text.length;
+
+  while (i < n) {
+    const c = text[i];
+
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+        i++;
+        continue;
+      }
+      field += c;
+      i++;
+      continue;
+    }
+
+    if (c === '"') {
+      inQuotes = true;
+      i++;
+      continue;
+    }
+    if (c === ',') {
+      row.push(field);
+      field = '';
+      i++;
+      continue;
+    }
+    if (c === '\r') {
+      // swallow CR; handle CRLF as a single newline
+      if (text[i + 1] === '\n') i++;
+      row.push(field);
+      field = '';
+      rows.push(row);
+      row = [];
+      i++;
+      continue;
+    }
+    if (c === '\n') {
+      row.push(field);
+      field = '';
+      rows.push(row);
+      row = [];
+      i++;
+      continue;
+    }
+    field += c;
+    i++;
+  }
+
+  // flush trailing field/row (file may not end with newline)
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+// Map header cells -> index, trimming + BOM-stripping each header name.
+function headerIndex(headerRow) {
+  const idx = {};
+  headerRow.forEach((h, i) => {
+    let key = h;
+    if (key.charCodeAt(0) === 0xfeff) key = key.slice(1);
+    idx[key.trim()] = i;
+  });
+  return idx;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function slug(name) {
+  return String(name)
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '') // strip diacritics
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60) || 'item';
+}
+
+function hash4(name) {
+  return createHash('sha1').update(String(name)).digest('hex').slice(0, 4);
+}
+
+const STATUS_MAP = {
+  'in progress': 'in_progress',
+  'backlog': 'backlog',
+  'done': 'done',
+  'dropped': 'dropped',
+};
+
+// Normalize a raw Notion status into the 4 canonical values.
+// Empty -> backlog. Unknown values are mapped heuristically but always recorded.
+function normStatus(raw, fallback, seenSet) {
+  const v = (raw == null ? '' : String(raw)).trim();
+  if (seenSet) seenSet.add(v === '' ? '(empty)' : v);
+  if (v === '') return fallback || 'backlog';
+  const key = v.toLowerCase();
+  if (STATUS_MAP[key]) return STATUS_MAP[key];
+  // Heuristics for any unexpected label so nothing silently becomes backlog wrongly.
+  if (/(beaten|finished|complete|watched|read|seen|played|platinum|100)/i.test(v)) return 'done';
+  if (/(drop|abandon|quit)/i.test(v)) return 'dropped';
+  if (/(progress|playing|watching|reading|ongoing|current)/i.test(v)) return 'in_progress';
+  if (/(backlog|todo|to[ -]?watch|to[ -]?play|wishlist|plan)/i.test(v)) return 'backlog';
+  return fallback || 'backlog'; // unknown: keep the row, default bucket
+}
+
+// Parse a score into an integer 0-100 or null. Empty/non-numeric -> null.
+function parseScore(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (s === '') return null;
+  const num = Number(s.replace(',', '.'));
+  if (!Number.isFinite(num)) return null;
+  let v = Math.round(num);
+  if (v < 0) v = 0;
+  if (v > 100) v = 100;
+  return v;
+}
+
+// Split a comma-separated Tags cell into a clean array.
+function parseTags(raw) {
+  if (raw == null) return [];
+  const s = String(raw).trim();
+  if (s === '') return [];
+  return s
+    .split(',')
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0);
+}
+
+// Build the per-category `extra` object from a row, given a header index.
+function buildExtra(category, get) {
+  const extra = {};
+  const put = (k, v) => {
+    const val = (v == null ? '' : String(v)).trim();
+    if (val !== '') extra[k] = val;
+  };
+  if (category === 'games') {
+    put('director', get('Director'));
+    put('studio', get('Studio'));
+    put('year', get('Year'));
+    put('exclusivity', get('Exclusivity'));
+    put('criticElements', get('Critic Elements'));
+  } else if (category === 'movies') {
+    put('realisator', get('Realisator'));
+  }
+  // anime-manga has no extra columns beyond tags (handled separately)
+  return extra;
+}
+
+// ---------------------------------------------------------------------------
+// Build one category manifest. Returns { manifest, count, dropped }.
+// ---------------------------------------------------------------------------
+function buildCategory(category, cfg, statusSeen) {
+  const items = [];
+  let dropped = 0;
+  // Guarantee unique ids even when the source has two rows with the same name
+  // (e.g. a game listed in the main DB AND in Untitled). The spec id formula
+  // slug(name)+'-'+hash4(name) is deterministic on the name, so identical names
+  // collide. We keep the spec id for the first occurrence and append -2, -3, ...
+  // to later collisions, so no oeuvre is dropped and every item stays addressable.
+  const idCounts = Object.create(null);
+  const uniqueId = (base) => {
+    const seen = idCounts[base] || 0;
+    idCounts[base] = seen + 1;
+    return seen === 0 ? base : `${base}-${seen + 1}`;
+  };
+
+  for (const file of cfg.files) {
+    if (!existsSync(file.path)) {
+      throw new Error(`Source CSV missing: ${file.path}`);
+    }
+    const text = readFileSync(file.path, 'utf8');
+    const rows = parseCSV(text);
+    if (rows.length === 0) continue;
+
+    const hidx = headerIndex(rows[0]);
+    const has = (name) => name in hidx;
+    const dataRows = rows.slice(1);
+
+    for (const r of dataRows) {
+      // Skip a row only if it is completely empty (all cells blank) — that is
+      // a CSV artifact, not a lost oeuvre. Everything else is kept.
+      const allBlank = r.every((c) => (c == null ? '' : String(c)).trim() === '');
+      if (allBlank) {
+        dropped++;
+        continue;
+      }
+
+      const get = (name) => (has(name) ? r[hidx[name]] : undefined);
+      const rawName = get('Name');
+      const name = (rawName == null ? '' : String(rawName)).trim();
+
+      // Even a nameless-but-nonblank row is preserved (never lose an oeuvre).
+      const safeName = name === '' ? '(untitled)' : name;
+
+      const status = normStatus(
+        get('Status'),
+        file.forceStatus || file.defaultStatusOnEmpty || 'backlog',
+        statusSeen,
+      );
+      const finalStatus = file.forceStatus ? file.forceStatus : status;
+
+      const score = file.forceScoreNull ? null : parseScore(get('Score'));
+      const tags = has('Tags') ? parseTags(get('Tags')) : [];
+      const extra = buildExtra(category, get);
+
+      items.push({
+        id: uniqueId(`${slug(safeName)}-${hash4(safeName)}`),
+        name: safeName,
+        score,
+        status: finalStatus,
+        tags,
+        extra,
+        image: null,
+        notes: null,
+      });
+    }
+  }
+
+  return {
+    manifest: { v: 1, category, label: cfg.label, items },
+    count: items.length,
+    dropped,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+function main() {
+  if (!existsSync(OUT_DIR)) mkdirSync(OUT_DIR, { recursive: true });
+
+  const statusSeen = new Set();
+  const perCategory = {};
+  let total = 0;
+  let droppedRows = 0;
+  const manifests = [];
+
+  const fileNames = { games: 'games.json', 'anime-manga': 'anime-manga.json', movies: 'movies.json' };
+
+  for (const [category, cfg] of Object.entries(SOURCES)) {
+    const { manifest, count, dropped } = buildCategory(category, cfg, statusSeen);
+    const outPath = resolve(OUT_DIR, fileNames[category]);
+    writeFileSync(outPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+    perCategory[category] = count;
+    total += count;
+    droppedRows += dropped;
+    manifests.push(outPath);
+    console.error(`[${category}] ${count} items -> ${outPath} (dropped blank rows: ${dropped})`);
+  }
+
+  const summary = {
+    perCategory,
+    total,
+    droppedRows,
+    manifests,
+    statusValuesSeen: Array.from(statusSeen).sort(),
+  };
+  console.error('SUMMARY:', JSON.stringify(summary, null, 2));
+  // Machine-readable line for the orchestrator / quick grep.
+  console.log(JSON.stringify(summary));
+}
+
+main();

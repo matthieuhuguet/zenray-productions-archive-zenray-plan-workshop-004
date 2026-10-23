@@ -1,0 +1,89 @@
+// @vitest-environment node
+import { createHash } from 'node:crypto'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import shareTokenHandler, { createSignedShareToken, resolveShareToken, shareRecordPath } from './share-token.js'
+
+const SECRET = 'a-long-and-stable-secret-for-tests'
+const hash = (v) => createHash('sha256').update(v).digest('hex')
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs() })
+
+const record = (token) => ({ v: 1, tokenHash: hash(token), kind: 'folder', path: 'pages/Photos/Trip', createdAt: new Date(0).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), revokedAt: null })
+
+describe('un jeton de partage se vérifie par GraphQL, pas par l’API REST', () => {
+  it('la lecture de l’enregistrement ne consomme AUCUN appel REST', async () => {
+    vi.stubEnv('GITHUB_TOKEN', 'faux'); vi.stubEnv('ZENRAY_SHARE_SECRET', SECRET)
+    const token = createSignedShareToken(SECRET, Buffer.alloc(24, 11))
+    const calls = []
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      calls.push(String(url))
+      if (String(url) === 'https://api.github.com/graphql') {
+        const vars = JSON.parse(init.body).variables
+        expect(vars.e0).toBe(`main:${shareRecordPath(token)}`)
+        return new Response(JSON.stringify({ data: { repository: { diskUsage: 1, ref: { target: { oid: 'h' } }, a0: { __typename: 'Blob', text: JSON.stringify(record(token)), byteSize: 10, isBinary: false } } } }), { status: 200 })
+      }
+      return new Response('unexpected REST call', { status: 500 })
+    }))
+    const share = await resolveShareToken(token, { expectedKind: 'folder', secret: SECRET })
+    expect(share.path).toBe('pages/Photos/Trip')
+    expect(calls).toEqual(['https://api.github.com/graphql'])
+  })
+
+  it('la révocation, elle, relit par REST : elle a besoin du sha du fichier', async () => {
+    vi.stubEnv('GITHUB_TOKEN', 'faux'); vi.stubEnv('ZENRAY_SHARE_SECRET', SECRET)
+    const token = createSignedShareToken(SECRET, Buffer.alloc(24, 12))
+    const calls = []
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      const u = String(url); calls.push(`${init && init.method || 'GET'} ${u.replace(/^https:\/\/api\.github\.com/, '')}`)
+      if (u.includes('/contents/') && (!init || !init.method)) return new Response(JSON.stringify({ sha: 'file-sha', content: Buffer.from(JSON.stringify(record(token))).toString('base64') }), { status: 200 })
+      if (u.includes('/contents/') && init.method === 'PUT') { expect(JSON.parse(init.body).sha).toBe('file-sha'); return new Response(JSON.stringify({ content: { sha: 'n' } }), { status: 200 }) }
+      return new Response('?', { status: 500 })
+    }))
+    const res = { code: 0, body: null, setHeader() {}, status(c) { this.code = c; return this }, json(b) { this.body = b; return this } }
+    await shareTokenHandler({ method: 'POST', query: {}, body: { action: 'revoke', token } }, res)
+    expect(res.body.ok).toBe(true)
+    expect(calls.some((c) => c.startsWith('PUT '))).toBe(true)
+  })
+})
+
+describe('un hoquet de GitHub ne fait jamais passer un lien valide pour inexistant', () => {
+  it('GraphQL puis REST échouent une fois (503), la lecture suivante réussit : le lien est reconnu', async () => {
+    vi.stubEnv('GITHUB_TOKEN', 'faux'); vi.stubEnv('ZENRAY_SHARE_SECRET', SECRET)
+    const token = createSignedShareToken(SECRET, Buffer.alloc(24, 21))
+    let rest = 0
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const u = String(url)
+      if (u === 'https://api.github.com/graphql') return new Response('{}', { status: 503 })
+      rest += 1
+      if (rest === 1) return new Response('boom', { status: 503 })
+      return new Response(JSON.stringify({ sha: 's', content: Buffer.from(JSON.stringify(record(token))).toString('base64') }), { status: 200 })
+    }))
+    const share = await resolveShareToken(token, { expectedKind: 'folder', secret: SECRET })
+    expect(share.path).toBe('pages/Photos/Trip')
+    expect(rest).toBe(2)
+  })
+
+  it('un vrai 404 de GitHub reste « lien inexistant », sans réessayer', async () => {
+    vi.stubEnv('GITHUB_TOKEN', 'faux'); vi.stubEnv('ZENRAY_SHARE_SECRET', SECRET)
+    const token = createSignedShareToken(SECRET, Buffer.alloc(24, 22))
+    let rest = 0
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (String(url) === 'https://api.github.com/graphql') return new Response(JSON.stringify({ data: { repository: { diskUsage: 1, ref: { target: { oid: 'h' } }, a0: null } } }), { status: 200 })
+      rest += 1
+      return new Response('{"message":"Not Found"}', { status: 404 })
+    }))
+    await expect(resolveShareToken(token, { expectedKind: 'folder', secret: SECRET })).rejects.toBeTruthy()
+    expect(rest).toBe(1)
+  })
+})
+
+// Calendar viewers stay valid until explicitly revoked. (19 October 2026, 01:14 Paris)
+it('permanent video shares require explicit opt-in and still honor revocation', async () => {
+  const token = createSignedShareToken(SECRET)
+  const value = { ...record(token), kind: 'video', path: 'pages/Movies/movie.media.json', expiresAt: null }
+  const options = { secret: SECRET, loadRecord: async () => value }
+  await expect(resolveShareToken(token, options)).rejects.toThrow('share-expired')
+  value.permanent = true
+  expect((await resolveShareToken(token, options)).path).toBe(value.path)
+  value.revokedAt = new Date().toISOString()
+  await expect(resolveShareToken(token, options)).rejects.toThrow('share-revoked')
+})

@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+# 3 October 2026, 03:55 CEST: inspect saved scene references headlessly without rendering or saving the scene.
+import argparse
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def inspect_scene(scene):
+    import hou
+    scene = Path(scene).resolve(strict=True)
+    before = hashlib.sha256(scene.read_bytes()).hexdigest()
+    hou.setUpdateMode(hou.updateMode.Manual)
+    warnings = []
+    try:
+        hou.hipFile.load(str(scene), suppress_save_prompt=True, ignore_load_warnings=False)
+    except hou.LoadWarning as error:
+        warnings.append(str(error))
+    references = []
+    for parameter, raw_path in hou.fileReferences():
+        resolved_path = parameter.evalAsString() if parameter else hou.text.expandString(raw_path)
+        mode = 'unknown'
+        if parameter:
+            template = parameter.parmTemplate()
+            chooser = template.tags().get('filechooser_mode')
+            mode = {'write': 'output', 'read': 'input'}.get(chooser, 'unknown')
+        internal = resolved_path.startswith(('op:', 'opdef:', 'oplib:'))
+        # 3 October 2026, 04:04 CEST: relative names and runtime URI references have no proven filesystem base.
+        path_kind = 'internal' if internal else 'uri' if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*:', resolved_path) else 'absolute' if Path(resolved_path).is_absolute() else 'relative'
+        filesystem_path = path_kind == 'absolute'
+        target = Path(resolved_path) if filesystem_path else None
+        file_kind = 'unknown' if not target else 'file' if target.is_file() else 'directory' if target.is_dir() else 'missing'
+        references.append({'parameterPath': parameter.path() if parameter else None, 'rawPath': raw_path,
+            'resolvedPath': resolved_path, 'canonicalPath': str(Path(resolved_path).resolve()) if filesystem_path else None,
+            'pathKind': path_kind, 'fileKind': file_kind, 'mode': mode, 'internal': internal,
+            'existsAtCurrentFrame': Path(resolved_path).exists() if filesystem_path else None,
+            'dynamic': '$F' in raw_path or '<UDIM>' in raw_path or '`' in raw_path})
+    if hashlib.sha256(scene.read_bytes()).hexdigest() != before:
+        raise RuntimeError('Scene changed during audit; proof refused')
+    return {'schemaVersion': 1, 'scenePath': str(scene), 'sceneSha256': before,
+        'checkedAt': datetime.now(timezone.utc).isoformat(), 'houdiniVersion': hou.applicationVersionString(),
+        'warnings': warnings, 'references': references, 'portabilityVerified': False}
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Inspect saved Houdini file references without a render or scene save.')
+    parser.add_argument('scene')
+    parser.add_argument('--output', required=True)
+    args = parser.parse_args()
+    output = Path(args.output).resolve()
+    if output.suffix != '.json' or output == Path(args.scene).resolve():
+        raise ValueError('Audit output must be a separate JSON file')
+    report = inspect_scene(args.scene)
+    output.write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps({'referenceCount': len(report['references']), 'warningCount': len(report['warnings']),
+        'sceneSha256': report['sceneSha256'], 'output': str(output), 'portabilityVerified': False}))
+
+
+if __name__ == '__main__':
+    main()

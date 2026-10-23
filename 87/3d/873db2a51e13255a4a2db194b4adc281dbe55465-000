@@ -1,0 +1,76 @@
+// 8 October 2026, 10:45 CEST: share conflict-safe Git Data commits across the Pages route and Assets publisher.
+const defaultSleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+
+export async function commitGitTree({ request, branch, entries, message, tries = 5, beforeCommit = null, sleepImpl = defaultSleep }) {
+  let last = 'fail'
+  for (let attempt = 0; attempt < tries; attempt++) {
+    const refResponse = await request(`git/ref/heads/${branch}`)
+    if (!refResponse.ok) { last = 'ref'; await sleepImpl(200 * (attempt + 1)); continue }
+    const headSha = (await refResponse.json()).object.sha
+    if (beforeCommit && !(await beforeCommit(headSha))) return { ok: false, conflict: true, error: 'content-conflict' }
+    const commitResponse = await request(`git/commits/${headSha}`)
+    if (!commitResponse.ok) { last = 'commit-read'; await sleepImpl(200 * (attempt + 1)); continue }
+    const baseTree = (await commitResponse.json()).tree.sha
+    const treeResponse = await request('git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree: entries }) })
+    if (!treeResponse.ok) {
+      last = `newtree ${(await treeResponse.text()).slice(0, 100)}`
+      if (treeResponse.status >= 500) { await sleepImpl(300 * (attempt + 1)); continue }
+      break
+    }
+    const newTree = (await treeResponse.json()).sha
+    const newCommitResponse = await request('git/commits', { method: 'POST', body: JSON.stringify({ message, tree: newTree, parents: [headSha] }) })
+    if (!newCommitResponse.ok) {
+      last = 'newcommit'
+      if (newCommitResponse.status >= 500) { await sleepImpl(300 * (attempt + 1)); continue }
+      break
+    }
+    const newCommit = (await newCommitResponse.json()).sha
+    const updateResponse = await request(`git/refs/heads/${branch}`, { method: 'PATCH', body: JSON.stringify({ sha: newCommit, force: false }) })
+    if (updateResponse.ok) return { ok: true, commit: newCommit }
+    last = `ref-update ${updateResponse.status}`
+    if (updateResponse.status === 422 || updateResponse.status === 409 || updateResponse.status >= 500) {
+      await sleepImpl(300 * (attempt + 1))
+      continue
+    }
+    break
+  }
+  return { ok: false, error: last }
+}
+
+export async function saveGitDataText({ request, branch, path, markdown, expectedSha, message = 'content save', sleepImpl = defaultSleep }) {
+  const expected = expectedSha || null
+  const contentShaAt = async (ref) => {
+    const response = await request(`contents/${encodeURI(path)}?ref=${encodeURIComponent(ref)}`)
+    if (response.status === 404) return null
+    if (!response.ok) throw new Error(`content-sha-${response.status}`)
+    const entry = await response.json()
+    if (!entry.sha) throw new Error('content-sha-missing')
+    return entry.sha
+  }
+  try {
+    if (await contentShaAt(branch) !== expected) return { ok: false, conflict: true }
+    const blobResponse = await request('git/blobs', {
+      method: 'POST',
+      // 8 October 2026, 10:53 CEST: send text as UTF-8 to avoid base64 request expansion.
+      body: JSON.stringify({ content: String(markdown ?? ''), encoding: 'utf-8' }),
+    })
+    if (!blobResponse.ok) return { ok: false, error: `blob-${blobResponse.status}: ${(await blobResponse.text()).slice(0, 160)}` }
+    const blob = await blobResponse.json()
+    if (!blob.sha) return { ok: false, error: 'blob-without-sha' }
+    const commit = await commitGitTree({
+      request,
+      branch,
+      entries: [{ path, mode: '100644', type: 'blob', sha: blob.sha }],
+      message,
+      tries: 5,
+      beforeCommit: async (headSha) => (await contentShaAt(headSha)) === expected,
+      sleepImpl,
+    })
+    if (commit.conflict) return { ok: false, conflict: true }
+    if (!commit.ok) return { ok: false, error: commit.error }
+    if (await contentShaAt(branch) !== blob.sha) return { ok: false, conflict: true }
+    return { ok: true, sha: blob.sha }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : 'large-content-save-failed' }
+  }
+}

@@ -1,0 +1,189 @@
+import React, { useEffect, useRef, useState, useMemo } from 'react'
+import { PALETTE, RADII } from '../theme.js'
+import { saveJsonWithRetry } from '../lib/saveJson.js'
+import { putLocalContent, tableToText } from '../search/contentIndex.js'
+import { DatabaseBoardView, DatabaseCalendarView, DatabaseFilterBar, DatabaseGalleryView, DatabaseListView } from '../table/DatabaseViews.jsx'
+import { findDatabaseDateColumn, selectDatabaseRows } from '../table/databaseViewModel.js'
+
+// Sprint 5 — Bases de données (vue Table). Modèle JSON dans la drive databases/<slug>.json.
+// { name, columns:[{id,name,type,options?}], rows:[{id, cells:{colId:value}}] }
+const FONTS = { serif: "var(--zr-police-serif)", sans: "var(--zr-police-sans)" }
+const TYPES = ['text', 'number', 'checkbox', 'select', 'date', 'relation']
+const uid = (p = 'x') => p + Math.random().toString(36).slice(2, 8)
+const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'db'
+
+export default function Databases({ t }) {
+  const [list, setList] = useState(null)
+  const [path, setPath] = useState(null)
+  const [db, setDb] = useState(null)
+  const [sha, setSha] = useState(null)
+  const [status, setStatus] = useState('')
+  const [sort, setSort] = useState(null) // {col, dir}
+  const [view, setView] = useState('table') // table | board | gallery | list | calendar
+  const [groupBy, setGroupBy] = useState(null)
+  const [calOff, setCalOff] = useState(0)
+  const [relCache, setRelCache] = useState({})
+  const timer = useRef(null)
+  const loadRel = (p) => { if (!p || relCache[p] !== undefined) return; setRelCache((c) => ({ ...c, [p]: null })); fetch(`/api/page?action=read&path=${encodeURIComponent(p)}`, { cache: 'no-store' }).then((r) => r.json()).then((j) => { let d = null; try { d = JSON.parse(j.markdown) } catch {} setRelCache((c) => ({ ...c, [p]: d })) }).catch(() => {}) }
+
+  const loadList = () => fetch('/api/page?action=list&dir=databases', { cache: 'no-store' }).then((r) => r.json()).then((j) => setList(j.items || [])).catch(() => setList([]))
+  useEffect(() => { loadList() }, [])
+
+  const open = async (p) => {
+    setStatus('ouverture…')
+    const j = await fetch(`/api/page?action=read&path=${encodeURIComponent(p.path)}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+    if (j && j.markdown) { let d; try { d = JSON.parse(j.markdown) } catch { d = { name: p.name, columns: [], rows: [] } } setDb(d); setSort((d.ui && d.ui.sort) || null); setSha(j.sha); setPath(p.path); setStatus('') }
+  }
+  const create = async () => {
+    const name = (window.prompt('Nom de la table ?', 'Sans titre') || '').trim()
+    if (!name) return
+    const p = `databases/${slug(name)}-${Date.now().toString(36).slice(-4)}.json`
+    const seed = { name, columns: [{ id: uid('c'), name: 'Nom', type: 'text' }], rows: [] }
+    const j = await fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'save', path: p, markdown: JSON.stringify(seed) }) }).then((r) => r.json()).catch(() => null)
+    if (j && j.ok) { setDb(seed); setSha(j.sha); setPath(p); loadList() }
+  }
+  const persist = (next, immediate) => {
+    setDb(next)
+    clearTimeout(timer.current)
+    const run = async () => {
+      setStatus('enregistrement…')
+      // Remplacement avec retry sur conflit (sha frais) -> l'enregistrement réussit au lieu d'échouer en silence.
+      // (Le merge ligne-à-ligne multi-éditeur d'une même table reste un chantier à part.)
+      const res = await saveJsonWithRetry(path, () => next, { sha, tries: 3 })
+      if (res.ok) { setSha(res.sha); setStatus('enregistré ✓'); try { putLocalContent(path, tableToText(next)) } catch {} } else setStatus('erreur')
+    }
+    if (immediate) run(); else timer.current = setTimeout(run, 800)
+  }
+
+  const addColumn = () => {
+    const name = (window.prompt('Nom de la colonne ?', 'Colonne') || '').trim(); if (!name) return
+    const type = (window.prompt('Type ? ' + TYPES.join(' / '), 'text') || 'text').trim().toLowerCase()
+    const col = { id: uid('c'), name, type: TYPES.includes(type) ? type : 'text' }
+    if (col.type === 'select') col.options = (window.prompt('Options (séparées par des virgules)', 'À faire, En cours, Fait') || '').split(',').map((s) => s.trim()).filter(Boolean)
+    if (col.type === 'relation') { const pick = window.prompt('Table liée ? numéro :\n' + (list || []).map((x, i) => `${i + 1}. ${x.name}`).join('\n')); const idx = parseInt(pick, 10) - 1; if (!(list && list[idx])) return; col.target = list[idx].path }
+    persist({ ...db, columns: [...db.columns, col] }, true)
+  }
+  const delColumn = (id) => { if (!window.confirm('Supprimer cette colonne ?')) return; persist({ ...db, columns: db.columns.filter((c) => c.id !== id), rows: db.rows.map((r) => { const cells = { ...r.cells }; delete cells[id]; return { ...r, cells } }) }, true) }
+  const addRow = () => persist({ ...db, rows: [...db.rows, { id: uid('r'), cells: {} }] }, true)
+  const delRow = (id) => persist({ ...db, rows: db.rows.filter((r) => r.id !== id) }, true)
+  const setCell = (rowId, colId, value) => persist({ ...db, rows: db.rows.map((r) => r.id === rowId ? { ...r, cells: { ...r.cells, [colId]: value } } : r) })
+  const delDb = async () => {
+    if (!window.confirm('Supprimer cette table ?')) return
+    const r = await fetch(`/api/page?action=read&path=${encodeURIComponent(path)}`, { cache: 'no-store' }).then((x) => x.json()).catch(() => null)
+    if (r && r.sha) await fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'delete', path, sha: r.sha }) })
+    setDb(null); setPath(null); loadList()
+  }
+
+  // C38 — filtres persistants (db.ui.filters) + tri persisté (db.ui.sort, miroir local `sort` pour le rendu)
+  const filters = (db && db.ui && db.ui.filters) || []
+  const setFilters = (next) => persist({ ...db, ui: { ...(db.ui || {}), filters: next } })
+  // Lignes filtrées + triées memoïsées : ne se recalculent que si la base/les filtres/le tri changent.
+  const rows = useMemo(() => selectDatabaseRows({ rows: db?.rows || [], columns: db?.columns || [], filters, sort }), [db, filters, sort])
+  const toggleSort = (colId) => { const next = sort && sort.col === colId ? (sort.dir === 'asc' ? { col: colId, dir: 'desc' } : null) : { col: colId, dir: 'asc' }; setSort(next); persist({ ...db, ui: { ...(db.ui || {}), sort: next } }) }
+  const dateColId = findDatabaseDateColumn(db, { infer: true })
+  const selectCols = db ? db.columns.filter((c) => c.type === 'select') : []
+  const gb = groupBy || (selectCols[0] && selectCols[0].id)
+
+  const inputBase = { width: '100%', background: 'transparent', color: t.textPrimary, border: 'none', outline: 'none', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)', padding: '6px 8px' }
+  const cell = (r, c) => {
+    const val = r.cells[c.id]
+    if (c.type === 'relation') {
+      const tdb = relCache[c.target]; if (tdb === undefined) loadRel(c.target)
+      const opts = tdb && tdb.rows ? tdb.rows.map((x) => ({ id: x.id, label: (x.cells && tdb.columns[0] && x.cells[tdb.columns[0].id]) || x.id })) : []
+      return <select value={val || ''} onChange={(e) => setCell(r.id, c.id, e.target.value)} style={{ ...inputBase, cursor: 'pointer' }}><option value="">{tdb === null ? '…' : ''}</option>{opts.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}</select>
+    }
+    if (c.type === 'checkbox') return <input type="checkbox" checked={!!val} onChange={(e) => setCell(r.id, c.id, e.target.checked)} />
+    if (c.type === 'date') return <input type="date" value={val || ''} onChange={(e) => setCell(r.id, c.id, e.target.value)} style={{ ...inputBase, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)' }} />
+    if (c.type === 'select') return (
+      <select value={val || ''} onChange={(e) => setCell(r.id, c.id, e.target.value)} style={{ ...inputBase, cursor: 'pointer' }}>
+        <option value=""></option>
+        {(c.options || []).map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
+    )
+    return <input type={c.type === 'number' ? 'number' : 'text'} value={val ?? ''} onChange={(e) => setCell(r.id, c.id, e.target.value)} style={{ ...inputBase, fontFamily: c.type === 'number' ? FONTS.sans : FONTS.sans }} />
+  }
+
+  return (
+    <>
+      <SectionLabel t={t}>Tables <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)', opacity: 0.6 }}>· databases dans la drive · {status}</span></SectionLabel>
+      <div style={{ display: 'flex', gap: 18, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+        <div style={{ flex: '0 0 220px', maxWidth: 220 }}>
+          <button onClick={create} style={{ ...btn(t), width: '100%', marginBottom: 10, color: PALETTE.primary, borderColor: PALETTE.primary }}>+ nouvelle table</button>
+          {list === null && <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-sm)' }}>chargement…</div>}
+          {list && list.length === 0 && <div style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-sm)' }}>Aucune table. Crée la première.</div>}
+          {list && list.map((p) => (
+            <button key={p.path} onClick={() => open(p)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '8px 10px', marginBottom: 3, borderRadius: RADII.sm, cursor: 'pointer', background: path === p.path ? PALETTE.primarySoft : 'transparent', color: path === p.path ? PALETTE.primary : t.textPrimary, border: `1px solid ${path === p.path ? PALETTE.primary : 'transparent'}`, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)', textTransform: 'capitalize', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>▤ {p.name.replace(/-[a-z0-9]{1,4}$/, '')}</button>
+          ))}
+        </div>
+        <div style={{ flex: 1, minWidth: 320, overflowX: 'auto' }}>
+          {!db && <div style={{ ...card(t), padding: 40, color: t.textSecondary, textAlign: 'center' }}>Sélectionne une table, ou crée-en une. Colonnes typées (texte, nombre, case, select, date), tri par colonne, sauvegarde GitHub.</div>}
+          {db && (
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+                <div style={{ fontFamily: FONTS.serif, fontSize: 20, fontWeight: 600 }}>{db.name}</div>
+                <div style={{ display: 'flex', gap: 2, background: t.bg, border: `1px solid ${t.border}`, borderRadius: RADII.sm, padding: 2 }}>
+                  {['table', 'board', 'gallery', 'list', 'calendar'].map((v) => (
+                    <button key={v} onClick={() => setView(v)} style={{ border: 'none', background: view === v ? PALETTE.primary : 'transparent', color: view === v ? '#fff' : t.textSecondary, borderRadius: 6, padding: '4px 11px', cursor: 'pointer', fontSize: 'var(--zr-ui-sm)', fontFamily: FONTS.sans, textTransform: 'capitalize' }}>{v}</button>
+                  ))}
+                </div>
+                {view === 'board' && (
+                  <select value={groupBy || ''} onChange={(e) => setGroupBy(e.target.value || null)} style={{ background: t.surface, color: t.textPrimary, border: `1px solid ${t.border}`, borderRadius: RADII.sm, padding: '5px 8px', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)' }}>
+                    <option value="">grouper par…</option>
+                    {selectCols.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                )}
+                <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>{db.rows.length} lignes</span>
+                <button onClick={delDb} style={{ ...btn(t), color: PALETTE.red, borderColor: PALETTE.red, marginLeft: 'auto' }}>Supprimer la table</button>
+              </div>
+
+              {/* C38 — barre de filtres persistants */}
+              <DatabaseFilterBar t={t} columns={db.columns} filters={filters} onChange={setFilters} categoricalContains={false} resultCount={rows.length} totalCount={db.rows.length} />
+
+              {view === 'board' && <DatabaseBoardView t={t} columns={db.columns} rows={rows} groupBy={gb} onSetCell={setCell} emptyMessage="Ajoute une colonne de type « select » pour utiliser le Board." />}
+
+              {view === 'gallery' && <DatabaseGalleryView t={t} columns={db.columns} rows={rows} />}
+
+              {view === 'list' && <DatabaseListView t={t} columns={db.columns} rows={rows} />}
+
+              {view === 'calendar' && (
+                !dateColId
+                  ? <div style={{ opacity: 0.6, padding: 20 }}>Aucune colonne date détectée pour la vue calendrier.</div>
+                  : <DatabaseCalendarView t={t} columns={db.columns} rows={db.rows} dateColumnId={dateColId} offset={calOff} onOffsetChange={setCalOff} />
+              )}
+              {view === 'table' && (<>
+              <table style={{ borderCollapse: 'collapse', width: '100%', fontFamily: FONTS.sans }}>
+                <thead>
+                  <tr>
+                    {db.columns.map((c) => (
+                      <th key={c.id} style={{ border: `1px solid ${t.border}`, background: t.cardBg, padding: '8px 10px', textAlign: 'left', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                        <span onClick={() => toggleSort(c.id)} style={{ cursor: 'pointer' }}>{c.name} <span style={{ color: t.textSecondary, fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-3xs)' }}>{c.type}{sort && sort.col === c.id ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : ''}</span></span>
+                        <button onClick={() => delColumn(c.id)} title="supprimer la colonne" style={{ background: 'none', border: 'none', color: t.textSecondary, cursor: 'pointer', marginLeft: 6, fontSize: 'var(--zr-ui-sm)' }}>×</button>
+                      </th>
+                    ))}
+                    <th style={{ border: `1px solid ${t.border}`, background: t.cardBg, padding: '4px 8px' }}><button onClick={addColumn} title="ajouter une colonne" style={{ ...btn(t), padding: '3px 9px' }}>+</button></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr key={r.id}>
+                      {db.columns.map((c) => <td key={c.id} style={{ border: `1px solid ${t.border}`, padding: 0, minWidth: 120 }}>{cell(r, c)}</td>)}
+                      <td style={{ border: `1px solid ${t.border}`, textAlign: 'center' }}><button onClick={() => delRow(r.id)} style={{ background: 'none', border: 'none', color: t.textSecondary, cursor: 'pointer', fontSize: 'var(--zr-ui-lg)' }}>×</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <button onClick={addRow} style={{ ...btn(t), marginTop: 10 }}>+ nouvelle ligne</button>
+              </>)}
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
+const card = (t) => ({ background: t.cardBg, border: `1px solid ${t.border}`, borderRadius: RADII.lg })
+const btn = (t) => ({ background: t.btnSecondaryBg, color: t.btnSecondaryText, border: `1px solid ${t.border}`, borderRadius: RADII.sm, padding: '7px 12px', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)', cursor: 'pointer' })
+function SectionLabel({ t, children }) {
+  return <div style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)', textTransform: 'uppercase', letterSpacing: 2, color: t.textSecondary, fontWeight: 700, margin: '0 0 14px' }}>{children}</div>
+}

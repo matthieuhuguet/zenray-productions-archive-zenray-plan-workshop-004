@@ -1,0 +1,234 @@
+// GET /api/hls-download-script?path=<...media.json>&format=zip|command|sh|ps1
+//
+// EN CLAIR (pour tout le monde) :
+//   Cet endpoint fabrique le petit "kit" que l'utilisateur lance chez lui. Il ne contient PAS la vidéo,
+//   PAS les morceaux, PAS la clé brute : juste des scripts texte qui appellent ffmpeg sur l'ordi de
+//   l'utilisateur. ffmpeg, lui, va chercher les morceaux et la clé via l'URL tokenisée, déchiffre, et
+//   recolle tout en un .mkv dans le dossier Téléchargements.
+//
+//   format=zip     -> bundle ZIP (README + download.command + download.sh + download.ps1 + video.url.txt)
+//   format=command -> juste le .command (macOS), en pièce jointe
+//   format=sh      -> juste le .sh (Linux/macOS)
+//   format=ps1     -> juste le .ps1 (Windows)
+//
+//   Le serveur ne reconstruit JAMAIS la vidéo et ne télécharge AUCUN segment : il génère du texte.
+import { signToken, MAX_TTL_MS } from './hls-token.js'
+import { safeName, siteBase } from './hls-download-info.js'
+
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+function safeMediaPath(p) {
+  return typeof p === 'string' && p.startsWith('pages/') && p.endsWith('.media.json') && !p.includes('..') && !p.startsWith('/')
+}
+
+// --- scripts ----------------------------------------------------------------------------------
+function commandScript(cliUrl, outName) {
+  // .command = double-clic ouvre Terminal sur macOS. set -e, check ffmpeg, sortie dans ~/Downloads.
+  return `#!/bin/bash
+# ZenRay - telechargement video via ffmpeg (macOS)
+set -e
+OUT="$HOME/Downloads/${outName}"
+echo "ZenRay - telechargement de la video dans Telechargements"
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo ""
+  echo "ffmpeg est requis."
+  echo "Installe-le avec :"
+  echo "  brew install ffmpeg"
+  echo ""
+  read -n 1 -s -r -p "Appuie sur une touche pour fermer."
+  exit 1
+fi
+ffmpeg -hide_banner -stats -i "${cliUrl}" -map 0 -c copy "$OUT"
+echo ""
+echo "Termine. Fichier cree :"
+echo "  $OUT"
+read -n 1 -s -r -p "Appuie sur une touche pour fermer."
+`
+}
+
+function shScript(cliUrl, outName) {
+  return `#!/usr/bin/env bash
+# ZenRay - telechargement video via ffmpeg (Linux / macOS)
+set -euo pipefail
+OUT="$HOME/Downloads/${outName}"
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "ffmpeg est requis. Installe-le (ex: apt install ffmpeg / brew install ffmpeg)." >&2
+  exit 1
+fi
+mkdir -p "$HOME/Downloads"
+ffmpeg -hide_banner -stats -i "${cliUrl}" -map 0 -c copy "$OUT"
+echo "Termine. Fichier cree : $OUT"
+`
+}
+
+function ps1Script(cliUrl, outName) {
+  return `# ZenRay - telechargement video via ffmpeg (Windows)
+$ErrorActionPreference = "Stop"
+$out = Join-Path $env:USERPROFILE ("Downloads\\${outName}")
+if (-not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) {
+  Write-Host "ffmpeg est requis."
+  Write-Host "Installe-le avec : winget install Gyan.FFmpeg"
+  Read-Host "Appuie sur Entree pour fermer"
+  exit 1
+}
+ffmpeg -hide_banner -stats -i "${cliUrl}" -map 0 -c copy "$out"
+Write-Host ""
+Write-Host "Termine. Fichier cree : $out"
+Read-Host "Appuie sur Entree pour fermer"
+`
+}
+
+function readme(outName, expiresAt) {
+  return `ZenRay - Telechargement video
+=============================
+
+Cette video est stockee en morceaux (HLS). Le site NE reconstruit PAS la video.
+Ces scripts lancent ffmpeg sur TON ordinateur pour telecharger les morceaux,
+dechiffrer si besoin et creer un fichier ${outName} dans ton dossier Telechargements.
+
+macOS :
+  Double-clique download.command
+  (si macOS bloque : clic droit > Ouvrir)
+
+Linux / macOS (terminal) :
+  bash download.sh
+
+Windows :
+  Clic droit download.ps1 > Executer avec PowerShell
+
+Si ffmpeg n'est pas installe :
+  macOS   : brew install ffmpeg
+  Linux   : apt install ffmpeg  (ou equivalent)
+  Windows : winget install Gyan.FFmpeg
+
+Important : le lien de telechargement expire le ${expiresAt}.
+Passe ce delai, relance le bouton "Telecharger via script" sur le site.
+`
+}
+
+// --- ZIP minimal (entrees STORED, sans compression) -------------------------------------------
+// EN CLAIR : un .zip est un format simple. Pour quelques petits fichiers texte, pas besoin de
+// compresser : on les empile "tels quels" (mode STORE) avec les en-tetes attendus. Resultat = un
+// vrai .zip valide, lisible par macOS/Windows/Linux, sans dependance externe.
+function crc32(buf) {
+  let c = ~0
+  for (let i = 0; i < buf.length; i++) { c ^= buf[i]; for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xEDB88320 & -(c & 1)) }
+  return (~c) >>> 0
+}
+function zipStore(files) {
+  // files = [{ name, data:Buffer, unix:0o755|0o644 }]
+  const locals = []
+  const centrals = []
+  let offset = 0
+  for (const f of files) {
+    const nameBuf = Buffer.from(f.name, 'utf8')
+    const crc = crc32(f.data)
+    const size = f.data.length
+    const lh = Buffer.alloc(30)
+    lh.writeUInt32LE(0x04034b50, 0)    // local file header signature
+    lh.writeUInt16LE(20, 4)            // version needed
+    lh.writeUInt16LE(0, 6)             // flags
+    lh.writeUInt16LE(0, 8)             // method 0 = store
+    lh.writeUInt16LE(0, 10)            // time
+    lh.writeUInt16LE(0x21, 12)         // date (1980-01-01-ish)
+    lh.writeUInt32LE(crc, 14)
+    lh.writeUInt32LE(size, 18)         // compressed size
+    lh.writeUInt32LE(size, 22)         // uncompressed size
+    lh.writeUInt16LE(nameBuf.length, 26)
+    lh.writeUInt16LE(0, 28)            // extra len
+    locals.push(lh, nameBuf, f.data)
+
+    const ch = Buffer.alloc(46)
+    ch.writeUInt32LE(0x02014b50, 0)    // central dir signature
+    ch.writeUInt16LE(0x031E, 4)        // version made by (unix)
+    ch.writeUInt16LE(20, 6)
+    ch.writeUInt16LE(0, 8)
+    ch.writeUInt16LE(0, 10)
+    ch.writeUInt16LE(0, 12)
+    ch.writeUInt16LE(0x21, 14)
+    ch.writeUInt32LE(crc, 16)
+    ch.writeUInt32LE(size, 20)
+    ch.writeUInt32LE(size, 24)
+    ch.writeUInt16LE(nameBuf.length, 28)
+    ch.writeUInt16LE(0, 30)            // extra
+    ch.writeUInt16LE(0, 32)            // comment
+    ch.writeUInt16LE(0, 34)            // disk
+    ch.writeUInt16LE(0, 36)            // internal attrs
+    const unix = (f.unix || 0o644) & 0xFFFF
+    ch.writeUInt32LE((unix << 16) >>> 0, 38) // external attrs = mode unix dans les 16 bits hauts
+    ch.writeUInt32LE(offset, 42)       // offset of local header
+    centrals.push(ch, nameBuf)
+    offset += lh.length + nameBuf.length + f.data.length
+  }
+  const localPart = Buffer.concat(locals)
+  const centralPart = Buffer.concat(centrals)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(0, 4)
+  end.writeUInt16LE(0, 6)
+  end.writeUInt16LE(files.length, 8)
+  end.writeUInt16LE(files.length, 10)
+  end.writeUInt32LE(centralPart.length, 12)
+  end.writeUInt32LE(localPart.length, 16)
+  end.writeUInt16LE(0, 20)
+  return Buffer.concat([localPart, centralPart, end])
+}
+
+export default async function handler(req, res) {
+  const ghToken = process.env.GITHUB_TOKEN
+  if (!ghToken) return res.status(500).end()
+  if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return res.status(405).end() }
+  res.setHeader('Cache-Control', 'no-store')
+
+  const mediaPath = (req.query.path || '').toString()
+  if (!safeMediaPath(mediaPath)) return res.status(400).json({ ok: false, error: 'bad-path' })
+  const format = (req.query.format || 'zip').toString()
+
+  let manifest
+  try {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/contents/${encodeURI(mediaPath)}?ref=${BRANCH}`, {
+      headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zenray-progress' },
+    })
+    if (r.status === 404) return res.status(404).json({ ok: false, error: 'not-found' })
+    if (!r.ok) return res.status(502).json({ ok: false, error: 'github' })
+    manifest = JSON.parse(await r.text())
+  } catch { return res.status(502).json({ ok: false, error: 'read' }) }
+  if (!manifest || manifest.type !== 'hls') return res.status(400).json({ ok: false, error: 'not-hls' })
+
+  const name = safeName(manifest.name || mediaPath.split('/').pop())
+  const outName = `${name}.mkv`
+  // TTL long (3 h) pour les scripts : un remux de longue video ne doit pas expirer en cours de route (plan §12).
+  const { token, exp } = signToken(mediaPath, MAX_TTL_MS)
+  const expIso = new Date(exp).toISOString()
+  const cliUrl = `${siteBase(req)}/api/hls-cli?token=${encodeURIComponent(token)}`
+
+  const cmd = commandScript(cliUrl, outName)
+  const sh = shScript(cliUrl, outName)
+  const ps1 = ps1Script(cliUrl, outName)
+
+  const attach = (filename, type, body) => {
+    res.setHeader('Content-Type', type)
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
+    res.setHeader('Content-Length', String(Buffer.byteLength(body)))
+    return res.status(200).send(body)
+  }
+
+  if (format === 'command') return attach('download.command', 'text/x-shellscript', cmd)
+  if (format === 'sh') return attach('download.sh', 'text/x-shellscript', sh)
+  if (format === 'ps1') return attach('download.ps1', 'text/plain; charset=utf-8', ps1)
+
+  // format=zip (defaut) : bundle complet.
+  const files = [
+    { name: 'README.txt', data: Buffer.from(readme(outName, expIso), 'utf8'), unix: 0o644 },
+    { name: 'download.command', data: Buffer.from(cmd, 'utf8'), unix: 0o755 },
+    { name: 'download.sh', data: Buffer.from(sh, 'utf8'), unix: 0o755 },
+    { name: 'download.ps1', data: Buffer.from(ps1, 'utf8'), unix: 0o644 },
+    { name: 'video.url.txt', data: Buffer.from(cliUrl + '\n', 'utf8'), unix: 0o644 },
+  ]
+  const zip = zipStore(files)
+  res.setHeader('Content-Type', 'application/zip')
+  res.setHeader('Content-Disposition', `attachment; filename="ZenRay-${name}.zip"`)
+  res.setHeader('Content-Length', String(zip.length))
+  return res.status(200).send(zip)
+}

@@ -1,0 +1,140 @@
+// Niveau 2 (remux -c copy) et niveau 3 (transcode) -> MediaSource. Octets via /api/stream (readRange).
+// Review fixes intégrés : codec string en CASCADE de candidats (pas figée), garde sb.updating avant
+// endOfStream, cache de l'input (pas de re-download au changement de piste), libération RAM.
+import { getFFmpeg, withLogs } from './ffmpegCore.js'
+import { readRange } from './rangeReader.js'
+
+// candidats AVC/HEVC du plus complet au plus permissif : on prend le 1er supporté par MSE.
+const AVC_CANDIDATES = ['avc1.640029', 'avc1.4D401F', 'avc1.42E01E']
+// On ne fige plus le level à L93 (3.1) : un HEVC 4K est L150+. Dérive profil/level du probe, fallback du + complet au + permissif.
+const HEVC_CANDIDATES = ['hvc1.1.6.L150.B0', 'hvc1.2.4.L153.B0', 'hvc1.1.6.L93.B0', 'hev1.1.6.L93.B0']
+function hevcCandidates(v) {
+  const out = []
+  const tier = v && v.level && v.level > 120 ? 'L' + v.level : null
+  const is10 = v && (/10/.test(String(v.profile || '')) || v.bitDepth === 10 || (v.pixFmt && /p10/.test(v.pixFmt)))
+  if (tier) { if (is10) out.push(`hvc1.2.4.${tier}.B0`, `hev1.2.4.${tier}.B0`); out.push(`hvc1.1.6.${tier}.B0`, `hev1.1.6.${tier}.B0`) }
+  if (is10) out.push('hvc1.2.4.L153.B0', 'hev1.2.4.L153.B0')
+  return [...out, ...HEVC_CANDIDATES]
+}
+
+function appendBuf(sb, data) {
+  return new Promise((res, rej) => {
+    const cleanup = () => { sb.removeEventListener('updateend', ok); sb.removeEventListener('error', ko) }
+    const ok = () => { cleanup(); res() }
+    const ko = () => { cleanup(); rej(new Error('append-error')) }
+    sb.addEventListener('updateend', ok, { once: true })
+    sb.addEventListener('error', ko, { once: true })
+    try { sb.appendBuffer(data) } catch (e) { cleanup(); rej(e && e.name === 'QuotaExceededError' ? new Error('append-quota-exceeded') : e) }
+  })
+}
+const onceEvent = (target, ev) => new Promise((res) => target.addEventListener(ev, res, { once: true }))
+async function endStream(ms, sb) {
+  if (ms.readyState !== 'open') return
+  if (sb && sb.updating) await onceEvent(sb, 'updateend') // review fix : pas d'endOfStream pendant updating
+  try { ms.endOfStream() } catch {}
+}
+
+// choisit la 1re codec string (vidéo+audio) acceptée par MediaSource pour ce probe.
+function pickCodecString(probe) {
+  const v = probe && probe.video && probe.video[0]
+  const isHevc = v && /hevc|h265/.test(v.codec || '')
+  const cands = isHevc ? hevcCandidates(v) : AVC_CANDIDATES
+  for (const c of cands) {
+    const s = `video/mp4; codecs="${c},mp4a.40.2"`
+    if (window.MediaSource && MediaSource.isTypeSupported(s)) return s
+  }
+  return `video/mp4; codecs="avc1.42E01E,mp4a.40.2"` // dernier recours
+}
+
+// Décide remux vs transcode depuis le probe. Sans probe -> tente remux.
+export function pickPipeline(probe) {
+  if (!probe || !probe.video || !probe.video.length) return 'remux'
+  const v = probe.video[0]
+  if (/hevc|h265|h264|avc/.test(v.codec || '')) return 'remux'
+  return 'transcode'
+}
+
+// ── NIVEAU 2 : remux -c copy ─────────────────────────────────────────────
+// input (Uint8Array) peut être fourni en cache pour ÉVITER le re-download au changement de piste audio.
+export async function playRemux({ path, manifest, video, audioTrack = null, input = null, onState, onProgress, signal }) {
+  const ff = await getFFmpeg()
+  const probe = manifest.probe
+  if (!input && !Number.isFinite(manifest.size)) throw new Error('manifest-size-missing')
+  if (!input) { onState && onState('Lecture du fichier…'); input = await readRange(path, 0, manifest.size - 1, { signal, onProgress }) }
+  if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError')
+
+  await ff.writeFile('in', input)
+  onState && onState('Préparation de la lecture…')
+
+  // Probe inline du codec vidéo réel (robuste sans probe upload) : on lit le stderr de `-i in`.
+  let detectedCodec = (probe && probe.video && probe.video[0] && probe.video[0].codec) || null
+  if (!detectedCodec) {
+    const plogs = await withLogs(ff, async () => { try { await ff.exec(['-i', 'in']) } catch {} })
+    for (const l of plogs) { const mt = /Stream #\d+:\d+.*?Video:\s*(\w+)/.exec(l); if (mt) { detectedCodec = mt[1].toLowerCase(); break } }
+  }
+
+  const aChosen = audioTrack != null ? (probe && probe.audio && probe.audio[audioTrack]) : (probe && probe.audio && (probe.audio.find((a) => a.default) || probe.audio[0]))
+  const aMap = aChosen ? ['-map', `0:${aChosen.index}`] : ['-map', '0:a:0?']
+  const aArgs = aChosen && aChosen.codec === 'aac' ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '192k']
+  const args = ['-i', 'in', '-map', '0:v:0', ...aMap, '-c:v', 'copy', ...aArgs,
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'out.mp4']
+
+  const logs = await withLogs(ff, async () => { await ff.exec(args) })
+  let data
+  try { data = await ff.readFile('out.mp4') } catch (e) { throw new Error('remux-failed: ' + logs.slice(-1)[0]) }
+  await ff.deleteFile('out.mp4').catch(() => {})
+  await ff.deleteFile('in').catch(() => {})
+  if (!data || data.byteLength === 0) throw new Error('remux-empty')
+
+  const ms = new MediaSource()
+  const objUrl = URL.createObjectURL(ms)
+  video.src = objUrl
+  await onceEvent(ms, 'sourceopen')
+  const cs = pickCodecString(detectedCodec ? { video: [{ codec: detectedCodec }] } : probe)
+  if (!MediaSource.isTypeSupported(cs)) { URL.revokeObjectURL(objUrl); throw new Error('codec-unsupported:' + cs) }
+  const sb = ms.addSourceBuffer(cs)
+  sb.mode = 'segments'
+  await appendBuf(sb, data)
+  await endStream(ms, sb)
+  onState && onState(null)
+  return { mediaSource: ms, objUrl, input } // renvoie input pour cache
+}
+
+// ── NIVEAU 3 : transcode segmenté libx264 + aac ──────────────────────────
+export async function playTranscode({ path, manifest, video, input = null, onPct, onState, signal }) {
+  const ff = await getFFmpeg()
+  const duration = (manifest.probe && manifest.probe.duration) || 0
+  if (!input && !Number.isFinite(manifest.size)) throw new Error('manifest-size-missing')
+  if (!input) { onState && onState('Lecture du fichier…'); input = await readRange(path, 0, manifest.size - 1, { signal }) }
+  if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError')
+  await ff.writeFile('in', input)
+
+  const ms = new MediaSource()
+  const objUrl = URL.createObjectURL(ms)
+  video.src = objUrl
+  await onceEvent(ms, 'sourceopen')
+  const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640029,mp4a.40.2"')
+  sb.mode = 'sequence'
+
+  const SEG = 8
+  onState && onState('Transcodage…')
+  try {
+    for (let tt = 0, i = 0; !duration || tt < duration; tt += SEG, i++) {
+      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError')
+      const out = `s${i}.mp4`
+      await ff.exec(['-ss', String(tt), '-t', String(SEG), '-i', 'in',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-b:a', '160k',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', out])
+      let data
+      try { data = await ff.readFile(out) } catch { break }
+      await ff.deleteFile(out).catch(() => {})
+      if (!data || data.byteLength === 0) break
+      await appendBuf(sb, data)
+      if (duration) onPct && onPct(Math.min(1, (tt + SEG) / duration))
+      if (!duration) break // sans durée connue, un seul passage de sécurité
+    }
+  } finally { await ff.deleteFile('in').catch(() => {}) }
+  await endStream(ms, sb)
+  onState && onState(null)
+  return { mediaSource: ms, objUrl, input }
+}

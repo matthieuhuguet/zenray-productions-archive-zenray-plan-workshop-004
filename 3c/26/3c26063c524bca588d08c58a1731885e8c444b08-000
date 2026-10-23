@@ -1,0 +1,141 @@
+// MotionPublish.mjs (12 October 2026, 11:05 CEST): the pure part of the ZenRay Motion Design publisher. It turns the
+// local workshop (motions/<id>/V_NNN) into the cloud contract of R06 section 9.2: neutral public ids (zrmd-0001),
+// one version manifest per version and format readable by VideoPlayer2, the motion card (.zmotion.json), the light
+// catalogue read by the gallery, and the invariants that CheckCatalogue.mjs verifies both ways. No I/O here.
+// FR : la partie pure du publieur : identifiants neutres, manifestes, fiche, catalogue et invariants. Aucune entree-sortie.
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+export const MOTION_CONFIG = JSON.parse(readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'MotionConfig.json'), 'utf8'))
+
+export const SCHEMA = Object.freeze({ catalogue: 'zenray-motion-catalogue', motion: 'zenray-motion', ids: 'zenray-motion-ids', verify: 'zenray-motion-verify' })
+const VERSION_RE = /^V_(\d{3})$/
+const CDN_RE = /^https:\/\/cdn\.jsdelivr\.net\/gh\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+@[0-9a-f]{7,40}\/.+\.(jpg|jpeg|png|webp)$/
+
+export const folderOf = (cfg = MOTION_CONFIG) => cfg.cloud.folder
+export const cloudPath = (rel, cfg = MOTION_CONFIG) => `${cfg.cloud.folder}/${rel}`
+
+/** Neutral public id per local motion id, stable forever (the map itself is private). */
+export function assignPublicIds(state, localIds, cfg = MOTION_CONFIG) {
+  const next = { schemaVersion: 1, kind: SCHEMA.ids, next: Number(state?.next) || 1, ids: { ...(state?.ids || {}) } }
+  for (const id of localIds) {
+    if (next.ids[id]) continue
+    next.ids[id] = `${cfg.publicId.prefix}${String(next.next).padStart(cfg.publicId.digits, '0')}`
+    next.next += 1
+  }
+  return next
+}
+
+export const versionSlug = (publicId, version) => `${publicId}-v${VERSION_RE.exec(version)[1]}`
+
+/** The paths of one published version, all neutral. */
+export function versionPaths(publicId, version, aspect = '16x9', cfg = MOTION_CONFIG) {
+  const slug = versionSlug(publicId, version)
+  const dir = cloudPath(`${publicId}/versions`, cfg)
+  return {
+    slug,
+    publicDir: `${publicId}/${slug.slice(publicId.length + 1)}-${aspect}`,
+    streamDir: `${dir}/.streams/${slug}-${aspect}`,
+    media: `${dir}/${slug}-${aspect}.media.json`,
+    verify: `${dir}/${slug}.verify.json`,
+    zmotion: cloudPath(`${publicId}/${publicId}.zmotion.json`, cfg),
+  }
+}
+
+/** A refusal reason, or null when the motion may be published (rights doctrine: content must be cleared). */
+export function rightsBlocker(motion, cfg = MOTION_CONFIG) {
+  if (!cfg.requireRightsCleared) return null
+  if (motion?.rights?.cleared === true) return null
+  return 'contenu non validé : poser "rights": {"cleared": true} dans motion.json après avoir vérifié qu\'aucun texte, logo ou image de la référence ne reste dans le rendu'
+}
+
+const round = (n, d = 4) => (Number.isFinite(n) ? Math.round(n * 10 ** d) / 10 ** d : null)
+
+/** Fidelity reduced to numbers (never an image or a word of the reference). */
+export function fidelityNumbers(fidelity, cfg = MOTION_CONFIG) {
+  if (!fidelity || typeof fidelity !== 'object') return null
+  const dims = Object.fromEntries(Object.entries(fidelity.dimensions || {}).filter(([, v]) => Number.isFinite(v)).map(([k, v]) => [k, round(v)]))
+  const overall = round(fidelity.score)
+  return { overall, ...dims, weakest: typeof fidelity.weakest === 'string' ? fidelity.weakest : null, target: cfg.fidelityTarget,
+    verdict: overall === null ? 'unverified' : overall >= cfg.fidelityTarget ? 'at-target' : 'below-target' }
+}
+
+/** The manifest VideoPlayer2 reads (type hls, master, mpd, poster), plus a motion block. */
+export function buildVersionManifest({ publicId, version, aspect = '16x9', masterPath, mpdPath, posterUrl, publicRepo, commitPublic, duration, width, height, fps, sha256, bytes, segments, audio, publishedAt }) {
+  return {
+    type: 'hls', mime: 'video/mp4', name: `${versionSlug(publicId, version)}-${aspect}.mp4`,
+    master: masterPath, mpd: mpdPath, poster: posterUrl, publicRepo, commitPublic,
+    duration: round(duration, 3), width, height, hlsDashVerified: true, streamingProtocols: ['hls', 'dash'],
+    cmafSegmentCount: segments, cmafBytes: bytes, audio: audio || [],
+    motion: { id: publicId, version, aspect, fps, sha256, publishedAt },
+  }
+}
+
+/** Merge one published version into the motion card (versions are append only, a published one never changes). */
+export function mergeZmotion(prev, { publicId, local, version, entry, exposed, now }) {
+  const base = prev && prev.kind === SCHEMA.motion ? prev : { schemaVersion: 1, kind: SCHEMA.motion, id: publicId, createdAt: now, versions: [] }
+  if (base.versions.some((v) => v.version === version && v.state === 'published')) throw new Error(`${publicId} ${version} is already published (versions are immutable)`)
+  const versions = [...base.versions.filter((v) => v.version !== version), entry].sort((a, b) => a.version.localeCompare(b.version))
+  return {
+    // localId stays in this PRIVATE card: the page needs it to ask the Mac for an iteration; it never reaches a public path.
+    ...base, title: local.title || publicId, localId: local.id || base.localId || null, updatedAt: now, recipe: local.recipe || null, tags: (local.tags || []).filter((t) => typeof t === 'string').slice(0, 12),
+    reference: local.source ? { durationSec: round((local.source.end ?? 0) - (local.source.start ?? 0), 3), shots: (local.source.shots || []).length } : null,
+    parameters: exposed || base.parameters || {},
+    versions,
+  }
+}
+
+/** One catalogue row per motion, rebuilt from the motion cards (the catalogue is an index, never a second truth). */
+export function catalogueRow(publicId, zmotion, cfg = MOTION_CONFIG) {
+  const published = zmotion.versions.filter((v) => v.state === 'published')
+  const latest = published.at(-1)
+  const best = published.reduce((acc, v) => (v.fidelity?.overall ?? -1) > (acc?.fidelity?.overall ?? -1) ? v : acc, null)
+  const r = latest?.renders?.[0]
+  return {
+    id: publicId, title: zmotion.title, zmotion: cloudPath(`${publicId}/${publicId}.zmotion.json`, cfg),
+    tags: zmotion.tags || [], recipe: zmotion.recipe || null, aspects: [...new Set(published.flatMap((v) => (v.renders || []).map((x) => x.aspect)))],
+    status: latest?.fidelity?.verdict === 'at-target' ? 'validated' : 'iterating', versionCount: published.length,
+    latest: latest ? { version: latest.version, media: r?.media || null, poster: r?.poster || null, durationSec: r?.durationSec ?? null,
+      fps: r?.fps ?? null, width: r?.width ?? null, height: r?.height ?? null, publishedAt: latest.publishedAt, fidelity: latest.fidelity || null } : null,
+    best: best ? { version: best.version, overall: best.fidelity?.overall ?? null } : null,
+    updatedAt: zmotion.updatedAt,
+  }
+}
+
+export function buildCatalogue(prev, rows, now) {
+  const byId = new Map((prev?.motions || []).map((m) => [m.id, m]))
+  for (const row of rows) byId.set(row.id, row)
+  const motions = [...byId.values()].sort((a, b) => a.id.localeCompare(b.id))
+  return { schemaVersion: 1, kind: SCHEMA.catalogue, updatedAt: now, motionCount: motions.length, motions }
+}
+
+/**
+ * The invariants of R06 section 9.2. exists(path) says whether a cloud path is in the same tree. Returns the list of
+ * problems (empty when green). Used after every publication and by CheckCatalogue.mjs.
+ */
+export function checkCatalogue(catalogue, exists, cfg = MOTION_CONFIG) {
+  const problems = []
+  const idRe = new RegExp(cfg.publicId.pattern)
+  if (!catalogue || catalogue.kind !== SCHEMA.catalogue) return ['catalogue absent ou de mauvais type']
+  const size = Buffer.byteLength(JSON.stringify(catalogue))
+  if (size > cfg.catalogueMaxBytes) problems.push(`catalogue de ${size} octets, au delà de ${cfg.catalogueMaxBytes}`)
+  if (catalogue.motionCount !== (catalogue.motions || []).length) problems.push('motionCount différent du nombre de motions')
+  for (const m of catalogue.motions || []) {
+    if (!idRe.test(m.id || '')) problems.push(`identifiant non neutre : ${m.id}`)
+    if (!exists(m.zmotion)) problems.push(`${m.id} : fiche absente (${m.zmotion})`)
+    const l = m.latest
+    if (!l) continue
+    if (!VERSION_RE.test(l.version || '')) problems.push(`${m.id} : version invalide ${l.version}`)
+    if (!l.media || !exists(l.media)) problems.push(`${m.id} : manifeste absent (${l.media})`)
+    if (!CDN_RE.test(l.poster || '')) problems.push(`${m.id} : affiche hors jsDelivr épinglé (${l.poster})`)
+    for (const k of ['durationSec', 'width', 'height', 'fps']) if (l[k] !== null && !Number.isFinite(l[k])) problems.push(`${m.id} : ${k} n'est pas un nombre`)
+    for (const [k, v] of Object.entries(l.fidelity || {})) if (!['weakest', 'verdict', 'report'].includes(k) && v !== null && !(Number.isFinite(v) && v >= 0 && v <= 1)) problems.push(`${m.id} : fidélité ${k} hors de 0..1`)
+  }
+  return problems
+}
+
+/** A public path or commit message never carries a human name: only neutral ids. */
+export function isNeutralPublicPath(rel, cfg = MOTION_CONFIG) {
+  return new RegExp(`^${cfg.publicId.prefix}[0-9]{${cfg.publicId.digits}}/v[0-9]{3}(-[0-9]+x[0-9]+)?/[A-Za-z0-9_.-]+$`).test(rel)
+}

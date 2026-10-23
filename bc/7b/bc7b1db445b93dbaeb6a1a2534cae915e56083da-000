@@ -1,0 +1,96 @@
+#!/usr/bin/env node
+// RepairAudioNames.mjs (12 October 2026): gives the audio track of every already-published film a real name.
+// FR : le menu Audio affichait "audio_1" car les playlists HLS des anciens films n'ont ni NAME ni LANGUAGE parlants.
+// The language comes from the SOURCE probe saved in Inventory.json (no re-upload, no download of any video byte).
+//   node scripts/RepairAudioNames.mjs --manifests <clone zenray-data with pages/> --inventory <Inventory.json> --plans <a.json,b.json> [--dry]
+import fs from 'node:fs'
+import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { collectAudioTracks } from './lib/cmaf-packaging.mjs'
+import { cleanMediaName } from './lib/clean-media-name.mjs'
+
+const REPAIR = { genericName: /^audio[_-]?\d+$/i, mediaLine: /^#EXT-X-MEDIA:.*TYPE=AUDIO/, branch: 'main', pushRetries: 4 }
+
+const argv = process.argv.slice(2)
+const value = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : '' }
+const dry = argv.includes('--dry')
+const root = path.resolve(value('--manifests'))
+if (!value('--manifests') || !fs.existsSync(path.join(root, 'pages'))) { console.error('--manifests must point to a directory containing pages/'); process.exit(2) }
+
+// name -> source path, from the upload plans, then by basename
+const inventory = new Map(JSON.parse(fs.readFileSync(value('--inventory'), 'utf8')).map((x) => [x.source, x]))
+const byName = new Map()
+for (const plan of String(value('--plans')).split(',').filter(Boolean)) {
+  for (const entry of JSON.parse(fs.readFileSync(plan, 'utf8'))) byName.set(entry.name || path.basename(entry.source || entry.src), entry.src || entry.source)
+}
+for (const source of inventory.keys()) if (!byName.has(path.basename(source))) byName.set(path.basename(source), source)
+// after the clean rename the manifests carry clean names: index the sources by their clean name too (ambiguous ones are dropped)
+const byClean = new Map()
+for (const [name, source] of byName) {
+  const clean = cleanMediaName(name)
+  byClean.set(clean, byClean.has(clean) && byClean.get(clean) !== source ? null : source)
+}
+
+const manifests = []
+const walk = (dir) => {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) { if (entry.name !== '.git' && entry.name !== '.streams') walk(full) } else if (entry.name.endsWith('.media.json')) manifests.push(full)
+  }
+}
+walk(path.join(root, 'pages'))
+
+const changed = []
+const skipped = []
+for (const file of manifests) {
+  const manifest = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (!manifest.master) continue
+  const masterPath = path.join(root, manifest.master)
+  if (!fs.existsSync(masterPath)) { skipped.push({ file: path.basename(file), reason: 'master_missing' }); continue }
+  const text = fs.readFileSync(masterPath, 'utf8')
+  const lines = text.split('\n')
+  const audioAt = lines.map((l, i) => (REPAIR.mediaLine.test(l) ? i : -1)).filter((i) => i >= 0)
+  if (!audioAt.length) continue
+  const name = path.basename(file).replace(/\.media\.json$/, '')
+  const source = byName.get(name) || byClean.get(name) || byClean.get(cleanMediaName(name))
+  const probe = source && inventory.get(source)?.probe?.streams
+  if (!probe) { skipped.push({ file: name, reason: 'no_source_probe' }); continue }
+  const tracks = collectAudioTracks(probe)
+  // repair when a name is generic, a language is missing, or the name is not the language label the packager now writes
+  const wrong = audioAt.some((i, n) => {
+    const name = /NAME="([^"]*)"/.exec(lines[i])?.[1] || ''
+    return REPAIR.genericName.test(name) || !/LANGUAGE="/.test(lines[i]) || (tracks[n] && name !== tracks[n].label.replace(/"/g, "'"))
+  })
+  if (!wrong) continue
+  audioAt.forEach((lineIndex, n) => {
+    const track = tracks[n]
+    if (!track) return
+    let line = lines[lineIndex].replace(/NAME="[^"]*"/, `NAME="${track.label.replace(/"/g, "'")}"`)
+    line = /LANGUAGE="/.test(line) ? line.replace(/LANGUAGE="[^"]*"/, `LANGUAGE="${track.lang}"`) : line.replace(/(NAME="[^"]*")/, `$1,LANGUAGE="${track.lang}"`)
+    lines[lineIndex] = line
+  })
+  manifest.audio = audioAt.map((_, n) => tracks[n]).filter(Boolean).map((t) => ({ lang: t.lang, label: t.label, default: t.default, codec: t.codec, channels: t.channels }))
+  if (manifest.probe && typeof manifest.probe === 'object') manifest.probe = { ...manifest.probe, audio: manifest.audio }
+  changed.push({ file, masterPath, text: lines.join('\n'), manifest, label: manifest.audio.map((t) => t.label).join(', ') })
+}
+console.log(`audio names to repair: ${changed.length}, skipped: ${skipped.length}`)
+if (dry) { console.log(JSON.stringify({ dry: true, changed: changed.length, skipped, sample: changed.slice(0, 3).map((c) => [path.basename(c.file), c.label]) }, null, 2)); process.exit(0) }
+
+const written = []
+for (const item of changed) {
+  fs.writeFileSync(item.masterPath, item.text)
+  fs.writeFileSync(item.file, JSON.stringify(item.manifest, null, 2) + '\n')
+  written.push(path.relative(root, item.masterPath), path.relative(root, item.file))
+}
+if (written.length) {
+  const git = (...a) => spawnSync('git', ['-C', root, ...a], { encoding: 'utf8' })
+  for (let i = 0; i < written.length; i += 200) git('add', '--', ...written.slice(i, i + 200))
+  const c = git('-c', 'user.email=bot@zenray', '-c', 'user.name=zenray-bot', 'commit', '-q', '-m', `audio names: ${changed.length} films get their language as track name (12 October 2026)`)
+  if (c.status !== 0) { console.error(c.stderr || c.stdout); process.exit(1) }
+  for (let attempt = 0; attempt < REPAIR.pushRetries; attempt += 1) {
+    if (git('push', 'origin', `HEAD:${REPAIR.branch}`).status === 0) break
+    if (attempt === REPAIR.pushRetries - 1) { console.error('push failed'); process.exit(1) }
+    git('pull', '--rebase', 'origin', REPAIR.branch)
+  }
+}
+console.log(JSON.stringify({ ok: true, repaired: changed.length, skipped }, null, 2))

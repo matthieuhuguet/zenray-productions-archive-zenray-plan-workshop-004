@@ -1,0 +1,100 @@
+// mediaViewerRoute.js — contrat unique manifest -> viewer.
+//
+// Cette couche reste volontairement pure : elle ne charge aucun moteur vidéo et ne dépend pas du DOM.
+// MediaViewer peut donc choisir exactement UN lecteur avant de monter React, ce qui évite les gardes
+// légèrement différentes qui ont déjà monté deux lecteurs pour un même manifeste (YouTube, 2026-07-03).
+
+export const VIDEO_ENGINE = Object.freeze({
+  unified: 'unified',       // VideoPlayer2 : video-raw, DASH, HLS, YouTube
+  mse: 'mse',               // StreamVideoMSE : pistes fMP4 séparées
+  native: 'native',         // StreamVideo : MP4/WebM/Ogg via /api/stream
+  legacyWasm: 'legacy-wasm', // VideoPlayer : dernier recours remux/transcode local
+})
+
+export const MEDIA_VIEWER = Object.freeze({
+  empty: 'empty',
+  transcoding: 'transcoding',
+  video: 'video',
+  audio: 'audio',
+  image: 'image',
+  pdf: 'pdf',
+  playlist: 'playlist',
+  gmaps: 'gmaps',
+  download: 'download',
+  invalid: 'invalid',
+})
+
+// Formats que le chemin /api/stream peut donner directement à un élément HTMLMediaElement.
+export const isPlayableInlineMime = (mime) => /^(video\/(mp4|webm|ogg)|audio\/(mpeg|mp3|wav|x-wav|ogg|mp4|x-m4a|aac|flac)|image\/)/.test(String(mime || ''))
+
+export function isUnifiedVideoManifest(manifest) {
+  if (!manifest || typeof manifest !== 'object') return false
+  switch (manifest.type) {
+    case 'video-raw': return Array.isArray(manifest.parts) && manifest.parts.length > 0
+    case 'dash': return typeof manifest.mpd === 'string' && manifest.mpd.length > 0
+    case 'hls': return typeof manifest.master === 'string' && manifest.master.length > 0
+    case 'youtube': return typeof manifest.videoId === 'string' && manifest.videoId.length > 0
+    default: return false
+  }
+}
+
+const mediaKindFromMime = (mime) => {
+  const value = String(mime || '')
+  if (value.startsWith('video/')) return 'video'
+  if (value.startsWith('audio/')) return 'audio'
+  if (value.startsWith('image/')) return 'image'
+  if (value === 'application/pdf') return 'pdf'
+  return 'file'
+}
+
+const result = (viewer, base, extra = {}) => ({ ...base, viewer, ...extra })
+
+/**
+ * Normalise un manifeste vers une seule destination de rendu.
+ *
+ * Le résultat est stable et exhaustif : MediaViewer ne doit plus recalculer de son côté des variantes de
+ * `streamable`, `inline` ou `isVideo`. Les manifestes incomplets des moteurs externes deviennent explicitement
+ * invalides au lieu de tomber accidentellement dans le transcodeur WebAssembly.
+ */
+export function resolveMediaViewerRoute(manifest, { phase = 'ready', forceDownload = false } = {}) {
+  const m = manifest && typeof manifest === 'object' ? manifest : null
+  const type = String(m?.type || '')
+  const mime = String(m?.mime || '')
+  const mediaKind = mediaKindFromMime(mime)
+  const inline = isPlayableInlineMime(mime)
+  const transcoding = !!m?.transcoding && type !== 'mse-av' && type !== 'hls'
+  const base = { type, mime, mediaKind, inline, transcoding, immersive: false, engine: null }
+
+  if (!m || phase !== 'ready') return result(MEDIA_VIEWER.empty, base)
+  if (transcoding) return result(MEDIA_VIEWER.transcoding, base)
+
+  if (type === 'gmaps') {
+    if (typeof m.embedUrl !== 'string' || !m.embedUrl) return result(MEDIA_VIEWER.invalid, base, { reason: 'Lien Google Maps incomplet' })
+    return result(MEDIA_VIEWER.gmaps, base, { immersive: true })
+  }
+  if (type === 'playlist') return result(MEDIA_VIEWER.playlist, base)
+
+  if (isUnifiedVideoManifest(m)) {
+    return result(MEDIA_VIEWER.video, { ...base, mediaKind: 'video' }, { engine: VIDEO_ENGINE.unified, immersive: true })
+  }
+  // Ces types désignent un moteur précis : s'ils sont incomplets, ne jamais les envoyer au fallback wasm.
+  if (['video-raw', 'dash', 'hls', 'youtube'].includes(type)) {
+    return result(MEDIA_VIEWER.invalid, { ...base, mediaKind: type === 'youtube' || type === 'video-raw' ? 'video' : mediaKind }, { reason: `Manifeste ${type} incomplet` })
+  }
+
+  if (type === 'mse-av') {
+    if (!m.video || typeof m.video.manifest !== 'string' || !Array.isArray(m.audio)) {
+      return result(MEDIA_VIEWER.invalid, { ...base, mediaKind: 'video' }, { reason: 'Manifeste mse-av incomplet' })
+    }
+    return result(MEDIA_VIEWER.video, { ...base, mediaKind: 'video' }, { engine: VIDEO_ENGINE.mse })
+  }
+
+  if (mediaKind === 'video') {
+    if (forceDownload) return result(MEDIA_VIEWER.download, base)
+    return result(MEDIA_VIEWER.video, base, { engine: inline ? VIDEO_ENGINE.native : VIDEO_ENGINE.legacyWasm })
+  }
+  if (mediaKind === 'audio' && inline) return result(MEDIA_VIEWER.audio, base)
+  if (mediaKind === 'image' && inline) return result(MEDIA_VIEWER.image, base)
+  if (mediaKind === 'pdf') return result(MEDIA_VIEWER.pdf, base)
+  return result(MEDIA_VIEWER.download, base)
+}

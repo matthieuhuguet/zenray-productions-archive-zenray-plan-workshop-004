@@ -1,0 +1,214 @@
+#!/usr/bin/env node
+// ZenRayMedia — ÉCHAFAUDAGE d'un nouveau thème.
+//
+//   node scripts/zrm-new-theme.mjs T-01-1-3--quotidien-de-reference-sobre \
+//     --from T-01-1-2--une-de-rupture \
+//     --report docs/zenraymedia/references-jpeg/T-01-1-3--quotidien-de-reference-sobre/font-report.json
+//
+// POURQUOI
+// --------
+// Le catalogue vise 1024 thèmes. Repartir d'un dossier vide à chaque fois, c'est re-décider
+// 1024 fois la liste des composants, leurs noms, leur ordre et leur regroupement — c'est-à-dire
+// 1024 occasions de diverger. Or ce qui distingue deux thèmes n'est PAS leur inventaire de
+// composants : un quotidien a un bandeau-titre, une navigation, des cartes, un filet, un rail,
+// une infolettre, qu'il s'appelle Libération ou Le Figaro. Ce qui les distingue, ce sont les
+// MESURES : les polices, l'échelle, la couleur, la densité, les filets.
+//
+// Ce script pose donc la structure commune et laisse le travail réel — la mesure — à faire.
+// Il inscrit dans chaque fichier hérité une mention explicite « hérité, à remesurer », pour que
+// l'héritage ne se fasse jamais passer pour une mesure.
+//
+// IL NE REND PAS LE THÈME JUSTE. Il rend le thème EXISTANT et compilable, à partir de quoi la
+// mesure composant par composant a un point d'appui au lieu d'une page blanche.
+
+import { readFile, writeFile, mkdir, readdir, cp } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+import { FONTS_BY_FAMILY } from '../src/zenraymedia/fonts.js'
+
+const ROOT = path.resolve(import.meta.dirname, '..')
+const THEMES = path.join(ROOT, 'src', 'zenraymedia', 'themes')
+
+// ---------------------------------------------------------------------------------------------
+// Lecture du rapport de détection.
+//
+// On ne retient une police que si le verdict la dit IDENTIFIÉE. Une détection « caractérisée
+// seulement » indique une classe (serif de labeur, linéale grotesque) mais pas une famille :
+// la reprendre telle quelle inscrirait dans le thème une précision que la mesure n'a pas.
+// Dans ce cas on garde la proposition ET on la marque, pour qu'elle soit relue.
+// ---------------------------------------------------------------------------------------------
+function fontsFromReport(report) {
+  const picks = []
+  for (const probe of report.probes || []) {
+    // Une police CONNUE prime sur toute mesure : elle vient de l'atelier de calibrage, donc de
+    // l'oeil de Matthieu. Mesure d'exactitude relevée sur le lot presse : le détecteur place la
+    // bonne réponse en tête dans 4 cas sur 8, et la manque complètement dans 2 (rangs 34 et 70).
+    // Se passer du `known` quand il existe reviendrait à préférer une mesure à 50 % de réussite
+    // à une réponse sûre.
+    if (probe.calibration && probe.calibration.installed) {
+      picks.push({
+        role: probe.role,
+        family: probe.calibration.family,
+        weight: probe.calibration.weight || '400',
+        confident: true,
+        note: `CONNUE — ${probe.calibration.source} (la mesure la classait n°${probe.calibration.rank || probe.calibration.rankAnyWeight})`,
+      })
+      continue
+    }
+    const v = probe.verdict
+    if (!v || v.invalid) {
+      picks.push({ role: probe.role, family: null, note: `sonde invalide — police non déterminée` })
+      continue
+    }
+    picks.push({
+      role: probe.role,
+      family: v.family,
+      weight: v.weight,
+      confident: !!v.decisive,
+      note: v.decisive
+        ? `identifiée (${(v.margin * 100).toFixed(1)} pts devant ${v.rival})`
+        : `NON DÉCISIF — classe ${v.dominantArchetype}, à confirmer à l'oeil sur font-report.html`,
+    })
+  }
+  return picks
+}
+
+// Les trois rôles typographiques du moteur. Un thème peut en utiliser moins, jamais plus :
+// au-delà de trois familles sur une page, l'oeil ne lit plus un système mais un accident.
+const ROLES = [
+  { key: 'display', match: /titre|masthead|une|headline/i, fallback: 'Source Serif 4' },
+  { key: 'body', match: /article|texte|corps|chapeau/i, fallback: 'Source Serif 4' },
+  { key: 'meta', match: /menu|nav|signature|meta|rubrique/i, fallback: 'Public Sans' },
+]
+
+function assignRoles(picks) {
+  const out = {}
+  for (const role of ROLES) {
+    const hit = picks.find((p) => p.family && role.match.test(p.role))
+    out[role.key] = hit ? { family: hit.family, weight: hit.weight, from: hit.role, note: hit.note } : { family: role.fallback, weight: '400', from: null, note: 'défaut de sous-famille — aucune sonde correspondante' }
+  }
+  return out
+}
+
+function stackFor(family) {
+  // Pile de repli cohérente avec la classe de la police : si le WOFF2 manque au chargement, la
+  // page doit dégrader vers une police de la même nature, pas vers Times par défaut.
+  const entry = FONTS_BY_FAMILY[family]
+  const arch = entry?.archetype || 'grotesque'
+  const tail = {
+    labeur: `Georgia, 'Times New Roman', serif`,
+    didone: `'Didot', Georgia, serif`,
+    condense: `'Arial Narrow', Impact, sans-serif`,
+    grotesque: `system-ui, -apple-system, sans-serif`,
+    humaniste: `system-ui, -apple-system, sans-serif`,
+    mono: `ui-monospace, 'SF Mono', monospace`,
+    technique: `system-ui, sans-serif`,
+    display: `Impact, sans-serif`,
+    script: `cursive`,
+  }[arch]
+  return `'${family}', ${tail}`
+}
+
+async function main() {
+  const argv = process.argv.slice(2)
+  const id = argv.find((a) => !a.startsWith('--'))
+  const arg = (n, d = null) => {
+    const i = argv.indexOf(`--${n}`)
+    return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : d
+  }
+  if (!id) throw new Error('usage : node scripts/zrm-new-theme.mjs <T-FF-S-V--slug> [--from <thème>] [--report <font-report.json>]')
+
+  const from = arg('from', 'T-01-1-2--une-de-rupture')
+  const dest = path.join(THEMES, id)
+  if (existsSync(dest) && !argv.includes('--force')) {
+    throw new Error(`${id} existe déjà. Ajouter --force pour écraser (les parts déjà mesurées seront perdues).`)
+  }
+  const src = path.join(THEMES, from)
+  if (!existsSync(src)) throw new Error(`thème modèle introuvable : ${from}`)
+
+  const reportPath = arg('report')
+  const report = reportPath ? JSON.parse(await readFile(reportPath, 'utf8')) : null
+  const picks = report ? fontsFromReport(report) : []
+  const roles = assignRoles(picks)
+
+  await mkdir(path.join(dest, 'parts'), { recursive: true })
+
+  // --- les parties : copiées, mais marquées comme héritées -------------------------------------
+  const parts = (await readdir(path.join(src, 'parts'))).filter((f) => f.endsWith('.html')).sort()
+  for (const file of parts) {
+    const raw = await readFile(path.join(src, 'parts', file), 'utf8')
+    const banner = `<!-- HÉRITÉ de ${from}. Structure seulement : les mesures (échelle, filets, `
+      + `couleurs, graisses) sont celles de l'autre média et sont FAUSSES ici tant qu'elles n'ont `
+      + `pas été relevées sur les captures de ${id}. -->\n`
+    await writeFile(path.join(dest, 'parts', file), banner + raw)
+  }
+
+  // --- theme.json ------------------------------------------------------------------------------
+  const srcTheme = JSON.parse(await readFile(path.join(src, 'theme.json'), 'utf8'))
+  const families = [...new Set(Object.values(roles).map((r) => r.family))]
+  const theme = {
+    description: `À ÉCRIRE — une phrase qui dit ce que ce thème fait de différent des autres.`,
+    formats: srcTheme.formats,
+    beatCount: srcTheme.beatCount,
+    measure: srcTheme.measure,
+    fonts: families,
+    calibration: {
+      // Le média de calibrage est repris du champ `calibrationMedia` du dossier de captures
+      // (LIBE, FIGARO, FT, SUN, LM). Il vit ICI, dans un champ privé, et JAMAIS dans le nom
+      // public du thème : `validateTheme` refuse une marque dans un champ public, et le
+      // catalogue promet un archétype de genre (« Une nationale du matin »), pas un journal.
+      ref: report?.calibrationMedia || id.split('--')[0],
+      scaffoldedFrom: from,
+      fontDetection: picks.length ? picks : 'aucun rapport de détection fourni',
+      notes: `Échafaudé automatiquement. Les polices viennent de zrm-detect-font ; celles marquées `
+        + `NON DÉCISIF doivent être confirmées sur font-report.html avant d'être considérées comme relevées.`,
+    },
+  }
+  await writeFile(path.join(dest, 'theme.json'), JSON.stringify(theme, null, 2) + '\n')
+
+  // --- tokens.css ------------------------------------------------------------------------------
+  // On reprend la palette du modèle en la marquant : une couleur héritée qui n'est pas relevée
+  // est le défaut le plus visible d'un thème, et le plus facile à oublier.
+  const srcTokens = await readFile(path.join(src, 'tokens.css'), 'utf8')
+  const palette = srcTokens
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((l) => /^\s*--zrm-/.test(l))
+    .join('\n')
+  const tokens = `/* ${id} — tokens.
+   ÉCHAFAUDÉ depuis ${from} : la palette ci-dessous est celle de l'AUTRE média. Chaque valeur
+   doit être relevée sur les captures de ce thème avant d'être considérée comme juste.
+
+   Polices, issues de la mesure (scripts/zrm-detect-font.mjs) :
+${Object.entries(roles).map(([k, r]) => `     --f-${k.padEnd(8)} ${r.family} ${r.weight}  — ${r.note}`).join('\n')}
+*/
+:root{
+${palette}
+
+  --u: clamp(13px, 1.85vw, 30px);
+  --measure: ${srcTheme.measure}ch;
+
+  --f-display: ${stackFor(roles.display.family)};
+  --f-body:    ${stackFor(roles.body.family)};
+  --f-meta:    ${stackFor(roles.meta.family)};
+}
+*{ box-sizing:border-box; }
+html,body{ margin:0; padding:0; }
+body{
+  background:var(--zrm-paper); color:var(--zrm-ink);
+  font-family:var(--f-body); font-size:var(--u); line-height:1.52;
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+}
+`
+  await writeFile(path.join(dest, 'tokens.css'), tokens)
+
+  console.log(`Échafaudé : ${path.relative(ROOT, dest)}`)
+  console.log(`  ${parts.length} parties héritées de ${from} (marquées « à remesurer »)`)
+  for (const [k, r] of Object.entries(roles)) {
+    console.log(`  --f-${k.padEnd(8)} ${r.family} ${r.weight}${r.confident === false ? '' : ''}  ${r.note}`)
+  }
+  console.log(`\nÉtape suivante : node scripts/zrm-build-theme.mjs ${id}`)
+  console.log(`Puis remesurer chaque partie sur les captures, une par une.`)
+}
+
+main().catch((e) => { console.error(e.message || e); process.exit(1) })

@@ -1,0 +1,268 @@
+import React, { useEffect, useRef, useState } from 'react'
+import Icon from '../components/Icon.jsx'
+import PlanCreatePicker from './PlanCreatePicker.jsx'
+import { linkCreateAttachment } from './linkCreateAttachment.js'
+import { createDropPaths } from './planAttachments.js'
+import SpinnerApple from '../components/SpinnerApple.jsx'
+import { captureAttachment } from '../capture/universalCapture.js'
+import { issueShareToken, revokeShareToken } from '../lib/shareLinks.js'
+import { attachmentLimitLabel, validateAttachmentBatch } from '../config/attachmentPolicy.js'
+import { PLAN_ATTACHMENTS, attachmentUrl } from './planAttachments.js'
+import { PLAN_UI } from './planUiConfig.js'
+import { useClipboardTarget } from '../clipboard/ClipboardProvider.jsx'
+import { fileToWebp } from '../api.js'
+
+// Upload, publication and the confirmed Plan save share one visible operation. (19 October 2026, 00:49 Paris)
+const STAGES = { storage: 'Preparing storage', encrypting: 'Encrypting file', uploading: 'Uploading', assembling: 'Finalizing upload', publishing: 'Publishing in Create', saving: 'Saving file in Create', linking: 'Creating download link', plan: 'Saving attachment in Plan', removing: 'Removing link', selecting: 'Creating shared link', done: 'Attached' }
+
+const isImageFile = (file) => {
+  if (!file) return false
+  if (file.type && file.type.startsWith('image/')) return true
+  const name = file.name || ''
+  return /\.(png|jpe?g|webp|gif|avif|svg)$/i.test(name)
+}
+
+// Fast 1s upload for images via /api/img (same path as Gallery Design, avoids multi-chunk shard encryption roundtrips)
+async function uploadImageFast(file, onProgress, onStage) {
+  onStage?.('uploading')
+  onProgress?.(0.2)
+  let dataUrl = null
+  try {
+    if (file.type !== 'image/gif' && !file.name?.toLowerCase().endsWith('.gif')) {
+      dataUrl = await fileToWebp(file, 0.92, 1920)
+    }
+  } catch {}
+  if (!dataUrl) {
+    dataUrl = await new Promise((res) => {
+      const fr = new FileReader()
+      fr.onload = () => res(fr.result)
+      fr.onerror = () => res(null)
+      fr.readAsDataURL(file)
+    })
+  }
+  if (!dataUrl) throw new Error('Cannot read image data')
+  onProgress?.(0.5)
+  onStage?.('saving')
+  const res = await fetch('/api/img', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ dataUrl, dir: 'uploads' }),
+  }).then((r) => r.json())
+  if (!res || !res.path) throw new Error(res?.error || 'Image upload failed')
+  onProgress?.(0.9)
+  const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : ''
+  const fullUrl = res.url?.startsWith('http') ? res.url : `${origin}${res.url}`
+  return {
+    name: file.name,
+    path: res.path,
+    size: file.size,
+    mime: file.type || 'image/webp',
+    url: fullUrl,
+    mode: 'view',
+  }
+}
+
+function AttachmentProgress({ state, draftMode }) {
+  const [now, setNow] = useState(Date.now())
+  const active = state.stage !== 'done'
+  useEffect(() => {
+    if (!active) return
+    const timer = setInterval(() => setNow(Date.now()), PLAN_UI.attachments.clockMs)
+    return () => clearInterval(timer)
+  }, [active])
+  const percent = Math.min(active ? 99 : 100, Math.floor(state.ratio * 100))
+  return <div className="zrp-attachment-progress" role="status" aria-live="polite">
+    <div className="zrp-attachment-progress-label">
+      {active && <SpinnerApple taille={PLAN_UI.attachments.spinnerSize} titre="Attachment in progress" />}
+      <span>{state.stage === 'done' && draftMode ? 'Ready to add' : STAGES[state.stage]}{state.file ? ` · ${state.file}` : ''}</span>
+      <span className="zrp-attachment-number">{percent}%</span>
+    </div>
+    <progress max="100" value={percent} aria-label="Attachment progress" />
+    <small><span className="zrp-attachment-number">{state.index} / {state.total}</span> files · <span className="zrp-attachment-number">{Math.max(0, Math.floor((now - state.startedAt) / 1000))}</span> s{active ? ' elapsed' : draftMode ? ' · Add the task to sync Calendar' : ' · Calendar syncs automatically'}</small>
+  </div>
+}
+
+export default function PlanAttachments({ task, onPatch, onBusyChange, draftMode = false }) {
+  const input = useRef(null)
+  const imageInput = useRef(null)
+  const [progress, setProgress] = useState(null)
+  const [error, setError] = useState('')
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [dragging, setDragging] = useState(false)
+  const [copied, setCopied] = useState('')
+  const busy = useRef(false)
+  const attachments = task.attachments || []
+  const active = progress && progress.stage !== 'done'
+  useEffect(() => { onBusyChange?.(Boolean(active)) }, [Boolean(active), onBusyChange])
+
+  // Support ⌘V clipboard image pasting into Plan Attachments
+  useClipboardTarget('plan-attachments:' + (task.id || 'draft'), {
+    onPasteImage: (files) => {
+      const imgs = files.filter((f) => f && f.type && f.type.startsWith('image/'))
+      if (imgs.length) upload(imgs)
+      else if (files.length) upload(files)
+    },
+  }, true)
+  const upload = async (files) => {
+    if (busy.current || !files.length) return
+    setError('')
+    setProgress(null)
+    try { validateAttachmentBatch(files) }
+    catch (cause) { setError(cause.message); return }
+    busy.current = true
+    const next = [...attachments], startedAt = Date.now()
+    const operation = { active: true }
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
+    let completedBytes = 0
+    try {
+      for (let index = 0; index < files.length; index++) {
+        const file = files[index]
+        const show = (stage, ratio) => setProgress({ stage, file: file.name, ratio: (completedBytes + file.size * ratio) / totalBytes, startedAt, index: index + 1, total: files.length })
+        let item = null
+        if (isImageFile(file)) {
+          show('uploading', 0.2)
+          try {
+            item = await uploadImageFast(file, (ratio) => {
+              const overall = (completedBytes + file.size * ratio) / totalBytes
+              setProgress((state) => operation.active && state ? { ...state, ratio: overall } : state)
+            }, (stage) => setProgress((state) => operation.active && state ? { ...state, stage } : state))
+          } catch {
+            item = null
+          }
+        }
+        if (!item) {
+          show('storage', 0)
+          const result = await captureAttachment(file, { folder: `${PLAN_ATTACHMENTS.folder}/${String(task.id).replace(/[^a-zA-Z0-9_-]/g, '_')}`,
+            onProgress: (ratio) => {
+              const overall = (completedBytes + file.size * (ratio === 1 ? PLAN_UI.attachments.storedRatio : ratio)) / totalBytes
+              setProgress((state) => operation.active && state ? { ...state, ratio: overall } : state)
+            },
+            onStage: (stage) => setProgress((state) => operation.active && state ? { ...state, stage } : state) })
+          show('linking', PLAN_UI.attachments.storedRatio)
+          const issued = await issueShareToken('file', result.nodePath)
+          item = { name: file.name, path: result.nodePath, size: file.size, mime: file.type,
+            token: issued.token, url: attachmentUrl(issued.token, window.location.origin) }
+        }
+        next.push(item)
+        show('plan', PLAN_UI.attachments.linkedRatio)
+        const saved = await onPatch({ attachments: [...next] })
+        if (saved?.ok === false) throw new Error(saved.error || 'Plan save failed')
+        completedBytes += file.size
+      }
+      setProgress({ stage: 'done', ratio: 1, startedAt, index: files.length, total: files.length })
+    } catch (cause) { setError(`Attachment failed: ${cause.message}`); setProgress(null) }
+    finally { operation.active = false; busy.current = false }
+  }
+  const linkExisting = async (paths, mode = 'auto') => {
+    if (busy.current || !paths.length) return
+    const missing = paths.filter((path) => !attachments.some((item) => item.path === path))
+    if (!missing.length) { setError('This file is already attached.'); return }
+    busy.current = true
+    setError('')
+    const next = [...attachments], startedAt = Date.now()
+    try {
+      for (let index = 0; index < missing.length; index++) {
+        setProgress({ stage: 'selecting', file: missing[index].split('/').pop(), ratio: index / missing.length, startedAt, index: index + 1, total: missing.length })
+        const item = await linkCreateAttachment(missing[index], { mode })
+        next.push(item)
+        setProgress((state) => ({ ...state, stage: 'plan', ratio: PLAN_UI.attachments.linkedRatio }))
+        const saved = await onPatch({ attachments: [...next] })
+        if (saved?.ok === false) throw new Error(saved.error || 'Plan save failed')
+      }
+      setPickerOpen(false)
+      setProgress({ stage: 'done', ratio: 1, startedAt, index: missing.length, total: missing.length })
+    } catch (cause) { setError(`Create link failed: ${cause.message}`); setProgress(null) }
+    finally { busy.current = false }
+  }
+  const copyLink = async (item) => {
+    try { await navigator.clipboard.writeText(item.url); setCopied(item.url) }
+    catch (cause) { setError(`Copy failed: ${cause.message}`) }
+  }
+  const remove = async (item) => {
+    if (busy.current) return
+    busy.current = true
+    setError('')
+    setProgress({ stage: 'removing', ratio: 0, startedAt: Date.now(), index: 1, total: 1 })
+    try {
+      if (item.token) await revokeShareToken(item.token)
+      const saved = await onPatch({ attachments: attachments.filter((entry) => entry !== item) })
+      if (saved?.ok === false) throw new Error(saved.error || 'Plan save failed')
+    } catch (cause) { setError(`Removal failed: ${cause.message}`) }
+    finally { busy.current = false; setProgress(null) }
+  }
+  const isImageAttachment = (item) => {
+    if (!item) return false
+    if (item.mime && item.mime.startsWith('image/')) return true
+    const name = item.name || ''
+    return /\.(png|jpe?g|webp|gif|avif|svg)$/i.test(name)
+  }
+  const imageAttachments = attachments.filter(isImageAttachment)
+  const fileAttachments = attachments.filter((item) => !isImageAttachment(item))
+
+  return <section className="zrp-attachments" aria-label="Task attachments" aria-busy={Boolean(active)}
+    onPaste={(event) => {
+      const files = Array.from(event.clipboardData?.files || [])
+      const imgs = files.filter((f) => f && f.type && f.type.startsWith('image/'))
+      if (imgs.length) {
+        event.preventDefault()
+        event.stopPropagation()
+        upload(imgs)
+      }
+    }}>
+    <div className={`zrp-attachment-drop${dragging ? ' zrp-drop-active' : ''}`} aria-label="Drop files or Create items here"
+      onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); setDragging(true) }}
+      onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false) }}
+      onDrop={(event) => {
+        event.preventDefault(); event.stopPropagation(); setDragging(false)
+        const files = Array.from(event.dataTransfer.files || [])
+        const raw = event.dataTransfer.getData('application/zenray-page') || event.dataTransfer.getData('application/zenray-page+json') || event.dataTransfer.getData('text/plain')
+        if (files.length) upload(files)
+        else { const paths = createDropPaths(raw); if (paths.length) linkExisting(paths); else setError('Drop a file or an existing Create media item.') }
+      }}>
+      <strong>Attachments</strong>
+      <span>Drop files here, or choose from Create</span>
+      <input ref={input} type="file" multiple hidden aria-label="Choose attachments" onChange={(event) => { upload(Array.from(event.target.files)); event.target.value = '' }} />
+      <input ref={imageInput} type="file" multiple accept="image/*,image/gif" hidden aria-label="Choose image attachments" onChange={(event) => { upload(Array.from(event.target.files)); event.target.value = '' }} />
+      <div className="zrp-attachment-actions">
+        <button type="button" className="zrp-meta-chip" disabled={Boolean(active)} onClick={() => input.current.click()}>
+          <Icon name="paperclip" size={13} /> Add attachments
+        </button>
+        <button type="button" className="zrp-meta-chip" disabled={Boolean(active)} onClick={() => imageInput.current?.click()}>
+          <Icon name="photo" size={13} /> Image
+        </button>
+        <button type="button" className="zrp-meta-chip" disabled={Boolean(active)} aria-expanded={pickerOpen} onClick={() => setPickerOpen((open) => !open)}>
+          <Icon name="folder" size={13} /> From Create
+        </button>
+      </div>
+      <small>New uploads: up to <span className="zrp-attachment-number">{attachmentLimitLabel()}</span> per file. Existing Create media is linked without uploading again.</small>
+    </div>
+    {pickerOpen && <PlanCreatePicker disabled={Boolean(active)} onPick={(path, mode) => linkExisting([path], mode)} />}
+    {imageAttachments.length > 0 && (
+      <div className="zrp-attachment-images" role="list" aria-label="Attached images">
+        {imageAttachments.map((item) => (
+          <div key={item.url} className="zrp-attachment-image-card" role="listitem">
+            <div className="zrp-attachment-image-preview">
+              <img src={item.url} alt={item.name} loading="lazy" />
+              <button type="button" className="zrp-attachment-image-remove" disabled={Boolean(active)} aria-label={`Remove ${item.name}`} title="Remove image" onClick={() => remove(item)}>
+                <Icon name="xmark" size={10} />
+              </button>
+            </div>
+            <div className="zrp-attachment-image-info">
+              <a href={item.url} target="_blank" rel="noopener noreferrer" className="zrp-attachment-name" title={item.name}>{item.name}</a>
+              <button type="button" className="zrp-detail-icon" aria-label={`Copy link for ${item.name}`} title={copied === item.url ? 'Copied' : 'Copy Calendar link'} onClick={() => copyLink(item)}>
+                <Icon name="link" size={11} />
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    )}
+    {fileAttachments.map((item) => <div className="zrp-attachment" key={item.url}>
+      <a href={item.url} download={item.mode !== 'view'} target={item.mode === 'view' ? '_blank' : undefined} rel="noopener noreferrer">{item.name}<small>{item.mode === 'view' ? ' · Shared view' : ' · Download'}</small></a>
+      <button type="button" className="zrp-detail-icon" aria-label={`Copy link for ${item.name}`} title={copied === item.url ? 'Copied' : 'Copy Calendar link'} onClick={() => copyLink(item)}><Icon name="link" size={12} /></button>
+      <button type="button" className="zrp-detail-icon" disabled={Boolean(active)} aria-label={`Remove ${item.name}`} title="Remove attachment and revoke its download link" onClick={() => remove(item)}><Icon name="xmark" size={12} /></button>
+    </div>)}
+    {progress && <AttachmentProgress state={progress} draftMode={draftMode} />}
+    {error && <div role="alert">{error}</div>}
+  </section>
+}

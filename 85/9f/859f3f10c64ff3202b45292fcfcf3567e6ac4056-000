@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+# Récupère les findings d'audit (StructuredOutput) depuis les transcripts d'un run Workflow
+# coupé par la limite de spawn, et les écrit sur disque (JSON brut + Markdown lisible).
+# Usage: python3 scripts/salvage_audit.py <dir_transcripts_workflow>
+
+import json, glob, os, sys
+
+DIR = sys.argv[1]
+OUT_JSON = "docs/AUDIT-2026-06-06-findings.json"
+OUT_MD = "docs/AUDIT-2026-06-06.md"
+
+findings = []
+seen = set()
+
+def walk(obj):
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            f = cur.get("findings")
+            if isinstance(f, list) and f and isinstance(f[0], dict) and "title" in f[0]:
+                for fnd in f:
+                    if not isinstance(fnd, dict):
+                        continue
+                    key = (fnd.get("id") or "") + "|" + (fnd.get("title") or "")
+                    if key.strip("|") and key not in seen:
+                        seen.add(key)
+                        findings.append(fnd)
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+
+for fp in glob.glob(os.path.join(DIR, "**", "*.jsonl"), recursive=True):
+    try:
+        with open(fp, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if "findings" not in line and "proposedFix" not in line:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    # certaines lignes encapsulent du JSON en string (input d'un tool_use)
+                    continue
+                walk(obj)
+    except Exception:
+        pass
+
+os.makedirs("docs", exist_ok=True)
+with open(OUT_JSON, "w", encoding="utf-8") as fh:
+    json.dump(findings, fh, ensure_ascii=False, indent=2)
+
+# Markdown groupé par dimension puis tag
+DIMS = ["render-perf", "load-perf", "drive-jsdelivr", "code-health", "video-hls",
+        "missing-features", "robustness", "ux-daily"]
+TAGS = ["SAFE-AUTO", "PROPOSE-REVIEW", "CONSULT-UI", "CONSULT-PRODUCT"]
+SEV = {"high": 0, "medium": 1, "low": 2}
+
+by_dim = {}
+for f in findings:
+    by_dim.setdefault(f.get("dimension") or "autre", []).append(f)
+
+lines = ["# Audit ZenRayProgress — 2026-06-06 (findings récupérés)", ""]
+lines.append(f"**{len(findings)} findings** extraits des transcripts du workflow (run coupé par la limite de spawn avant Synthesize/Implement). Source brute : `{OUT_JSON}`.", )
+lines.append("")
+# Compteurs
+cnt_tag = {t: sum(1 for f in findings if f.get("tag") == t) for t in TAGS}
+cnt_sev = {s: sum(1 for f in findings if f.get("severity") == s) for s in ["high", "medium", "low"]}
+lines.append("## Compteurs")
+lines.append("")
+lines.append("- Par tag : " + " · ".join(f"{t} {cnt_tag.get(t,0)}" for t in TAGS))
+lines.append("- Par sévérité : " + " · ".join(f"{s} {cnt_sev.get(s,0)}" for s in ["high", "medium", "low"]))
+lines.append("")
+
+for dim in DIMS + [d for d in by_dim if d not in DIMS]:
+    fs = by_dim.get(dim)
+    if not fs:
+        continue
+    fs.sort(key=lambda x: (SEV.get(x.get("severity"), 3), TAGS.index(x["tag"]) if x.get("tag") in TAGS else 9))
+    lines.append(f"## {dim}  ({len(fs)})")
+    lines.append("")
+    for f in fs:
+        sev = (f.get("severity") or "?").upper()
+        tag = f.get("tag") or "?"
+        eff = f.get("effort") or "?"
+        conf = f.get("confidence")
+        loc = f.get("file") or ""
+        if f.get("location"):
+            loc = (loc + " " + f["location"]).strip()
+        lines.append(f"### [{sev}] {f.get('title','(sans titre)')}  ·  `{tag}` · effort {eff}" + (f" · conf {conf}" if conf is not None else ""))
+        if loc:
+            lines.append(f"`{loc}`")
+        if f.get("detail"):
+            lines.append("")
+            lines.append("**Problème :** " + f["detail"])
+        if f.get("proposedFix"):
+            lines.append("")
+            lines.append("**Correctif :** " + f["proposedFix"])
+        lines.append("")
+
+with open(OUT_MD, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines))
+
+print(f"findings: {len(findings)}")
+print("par tag:", {t: cnt_tag.get(t, 0) for t in TAGS})
+print("par dim:", {d: len(by_dim.get(d, [])) for d in DIMS})
+print(f"écrits: {OUT_JSON} + {OUT_MD}")

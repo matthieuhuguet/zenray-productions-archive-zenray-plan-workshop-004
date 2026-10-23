@@ -1,0 +1,831 @@
+#!/usr/bin/env node
+// ZenRayMedia — DÉTECTION AUTOMATIQUE DE POLICE depuis une capture d'écran.
+//
+// POURQUOI CE FICHIER EXISTE
+// --------------------------
+// Pendant trois thèmes, la police a été choisie « à l'oeil » puis déclarée dans theme.json.
+// Résultat mesuré : le gabarit LIBÉRATION annonçait une graisse condensée alors que la capture
+// montrait Anton. Une erreur de police n'est pas un détail de finition : elle change la largeur
+// de chaque mot, donc le nombre de lignes, donc la hauteur des blocs, donc la mise en page
+// entière. Se tromper de police, c'est se tromper de gabarit.
+//
+// Ce script remplace le jugement par une MESURE. Il ne devine pas : il rend le même texte dans
+// chacune des polices installées, superpose la silhouette obtenue à celle de la capture, et
+// classe les candidates par distance réelle.
+//
+// COMMENT ÇA MARCHE (le raisonnement, pas la recette)
+// ---------------------------------------------------
+// Deux mots composés dans la même police, à des tailles différentes, ont des silhouettes
+// SUPERPOSABLES une fois ramenées à la même hauteur. Deux mots composés dans des polices
+// différentes ne le sont pas, même à taille identique. Toute la méthode tient là-dedans.
+//
+//   1. On isole l'encre. Seuillage d'Otsu : le fond disparaît, il ne reste que la forme des
+//      lettres. On tolère le texte clair sur fond sombre (--invert), fréquent dans les bandeaux.
+//   2. On rend la candidate À LA MÊME HAUTEUR D'ENCRE que la capture. Ce point a coûté une
+//      première version fausse : rendre une police à 200 px puis la comparer à une capture de
+//      32 px compare deux régimes de rastérisation différents. À 32 px le moteur épaissit les
+//      fûts fins et bouche les contreformes ; une police fine y paraît grasse. En rendant la
+//      candidate à la hauteur réelle de la capture, les deux subissent la MÊME déformation, et
+//      celle-ci cesse d'être un biais.
+//   3. On normalise ensuite les deux à une hauteur commune (128 px), pour comparer des formes
+//      indépendamment de la taille d'origine.
+//   4. On compare sur quatre axes qui ne mesurent pas la même chose :
+//        - le rapport de chasse (largeur/hauteur du mot entier) : il sépare une condensée d'une
+//          normale, et c'est lui qui change la mise en page ;
+//        - la densité d'encre (part de la boîte réellement noircie) : c'est la GRAISSE. Sans
+//          elle, une Oswald 700 et une Anton se confondent alors qu'elles n'ont pas du tout le
+//          même noir sur la page ;
+//        - l'intersection sur union des masques : la superposition réelle des tracés ;
+//        - la corrélation du profil d'encre par ligne : la répartition verticale, donc la
+//          hauteur d'x relative aux capitales, très signée d'une police à l'autre.
+//
+// La corrélation par COLONNE a été retirée après mesure : sur un texte de dix-huit signes,
+// chaque caractère occupe moins de 6 % de la largeur, et un décalage d'un demi-caractère suffit
+// à effondrer la corrélation. Elle notait Anton 37 % là où sa superposition réelle valait 62 % :
+// elle mesurait un défaut d'alignement, pas une différence de dessin. Un indicateur qui bouge
+// pour une autre raison que celle qu'on croit mesurer est pire qu'un indicateur absent.
+//
+// CE QU'IL NE FAIT PAS
+// --------------------
+// Il ne lit pas le texte dans l'image. Le texte est fourni (--text) ou lu dans le fichier de
+// sondes. Une reconnaissance de caractères ajouterait une dépendance lourde et une source
+// d'erreur supplémentaire pour remplacer trois mots tapés à la main.
+//
+// USAGE
+//   node scripts/zrm-detect-font.mjs <image.jpg> --text "LIBÉRATION" --rect x,y,w,h
+//   node scripts/zrm-detect-font.mjs --probe docs/zenraymedia/references-jpeg/<thème>/fonts.probe.json
+//
+// SORTIES
+//   - classement imprimé dans le terminal ;
+//   - avec --probe : un font-report.json + un font-report.html côte-à-côte à côté des captures,
+//     pour VOIR la superposition au lieu de croire un chiffre.
+
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { chromium } from 'playwright'
+import { FONTS } from '../src/zenraymedia/fonts.js'
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+// Hauteur d'encre commune. 128 px : assez fin pour distinguer un empattement, assez grossier
+// pour que le crénelage du JPEG ne pèse pas dans le score.
+const NORM_H = 128
+
+// ---------------------------------------------------------------------------------------------
+// Sélection des faces candidates.
+// On ne charge que le sous-ensemble « latin » : la capture d'un journal français n'a jamais
+// besoin du cyrillique, et charger 128 familles entières coûterait des dizaines de mégaoctets
+// pour un résultat identique.
+// ---------------------------------------------------------------------------------------------
+function candidateFaces({ weights, families }) {
+  const wanted = weights && weights.length ? weights.map(String) : null
+  const out = []
+  for (const font of FONTS) {
+    if (families && families.length && !families.includes(font.family)) continue
+    for (const face of font.faces) {
+      if (face.style !== 'normal') continue
+      if (face.subset !== 'latin') continue
+      if (wanted && !wanted.includes(String(face.weight))) continue
+      out.push({ family: font.family, weight: String(face.weight), file: face.file, archetype: font.archetype })
+    }
+  }
+  return out
+}
+
+async function loadFaceBuffers(faces) {
+  const out = []
+  for (const face of faces) {
+    try {
+      const buf = await readFile(path.join(ROOT, 'public', face.file))
+      out.push({ ...face, b64: buf.toString('base64') })
+    } catch {
+      // Une police déclarée mais non installée n'est pas une erreur fatale : on la signale et on
+      // continue. Le classement reste valable sur les polices réellement présentes.
+      console.warn(`  ! police absente du disque, ignorée : ${face.family} ${face.weight}`)
+    }
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Le coeur du calcul tourne DANS le navigateur : c'est lui qui sait décoder un JPEG, composer du
+// texte et rasteriser une police. Le reproduire en Node demanderait trois dépendances de plus.
+// ---------------------------------------------------------------------------------------------
+const PAGE_CODE = `
+window.ZRM = (() => {
+  const NORM_H = ${NORM_H}
+
+  // Seuil d'Otsu : sépare encre et fond sans réglage manuel, en cherchant le seuil qui minimise
+  // la variance à l'intérieur de chacun des deux groupes. Un seuil fixe (128) échouerait sur un
+  // bandeau gris ou une capture sous-exposée.
+  function otsu(gray) {
+    const hist = new Array(256).fill(0)
+    for (const v of gray) hist[v]++
+    const total = gray.length
+    let sum = 0
+    for (let i = 0; i < 256; i++) sum += i * hist[i]
+    let sumB = 0, wB = 0, best = 0, thr = 127
+    for (let t = 0; t < 256; t++) {
+      wB += hist[t]; if (!wB) continue
+      const wF = total - wB; if (!wF) break
+      sumB += t * hist[t]
+      const mB = sumB / wB, mF = (sum - sumB) / wF
+      const between = wB * wF * (mB - mF) * (mB - mF)
+      if (between > best) { best = between; thr = t }
+    }
+    return thr
+  }
+
+  // Transforme une zone d'image en masque binaire recadré sur l'encre, puis ramené à NORM_H.
+  function maskFromImageData(img, invert) {
+    const gray = new Uint8Array(img.width * img.height)
+    for (let i = 0; i < gray.length; i++) {
+      const p = i * 4
+      gray[i] = (img.data[p] * 0.299 + img.data[p + 1] * 0.587 + img.data[p + 2] * 0.114) | 0
+    }
+    const thr = otsu(gray)
+    // Sans --invert on suppose de l'encre sombre sur fond clair, le cas courant en presse.
+    const ink = new Uint8Array(gray.length)
+    for (let i = 0; i < gray.length; i++) ink[i] = invert ? (gray[i] > thr ? 1 : 0) : (gray[i] < thr ? 1 : 0)
+    return normalize(ink, img.width, img.height)
+  }
+
+  function normalize(ink, w, h) {
+    let x0 = w, y0 = h, x1 = -1, y1 = -1
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      if (!ink[y * w + x]) continue
+      if (x < x0) x0 = x; if (x > x1) x1 = x
+      if (y < y0) y0 = y; if (y > y1) y1 = y
+    }
+    if (x1 < 0) return null
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1
+    // Densité mesurée AVANT normalisation, sur les pixels d'origine : c'est la graisse réelle
+    // du tracé, pas celle qu'aurait introduite le ré-échantillonnage.
+    let inked = 0
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) inked += ink[y * w + x]
+    const density = inked / (bw * bh)
+    const scale = NORM_H / bh
+    const nw = Math.max(1, Math.round(bw * scale))
+    const out = new Uint8Array(nw * NORM_H)
+    // Ré-échantillonnage par moyenne de bloc : préserve l'épaisseur des fûts fins, qu'un simple
+    // plus-proche-voisin ferait clignoter d'une police à l'autre.
+    for (let y = 0; y < NORM_H; y++) {
+      const sy0 = y0 + Math.floor(y / scale), sy1 = Math.min(y1, y0 + Math.floor((y + 1) / scale))
+      for (let x = 0; x < nw; x++) {
+        const sx0 = x0 + Math.floor(x / scale), sx1 = Math.min(x1, x0 + Math.floor((x + 1) / scale))
+        let acc = 0, n = 0
+        for (let sy = sy0; sy <= sy1; sy++) for (let sx = sx0; sx <= sx1; sx++) { acc += ink[sy * w + sx]; n++ }
+        out[y * nw + x] = n && acc / n >= 0.5 ? 1 : 0
+      }
+    }
+    return { data: out, w: nw, h: NORM_H, aspect: nw / NORM_H, density, inkHeight: bh, bbox: [x0, y0, bw, bh] }
+  }
+
+  // Profil par LIGNE : quelle part de chaque bande horizontale est encrée. Il décrit où se
+  // concentre la matière — bandeau dense de la hauteur d'x, traits fins des ascendantes — et
+  // reste stable même si le mot est décalé horizontalement.
+  function rowProfile(mask) {
+    const p = new Float64Array(mask.h)
+    for (let y = 0; y < mask.h; y++) {
+      let n = 0
+      for (let x = 0; x < mask.w; x++) n += mask.data[y * mask.w + x]
+      p[y] = n / mask.w
+    }
+    return p
+  }
+
+  // Rééchantillonne un profil sur une longueur fixe pour comparer deux mots de chasses
+  // différentes : la corrélation répond alors « les fûts sont-ils aux mêmes endroits
+  // PROPORTIONNELS », question indépendante de la largeur totale déjà mesurée par l'aspect.
+  function resample(p, n) {
+    const out = new Float64Array(n)
+    for (let i = 0; i < n; i++) {
+      const t = (i / (n - 1 || 1)) * (p.length - 1)
+      const a = Math.floor(t), b = Math.min(p.length - 1, a + 1), f = t - a
+      out[i] = p[a] * (1 - f) + p[b] * f
+    }
+    return out
+  }
+
+  function pearson(a, b) {
+    const n = a.length
+    let ma = 0, mb = 0
+    for (let i = 0; i < n; i++) { ma += a[i]; mb += b[i] }
+    ma /= n; mb /= n
+    let num = 0, da = 0, db = 0
+    for (let i = 0; i < n; i++) {
+      const x = a[i] - ma, y = b[i] - mb
+      num += x * y; da += x * x; db += y * y
+    }
+    return da && db ? num / Math.sqrt(da * db) : 0
+  }
+
+  // Superposition des masques après mise à la même largeur. On ne « glisse » pas l'un sur
+  // l'autre : les deux sont déjà calés sur leur boîte d'encre, un décalage supplémentaire
+  // masquerait justement l'erreur de chasse qu'on cherche à mesurer.
+  function iou(a, b) {
+    const w = Math.round((a.w + b.w) / 2)
+    const ra = stretch(a, w), rb = stretch(b, w)
+    let inter = 0, union = 0
+    for (let i = 0; i < ra.length; i++) {
+      const x = ra[i], y = rb[i]
+      if (x && y) inter++
+      if (x || y) union++
+    }
+    return union ? inter / union : 0
+  }
+
+  function stretch(mask, w) {
+    const out = new Uint8Array(w * mask.h)
+    for (let y = 0; y < mask.h; y++) for (let x = 0; x < w; x++) {
+      const sx = Math.min(mask.w - 1, Math.round((x / (w - 1 || 1)) * (mask.w - 1)))
+      out[y * w + x] = mask.data[y * mask.w + sx]
+    }
+    return out
+  }
+
+  async function maskFromCapture(dataUrl, rect, invert) {
+    const img = new Image()
+    img.src = dataUrl
+    await img.decode()
+    const w = rect ? rect[2] : img.naturalWidth
+    const h = rect ? rect[3] : img.naturalHeight
+    const c = document.createElement('canvas')
+    c.width = w; c.height = h
+    const ctx = c.getContext('2d', { willReadFrequently: true })
+    ctx.drawImage(img, rect ? rect[0] : 0, rect ? rect[1] : 0, w, h, 0, 0, w, h)
+    const mask = maskFromImageData(ctx.getImageData(0, 0, w, h), invert)
+    // On conserve le CROP BRUT en plus du masque. Le rapport doit montrer la capture telle
+    // qu'elle est — couleur, lissage, compression comprises — et non sa silhouette binarisée :
+    // c'est elle la référence, et c'est à elle que l'oeil compare. Le masque reste affiché à
+    // côté, en petit, parce que c'est lui qui a servi au calcul.
+    if (mask) {
+      mask.crop = c.toDataURL('image/png')
+      // Et une seconde version recadrée sur la boîte d'encre. C'est elle qui sert à l'atelier :
+      // pour comparer une capture à une police, les deux doivent avoir la MÊME hauteur de
+      // lettre à l'écran. Un crop qui garde ses marges blanches se retrouve affiché plus petit
+      // que les spécimens et la comparaison devient impossible.
+      const b = mask.bbox
+      const t = document.createElement('canvas')
+      t.width = b[2]; t.height = b[3]
+      t.getContext('2d').drawImage(c, b[0], b[1], b[2], b[3], 0, 0, b[2], b[3])
+      mask.cropTight = t.toDataURL('image/png')
+    }
+    return mask
+  }
+
+  function drawAt(text, family, weight, size, opts) {
+    const c = document.createElement('canvas')
+    const probe = c.getContext('2d', { willReadFrequently: true })
+    probe.font = \`\${weight} \${size}px "\${family}"\`
+    if (opts && opts.letterSpacing) probe.letterSpacing = opts.letterSpacing
+    const m = probe.measureText(text)
+    const pad = Math.ceil(size)
+    c.width = Math.ceil(m.width + pad * 2)
+    c.height = Math.ceil(size * 2.6)
+    const g = c.getContext('2d', { willReadFrequently: true })
+    g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height)
+    g.fillStyle = '#000'
+    g.font = \`\${weight} \${size}px "\${family}"\`
+    if (opts && opts.letterSpacing) g.letterSpacing = opts.letterSpacing
+    g.textBaseline = 'alphabetic'
+    g.fillText(text, pad, size * 1.7)
+    return g.getImageData(0, 0, c.width, c.height)
+  }
+
+  // Rendu en deux passes. La première mesure combien de pixels d'encre la police produit à une
+  // taille arbitraire ; la seconde re-rend à la taille qui reproduit exactement la hauteur
+  // d'encre de la capture. C'est ce qui met les deux images dans le même régime de
+  // rastérisation, condition pour que la densité mesurée signifie « graisse » et non
+  // « définition ».
+  function maskFromFont(text, family, weight, targetInk, opts) {
+    const first = maskFromImageData(drawAt(text, family, weight, 200, opts), false)
+    if (!first) return null
+    if (!targetInk || targetInk >= 200) return first
+    const size = Math.max(6, Math.round(200 * (targetInk / first.inkHeight)))
+    return maskFromImageData(drawAt(text, family, weight, size, opts), false) || first
+  }
+
+  // Spécimen NET, destiné au seul jugement visuel. Il n'entre dans aucun score.
+  function specimen(text, family, weight, letterSpacing) {
+    const size = 64
+    const img = drawAt(text, family, weight, size, { letterSpacing })
+    const c = document.createElement('canvas')
+    c.width = img.width; c.height = img.height
+    c.getContext('2d').putImageData(img, 0, 0)
+    // On recadre sur l'encre pour que toutes les lignes du rapport soient alignées et à la même
+    // hauteur : sinon l'oeil compare des tailles, pas des dessins.
+    const g = c.getContext('2d', { willReadFrequently: true })
+    const d = g.getImageData(0, 0, c.width, c.height)
+    let x0 = c.width, y0 = c.height, x1 = -1, y1 = -1
+    for (let y = 0; y < c.height; y++) for (let x = 0; x < c.width; x++) {
+      if (d.data[(y * c.width + x) * 4] > 200) continue
+      if (x < x0) x0 = x; if (x > x1) x1 = x
+      if (y < y0) y0 = y; if (y > y1) y1 = y
+    }
+    if (x1 < 0) return c.toDataURL('image/png')
+    const out = document.createElement('canvas')
+    out.width = x1 - x0 + 1; out.height = y1 - y0 + 1
+    const og = out.getContext('2d')
+    og.fillStyle = '#fff'; og.fillRect(0, 0, out.width, out.height)
+    og.drawImage(c, x0, y0, out.width, out.height, 0, 0, out.width, out.height)
+    return out.toDataURL('image/png')
+  }
+
+  async function loadFace(family, weight, b64) {
+    const bin = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0))
+    const ff = new FontFace(family, bin.buffer, { weight, style: 'normal' })
+    await ff.load()
+    document.fonts.add(ff)
+  }
+
+  function score(ref, cand) {
+    // Écart de chasse, ramené en [0,1]. Une condensée face à une normale produit couramment
+    // 25 % d'écart : le terme s'effondre alors à ~0.25, ce qui suffit à la disqualifier.
+    const ratio = Math.min(ref.aspect, cand.aspect) / Math.max(ref.aspect, cand.aspect)
+    const overlap = iou(ref, cand)
+    // Densité : le rapport, pas la différence. Passer de 0.30 à 0.45 d'encre double presque le
+    // noir perçu ; en absolu l'écart n'est que de 0.15 et paraîtrait négligeable.
+    const weightMatch = Math.min(ref.density, cand.density) / Math.max(ref.density, cand.density)
+    const rows = Math.max(0, pearson(rowProfile(ref), rowProfile(cand)))
+    const total = ratio * 0.35 + weightMatch * 0.25 + overlap * 0.25 + rows * 0.15
+    return { total, ratio, weightMatch, overlap, rows, aspect: cand.aspect, density: cand.density }
+  }
+
+  function toPng(mask) {
+    const c = document.createElement('canvas')
+    c.width = mask.w; c.height = mask.h
+    const ctx = c.getContext('2d')
+    const img = ctx.createImageData(mask.w, mask.h)
+    for (let i = 0; i < mask.data.length; i++) {
+      const v = mask.data[i] ? 0 : 255
+      img.data[i * 4] = v; img.data[i * 4 + 1] = v; img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255
+    }
+    ctx.putImageData(img, 0, 0)
+    return c.toDataURL('image/png')
+  }
+
+  return { maskFromCapture, maskFromFont, loadFace, score, toPng, specimen }
+})()
+`
+
+// ---------------------------------------------------------------------------------------------
+// Pilotage.
+// ---------------------------------------------------------------------------------------------
+async function detect(page, { imagePath, rect, text, invert, letterSpacing, known }, faces) {
+  const buf = await readFile(imagePath)
+  const ext = path.extname(imagePath).slice(1).toLowerCase()
+  const dataUrl = `data:image/${ext === 'jpg' ? 'jpeg' : ext};base64,${buf.toString('base64')}`
+
+  const ref = await page.evaluate(
+    async ([url, r, inv]) => {
+      const m = await window.ZRM.maskFromCapture(url, r, inv)
+      if (!m) return null
+      window.__ref = m
+      return { w: m.w, h: m.h, aspect: m.aspect, density: m.density, inkHeight: m.inkHeight,
+               png: window.ZRM.toPng(m), crop: m.crop, cropTight: m.cropTight }
+    },
+    [dataUrl, rect || null, !!invert],
+  )
+  if (!ref) throw new Error(`aucune encre détectée dans ${path.basename(imagePath)} — vérifier --rect ou --invert`)
+
+  // Garde-fou de LISIBILITÉ de la sonde, appris sur Le Figaro.
+  //
+  // Une sonde longue et basse ne contient pas assez de pixels par signe pour que la mesure
+  // distingue quoi que ce soit. Sur un titre de 32 signes haut de 24 px, chaque lettre fait
+  // 11 px de large : un empattement y occupe UN pixel. Le classement obtenu plaçait alors une
+  // linéale (Sora) à un point d'une serif (PT Serif) — non parce qu'elles se ressemblent, mais
+  // parce qu'à cette définition elles étaient devenues indiscernables.
+  //
+  // On ne bloque pas : on avertit, et l'avertissement figure dans le rapport. Un classement peu
+  // discriminant reste informatif — il dit « c'est une grasse de chasse normale » — à condition
+  // de ne pas être lu comme une identification.
+  const perGlyph = ref.inkHeight ? (ref.aspect * ref.inkHeight) / Math.max(1, text.length) : 0
+  if (ref.aspect > 12 || perGlyph < 14) {
+    ref.warning = `sonde peu discriminante : ${ref.aspect.toFixed(1)} de chasse, ~${perGlyph.toFixed(0)} px par signe. `
+      + `Viser une chasse < 12 et > 14 px par signe — un mot court sur du gros texte, pas une phrase entière.`
+    console.warn(`  ⚠ ${ref.warning}`)
+  }
+
+  const results = []
+  for (const face of faces) {
+    const r = await page.evaluate(
+      async ([family, weight, b64, txt, ls]) => {
+        await window.ZRM.loadFace(family, weight, b64)
+        const cand = window.ZRM.maskFromFont(txt, family, weight, window.__ref.inkHeight, { letterSpacing: ls })
+        if (!cand) return null
+        const s = window.ZRM.score(window.__ref, cand)
+        // DEUX images, deux usages — la confusion des deux a produit un rapport illisible.
+        //   png     le masque qui a SERVI AU CALCUL, rendu à la définition de la capture. Il est
+        //           grossier, et il doit l'être : c'est exactement ce que le score a comparé.
+        //   clean   un spécimen net, rendu en pleine définition, pour que l'oeil puisse juger.
+        // Montrer le seul masque de calcul revenait à demander de juger une police sur une
+        // image volontairement dégradée.
+        return { ...s, png: window.ZRM.toPng(cand), clean: window.ZRM.specimen(txt, family, weight, ls) }
+      },
+      [face.family, face.weight, face.b64, text, letterSpacing || ''],
+    )
+    if (r) results.push({ family: face.family, weight: face.weight, archetype: face.archetype, ...r })
+  }
+  results.sort((a, b) => b.total - a.total)
+  return { ref, results, verdict: verdictOf(results), calibration: calibrationOf(results, known) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Le VERDICT : le classement dit qui gagne, le verdict dit si gagner veut dire quelque chose.
+//
+// Sur LIBÉRATION, Anton devance de 6 points la première candidate d'un autre style : c'est une
+// identification. Sur Le Figaro, une linéale se glisse à 1 point d'une serif : le classement est
+// alors une CARACTÉRISATION (« une grasse de chasse normale »), pas une identification, et le
+// présenter autrement serait un mensonge poli.
+//
+// La décisivité se mesure donc contre le premier concurrent d'ARCHÉTYPE DIFFÉRENT, pas contre le
+// deuxième du classement : deux serifs voisines qui se disputent la tête ne remettent pas en
+// cause le fait que c'en est une.
+// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// POLICE CONNUE : la réponse d'un outil externe fait autorité sur la mesure.
+//
+// Il n'existe aucune bibliothèque installable qui identifie une police depuis une image — les
+// outils qui savent le faire (what-the-google-font, whatfont.texs.org, Matcherator) sont des
+// services web. Quand Matthieu en fait passer une capture, sa réponse est MEILLEURE que ce
+// script, et prétendre l'inverse serait absurde.
+//
+// Le champ `known` d'une sonde enregistre donc cette réponse. Elle devient la vérité inscrite
+// dans le thème, et la mesure sert alors à autre chose de plus utile : à SE FAIRE NOTER. On
+// affiche le rang qu'obtient la police connue dans le classement.
+//
+//   rang 1        la mesure est d'accord — utilisable seule sur un thème comparable
+//   rang 2 à 5    la mesure situe correctement sans trancher — bonne pour présélectionner
+//   au-delà       la mesure se trompe sur ce type de capture, et il faut savoir pourquoi
+//
+// Chaque `known` renseigné rend donc le détecteur mesurable. Sans eux, il n'a aucun moyen de
+// savoir s'il s'améliore ou s'il dérive.
+function calibrationOf(results, known) {
+  if (!known) return null
+  const norm = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim()
+  const wanted = norm(known.family)
+  const idx = results.findIndex((r) => norm(r.family) === wanted
+    && (!known.weight || String(r.weight) === String(known.weight)))
+  const anyWeight = results.findIndex((r) => norm(r.family) === wanted)
+  return {
+    family: known.family,
+    weight: known.weight || null,
+    source: known.source || 'outil externe',
+    rank: idx >= 0 ? idx + 1 : null,
+    rankAnyWeight: anyWeight >= 0 ? anyWeight + 1 : null,
+    agrees: idx === 0,
+    // Une police connue absente du classement signifie qu'elle n'est pas installée : c'est un
+    // défaut d'installation, pas un défaut de mesure, et il faut le dire séparément.
+    installed: anyWeight >= 0,
+  }
+}
+
+function verdictOf(results) {
+  if (!results.length) return null
+  const top = results[0]
+
+  // PLANCHER ABSOLU, ajouté après un faux positif. La règle d'écart ci-dessous compare les
+  // candidates ENTRE ELLES : elle peut donc déclarer un vainqueur net dans un classement où
+  // aucune candidate ne ressemble à la capture. C'est arrivé sur une sonde du Figaro dont le
+  // rectangle attrapait deux lignes et une puce rouge : la meilleure superposition valait 17 %,
+  // et le verdict annonçait pourtant « identifiée ».
+  //
+  // Une superposition sous 35 % ne signifie pas « police inconnue » mais « la sonde ne montre
+  // pas ce que le texte annonce » : mauvais rectangle, texte mal recopié, deux lignes prises
+  // pour une. C'est une erreur d'opérateur, et elle doit être nommée comme telle.
+  if (top.overlap < 0.35) {
+    return {
+      family: top.family, weight: top.weight, archetype: top.archetype,
+      margin: 0, decisive: false, invalid: true,
+      reason: `aucune candidate ne dépasse ${(top.overlap * 100).toFixed(0)} % de superposition. `
+        + `La sonde ne correspond pas à son texte : vérifier le rectangle (une seule ligne ? pas de puce ni d'icône ?) `
+        + `et l'orthographe exacte, accents compris.`,
+      dominantArchetype: top.archetype, dominantShare: 0, rival: null,
+    }
+  }
+  const rival = results.find((r) => r.archetype !== top.archetype)
+  const margin = rival ? top.total - rival.total : top.total
+  const top5 = results.slice(0, 5)
+  const counts = {}
+  for (const r of top5) counts[r.archetype] = (counts[r.archetype] || 0) + 1
+  const dominant = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]
+  return {
+    family: top.family,
+    weight: top.weight,
+    archetype: top.archetype,
+    margin,
+    // 3 points d'écart : seuil relevé sur les deux thèmes mesurés. En dessous, deux styles
+    // typographiques distincts se tenaient dans le bruit de la mesure.
+    decisive: margin >= 0.03,
+    dominantArchetype: dominant[0],
+    dominantShare: dominant[1] / top5.length,
+    rival: rival ? `${rival.family} ${rival.weight} (${rival.archetype})` : null,
+  }
+}
+
+function fmt(n) { return (n * 100).toFixed(1).padStart(5) }
+
+function reportHtml(probes) {
+  const blocks = probes.map((p) => {
+    const rows = p.results.slice(0, 8).map((r, i) => `
+      <tr class="${i === 0 ? 'win' : ''}">
+        <td class="rk">${i + 1}</td>
+        <td class="fam">${r.family}<span class="w">${r.weight}</span></td>
+        <td class="sc">${fmt(r.total)}</td>
+        <td class="sub">${fmt(r.ratio)}</td>
+        <td class="sub">${fmt(r.weightMatch)}</td>
+        <td class="sub">${fmt(r.overlap)}</td>
+        <td class="sub">${fmt(r.rows)}</td>
+        <td class="img"><img class="clean" src="${r.clean}" alt=""></td>
+        <td class="img"><img class="mask" src="${r.png}" alt="" title="le masque réellement comparé, à la définition de la capture"></td>
+      </tr>`).join('')
+    return `
+    <section>
+      <h2>${p.role} <span class="txt">« ${p.text} »</span></h2>
+      <div class="ref">
+        <span class="lab">capture</span>
+        <img class="ref-crop" src="${p.ref.crop || p.ref.png}" alt="">
+        <span class="lab lab-mask">comparé</span>
+        <img class="ref-mask" src="${p.ref.png}" alt="" title="silhouette binarisée réellement utilisée pour le score">
+      </div>
+      ${p.calibration ? `<p class="${p.calibration.installed ? 'ok' : 'warn'}">Police connue :
+        <strong>${p.calibration.family}${p.calibration.weight ? ' ' + p.calibration.weight : ''}</strong>
+        (${p.calibration.source}) — fait autorité.
+        ${p.calibration.installed
+          ? `La mesure la classe n°${p.calibration.rank || p.calibration.rankAnyWeight}${p.calibration.agrees ? ', elle est d\'accord.' : ', elle ne la met pas en tête.'}`
+          : `Elle n'est PAS installée : à ajouter à zrm-fonts.mjs.`}</p>` : ''}
+      ${p.ref.warning ? `<p class="warn">⚠ ${p.ref.warning}</p>` : ''}
+      ${p.verdict ? `<p class="${p.verdict.invalid ? 'warn' : p.verdict.decisive ? 'ok' : 'soft'}">${p.verdict.invalid
+        ? `Sonde invalide : ${p.verdict.reason}`
+        : p.verdict.decisive
+        ? `Identifiée : <strong>${p.verdict.family} ${p.verdict.weight}</strong> — ${(p.verdict.margin * 100).toFixed(1)} pts devant le premier ${p.verdict.rival}.`
+        : `Caractérisée seulement : <strong>${p.verdict.dominantArchetype}</strong>. L'écart avec ${p.verdict.rival} n'est que de ${(p.verdict.margin * 100).toFixed(1)} pts — choisir en s'appuyant aussi sur l'affinité d'archétype.`}</p>` : ''}
+      <table>
+        <thead><tr><th></th><th>police</th><th>score</th><th>chasse</th><th>graisse</th><th>superp.</th><th>lignes</th><th>rendu net</th><th>ce qui a été comparé</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </section>`
+  }).join('')
+  return `<!doctype html><meta charset="utf-8"><title>ZenRayMedia — rapport de détection de police</title>
+<style>
+  :root{color-scheme:light}
+  body{margin:0;padding:32px;background:#f6f6f4;color:#111;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  h1{font-size:22px;margin:0 0 6px}
+  .intro{color:#555;max-width:70ch;margin:0 0 28px}
+  section{background:#fff;border:1px solid #e3e3df;border-radius:10px;padding:18px 20px;margin:0 0 20px}
+  h2{font-size:15px;margin:0 0 12px;text-transform:uppercase;letter-spacing:.08em}
+  h2 .txt{text-transform:none;letter-spacing:0;color:#777;font-weight:400}
+  .ref{display:flex;align-items:center;gap:12px;padding:10px 0 16px;border-bottom:1px solid #eee;margin-bottom:12px}
+  .lab{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#999;flex:0 0 70px}
+  .ref .ref-crop{max-height:52px;image-rendering:auto;border:1px solid #eee;border-radius:3px}
+  .ref .ref-mask{max-height:34px;image-rendering:pixelated;opacity:.5}
+  .ref .lab-mask{flex:0 0 auto;margin-left:18px}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#999;padding:0 8px 8px;font-weight:600}
+  td{padding:6px 8px;border-top:1px solid #f0f0ee;vertical-align:middle}
+  .rk{color:#bbb;width:24px}
+  .fam{font-weight:600;white-space:nowrap}
+  .fam .w{color:#aaa;font-weight:400;margin-left:6px;font-size:12px}
+  .sc{font-variant-numeric:tabular-nums;font-weight:700}
+  .sub{font-variant-numeric:tabular-nums;color:#888;font-size:13px}
+  .img img.clean{max-height:34px;image-rendering:auto}
+  .img img.mask{max-height:26px;image-rendering:pixelated;opacity:.55}
+  .ok{margin:0 0 12px;padding:8px 12px;background:#f0f8f1;border:1px solid #cfe6d3;border-radius:6px;font-size:13px;color:#1a5c2a}
+  .soft{margin:0 0 12px;padding:8px 12px;background:#f4f4f8;border:1px solid #dcdce6;border-radius:6px;font-size:13px;color:#4a4a66}
+  .warn{margin:0 0 12px;padding:8px 12px;background:#fff8e6;border:1px solid #f0dfa8;border-radius:6px;font-size:13px;color:#7a5c00}
+  tr.win{background:#f2f8f2}
+  tr.win .sc{color:#1a7f37}
+</style>
+<h1>Rapport de détection de police</h1>
+<p class="intro">Chaque bloc compare la silhouette relevée dans la capture (première ligne) aux polices installées,
+ramenées à la même hauteur d'encre. <strong>chasse</strong> = rapport largeur/hauteur du mot entier,
+<strong>graisse</strong> = rapport des densités d'encre, <strong>superp.</strong> = intersection sur union
+des tracés, <strong>lignes</strong> = corrélation de la répartition d'encre par bande horizontale.
+Le score les combine en 35/25/25/15. Chaque candidate est rendue à la hauteur d'encre exacte de la
+capture, pour que les deux subissent la même rastérisation.</p>
+${blocks}`
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// L'ATELIER DE CALIBRAGE.
+//
+// Le rapport de détection sert à comprendre POURQUOI une police l'emporte. L'atelier sert à
+// autre chose : à ce que Matthieu tranche en dix secondes.
+//
+// La différence tient à une seule idée. Comparer une capture à une police est instantané SI les
+// deux montrent le même mot, à la même hauteur de lettre, alignés à gauche, empilés
+// verticalement. L'oeil descend la colonne et s'arrête. Dès qu'une de ces conditions manque —
+// tailles différentes, mots différents, disposition en tableau — la comparaison redevient un
+// travail, et un travail qu'on n'a aucune raison de lui demander.
+//
+// D'où : la capture en haut, figée, et les huit meilleures candidates dessous, toutes au même
+// gabarit. Il répond par un numéro. S'il ne reconnaît rien, il a le chemin du crop sous la main
+// pour le passer dans son outil externe — et ce chemin est affiché, sélectionnable.
+// ---------------------------------------------------------------------------------------------
+function workbenchHtml(probes, topN = 8) {
+  const sections = probes.map((p, pi) => {
+    const rows = p.results.slice(0, topN).map((r, i) => `
+      <label class="cand">
+        <span class="num">${i + 1}</span>
+        <img src="${r.clean}" alt="">
+        <span class="nom">${r.family} <b>${r.weight}</b></span>
+        <span class="sc">${(r.total * 100).toFixed(0)}</span>
+      </label>`).join('')
+    return `
+    <section class="probe">
+      <h2><span class="idx">${pi + 1}</span>${p.role}</h2>
+      <div class="capture">
+        <span class="tag">capture</span>
+        <img src="${p.ref.cropTight || p.ref.crop}" alt="">
+      </div>
+      <div class="cands">${rows}</div>
+      <div class="answer">
+        <span class="none">Aucune ne correspond ?</span>
+        <code>${p.imagePath}</code>
+        <span class="hint">rect ${(p.rect || []).join(',')} — le PNG découpé est dans <code>probes/${String(p.role).split('·').pop().trim()}.png</code></span>
+      </div>
+    </section>`
+  }).join('')
+  return `<!doctype html><meta charset="utf-8"><title>ZenRayMedia — atelier de calibrage des polices</title>
+<style>
+  :root{color-scheme:light}
+  body{margin:0;padding:28px 32px 64px;background:#f6f6f4;color:#111;
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  h1{font-size:21px;margin:0 0 4px}
+  .intro{color:#555;max-width:74ch;margin:0 0 26px}
+  .intro b{color:#111}
+  .probe{background:#fff;border:1px solid #e3e3df;border-radius:12px;padding:20px 22px 16px;margin:0 0 22px}
+  h2{display:flex;align-items:center;gap:10px;font-size:14px;margin:0 0 14px;
+    text-transform:uppercase;letter-spacing:.07em;color:#666}
+  .idx{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;
+    border-radius:50%;background:#111;color:#fff;font-size:12px;letter-spacing:0}
+  .capture{display:flex;align-items:center;gap:14px;padding:14px 16px;background:#fbfbf9;
+    border:1px dashed #d5d5cf;border-radius:8px;margin:0 0 4px}
+  .tag{font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:#999;flex:0 0 58px}
+  /* LA règle qui fait tout marcher : capture et candidates à hauteur d'encre identique. */
+  .capture img,.cand img{height:38px;width:auto;image-rendering:auto}
+  .cands{display:flex;flex-direction:column}
+  .cand{display:flex;align-items:center;gap:14px;padding:9px 16px;border-bottom:1px solid #f2f2ee}
+  .cand:hover{background:#f2f8f2}
+  .num{flex:0 0 58px;color:#bbb;font-variant-numeric:tabular-nums;font-size:13px;text-align:left}
+  .cand:first-child .num{color:#1a7f37;font-weight:700}
+  .nom{margin-left:auto;color:#666;font-size:13px;white-space:nowrap}
+  .nom b{color:#999;font-weight:500}
+  .sc{flex:0 0 34px;text-align:right;color:#c0c0bb;font-size:12px;font-variant-numeric:tabular-nums}
+  .answer{margin-top:12px;padding-top:12px;border-top:1px solid #f0f0ec;font-size:12px;color:#888}
+  .answer .none{color:#555;margin-right:8px}
+  code{background:#f4f4f0;border:1px solid #e6e6e0;border-radius:4px;padding:1px 5px;
+    font:11px/1.6 ui-monospace,"SF Mono",monospace;color:#555;user-select:all}
+  .hint{display:block;margin-top:6px;color:#aaa}
+</style>
+<h1>Atelier de calibrage des polices</h1>
+<p class="intro">Pour chaque sonde : la <b>capture</b> en haut, puis les huit meilleures candidates
+rendues <b>dans le même mot, à la même hauteur de lettre</b>. Descendre la colonne, s'arrêter sur
+celle qui se superpose. Répondre par <b>numéro de sonde → numéro de candidate</b> (par exemple
+« 1 → 3 »). Si rien ne correspond, le chemin du fichier est sous la liste, à passer dans
+what-the-google-font.</p>
+${sections}`
+}
+
+async function main() {
+  const argv = process.argv.slice(2)
+  const arg = (name, def = null) => {
+    const i = argv.indexOf(`--${name}`)
+    return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : def
+  }
+  const has = (name) => argv.includes(`--${name}`)
+
+  // Plusieurs --probe acceptés : un rapport unique, une section par sonde, dans l'ordre donné.
+  // Comparer cinq quotidiens dans cinq fichiers séparés ne permet pas de VOIR ce qui les
+  // distingue ; côte à côte, la doctrine typographique de chacun saute aux yeux.
+  const probePaths = argv.reduce((acc, a, i) => (a === '--probe' && argv[i + 1] && !argv[i + 1].startsWith('--') ? [...acc, argv[i + 1]] : acc), [])
+  const probePath = probePaths[0] || null
+  const outPath = arg('out')
+  const top = Number(arg('top', 10))
+  const weights = (arg('weights') || '').split(',').filter(Boolean)
+  const families = (arg('families') || '').split(',').filter(Boolean)
+
+  let probes = []
+  let outDir = null
+  if (probePath) {
+    outDir = path.dirname(probePath)
+    for (const file of probePaths) {
+      const spec = JSON.parse(await readFile(file, 'utf8'))
+      const dir = path.dirname(file)
+      for (const p of spec.probes) {
+        probes.push({
+          ...p,
+          // Le rôle est préfixé du thème dès qu'on en compare plusieurs : sans ça, cinq sondes
+          // « titre-une » deviennent indiscernables dans le rapport combiné.
+          role: probePaths.length > 1 ? `${spec.calibrationMedia || spec.theme} · ${p.role}` : p.role,
+          imagePath: path.resolve(dir, p.image),
+          rect: p.rect || null,
+        })
+      }
+    }
+  } else {
+    const image = argv.find((a) => !a.startsWith('--') && /\.(jpe?g|png)$/i.test(a))
+    if (!image) throw new Error('usage : node scripts/zrm-detect-font.mjs <image> --text "..." [--rect x,y,w,h]')
+    probes = [{
+      role: arg('role', 'échantillon'),
+      text: arg('text') || 'Hamburgefonstiv',
+      imagePath: path.resolve(image),
+      rect: arg('rect') ? arg('rect').split(',').map(Number) : null,
+      invert: has('invert'),
+      letterSpacing: arg('letter-spacing') || '',
+    }]
+  }
+
+  const faces = await loadFaceBuffers(candidateFaces({ weights, families }))
+  console.log(`Polices candidates : ${faces.length} faces (${new Set(faces.map((f) => f.family)).size} familles)\n`)
+
+  const browser = await chromium.launch()
+  const page = await browser.newPage()
+  await page.setContent('<!doctype html><meta charset="utf-8"><body></body>')
+  await page.addScriptTag({ content: PAGE_CODE })
+
+  const done = []
+  for (const probe of probes) {
+    process.stdout.write(`▸ ${probe.role} — « ${probe.text} »\n`)
+    const { ref, results, verdict, calibration } = await detect(page, probe, faces)
+    console.log(`  capture : chasse ${ref.aspect.toFixed(3)}  densite ${ref.density.toFixed(3)}  hauteur d'encre ${ref.inkHeight}px`)
+    for (const [i, r] of results.slice(0, top).entries()) {
+      const mark = i === 0 ? '★' : ' '
+      console.log(`  ${mark} ${String(i + 1).padStart(2)}. ${r.family.padEnd(24)} ${r.weight}  score ${fmt(r.total)}  chasse ${fmt(r.ratio)}  graisse ${fmt(r.weightMatch)}  superp ${fmt(r.overlap)}  lignes ${fmt(r.rows)}`)
+    }
+    if (verdict) {
+      console.log(verdict.invalid
+        ? `  → SONDE INVALIDE : ${verdict.reason}`
+        : verdict.decisive
+        ? `  → IDENTIFIÉE : ${verdict.family} ${verdict.weight} (${verdict.archetype}), ${(verdict.margin * 100).toFixed(1)} pts devant ${verdict.rival}`
+        : `  → CARACTÉRISÉE seulement : ${verdict.dominantArchetype} (${Math.round(verdict.dominantShare * 100)} % du top 5). `
+          + `${verdict.family} ${verdict.weight} n'a que ${(verdict.margin * 100).toFixed(1)} pts sur ${verdict.rival} — écart non concluant.`)
+    }
+    if (calibration) {
+      if (!calibration.installed) {
+        console.log(`  ⚑ POLICE CONNUE : ${calibration.family} (${calibration.source}) — PAS INSTALLÉE. `
+          + `L'ajouter à scripts/zrm-fonts.mjs, sinon le thème la déclarera sans pouvoir la rendre.`)
+      } else {
+        console.log(`  ⚑ POLICE CONNUE : ${calibration.family}${calibration.weight ? ' ' + calibration.weight : ''} `
+          + `(${calibration.source}) — fait autorité. La mesure la classe ${calibration.rank ? `n°${calibration.rank}` : `n°${calibration.rankAnyWeight} (autre graisse)`}`
+          + `${calibration.agrees ? ' : la mesure est d\'accord.' : ' : la mesure ne la met pas en tête.'}`)
+      }
+    }
+    console.log('')
+    done.push({ ...probe, ref, results, verdict, calibration })
+  }
+  await browser.close()
+
+  if (outDir) {
+    const json = done.map((p) => ({
+      role: p.role,
+      text: p.text,
+      image: path.basename(p.imagePath),
+      refAspect: p.ref.aspect,
+      refDensity: p.ref.density,
+      refInkHeight: p.ref.inkHeight,
+      warning: p.ref.warning || null,
+      verdict: p.verdict,
+      calibration: p.calibration,
+      ranking: p.results.slice(0, 12).map((r) => ({
+        family: r.family, weight: r.weight, total: r.total, ratio: r.ratio, weightMatch: r.weightMatch, overlap: r.overlap, rows: r.rows,
+      })),
+    }))
+    const htmlOut = outPath || path.join(outDir, 'font-report.html')
+    const jsonOut = htmlOut.replace(/\.html$/, '.json')
+    await mkdir(path.dirname(htmlOut), { recursive: true })
+    // On propage le média de calibrage : c'est lui qui identifie la source du relevé, et
+    // zrm-new-theme le reprend dans le champ privé `calibration.ref` du thème.
+    const media = probePaths.length === 1
+      ? JSON.parse(await readFile(probePaths[0], 'utf8')).calibrationMedia || null
+      : null
+    await writeFile(jsonOut, JSON.stringify({ calibrationMedia: media, probes: json }, null, 2))
+    await writeFile(htmlOut, reportHtml(done))
+    const benchOut = htmlOut.replace(/\.html$/, '-atelier.html')
+    await writeFile(benchOut, workbenchHtml(done))
+    console.log(`Rapport  : ${htmlOut}`)
+    console.log(`Atelier  : ${benchOut}`)
+
+    // Proposition prête à coller dans theme.json : le script ne modifie pas le thème lui-même,
+    // parce qu'un classement à 2 % d'écart mérite un oeil humain sur la planche côte-à-côte.
+    const proposal = {}
+    for (const p of done) {
+      if (p.calibration && p.calibration.installed) {
+        proposal[p.role] = `${p.calibration.family}${p.calibration.weight ? ' ' + p.calibration.weight : ''}  (connue — ${p.calibration.source})`
+        continue
+      }
+      proposal[p.role] = p.verdict.invalid
+        ? `SONDE INVALIDE — à refaire`
+        : p.verdict.decisive
+        ? `${p.verdict.family} ${p.verdict.weight}`
+        : `${p.verdict.family} ${p.verdict.weight}  (non décisif — ${p.verdict.dominantArchetype})`
+    }
+    console.log('\nProposition :')
+    console.log(JSON.stringify(proposal, null, 2))
+  }
+}
+
+main().catch((e) => { console.error(e); process.exit(1) })

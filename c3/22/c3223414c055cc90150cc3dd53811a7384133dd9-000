@@ -1,0 +1,45 @@
+// ProfileEngine.mjs (21 October 2026): where does ONE archive batch spend its time? Runs scripts/archive-folder.mjs exactly as the service does
+// (same arguments, same environment) on a staging folder and prints the offset of every engine event plus the time between them.
+// FR : mesure par phase le coût d'un lot d'archive, avant et après chaque optimisation (le service ne mesure que le total du moteur).
+//   node scripts/Assets/ProfileEngine.mjs <stage-folder> <cloud-destination> [--json]
+// The run is REAL: it uploads the staged file and commits its manifest. Use a throwaway destination, never a project folder:
+//   node scripts/Assets/ProfileEngine.mjs /tmp/prof-stage pages/ZenRayAssets/_engine-profile
+import { spawn, execFileSync } from 'node:child_process'
+import path from 'node:path'
+import os from 'node:os'
+import { fileURLToPath } from 'node:url'
+
+const [stage, destination, ...flags] = process.argv.slice(2)
+if (!stage || !destination) { console.error('usage: ProfileEngine.mjs <stage-folder> <cloud-destination> [--json]'); process.exit(2) }
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
+const stateDir = path.join(os.homedir(), 'Library', 'Application Support', 'ZenRayAssets')
+const token = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim()
+const env = { ...process.env, GITHUB_TOKEN: token, ZR_API_BASE: process.env.ZR_API_BASE || 'http://127.0.0.1:3100', ZR_ARCHIVE_REPO_SUFFIX: '',
+  ZR_ARCHIVE_REFERENCE_REPO: path.join(stateDir, 'repositories', 'matthieuhuguet_zenray-data') }
+const indexFile = path.join(os.tmpdir(), `profile-engine-${process.pid}.json`)
+const started = Date.now()
+const events = []
+const child = spawn(process.execPath, [path.join(repoRoot, 'scripts', 'archive-folder.mjs'), stage, destination, '--json', '--skip-noise', `--index=${indexFile}`], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+let buffered = '', stderr = ''
+child.stdout.on('data', (data) => {
+  buffered += data
+  let index
+  while ((index = buffered.indexOf('\n')) >= 0) {
+    const line = buffered.slice(0, index); buffered = buffered.slice(index + 1)
+    if (line.startsWith('{"zr":')) { try { const event = JSON.parse(line); events.push({ at: Date.now() - started, ev: event.ev }) } catch {} }
+  }
+})
+child.stderr.on('data', (data) => { stderr += data })
+child.once('close', (code) => {
+  const total = Date.now() - started
+  const phases = events.map((event, i) => ({ ev: event.ev, at: event.at, since: event.at - (events[i - 1]?.at ?? 0) }))
+  const firstEvent = events[0]?.at ?? total
+  const result = { code, totalMs: total, beforeFirstEventMs: firstEvent, phases, stderr: stderr.slice(-500) }
+  if (flags.includes('--json')) console.log(JSON.stringify(result))
+  else {
+    console.log(`exit ${code}, total ${total} ms, before the first engine event ${firstEvent} ms (clone and setup)`)
+    for (const phase of phases) console.log(`  ${String(phase.at).padStart(6)} ms  +${String(phase.since).padStart(6)}  ${phase.ev}`)
+    if (stderr.trim()) console.log('stderr:', stderr.slice(-300))
+  }
+  process.exit(code === 0 ? 0 : 1)
+})

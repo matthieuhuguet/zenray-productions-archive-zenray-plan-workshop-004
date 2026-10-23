@@ -1,0 +1,77 @@
+// Remplit `image` des manifestes public/shelf/*.json via Wikipedia (RECHERCHE -> affiche/jaquette de la page).
+// CLÉ : pilicense=any -> Wikipedia renvoie l'image NON-LIBRE (affiches/jaquettes en fair-use), sinon il les cache.
+// 3 catégories EN PARALLÈLE, haute concurrence, zéro clé, Wikipedia ne throttle pas comme iTunes/AniList.
+// IDEMPOTENT : ne touche que les items sans image (relançable). Format Shelf : { kind:'url', ref:'<url>' }.
+import { readFile, writeFile } from 'node:fs/promises'
+
+const ROOT = new URL('../public/shelf/', import.meta.url)
+const UA = { 'User-Agent': 'ZenRayProgress-Shelf/1.2 (personal media library)' }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+const clean = (name) => String(name)
+  .replace(/\s*[:\-–]\s*$/, '')
+  .replace(/\s+(S\d{1,2}|Season\s*\d+|Saison\s*\d+|Part\s*\d+|Cour\s*\d+|\(\d{4}\)|\bOVA\b)\s*$/i, '')
+  .replace(/\s+S\d{1,2}\b/i, '')
+  .trim()
+
+async function jget(url) {
+  for (let a = 0; a < 3; a++) {
+    try {
+      const r = await fetch(url, { headers: UA })
+      if (r.status === 429) { await sleep(800 + a * 800); continue }
+      return r.ok ? await r.json() : null
+    } catch { return null }
+  }
+  return null
+}
+
+async function wikiTop(q) {
+  const j = await jget(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&srlimit=1&srnamespace=0&format=json`)
+  return (j && j.query && j.query.search && j.query.search[0] && j.query.search[0].title) || null
+}
+async function wikiImg(title) {
+  const j = await jget(`https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(title)}&prop=pageimages&piprop=original%7Cthumbnail&pithumbsize=600&pilicense=any&format=json`)
+  const p = j && j.query && j.query.pages && Object.values(j.query.pages)[0]
+  const src = (p && p.original && p.original.source) || (p && p.thumbnail && p.thumbnail.source)
+  return (src && /\.(jpe?g|png|webp)$/i.test(src)) ? src : null
+}
+const wikiFor = (hint) => async (name) => {
+  for (const q of [`${clean(name)} ${hint}`, clean(name), name]) {
+    const t = await wikiTop(q)
+    if (t) { const img = await wikiImg(t); if (img) return img }
+  }
+  return null
+}
+
+async function pool(items, limit, fn) {
+  let i = 0
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) { const idx = i++; await fn(items[idx]) }
+  }))
+}
+
+const PLAN = [
+  { file: 'games.json', fetch: wikiFor('video game'), conc: 8 },
+  { file: 'movies.json', fetch: wikiFor('film'), conc: 8 },
+  { file: 'anime-manga.json', fetch: wikiFor('anime'), conc: 8 },
+]
+
+async function run({ file, fetch: fetcher, conc }) {
+  const path = new URL(file, ROOT)
+  const data = JSON.parse(await readFile(path, 'utf8'))
+  const todo = data.items.filter((it) => !it.image)
+  let filled = 0, done = 0
+  console.log(`== ${file}: ${todo.length} à remplir (déjà ${data.items.length - todo.length}) ==`)
+  await pool(todo, conc, async (it) => {
+    const url = await fetcher(it.name)
+    if (url) { it.image = { kind: 'url', ref: url }; filled++ }
+    if (++done % 40 === 0) { await writeFile(path, JSON.stringify(data, null, 2)); console.log(`  ${file}: ${done}/${todo.length} (+${filled})`) }
+  })
+  await writeFile(path, JSON.stringify(data, null, 2))
+  const total = data.items.filter((i) => i.image).length
+  console.log(`DONE ${file}: +${filled} -> ${total}/${data.items.length}`)
+  return { file, total, of: data.items.length }
+}
+
+const res = await Promise.all(PLAN.map(run))
+console.log('\nALL DONE ' + JSON.stringify(res))

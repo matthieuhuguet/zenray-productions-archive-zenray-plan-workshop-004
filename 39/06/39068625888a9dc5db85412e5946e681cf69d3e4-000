@@ -1,0 +1,51 @@
+// /api/guest-upload — people who hold a SHARE LINK add photos to the shared folder (2 October 2026).
+//
+// Public route (no drive code): the signed share token IS the credential, checked on every request. Everything else is in
+// server/guestUploadCore.js; this file only adapts HTTP to it (binary frame in, JSON out) and builds the real GitHub client.
+// The reply is ALWAYS HTTP 200 JSON: `{ ok:true, ... }`, `{ ok:false, retry:true, waitMs }` (the browser waits and retries, the guest
+// sees nothing) or `{ ok:false, retry:false, reason }` (a polite stop: daily cap, link no longer accepting photos).
+import { unpackFrame } from '../src/lib/guestFrame.js'
+import { GUEST } from '../src/config/guestUpload.js'
+import { processGuestUpload, importMediaKey } from './guestUploadCore.js'
+import { makeGitHub } from './githubGraphql.js'
+import { resolveShareToken, shareRecordPath } from './share-token.js'
+import { loadMediaKey } from './media-key.js'
+
+const secretFromEnv = () => process.env.ZENRAY_SHARE_SECRET || process.env.ZENRAY_API_SECRET || process.env.GITHUB_TOKEN || ''
+let keyPromise = null
+const mediaKey = () => (keyPromise ||= importMediaKey(loadMediaKey()).catch((e) => { keyPromise = null; throw e }))
+const records = new Map()                      // share records are read for every request: remember them for a few seconds
+const RECORD_MS = 10_000
+
+export function makeResolveShare(gh, dataRepoName) {
+  return async (token) => {
+    const hit = records.get(token)
+    const loadRecord = async (t) => {
+      if (hit && hit.until > Date.now()) return hit.record
+      const text = await gh.readText(dataRepoName, shareRecordPath(t))
+      const record = text ? JSON.parse(text) : null
+      if (record) { records.delete(t); records.set(t, { record, until: Date.now() + RECORD_MS }); while (records.size > 256) records.delete(records.keys().next().value) }
+      return record
+    }
+    return resolveShareToken(token, { expectedKind: 'folder', loadRecord })
+  }
+}
+
+export default async function handler(req, res) {
+  res.setHeader('Cache-Control', 'no-store')
+  const json = (o) => res.status(200).json(o)
+  if (req.method !== 'POST') return json({ ok: false, retry: false, reason: 'method' })
+  const githubToken = process.env.GITHUB_TOKEN
+  const secret = secretFromEnv()
+  if (!githubToken || !secret) return json({ ok: false, retry: true, reason: 'server', waitMs: 15000 })
+  const body = req.body
+  if (!(body instanceof Uint8Array) || body.byteLength > GUEST.FRAME_MAX_BYTES) return json({ ok: false, retry: false, reason: 'bad-request' })
+  let frame
+  try { frame = unpackFrame(body) } catch { return json({ ok: false, retry: false, reason: 'bad-request' }) }
+  const [owner, dataRepoName] = (process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data').split('/')
+  const gh = makeGitHub({ token: githubToken, owner, dataRepo: dataRepoName, branch: process.env.CONTENT_BRANCH || 'main' })
+  let key
+  try { key = await mediaKey() } catch { return json({ ok: false, retry: true, reason: 'server', waitMs: 15000 }) }
+  const reply = await processGuestUpload({ header: frame.header, payload: frame.payload, gh, key, secret, resolveShare: makeResolveShare(gh, dataRepoName), owner })
+  return json(reply)
+}

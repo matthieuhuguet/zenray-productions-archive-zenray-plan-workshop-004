@@ -1,0 +1,62 @@
+// LOT IMAGES — file de chargement PRIORISÉE à concurrence bornée.
+//
+// EN CLAIR POUR TOUS : on ne charge pas 1000 images d'un coup (ça noie le réseau et tout rame).
+// On charge par petits paquets (6 à la fois). On met en PREMIER ce qui compte (la 1re image de
+// l'arbre, ce qui est visible à l'écran), le reste suit tranquillement en tâche de fond.
+//
+// TECHNIQUE : une file à deux priorités (haute / normale). Au plus N chargements actifs en même
+// temps (N = 6). Chaque tâche passe par le cache LRU (imageCache.load) donc rien n'est décodé
+// deux fois. Annulable via AbortSignal (quand on quitte un dossier, on stoppe ses chargements).
+
+import { imageCache } from './imageCache.js'
+
+const _ric = (cb) => (typeof requestIdleCallback === 'function'
+  ? requestIdleCallback(cb, { timeout: 1200 })
+  : setTimeout(cb, 120))
+
+class PriorityImageQueue {
+  constructor(concurrency = 6) {
+    this.concurrency = concurrency
+    this.high = []   // urls prioritaires (visibles / 1re image)
+    this.normal = [] // le reste (prefetch de fond)
+    this.active = 0
+    this.seen = new Set() // évite de re-empiler une url déjà traitée/en cours
+  }
+
+  _next() { return this.high.shift() || this.normal.shift() || null }
+
+  enqueue(url, { priority = false, signal } = {}) {
+    if (!url || this.seen.has(url) || imageCache.has(url)) return
+    this.seen.add(url)
+    const job = { url, signal }
+    if (priority) this.high.push(job); else this.normal.push(job)
+    this._pump()
+  }
+
+  // Empile une liste (prefetch de fond). La 1re entrée passe en priorité haute.
+  enqueueMany(urls, { signal, firstHighPriority = true } = {}) {
+    if (!Array.isArray(urls)) return
+    urls.forEach((u, i) => this.enqueue(u, { priority: firstHighPriority && i === 0, signal }))
+  }
+
+  _pump() {
+    while (this.active < this.concurrency) {
+      const job = this._next()
+      if (!job) break
+      if (job.signal && job.signal.aborted) { continue }
+      this.active++
+      ;(async () => {
+        try { await imageCache.load(job.url, { signal: job.signal }) }
+        catch { /* best-effort */ }
+        finally {
+          this.active--
+          // laisse respirer le thread principal entre deux paquets de fond
+          if (this.high.length) this._pump()
+          else _ric(() => this._pump())
+        }
+      })()
+    }
+  }
+}
+
+export const imageQueue = new PriorityImageQueue(6)

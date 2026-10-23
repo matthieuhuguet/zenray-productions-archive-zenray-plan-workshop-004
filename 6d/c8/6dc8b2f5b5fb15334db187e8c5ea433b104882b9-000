@@ -1,0 +1,249 @@
+#!/usr/bin/env node
+// ZenRayMedia — SOURCE contre RENDU. La planche de travail qui sert à FABRIQUER les composants.
+//
+//   node scripts/zrm-source-vs-rendu.mjs T-04-1-1--revelation-cinematique
+//
+// Le fichier s'appelait « etat.html » et le nom était faux : un tableau de bord se consulte,
+// une planche de comparaison se TRAVAILLE. Matthieu : « à quoi sert ton fichier de comparaison ?
+// Il sert à créer les composants. » Le nom dit maintenant ce qu'on y fait.
+//
+// POURQUOI CE FICHIER EXISTE
+// --------------------------
+// Matthieu, 2026-07-26 : « je n'ai toujours pas un HTML complet qui me permet de voir le
+// résultat et ce que tu comptes faire ». Il a raison, et le manque n'était pas cosmétique :
+// sans page unique, l'état du thème vivait dans trois fichiers séparés (l'inventaire, la spec de
+// comparaison, les parts) plus mes messages. Personne ne pouvait vérifier ce que je disais.
+//
+// Cette page croise les trois et affiche, pour chaque composant : son ÉTAT réel, son crop de
+// référence, son rendu, et ce qu'il reste à faire. Elle se régénère, donc elle ne peut pas
+// mentir plus longtemps qu'une commande.
+//
+// LES QUATRE ÉTATS, ET ILS SONT ORDONNÉS
+//   recensé    l'élément existe dans l'inventaire. C'est le POINT DE DÉPART, et je l'avais
+//              oublié de la liste des étapes alors que c'est la première.
+//   écrit      un fichier de composant le couvre. Les dimensions restent supposées.
+//   cadré      son crop de référence est VÉRIFIÉ — on sait à quoi le comparer.
+//   comparé    la boucle a tourné, l'écart est visible et nommé.
+//   validé     Matthieu l'a regardé et l'a dit bon.
+// Un composant ne saute jamais un état.
+//
+// LA MISE EN PAGE, ET ELLE EST DICTÉE PAR L'USAGE
+// Deux colonnes, rien d'autre : la source à gauche, le rendu à droite, MÊME RATIO et grandes.
+// Une ligne de tableau à cinq colonnes rend les images minuscules, donc la comparaison
+// impossible — c'était le défaut de la version précédente. Tout le reste (titre, état, fichier
+// source, couleurs, éléments couverts) passe SOUS les deux images, où rien ne les écrase.
+
+import { readFile, writeFile, readdir } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+import { chromium } from 'playwright'
+
+const ROOT = path.resolve(import.meta.dirname, '..')
+
+async function main() {
+  const id = process.argv[2]
+  if (!id) throw new Error('usage : node scripts/zrm-status.mjs <T-FF-S-V--slug>')
+  const dir = path.join(ROOT, 'src', 'zenraymedia', 'themes', id)
+  const theme = JSON.parse(await readFile(path.join(dir, 'theme.json'), 'utf8'))
+  const registry = JSON.parse(await readFile(path.join(dir, 'component-registry.json'), 'utf8'))
+  const parts = Array.isArray(registry) ? registry : registry.components
+
+  const spec = existsSync(path.join(dir, 'compare.json'))
+    ? JSON.parse(await readFile(path.join(dir, 'compare.json'), 'utf8')).compare : []
+  const byPart = new Map(spec.map((c) => [path.basename(c.html, '.html'), c]))
+
+  // L'inventaire vit à côté des captures, sous un dossier dont le nom porte le média de
+  // calibrage. On le retrouve par préfixe plutôt qu'en le codant en dur.
+  const refRoot = path.join(ROOT, 'docs', 'zenraymedia', 'references-jpeg')
+  const invDir = (await readdir(refRoot)).find((d) => d.startsWith(id.split('--')[0]))
+  const invPath = invDir && path.join(refRoot, invDir, 'components.inventory.json')
+  const inv = invPath && existsSync(invPath) ? JSON.parse(await readFile(invPath, 'utf8')) : null
+
+  // ORDRE D'INVENTAIRE. Les composants sont classés par la première apparition de l'un de leurs
+  // éléments dans l'inventaire — pas par numéro de fichier. C'est l'ordre dans lequel les
+  // captures les présentent, donc l'ordre dans lequel il faut les traiter.
+  const elementsByPart = new Map()
+  const orderByPart = new Map()
+  const invList = []
+  if (inv) {
+    const seen = new Set()
+    let rank = 0
+    for (const img of inv.images) for (const el of img.elements) {
+      if (seen.has(el.name)) continue
+      seen.add(el.name)
+      const key = el.part ? path.basename(el.part, '.html') : '—'
+      elementsByPart.set(key, [...(elementsByPart.get(key) || []), el.name])
+      if (!orderByPart.has(key)) orderByPart.set(key, rank)
+      invList.push({ n: ++rank, name: el.name, type: el.type, part: key, image: img.image })
+    }
+  }
+  const totalElements = invList.length
+
+  // Les crops de référence déjà vérifiés par `zrm-compare --dump`. Leur PRÉSENCE ne suffit pas :
+  // un crop peut être écrit et pointer à côté. La liste des rects validés à l'oeil est tenue
+  // dans compare.json, champ `rectChecked`.
+  const refsDir = path.join(dir, 'refs')
+  const refs = existsSync(refsDir) ? new Set(await readdir(refsDir)) : new Set()
+
+  const browser = await chromium.launch()
+  const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
+  const rows = []
+  const ordered = [...parts].sort((a, b) =>
+    (orderByPart.get(a.id) ?? 9999) - (orderByPart.get(b.id) ?? 9999))
+  for (const p of ordered) {
+    const c = byPart.get(p.id)
+    const compFile = path.join(dir, 'components', `${p.id}.html`)
+    let shot = ''
+    if (existsSync(compFile)) {
+      await page.goto('file://' + compFile)
+      await page.waitForTimeout(220)
+      const el = c?.selector ? await page.$(c.selector) : null
+      const buf = el ? await el.screenshot() : await page.screenshot({ clip: { x: 0, y: 0, width: 1400, height: 320 } })
+      shot = 'data:image/png;base64,' + buf.toString('base64')
+    }
+    let ref = ''
+    const refFile = c && path.join(refsDir, `${c.name}.png`)
+    if (refFile && refs.has(`${c.name}.png`)) {
+      ref = 'data:image/png;base64,' + (await readFile(refFile)).toString('base64')
+    }
+    const state = p.validated ? 'valide' : c?.compared ? 'compare' : c?.rectChecked ? 'cadre' : 'ecrit'
+    // CINQ COULEURS échantillonnées sur le crop de référence. Elles disent en un coup d'oeil si
+    // le rendu est dans le bon registre chromatique — le défaut le plus visible et le plus
+    // souvent manqué. Calculées dans la page pendant qu'elle est ouverte : aucun coût ajouté.
+    let swatches = []
+    if (ref) {
+      swatches = await page.evaluate(async (u) => {
+        const im = new Image(); im.src = u; await im.decode()
+        const c = document.createElement('canvas'); c.width = 60; c.height = 60
+        const g = c.getContext('2d', { willReadFrequently: true })
+        g.drawImage(im, 0, 0, 60, 60)
+        const d = g.getImageData(0, 0, 60, 60).data, m = new Map()
+        for (let i = 0; i < d.length; i += 4) {
+          const k = `${d[i] >> 4},${d[i + 1] >> 4},${d[i + 2] >> 4}`
+          const e = m.get(k); if (e) { e.n++ } else m.set(k, { n: 1, r: d[i], g: d[i + 1], b: d[i + 2] })
+        }
+        return [...m.values()].sort((a, b) => b.n - a.n).slice(0, 5)
+          .map((v) => '#' + [v.r, v.g, v.b].map((x) => x.toString(16).padStart(2, '0')).join(''))
+      }, ref)
+    }
+    rows.push({ id: p.id, name: p.name, group: p.group, state, ref, shot, swatches,
+      rect: c?.rect, source: c?.ref ? path.basename(c.ref) : null,
+      covers: elementsByPart.get(p.id) || [] })
+  }
+  await browser.close()
+
+  const count = (s) => rows.filter((r) => r.state === s).length
+  const ST = { ecrit:'écrit', cadre:'cadré', compare:'comparé', valide:'validé' }
+
+  const html = `<!doctype html><meta charset="utf-8"><title>${id} — source vs rendu</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;padding:24px 28px 80px;background:#0b0d10;color:#c9d4e0;
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  h1{font-size:21px;margin:0 0 2px;color:#fff}
+  .sub{color:#7d8b9b;margin:0 0 18px}
+  .box{background:#11151a;border:1px solid #1f262e;border-radius:10px;padding:14px 18px;margin:0 0 18px}
+  .box h2{font-size:12px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.09em;color:#8fa3b8}
+  .box ol{margin:0;padding-left:1.2em;color:#a8b6c4}.box b{color:#fff}
+  .tally{display:flex;gap:8px;margin:0 0 24px;flex-wrap:wrap;font-size:12px}
+  .tally span{padding:5px 13px;border-radius:20px;border:1px solid}
+  .t-ecrit{color:#c9975a;border-color:#4a3a24;background:#22190f}
+  .t-cadre{color:#5aa8d8;border-color:#22415a;background:#0f1c26}
+  .t-compare{color:#a98ee0;border-color:#3a2f5a;background:#171227}
+  .t-valide{color:#5fc98a;border-color:#254a35;background:#0f2318}
+
+  /* DEUX COLONNES, et rien d'autre au-dessus de la ligne de flottaison. */
+  .cmp{margin:0 0 34px;border-bottom:1px solid #171d24;padding-bottom:20px}
+  .duo{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+  .duo figure{margin:0}
+  .duo figcaption{font-size:10px;text-transform:uppercase;letter-spacing:.13em;color:#6b7a8a;margin:0 0 5px}
+  /* Meme ratio des deux cotes : c'est la condition d'une comparaison honnete. object-fit
+     contain garde les proportions reelles, cover les trancherait.
+     AUCUN ACCENT GRAVE DANS CE COMMENTAIRE : il est a l'interieur d'un gabarit, et un accent
+     grave y termine la chaine. Panne payee trois fois le meme jour — zrm-fonts, puis
+     zrm-build-theme, puis ici. La lecon n'avait ete appliquee qu'aux deux premiers. */
+  .duo img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;
+    background:#05080b;border:1px solid #1c232b;border-radius:4px}
+  /* La SUPERPOSITION. Matthieu, 2026-07-27 : « tu n'as toujours pas mis le truc qu'on a mis
+     4 heures à corriger ». Il parlait de ça, et il avait raison de le réclamer ici plutôt que
+     dans un fichier à côté : deux images côte à côte laissent croire qu'elles se ressemblent,
+     deux images superposées montrent le décalage au pixel. C'est la vue qui tranche. */
+  .sup{margin-top:14px;border-top:1px solid #1d232a;padding-top:12px}
+  .sup .st{position:relative;max-width:640px}
+  .sup .st img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;background:#05080b;
+    border:1px solid #232a32;border-radius:4px}
+  .sup .st img.top{position:absolute;inset:0;opacity:.5}
+  .sup input{width:100%;max-width:640px;margin-top:8px;accent-color:#7fd4ff}
+  .duo .none{display:grid;place-items:center;aspect-ratio:16/9;background:#05080b;
+    border:1px dashed #232b34;border-radius:4px;color:#4b5866;font:11px ui-monospace,monospace}
+
+  /* Les attributs passent SOUS les images, jamais à côté. */
+  .meta{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin-top:12px}
+  .meta .nm{color:#fff;font-size:15px}
+  .meta .idc{font:11px ui-monospace,monospace;color:#5f6d7c}
+  .st{font-size:11px;padding:2px 10px;border-radius:20px;border:1px solid}
+  .sw{display:flex;gap:3px}
+  .sw i{width:20px;height:20px;border-radius:3px;border:1px solid #222a33}
+  .cov{width:100%;font-size:11px;color:#6d7b8a}
+  .cov b{color:#8fa3b8;font-weight:400}
+
+  details{margin:0 0 26px}
+  summary{cursor:pointer;color:#8fa3b8;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+  .inv{columns:3;column-gap:22px;font:11px ui-monospace,monospace;color:#6d7b8a;margin-top:10px}
+  .inv div{break-inside:avoid}
+  .inv u{text-decoration:none;color:#3f4b58}
+</style>
+<h1>${id} — source vs rendu</h1>
+<p class="sub">${theme.description || ''}</p>
+
+<div class="box"><h2>Le procédé</h2><ol>
+  <li><b>Inventorier.</b> Recenser chaque élément sur chaque capture. C'est la première étape et
+    je l'avais oubliée de ma propre liste — on ne peut pas manquer ce qu'on n'a jamais compté.</li>
+  <li><b>Cadrer.</b> Découper la zone qui montre le composant, et la REGARDER.</li>
+  <li><b>Écrire</b> ou corriger, mesures en main.</li>
+  <li><b>Comparer</b> en superposition, itérer jusqu'à ce que l'écart soit nommé.</li>
+  <li><b>Montrer</b> à Matthieu.</li>
+  <li><b>Valider.</b> Lui seul fait passer un composant à « validé ».</li>
+</ol></div>
+
+<div class="tally">
+  <span class="t-ecrit">écrit ${count('ecrit')}</span>
+  <span class="t-cadre">cadré ${count('cadre')}</span>
+  <span class="t-compare">comparé ${count('compare')}</span>
+  <span class="t-valide">validé ${count('valide')}</span>
+  <span style="color:#7d8b9b;border-color:#252c35">${rows.length} composants · ${totalElements} éléments</span>
+</div>
+
+<details><summary>Inventaire complet — ${totalElements} éléments, dans l'ordre des captures</summary>
+  <div class="inv">${invList.map((e) => `<div><u>${String(e.n).padStart(3, '0')}</u> ${e.name} <u>${e.part}</u></div>`).join('')}</div>
+</details>
+
+${rows.map((r, i) => `<section class="cmp">
+  <div class="duo">
+    <figure><figcaption>source</figcaption>${r.ref ? `<img src="${r.ref}">` : '<div class="none">pas de crop — à cadrer</div>'}</figure>
+    <figure><figcaption>rendu</figcaption>${r.shot ? `<img src="${r.shot}">` : '<div class="none">—</div>'}</figure>
+  </div>
+  ${r.ref && r.shot ? `<div class="sup">
+    <figcaption>superposition — glisser pour fondre le rendu sur la source</figcaption>
+    <div class="st" id="sup${i}"><img src="${r.ref}"><img src="${r.shot}" class="top"></div>
+    <input type="range" min="0" max="100" value="50"
+      oninput="document.querySelector('#sup${i} .top').style.opacity=this.value/100">
+  </div>` : ''}
+  <div class="meta">
+    <span class="idc">${String(i + 1).padStart(2, '0')}</span>
+    <span class="nm">${r.name}</span>
+    <span class="st t-${r.state}">${ST[r.state]}</span>
+    <span class="idc">${r.id}</span>
+    <span class="idc">${r.source || ''} ${r.rect ? r.rect.join(',') : ''}</span>
+    <span class="sw">${(r.swatches || []).map((c) => `<i style="background:${c}" title="${c}"></i>`).join('')}</span>
+    <span class="cov"><b>couvre</b> ${r.covers.join(' · ') || '—'}</span>
+  </div>
+</section>`).join('')}`
+
+  const out = path.join(dir, 'source-vs-rendu.html')
+  await writeFile(out, html)
+  console.log(`écrit ${count('ecrit')} · cadré ${count('cadre')} · comparé ${count('compare')} · validé ${count('valide')}`)
+  console.log(`→ ${path.relative(ROOT, out)}`)
+}
+
+main().catch((e) => { console.error(e.message || e); process.exit(1) })

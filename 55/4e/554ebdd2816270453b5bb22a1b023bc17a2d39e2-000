@@ -1,0 +1,102 @@
+// 3 October 2026, 14:10 : CONTRACT test. The dashboard is rendered against the REAL PostKit application (the sibling repo ZenRayPostKit, in memory,
+// sandbox platform), not against hand-written fixtures, so a field renamed on either side fails here instead of showing a blank panel. (3 October 2026)
+// Skipped when the sibling repository is not on this machine. (3 October 2026)
+import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest'
+import { render, screen, waitFor, fireEvent, cleanup } from '@testing-library/react'
+import { existsSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
+import { execFileSync, spawn } from 'node:child_process'
+import path from 'node:path'
+import PostKitView from './PostKitView.jsx'
+import { POSTKIT } from './postkitConfig.js'
+
+const SIBLING = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../ZenRayPostKit')
+const CLI = path.join(SIBLING, 'src/server/cli.js')
+const present = existsSync(CLI)
+const tab = (name) => fireEvent.click(screen.getByRole('tab', { name }))
+
+describe.skipIf(!present)('PostKitView against a real PostKit server process', () => {
+  let h
+  let child
+  beforeAll(async () => {
+    const dir = path.join(mkdtempSync(path.join(tmpdir(), 'pkcontract-')), 'data')
+    const port = 18000 + Math.floor(Math.random() * 1500)
+    const env = { ...process.env, POSTKIT_DATA_DIR: dir, POSTKIT_PORT: String(port), POSTKIT_PUBLIC_URL: `http://127.0.0.1:${port}`, POSTKIT_MASTER_KEY: 'contract-test-key' }
+    const key = execFileSync('node', [CLI, 'key', 'create', 'contract'], { env }).toString().replace(/^.*: /, '').trim()
+    child = spawn('node', [CLI, 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+    await new Promise((resolve, reject) => { const t = setTimeout(() => reject(new Error('PostKit server did not start')), 15000); child.stdout.on('data', (d) => { if (String(d).includes('listening')) { clearTimeout(t); resolve() } }); child.on('exit', (c) => reject(new Error(`server exited ${c}`))) })
+    const base = `http://127.0.0.1:${port}`
+    const call = async (method, p, body) => { const r = await fetch(`${base}${p}`, { method, headers: { authorization: `Bearer ${key}`, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined }); return r.json() }
+    const profile = await call('POST', '/v1/profiles', { name: 'Brand' })
+    const sbx = await call('POST', '/v1/accounts/connect', { platform: 'sandbox', profileId: profile.id, externalId: 's1', username: 'sbx' })
+    const art = await call('POST', '/v1/accounts/connect', { platform: 'artstation', profileId: profile.id, externalId: 'zr', username: 'zenray' })
+    await call('POST', '/v1/posts', { profileId: profile.id, content: 'Live from the contract test', accountIds: [sbx.id], publishNow: true })
+    await call('POST', '/v1/posts', { profileId: profile.id, title: 'Church', content: 'Houdini church #houdini', accountIds: [art.id], mediaItems: [{ url: 'https://cdn.test/a.jpg', type: 'image' }], publishNow: true })
+    await call('POST', '/v1/sandbox/inject', { accountId: sbx.id, kind: 'message', handle: 'lea', text: 'Hello from Léa' })
+    await call('POST', '/v1/sandbox/inject', { accountId: sbx.id, kind: 'comment', postId: 'p1', handle: 'tom', text: 'Where can I get this?' })
+    await call('POST', '/v1/engagement/sync', {})
+    h = { base, key, call }
+  }, 30000)
+  afterAll(() => { child?.kill() })
+  afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+  // jsdom replaces AbortController with its own class, which Node's fetch refuses: drop the signal and keep the real network. (3 October 2026)
+  const realFetch = globalThis.fetch
+  const connect = () => { vi.stubGlobal('fetch', (u, init = {}) => realFetch(u, { ...init, signal: undefined })); localStorage.setItem(POSTKIT.storageKey, JSON.stringify({ baseUrl: h.base, key: h.key })) }
+  const noErrors = () => expect(document.querySelectorAll('[role="alert"]').length).toBe(0)
+
+  it('renders every panel from real API responses without a single error line', async () => {
+    connect(); render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Waiting for your step')).toBeTruthy(), { timeout: 5000 })
+    expect(screen.getByText('Open ArtStation and start a new project.')).toBeTruthy()
+    expect(screen.getByText('Live from the contract test')).toBeTruthy()
+    noErrors()
+    for (const name of ['Accounts', 'Posts', 'Inbox', 'Comments', 'Analytics', 'Campaigns', 'Webhooks & keys', 'Platforms', 'Docs']) {
+      tab(name)
+      await waitFor(() => expect(screen.getByRole('tab', { name, selected: true })).toBeTruthy())
+      await new Promise((r) => setTimeout(r, 150)) // let the panel's queries settle (3 October 2026)
+      noErrors()
+    }
+  }, 30000)
+
+  it('Accounts lists the real connectors with their verification level; Platforms marks the additions', async () => {
+    connect(); render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Waiting for your step')).toBeTruthy(), { timeout: 5000 })
+    tab('Accounts')
+    await waitFor(() => expect(screen.getAllByText('Handoff').length).toBeGreaterThan(0))
+    expect(screen.getAllByText('Sandbox').length).toBeGreaterThan(0)
+    tab('Platforms')
+    await waitFor(() => expect(screen.getAllByText('added').length).toBe(3))
+    expect(screen.getByText('LinkedIn')).toBeTruthy(); expect(screen.getByText('ArtStation')).toBeTruthy()
+  }, 30000)
+
+  it('Inbox shows the real conversation and its open 24 hour window; Comments shows the real comment', async () => {
+    connect(); render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Waiting for your step')).toBeTruthy(), { timeout: 5000 })
+    tab('Inbox')
+    const conv = await screen.findByText('lea')
+    fireEvent.click(conv.closest('button'))
+    await screen.findByText('Hello from Léa')
+    expect(screen.getByText(/free text until/)).toBeTruthy()
+    tab('Comments')
+    await screen.findByText('Where can I get this?')
+  }, 30000)
+
+  it('Docs reads the skill documents through the server', async () => {
+    connect(); render(<PostKitView t={{}} />)
+    await waitFor(() => expect(screen.getByText('Waiting for your step')).toBeTruthy(), { timeout: 5000 })
+    tab('Docs')
+    await screen.findByText(/PlugKit : document de référence/, {}, { timeout: 5000 })
+  }, 30000)
+
+  it('finishing the ArtStation handoff from the dashboard publishes the real post', async () => {
+    connect(); render(<PostKitView t={{}} />)
+    const input = await screen.findByLabelText('Published URL', {}, { timeout: 5000 })
+    fireEvent.change(input, { target: { value: 'https://www.artstation.com/artwork/real' } })
+    fireEvent.click(screen.getByText('Mark as published'))
+    await waitFor(() => expect(screen.queryByText('Waiting for your step')).toBeNull(), { timeout: 5000 })
+    const posts = await h.call('GET', '/v1/posts?status=published')
+    expect(posts.posts.some((p) => p.targets[0].platformPostUrl === 'https://www.artstation.com/artwork/real')).toBe(true)
+  }, 30000)
+})

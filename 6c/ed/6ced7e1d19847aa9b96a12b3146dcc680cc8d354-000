@@ -1,0 +1,296 @@
+// Réindexation des anciennes IMAGES privées vers les bons dépôts/dossiers média selon la visibilité.
+//
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// EN UNE PHRASE (pour tout le monde)
+//   Ce script déménage les images qui sont rangées dans un dossier « public » depuis le coffre privé
+//   (lent, payant en bande passante) vers une étagère publique gratuite et rapide (le CDN jsDelivr),
+//   sans jamais perdre ni abîmer l'original. Par défaut il NE FAIT RIEN : il décrit seulement ce qu'il
+//   ferait. On lit le rapport, et seulement si tout va bien on relance avec --apply.
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// CE QUE FAIT CE SCRIPT (détail)
+//   1. Il parcourt tous les manifests .img.json du drive (dépôt zenray-data, PRIVÉ). Un manifest = la
+//      fiche d'identité d'une image (nom, taille, où sont ses octets, sa vignette…).
+//   2. Pour chaque image il calcule la VISIBILITÉ EFFECTIVE de son dossier : il remonte les dossiers
+//      parents en cherchant le marqueur .zrvis.json le plus proche ({vis:'public'|'private'}). Défaut
+//      = 'private' si aucun ancêtre n'en porte (héritage à la macOS : on hérite du dossier au-dessus).
+//   3. Filtrage : on ne garde que les images dont le dossier est PUBLIC et qui ne sont PAS déjà migrées
+//      (idempotence : si le manifest a déjà vis:'public' + cdnRepo + cdnCommit, on saute).
+//   4. Migration d'une image (en --apply) :
+//        a. On lit le binaire d'origine + sa vignette .webp depuis le shard privé source.
+//        b. On les POUSSE, en gardant EXACTEMENT le même chemin haché ab/cd/<sha>.<ext>(+.webp), vers
+//           le shard PUBLIC actif zenray-img-public-NN (rollover/état gérés par le serveur). Même hash
+//           => re-push idempotent (même blob).
+//        c. On RÉÉCRIT le manifest avec vis:'public' + cdnRepo + cdnPath + cdnCommit (le commit PIN
+//           l'URL jsDelivr : cache immuable, anti-écran-blanc).
+//        d. PURGE conditionnelle de l'ancien binaire privé : déléguée à l'action serveur purge-binary,
+//           qui ne supprime QUE si plus aucun autre manifest vivant ne référence ce hash (refcount,
+//           garde si encore partagé). Jamais de delete brut. Si refcount > 0 ou cap dépassé : on GARDE.
+//
+//   ORDRE NON DESTRUCTIF : on AJOUTE le public puis on RÉÉCRIT le manifest AVANT toute purge. À aucun
+//   instant l'image n'est inaccessible. Si --apply s'interrompt avant la réécriture, le manifest reste
+//   privé valide (image servie par /api/shard) et un re-run reprend proprement.
+//
+// SÉCURITÉ : DRY-RUN PAR DÉFAUT. Sans --apply, le script n'écrit RIEN. Il logge ligne par ligne ce qu'il
+//   FERAIT, plus un plan chiffré final (combien d'images, vers quels dépôts, combien d'octets).
+//
+// ANTI-FUITE (P0) : le dépôt public et les messages de commit ne contiennent AUCUN nom humain. Le chemin
+//   est haché (ab/cd/<sha>.<ext>). Le nom humain reste dans le manifest, qui vit dans zenray-data (PRIVÉ)
+//   — on ne le copie JAMAIS dans le dépôt public.
+//
+// USAGE
+//   Le serveur local doit tourner (il porte le token GitHub) :
+//     pkill -f local-server.mjs ; GITHUB_TOKEN=$(gh auth token) node scripts/local-server.mjs 3100 &
+//   Puis :
+//     node scripts/reindex-images.mjs                          # DRY-RUN : montre ce qui se passerait
+//     node scripts/reindex-images.mjs --apply                  # exécute réellement (migration + purge)
+//     node scripts/reindex-images.mjs --folder pages/Refs      # ne traite qu'un sous-dossier
+//     node scripts/reindex-images.mjs --jobs 16                # concurrence de lecture des manifests
+//     node scripts/reindex-images.mjs --base http://localhost:3100   # URL du serveur local
+//
+// NOTE D'ÉTAPE (à savoir, pas un bug) : tant qu'AUCUN dossier ne porte .zrvis.json={vis:'public'}, ce
+//   script trouvera 0 image à migrer. C'est normal : il est l'étape 6 du chantier, utile une fois que
+//   l'UI de bascule public/privé a marqué au moins un dossier public.
+
+const args = process.argv.slice(2)
+const APPLY = args.includes('--apply')
+const argVal = (flag, def) => { const i = args.indexOf(flag); return i >= 0 && args[i + 1] ? args[i + 1] : def }
+const BASE = argVal('--base', 'http://localhost:3100')
+const JOBS = Math.max(1, parseInt(argVal('--jobs', '16'), 10) || 16)
+// Filtre de sous-dossier optionnel : on ne traite que les manifests sous ce préfixe (défaut 'pages').
+const FOLDER = String(argVal('--folder', 'pages')).replace(/\/+$/, '') || 'pages'
+
+// ── helpers HTTP vers l'API locale (qui porte le token GitHub) ──
+async function api(path, init) {
+  const r = await fetch(BASE + path, init)
+  const txt = await r.text()
+  let json = null
+  try { json = JSON.parse(txt) } catch { /* réponse non-JSON (binaire/erreur) */ }
+  return { ok: r.ok, status: r.status, json, txt }
+}
+const post = (path, body) => api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+
+// Lit l'arbre récursif des nœuds (action tree, en GET). Renvoie la liste des chemins de nœuds.
+// NB : les marqueurs .zrvis.json ne sont PAS dans cette liste (filtrés par NODE_RE serveur), on les lit
+// à la demande via readNode. L'action lit l'arbre ENTIER puis filtre par préfixe `dir` => --folder marche.
+async function readTree() {
+  const r = await api(`/api/page?action=tree&dir=${encodeURIComponent(FOLDER)}`)
+  if (!r.json) throw new Error('tree: pas de réponse (serveur local lancé ?)')
+  if (r.json.truncated) console.warn('  ATTENTION : arbre tronqué côté GitHub (>100k nœuds) — réindex partiel sur ce run.')
+  return r.json.paths || []
+}
+
+// Lit un nœud texte (manifest ou marqueur) via /api/page action read. Renvoie { obj, sha } ou null.
+// Le sha est REQUIS pour réécrire le manifest sans conflit (l'action save renvoie 'conflict' sans sha).
+async function readNode(path) {
+  const r = await api(`/api/page?action=read&path=${encodeURIComponent(path)}`)
+  if (!r.json || r.json.missing || r.json.error || r.json.markdown == null) return null
+  let obj = null
+  try { obj = JSON.parse(r.json.markdown) } catch { return null }
+  return { obj, sha: r.json.sha || null }
+}
+
+// Visibilité EFFECTIVE d'un dossier : marqueur .zrvis.json le plus proche en remontant, hérité, défaut
+// 'private'. Cache mémoire par dossier pour ne lire chaque .zrvis.json qu'une seule fois.
+const _visCache = new Map()
+async function folderVis(dir) {
+  const norm = String(dir || 'pages').replace(/\/+$/, '') || 'pages'
+  if (_visCache.has(norm)) return _visCache.get(norm)
+  let cur = norm
+  for (;;) {
+    const node = await readNode(cur + '/.zrvis.json')
+    const m = node && node.obj
+    if (m && (m.vis === 'public' || m.vis === 'private')) { _visCache.set(norm, m.vis); return m.vis }
+    const slash = cur.lastIndexOf('/')
+    if (slash < 0) break
+    const parent = cur.slice(0, slash) || 'pages'
+    if (parent === cur) break
+    cur = parent
+  }
+  _visCache.set(norm, 'private')
+  return 'private'
+}
+
+// Récupère le binaire d'un shard privé (octets bruts) via le proxy /api/shard. Renvoie un Buffer ou null.
+async function fetchPrivateBinary(repo, path) {
+  const r = await fetch(`${BASE}/api/shard?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`)
+  if (!r.ok) return null
+  const ab = await r.arrayBuffer()
+  return Buffer.from(ab)
+}
+
+const toB64 = (buf) => buf.toString('base64')
+
+// Pousse un lot de binaires vers le shard PUBLIC actif (active-shard kind=img vis=public + blob + commit
+// groupé). Retourne { repo, commit } : le commit pin l'URL jsDelivr. N'est appelé qu'en mode --apply.
+async function pushPublic(files /* [{path, buf}] */, addBytes) {
+  const need = files.reduce((s, f) => s + f.buf.length, 0)
+  const act = await post('/api/upload-shard', { action: 'active-shard', kind: 'img', vis: 'public', need })
+  if (!act.json || act.json.error || !act.json.repo) throw new Error('active-shard public: ' + (act.json && (act.json.error || act.json.detail)))
+  const repo = act.json.repo
+  const committed = []
+  for (const f of files) {
+    const b = await post('/api/upload-shard', { action: 'blob', repo, b64: toB64(f.buf) })
+    if (!b.json || !b.json.sha) throw new Error('blob: ' + (b.json && (b.json.error || b.json.detail)))
+    committed.push({ path: f.path, sha: b.json.sha })
+  }
+  const c = await post('/api/upload-shard', { action: 'commit', repo, files: committed, addBytes })
+  if (!c.json || !c.json.ok) throw new Error('commit: ' + (c.json && (c.json.error || c.json.detail)))
+  return { repo, commit: c.json.commit }
+}
+
+// Purge conditionnelle de l'ancien binaire privé via l'action serveur purge-binary (refcount intégré).
+// Le serveur ne supprime QUE si plus aucun manifest vivant ne référence ce hash, sinon il garde (refs>0)
+// ou refuse par prudence (cap dépassé, refs:-1). N'est appelé qu'en mode --apply. Best-effort : un échec
+// de purge ne fait pas échouer la migration (l'image publique est déjà en place).
+async function purgePrivate(srcRepo, hash, paths, decBytes) {
+  const r = await post('/api/upload-shard', { action: 'purge-binary', repo: srcRepo, hash, paths, decBytes })
+  return r.json || { error: 'no-response' }
+}
+
+// ── extraction du hash depuis le chemin haché ab/cd/<hash>.<ext> ──
+function hashFromPath(p) {
+  const m = /([0-9a-f]{16,64})\.[^./]+$/.exec(String(p || ''))
+  return m ? m[1] : null
+}
+const thumbPathOf = (path) => path.replace(/\.[^./]+$/, '.webp')
+const fmtBytes = (n) => {
+  if (n < 1024) return n + ' o'
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' Ko'
+  if (n < 1024 * 1024 * 1024) return (n / 1048576).toFixed(1) + ' Mo'
+  return (n / 1073741824).toFixed(2) + ' Go'
+}
+
+// Mappe une concurrence bornée sur un tableau (pour lire les manifests en parallèle, JOBS à la fois).
+async function mapPool(items, limit, fn) {
+  const out = new Array(items.length)
+  let i = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const idx = i++
+      if (idx >= items.length) return
+      out[idx] = await fn(items[idx], idx)
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+// ── programme principal ──
+async function main() {
+  console.log(`reindex-images — ${APPLY ? 'APPLY (écriture réelle)' : 'DRY-RUN (aucune écriture)'} — serveur ${BASE} — dossier ${FOLDER} — jobs ${JOBS}`)
+
+  // PHASE 1 : lister tous les manifests .img.json sous le dossier (hors trash/).
+  const all = await readTree()
+  const manifestPaths = all.filter((p) => p.endsWith('.img.json') && !p.includes('/trash/') && !p.startsWith('pages/trash/'))
+  console.log(`${manifestPaths.length} manifest(s) image trouvé(s) sous ${FOLDER}.`)
+
+  // PHASE 2 : charger les manifests en parallèle (JOBS à la fois) avec leur sha (nécessaire pour réécrire).
+  const loaded = await mapPool(manifestPaths, JOBS, async (mpath) => {
+    const node = await readNode(mpath)
+    return { mpath, obj: node && node.obj, sha: node && node.sha }
+  })
+
+  // PHASE 3+4 : résoudre la visibilité effective + filtrer (public ET pas déjà migré).
+  const toMigrate = []
+  let alreadyPublic = 0, privateKept = 0, skipped = 0
+  for (const { mpath, obj, sha } of loaded) {
+    if (!obj || obj.type !== 'image') { skipped++; continue }
+    const dir = mpath.replace(/\/[^/]+$/, '')
+    const vis = await folderVis(dir)
+    if (vis !== 'public') { privateKept++; continue }
+    // Idempotence stricte : déjà migré si vis:'public' + refs CDN présentes.
+    if (obj.vis === 'public' && obj.cdnRepo && obj.cdnCommit && obj.cdnPath) { alreadyPublic++; continue }
+    const srcRepo = obj.repo
+    const srcPath = obj.path
+    if (!srcRepo || !srcPath) { console.log(`  SKIP ${mpath} : manifest sans repo/path source.`); skipped++; continue }
+    const hash = hashFromPath(srcPath)
+    if (!hash) { console.log(`  SKIP ${mpath} : impossible d'extraire le hash de ${srcPath}.`); skipped++; continue }
+    toMigrate.push({ mpath, obj, sha, srcRepo, srcPath, hash })
+  }
+
+  console.log(`\n— Plan —`)
+  console.log(`  à migrer vers public : ${toMigrate.length}`)
+  console.log(`  déjà publics         : ${alreadyPublic}`)
+  console.log(`  privés conservés     : ${privateKept}`)
+  console.log(`  ignorés              : ${skipped}`)
+
+  // PHASE 5+6 : pour chaque image à migrer.
+  let done = 0, failed = 0, purged = 0, keptRef = 0
+  let plannedBytes = 0
+  const targetRepos = new Set()
+
+  for (const it of toMigrate) {
+    const { mpath, obj, sha, srcRepo, srcPath, hash } = it
+    const thumbSrc = obj.thumb || thumbPathOf(srcPath)
+    const declaredBytes = Number(obj.size) || 0
+
+    if (!APPLY) {
+      // DRY-RUN : décrire précisément, additionner les octets pour le plan chiffré final.
+      plannedBytes += declaredBytes
+      console.log(`  [DRY-RUN] ${hash.slice(0, 8)}  «${obj.name || '?'}»  dossier ${mpath.replace(/\/[^/]+$/, '')}`)
+      console.log(`      copierait binaire ${srcRepo}:${srcPath}  ->  zenray-img-public-NN:${srcPath}  (${fmtBytes(declaredBytes)})`)
+      console.log(`      copierait vignette ${srcRepo}:${thumbSrc}  ->  zenray-img-public-NN:${thumbPathOf(srcPath)}`)
+      console.log(`      réécrirait le manifest avec vis:'public' + cdnRepo/cdnPath/cdnCommit (pinné sur le commit)`)
+      console.log(`      tenterait ensuite la purge du binaire privé (gardé si encore référencé par un autre manifest)`)
+      continue
+    }
+
+    // APPLY : best-effort par image (un échec n'arrête pas le lot).
+    try {
+      // a. Lire le binaire + vignette depuis le shard privé.
+      const bin = await fetchPrivateBinary(srcRepo, srcPath)
+      if (!bin) throw new Error('binaire source introuvable')
+      const files = [{ path: srcPath, buf: bin }]
+      let addBytes = bin.length
+      const thumbPaths = [srcPath] // chemins à purger ensuite (binaire + éventuelle vignette)
+      const thumb = await fetchPrivateBinary(srcRepo, thumbSrc)
+      if (thumb) { files.push({ path: thumbPathOf(srcPath), buf: thumb }); addBytes += thumb.length; thumbPaths.push(thumbPathOf(srcPath)) }
+
+      // b. Pousser vers le public.
+      const { repo, commit } = await pushPublic(files, addBytes)
+      targetRepos.add(repo)
+
+      // c. Réécrire le manifest (avec le sha pour éviter le conflit). On garde les méta humaines DANS
+      //    zenray-data privé, jamais dans le public.
+      const next = {
+        type: 'image', v: 1, name: obj.name, ext: obj.ext,
+        w: obj.w || 0, h: obj.h || 0, size: obj.size || bin.length, tags: obj.tags || [], addedAt: obj.addedAt || new Date().toISOString(),
+        vis: 'public', cdnRepo: repo, cdnPath: srcPath, cdnCommit: commit,
+      }
+      const sv = await post('/api/page', { action: 'save', path: mpath, markdown: JSON.stringify(next), ...(sha ? { sha } : {}) })
+      if (!sv.json || !sv.json.ok) throw new Error('save manifest: ' + (sv.json && (sv.json.error || sv.json.detail)))
+      console.log(`  [APPLY] ${hash.slice(0, 8)} migré -> ${repo}@${String(commit).slice(0, 8)}`)
+      done++
+
+      // d. Purge conditionnelle de l'ancien binaire privé (refcount serveur). Best-effort.
+      try {
+        const pr = await purgePrivate(srcRepo, hash, thumbPaths, addBytes)
+        if (pr && Array.isArray(pr.deleted) && pr.deleted.length) { purged++; console.log(`      purge privé : ${pr.deleted.length} fichier(s) supprimé(s) (orphelin)`) }
+        else if (pr && pr.refs > 0) { keptRef++; console.log(`      purge privé : gardé (encore référencé par ${pr.refs} manifest(s))`) }
+        else if (pr && pr.reason === 'refcount-cap') { keptRef++; console.log(`      purge privé : gardé (trop de manifests à scanner, prudence)`) }
+      } catch (e) { console.log(`      purge privé : échec best-effort (${(e && e.message) || e})`) }
+    } catch (e) {
+      console.log(`  [APPLY] ${hash.slice(0, 8)} ÉCHEC : ${(e && e.message) || e}`)
+      failed++
+    }
+  }
+
+  // RÉCAP FINAL.
+  console.log(`\n— Récapitulatif —`)
+  if (!APPLY) {
+    console.log(`  images qui seraient migrées : ${toMigrate.length}`)
+    console.log(`  volume estimé à copier      : ${fmtBytes(plannedBytes)} (octets déclarés dans les manifests, vignettes en sus)`)
+    console.log(`  dépôt cible                 : zenray-img-public-NN (rollover auto côté serveur, ~4,5 Go/shard)`)
+    console.log(`  purge privé prévue          : oui, après migration, conditionnée au refcount (garde si partagé)`)
+    console.log(`\n  (DRY-RUN : aucune écriture. Relancer avec --apply pour exécuter réellement.)`)
+  } else {
+    console.log(`  migrées OK        : ${done}`)
+    console.log(`  échecs            : ${failed}`)
+    console.log(`  binaires purgés   : ${purged}`)
+    console.log(`  binaires gardés   : ${keptRef} (encore référencés / prudence refcount)`)
+    console.log(`  dépôts publics    : ${[...targetRepos].join(', ') || '(aucun)'}`)
+  }
+}
+
+main().catch((e) => { console.error('erreur fatale :', (e && e.message) || e); process.exit(1) })

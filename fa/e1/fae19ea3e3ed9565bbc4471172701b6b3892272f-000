@@ -1,0 +1,1268 @@
+// VideoPlayer2.jsx — LECTEUR VIDÉO UNIFIÉ, UI YouTube (réf Design/RefUIYoutube.png), contrôles CUSTOM.
+//
+// EN CLAIR : un seul lecteur pour toutes les vidéos streamables. Contrôles maison (pas les boutons bruts du
+// navigateur) : lecture/pause, barre de progression cliquable, temps, volume, plein écran, et un SÉLECTEUR DE
+// QUALITÉ (Auto / 360p / 720p / 1080p / 4K) façon YouTube. Lit le DASH (.mpd via dash.js, échelle adaptative)
+// et l'ancien HLS (.m3u8 via hls.js / Safari natif). Sous le lecteur : titre + auteur ZenRay éditables.
+import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { createCdnFallbackLoader, createCdnHealth } from '../lib/cdnFallbackLoader.js'
+import Icon from './Icon.jsx'
+import { PlayPauseGlyph } from '../media/playerControls.jsx'
+import { createShareLink, SHARE_KIND } from '../lib/shareLinks.js'
+import { streamDownload, streamDownloadChunks } from '../lib/fetchAsset.js'
+import { fetchMaybePrivate } from '../lib/privateFetch.js'
+import { decryptBytes } from '../media/crypto.js'
+import { useT } from '../i18n/useT.js'
+import { DELIVERY_STYLE, deliveryKind, deliveryRows } from '../lib/deliveryKind.js'
+import { planStreamFiles, decodeSubtitle, parseMaster } from '../lib/streamFiles.js'
+import { urlLectureAffichage } from '../lib/urlLecture.js'
+import SubtitleLayer from './subtitles/SubtitleLayer.jsx'
+import { SUB_KEYS, SUB_PERCENT, clampPercent, percentGrid, readSubtitlePrefs, writeSubtitlePref } from '../media/subtitles/subtitleSettings.js'
+import { PLAYER_PREF_KEYS, readPlayerPrefs, writePlayerPref, playerStorage, trackLang, findByLang, pickLevelByHeight } from '../media/playerPrefs.js'
+import { decodeSubtitleText } from '../lib/subtitleSidecar.js'
+import { HORS_NORMES_PLACEHOLDER_SRT } from '../media/subtitles/subtitleParser.js'
+import { menuAudioTracks, readAudioTracks, selectAudioTrack } from '../media/audioTrackControl.js'
+
+const ACCENT = '#cc7c5e'
+let _dashMod = null
+const loadDash = async () => { if (!_dashMod) { const m = await import('dashjs'); _dashMod = m.MediaPlayer ? m : (m.default || m) } return _dashMod }
+let _hlsMod = null
+const loadHls = async () => { if (!_hlsMod) _hlsMod = (await import('hls.js')).default; return _hlsMod }
+// 14 October 2026: ONE memory per tab of which origin (jsDelivr or GitHub raw) works for each commit; see src/lib/cdnFallbackLoader.js.
+// FR : une memoire par onglet de l'origine qui marche pour chaque commit.
+const cdnHealth = createCdnHealth()
+
+// MOTEUR YOUTUBE (2026-07-02, révisé 2026-07-03) : Matthieu bascule ses clips (DJI notamment) sur des liens
+// YouTube non répertoriés — YouTube fait le transcodage/streaming, ZenRay ne fait que RÉFÉRENCER
+// (manifest.type==='youtube'). L'IFrame Player API (script global, singleton comme loadDash/loadHls) monte
+// le lecteur YouTube AVEC SES PROPRES CONTRÔLES natifs (controls:1) — pas de bandeau custom par-dessus (une
+// 1re version le faisait avec controls:0, mais YouTube affiche quand même son propre écran de pause imposé,
+// non désactivable ; voir le commentaire sur l'effet de montage plus bas). Seul le cadre 16:9 à coins
+// arrondis reste du site ; tout le reste de l'interaction est géré nativement par YouTube.
+let _ytApiPromise = null
+const loadYouTubeApi = () => {
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT)
+  if (_ytApiPromise) return _ytApiPromise
+  _ytApiPromise = new Promise((resolve) => {
+    const prev = window.onYouTubeIframeAPIReady
+    window.onYouTubeIframeAPIReady = () => { try { prev && prev() } catch {}; resolve(window.YT) }
+    if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
+      const s = document.createElement('script'); s.src = 'https://www.youtube.com/iframe_api'; document.head.appendChild(s)
+    }
+  })
+  return _ytApiPromise
+}
+
+const fmt = (s) => { s = Math.max(0, Math.floor(s || 0)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60; return h ? `${h}:${String(m).padStart(2, '0')}:${String(x).padStart(2, '0')}` : `${m}:${String(x).padStart(2, '0')}` }
+const qLabel = (h) => {
+  if (h >= 1800) return '4K'
+  if (h >= 750) return '1080p'
+  if (h >= 500) return '720p'
+  if (h >= 400) return '480p'
+  if (h >= 240) return '360p'
+  return `${h}p`
+}
+
+export default function VideoPlayer2({ t, path, manifest, onSaveMeta, shared = false }) {
+  const tr = useT() // i18n : distinct de `t` (thème) déjà utilisé pour les couleurs dans ce composant
+  const wrapRef = useRef(null)
+  const videoRef = useRef(null)
+  const engineRef = useRef(null) // { kind:'dash'|'hls', api }
+  const ytRef = useRef(null) // instance YT.Player (moteur youtube)
+  const trackEndRef = useRef(() => {}) // widget audio : callback fin de piste (toujours à jour, cf. effet plus bas)
+  const isLocalHost = typeof window !== 'undefined' && /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)
+  const [err, setErr] = useState(null)
+  const isYoutube = manifest && manifest.type === 'youtube'
+  const isAudioOnly = isYoutube && manifest.audioOnly === true
+  // HLS / DASH PRIORITAIRE (10 October 2026) : si master.m3u8 ou manifest.mpd existe (même sur un manifeste video-raw qui conserve parts[] pour l'archive originale), on lit en HLS/DASH via jsDelivr (zéro quota raw.github).
+  const hasMaster = Boolean(manifest && manifest.master)
+  const hasMpd = Boolean(manifest && manifest.mpd)
+  // FMP4-SINGLE (14 October 2026): `isRaw` (archive played through the Service Worker) and master/mpd (separate renditions) are the two
+  // playback modes today. A single muxed fMP4 cannot switch audio language in HLS: keep master/mpd for streaming (see lib/fmp4-single.mjs).
+  const isRaw = Boolean(manifest && manifest.type === 'video-raw' && !hasMaster && !hasMpd) // VIDÉO BRUTE : parts 95 Mo raw.github, lues via SW range-shim si pas de HLS/DASH
+  const isDash = manifest && !isRaw && !isYoutube && !hasMaster && (manifest.type === 'dash' || hasMpd)
+  const isHls = manifest && !isRaw && !isYoutube && (hasMaster || (!hasMpd && manifest.type !== 'dash'))
+  const srcPath = isHls ? (manifest.master || manifest.mpd) : (isDash ? manifest.mpd : manifest.master)
+  const srcUrl = !isYoutube && srcPath ? `/api/hls?path=${encodeURIComponent(srcPath)}` : null
+  // 14 October 2026 (Matthieu): a badge says HOW this film was uploaded (archive, streaming, both) and a toggle opens the details.
+  // FR : une pastille dit COMMENT le film a ete envoye (archive, streaming, les deux) et un bouton ouvre les details.
+  const [showDelivery, setShowDelivery] = useState(false)
+  const delivery = deliveryKind(manifest, isYoutube)
+  const poster = manifest && manifest.poster
+  const [ytDivId] = useState(() => 'zr-yt-' + Math.random().toString(36).slice(2))
+
+  // état lecture
+  const [playing, setPlaying] = useState(false)
+  const [cur, setCur] = useState(0)
+  const [dur, setDur] = useState((manifest && manifest.duration) || 0)
+  const [buffered, setBuffered] = useState(0)
+  const [muted, setMuted] = useState(false)
+  const [vol, setVol] = useState(1)
+  const [full, setFull] = useState(false)
+  const [pip, setPip] = useState(false)
+  const [hover, setHover] = useState(true)
+  const [levels, setLevels] = useState([])      // [{label, index}] haut->bas
+  const [playbackAudioTracks, setPlaybackAudioTracks] = useState([])
+  const [curLevel, setCurLevel] = useState(-1)   // -1 = Auto
+  const [menu, setMenu] = useState(null)         // null | 'quality' | 'speed'
+  const [buffering, setBuffering] = useState(false)
+  // 14 October 2026: speed, subtitle language, subtitles on/off, audio language and quality are read from the saved choices, so the next
+  // video opens as the last one was left (src/media/playerPrefs.js). FR : les choix sauvegardes suivent d'une video a l'autre.
+  const [speed, setSpeed] = useState(() => readPlayerPrefs(playerStorage()).speed)
+  const hideTimer = useRef(null)
+  const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2]
+
+  // ── SOUS-TITRES UNIVERSELS (07 October 2026) : détection multi-sources (manifest.subtitles, manifest.subs)
+  // et injection automatique d'un sous-titre de test pour Hors Normes (2019).
+  const isHorsNormes = Boolean(
+    (manifest?.title && /hors\s*normes|the\s*specials/i.test(manifest.title)) ||
+    (manifest?.name && /hors\s*normes|the\s*specials/i.test(manifest.name)) ||
+    (path && /hors\s*normes|the\s*specials/i.test(path))
+  )
+
+  const rawSubList = Array.isArray(manifest?.subtitles)
+    ? manifest.subtitles
+    : Array.isArray(manifest?.subs)
+      ? manifest.subs
+      : []
+
+  const availableSubTracks = React.useMemo(() => {
+    const list = []
+    if (isHorsNormes) {
+      list.push({
+        id: 'hn-fr-test',
+        label: 'Français (Test Démo)',
+        lang: 'fr',
+        format: 'srt',
+        text: HORS_NORMES_PLACEHOLDER_SRT,
+      })
+    }
+    rawSubList.forEach((s, idx) => {
+      list.push({
+        id: s.id || `track-${idx}`,
+        label: s.title || s.label || (s.lang ? s.lang.toUpperCase() : `Piste ${idx + 1}`),
+        lang: s.lang || 'und',
+        format: s.format || (s.src?.endsWith('.vtt') ? 'vtt' : s.src?.endsWith('.srt') ? 'srt' : 'ass'),
+        src: s.src || s.url,
+        text: s.text || s.content,
+        data: s.data,
+        encoding: s.encoding,
+      })
+    })
+    return list
+  }, [isHorsNormes, rawSubList])
+
+  const [activeSubTrackId, setActiveSubTrackId] = useState(() => {
+    const wanted = findByLang(availableSubTracks, readPlayerPrefs(playerStorage()).subLang)
+    return (wanted || availableSubTracks[0])?.id ?? null
+  })
+  const [subsOn, setSubsOn] = useState(() => readPlayerPrefs(playerStorage()).subsOn)
+  // 12 October 2026: size as a percentage, background pill and family are three preferences shared by every film.
+  const [subPrefs, setSubPrefs] = useState(() => readSubtitlePrefs(typeof localStorage !== 'undefined' ? localStorage : null))
+  const [subPanel, setSubPanel] = useState('main')
+  useEffect(() => { if (menu !== 'settings') setSubPanel('main') }, [menu])
+  const setSubPref = (patch) => {
+    setSubPrefs((prev) => ({ ...prev, ...patch }))
+    if ('sizePct' in patch) writeSubtitlePref(localStorage, SUB_KEYS.size, patch.sizePct)
+    if ('background' in patch) writeSubtitlePref(localStorage, SUB_KEYS.background, patch.background ? '1' : '0')
+    if ('font' in patch) writeSubtitlePref(localStorage, SUB_KEYS.font, patch.font)
+  }
+
+  // 14 October 2026: a new film brings its own tracks ("track-0" is not the same language in every film), so the track is chosen again
+  // by the saved language; when the film does not have it, the first track stays. The choice made inside a film is kept: the effect
+  // only runs when the list of tracks changes. FR : a chaque film la piste se rechoisit par la langue sauvegardee.
+  const subSignature = availableSubTracks.map((t) => `${t.id}:${t.lang}:${t.label}`).join('|')
+  useEffect(() => {
+    if (availableSubTracks.length === 0) return
+    const wanted = findByLang(availableSubTracks, readPlayerPrefs(playerStorage()).subLang)
+    setActiveSubTrackId((wanted || availableSubTracks[0]).id)
+  }, [subSignature]) // eslint-disable-line react-hooks/exhaustive-deps
+  const pickSubtitle = (track) => {
+    setActiveSubTrackId(track.id); setSubsOn(true)
+    const lang = trackLang(track)
+    if (lang) writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.subLang, lang)
+    writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.subsOn, '1')
+  }
+  const setSubtitlesVisible = (on) => { setSubsOn(on); writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.subsOn, on ? '1' : '0') }
+
+  const currentSubTrack = availableSubTracks.find((t) => t.id === activeSubTrackId) || availableSubTracks[0] || null
+
+  // ── moteur de lecture (dash.js / hls.js) ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    let dead = false
+    const v = videoRef.current
+    if (!v || !srcUrl) return
+    setErr(null); setLevels([]); setCurLevel(-1); setPlaybackAudioTracks([])
+    const cleanup = () => { try { const e = engineRef.current; if (e) { if (e.kind === 'dash') e.api.destroy(); else if (e.kind === 'hls' && e.api.destroy) e.api.destroy(); engineRef.current = null } } catch {} }
+    cleanup()
+    ;(async () => {
+      try {
+        if (isDash) {
+          const dash = await loadDash(); if (dead) return
+          const player = dash.MediaPlayer().create()
+          // Buffer réactif : 12-15s de buffer stable pour éviter les temps d'attente excessifs au seek
+          player.updateSettings({
+            streaming: {
+              buffer: { stableBufferTime: 12, bufferTimeAtTopQuality: 15, bufferTimeAtTopQualityLongForm: 15, fastSwitchEnabled: true, bufferToKeep: 10 },
+              abr: { autoSwitchBitrate: { video: true } },
+              jumpGaps: { enable: true },
+            },
+          })
+          player.initialize(v, srcUrl, false)
+          engineRef.current = { kind: 'dash', api: player }
+          const readLevels = () => {
+            try {
+              const list = player.getBitrateInfoListFor('video') || []
+              const lv = list.map((b) => ({ label: qLabel(b.height), index: b.qualityIndex, h: b.height })).sort((a, b) => b.h - a.h)
+              if (!dead) setLevels(lv)
+            } catch {}
+          }
+          player.on('streamInitialized', readLevels)
+          const readDashAudio = () => { if (!dead) setPlaybackAudioTracks(readAudioTracks(engineRef.current, v)) }
+          player.on('streamInitialized', readDashAudio)
+          player.on('currentTrackChanged', readDashAudio)
+          player.on('error', (e) => { if (!dead) setErr((e && e.error && (e.error.message || e.error.code)) || 'dash error') })
+        } else {
+          const Hls = await loadHls(); if (dead) return
+          if (Hls && Hls.isSupported()) {
+            // Hls.js avec seek optimisé : charge uniquement le segment ciblé et reprend la lecture en 150-300ms
+            // 14 October 2026: fragments go through CdnFallbackLoader: jsDelivr first with a 3 s first byte window and no retry, GitHub
+            // raw at once when it refuses (404 "Failed to fetch the requested commit", 503, silence), and a commit that failed twice is
+            // asked to raw first. FR : jsDelivr d'abord (3 s, sans retente), GitHub raw tout de suite s'il refuse, memoire par commit.
+            const hls = new Hls({
+              fLoader: createCdnFallbackLoader(Hls.DefaultConfig.loader, { health: cdnHealth }),
+              maxBufferLength: 15,
+              maxMaxBufferLength: 30,
+              maxBufferSize: 30 * 1000 * 1000,
+              backBufferLength: 15,
+              enableWorker: true,
+              maxBufferHole: 0.5,
+              highBufferWatchdogPeriod: 2,
+              nudgeOffset: 0.1,
+              nudgeMaxRetry: 5,
+              lowLatencyMode: false,
+              startFragPrefetch: true,
+              // 14 October 2026 (FIX "la video ne demarre pas"): jsDelivr answers 403 ("Package size exceeded the configured limit of
+              // 50 MB") or 404 ("Failed to fetch the requested commit") for a segment it has never served from a large public shard,
+              // then 200 a few seconds later once it has fetched it (measured on 75 segments: 10 failures, 0 on the next pass).
+              // hls.js does NOT retry a 4xx by default, so the first cold segment was a fatal error. We retry 403 and 404 up to 10
+              // times with a growing delay. FR : hls.js ne rejoue jamais un 4xx ; jsDelivr en donne a froid puis 200 apres quelques secondes.
+              fragLoadPolicy: {
+                default: {
+                  maxTimeToFirstByteMs: 15000,
+                  maxLoadTimeMs: 120000,
+                  timeoutRetry: { maxNumRetry: 4, retryDelayMs: 0, maxRetryDelayMs: 0 },
+                  errorRetry: {
+                    maxNumRetry: 10,
+                    retryDelayMs: 1500,
+                    maxRetryDelayMs: 10000,
+                    backoff: 'linear',
+                    shouldRetry: (config, retryCount, isTimeout, response, retry) =>
+                      retry || (retryCount < config.maxNumRetry && (response?.code === 403 || response?.code === 404)),
+                  },
+                },
+              },
+            })
+            hls.loadSource(srcUrl)
+            hls.attachMedia(v)
+            engineRef.current = { kind: 'hls', api: hls }
+            const readHlsAudio = () => { if (!dead) setPlaybackAudioTracks(readAudioTracks(engineRef.current, v)) }
+            hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, readHlsAudio)
+            hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, readHlsAudio)
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+              const lv = (hls.levels || []).map((l, i) => ({ label: qLabel(l.height), index: i, h: l.height })).sort((a, b) => b.h - a.h)
+              if (!dead) setLevels(lv)
+            })
+            hls.on(Hls.Events.ERROR, (event, data) => {
+              if (data && data.fatal) {
+                switch (data.type) {
+                  case Hls.ErrorTypes.NETWORK_ERROR:
+                    hls.startLoad()
+                    break
+                  case Hls.ErrorTypes.MEDIA_ERROR:
+                    hls.recoverMediaError()
+                    break
+                  default:
+                    hls.destroy()
+                    if (!dead) setErr(tr('player.playbackError') + (data.details || ''))
+                    break
+                }
+              }
+            })
+          } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+            // Safari iOS (pas de MediaSource pour la vidéo, moteur AVPlayer natif)
+            v.src = srcUrl
+            engineRef.current = { kind: 'native', api: null }
+          } else {
+            v.src = srcUrl
+          }
+        }
+      } catch (e) { if (!dead) setErr(String(e && e.message || e)) }
+    })()
+    return () => { dead = true; cleanup() }
+  }, [srcUrl, isDash])
+
+  // ── moteur VIDÉO BRUTE (video-raw) : on enregistre le manifeste au Service Worker, qui présente un fichier
+  // virtuel seekable à /zr-stream/<id> ; le <video> natif le lit (HEVC décodé par l'OS, seek natif). Pas de
+  // dash.js/hls.js. Réutilise tous les contrôles custom (ils pilotent l'élément <video> directement).
+  useEffect(() => {
+    if (!isRaw || !manifest) return
+    let dead = false
+    const v = videoRef.current; if (!v) return
+    setErr(null); setLevels([]); setCurLevel(-1)
+    ;(async () => {
+      try {
+        const { registerRawVideo, streamSWControlling } = await import('../lib/vidStream.js')
+        const url = await registerRawVideo(manifest)
+        if (dead) return
+        // Un nouveau SW ne peut intercepter cet onglet qu'après un rechargement. On le fait une
+        // seule fois : plus de faux échec rouge au premier média brut d'un déploiement.
+        if (!streamSWControlling()) {
+          const key = 'zr-stream-controller-reload-v1'
+          if (!sessionStorage.getItem(key)) { sessionStorage.setItem(key, '1'); window.location.reload(); return }
+          setErr(tr('player.rawEngineActivating')); return
+        }
+        sessionStorage.removeItem('zr-stream-controller-reload-v1')
+        v.src = url
+        v.load()
+      } catch (e) {
+        if (dead) return
+        // Page not under the service worker's control (typically after ⇧⌘R) : ONE automatic normal reload fixes it.
+        // The sessionStorage guard keeps it from ever looping; it is cleared as soon as playback registers.
+        const key = 'zr-stream-controller-reload-v1'
+        if (e && (e.code === 'stream_controller_missing' || e.code === 'stream_ack_timeout') && !sessionStorage.getItem(key)) { sessionStorage.setItem(key, '1'); window.location.reload(); return }
+        setErr(tr('player.rawPlaybackError') + String((e && e.message) || e))
+      }
+    })()
+    return () => { dead = true; try { v.removeAttribute('src'); v.load() } catch {} }
+  }, [isRaw, manifest && manifest.parts && manifest.parts[0] && manifest.parts[0].url])
+
+  // ── moteur YOUTUBE : IFrame Player API créé sur un <div> (pas de <video> natif).
+  //
+  // BUG TROUVÉ EN PROD (2026-07-03, Matthieu) : la 1re version pilotait YouTube avec controls:0 (chrome natif
+  // masqué) + notre bandeau custom par-dessus (play/pause/scrubber/volume maison, comme le <video> natif).
+  // Ça casse : quand on met en pause via l'API pendant que controls:0 est actif, YouTube affiche QUAND MÊME
+  // SON PROPRE écran de pause (vidéo réduite ~50%, fond noir, parfois suggestions) — un comportement de
+  // branding IMPOSÉ par YouTube, non désactivable via playerVars, documenté et déjà rencontré par d'autres
+  // intégrateurs. Résultat : mélange incohérent (cadre arrondi du site + chrome de pause de YouTube qui
+  // apparaît quand même par-dessus nos propres contrôles).
+  //
+  // FIX : on arrête de lutter contre la plateforme. controls:1 -> YouTube garde SES PROPRES contrôles
+  // natifs (fiables, déjà connus des utilisateurs, aucun conflit d'état possible puisque c'est YouTube qui
+  // gère lecture/pause/volume/qualité/vitesse/plein écran de bout en bout). Ce qui RESTE du site : le cadre
+  // 16:9 à coins arrondis (même position/taille que les autres vidéos), le titre, et les actions Éditer /
+  // Partager / Ouvrir sur YouTube / Commentaires en dessous — tout ce qui est VRAIMENT à nous.
+  useEffect(() => {
+    if (!isYoutube || !manifest || !manifest.videoId) return
+    let dead = false
+    setErr(null)
+    ;(async () => {
+      try {
+        const YT = await loadYouTubeApi()
+        if (dead) return
+        const player = new YT.Player(ytDivId, {
+          // width/height EXPLICITES en % (2026-07-04, fix bug réel : sans ça, YT crée un iframe à taille FIXE
+          // 640×360 en attributs HTML, ensuite étiré en CSS par le div englobant — ce décalage entre la taille
+          // "native" que YouTube utilise pour positionner ses propres sprites d'icônes et la taille RÉELLE
+          // affichée cassait le rendu de certains boutons (ex. plein écran = rond vide sans icône visible tant
+          // qu'on ne survolait pas). En donnant '100%' dès la construction, YouTube dimensionne son iframe ET
+          // ses icônes cohéremment avec la taille réelle du conteneur, plus de décalage.
+          width: '100%', height: '100%',
+          videoId: manifest.videoId,
+          // AUDIO (isAudioOnly) : controls:0 — le petit cadre YouTube n'a plus besoin d'être interactif, tout
+          // passe par la barre custom façon Spotify plus bas (fiable : play/pause/seek pilotés par l'API, pas
+          // par les boutons YouTube). VIDÉO : controls:1 inchangé (cf. commentaire du bloc juste au-dessus).
+          // color:'white' (2026-07-04) : SEUL paramètre officiel de l'API YouTube qui influence la couleur de
+          // la barre de progression — passe du rouge YouTube à un gris clair neutre. Ne change PAS les icônes
+          // (toujours blanches/grises, déjà neutres) ni le fond de la barre (iframe cross-origin, aucun accès
+          // CSS à ça) — c'est le seul levier de couleur réellement exposé par l'API, pas un choix arbitraire.
+          playerVars: { controls: isAudioOnly ? 0 : 1, modestbranding: 1, rel: 0, iv_load_policy: 3, playsinline: 1, color: 'white', start: manifest.start || 0, origin: window.location.origin },
+          events: isAudioOnly ? {
+            onStateChange: (e) => { if (e.data === 0) trackEndRef.current() },
+            // BANDE PASSANTE (2026-07-04, demande explicite de Matthieu) : le rendu du cadre YouTube est déjà
+            // minuscule (6×4px, cf. plus bas), ce qui pousse l'algo de qualité adaptative de YouTube à choisir
+            // sa PLUS BASSE résolution disponible dès le départ (comportement documenté : la taille RENDUE du
+            // lecteur influence le choix initial). En plus de ça, on force explicitement la qualité la plus
+            // basse dès que le lecteur est prêt — ceinture ET bretelles, pas juste un espoir basé sur la taille.
+            // NB honnête : YouTube n'expose aucun mode "audio only" officiel côté IFrame API — impossible de
+            // couper le flux vidéo à 100%, seulement de le réduire au minimum. setPlaybackQuality peut être
+            // ignoré par le lecteur selon les cas (API ancienne, dépréciée en pratique côté forçage manuel) ;
+            // le vrai levier fiable reste la taille de rendu minuscule ci-dessous.
+            onReady: (e) => { try { e.target.setPlaybackQuality('tiny') } catch {} },
+          } : undefined,
+        })
+        ytRef.current = player
+      } catch (e) { if (!dead) setErr(String((e && e.message) || e)) }
+    })()
+    return () => {
+      dead = true
+      try { ytRef.current && ytRef.current.destroy() } catch {}
+      ytRef.current = null
+    }
+  }, [isYoutube, manifest && manifest.videoId])
+
+  // ── SYNCHRO état lecture YouTube -> UI (cur/dur/playing), pour le widget audio (barre de progression et
+  // icône lecture/pause custom). Le <video> natif n'existe pas en mode youtube, donc pas d'événements
+  // timeupdate/play/pause à écouter -> on interroge l'API toutes les 400ms (léger, léger, cf. YT docs).
+  useEffect(() => {
+    if (!isAudioOnly) return
+    let alive = true, timer = null
+    const tick = () => {
+      const p = ytRef.current
+      if (p && typeof p.getCurrentTime === 'function') {
+        try {
+          setCur(p.getCurrentTime() || 0)
+          const d = p.getDuration(); if (d) setDur(d)
+          setPlaying(p.getPlayerState() === 1)
+        } catch {}
+      }
+      if (alive) timer = setTimeout(tick, 400)
+    }
+    timer = setTimeout(tick, 400)
+    return () => { alive = false; clearTimeout(timer) }
+  }, [isAudioOnly, manifest && manifest.videoId])
+
+  // ── PISTES SŒURS (widget audio) : liste les autres liens audio YouTube du MÊME dossier, pour que
+  // précédent/suivant/aléatoire aient un vrai contenu à jouer (comme une file de lecture Spotify locale au
+  // dossier). Lecture des manifestes en parallèle (dossier typique = quelques dizaines de pistes, pas un souci
+  // de perf). Triées par chemin (= ordre alphabétique du Finder, cohérent avec le reste de l'app).
+  const [siblings, setSiblings] = useState([])
+  const [activeIdx, setActiveIdx] = useState(-1) // -1 = piste initialement ouverte (pas encore navigué)
+  const [shuffleOn, setShuffleOn] = useState(false)
+  const [repeatOn, setRepeatOn] = useState(false)
+  useEffect(() => {
+    if (!isAudioOnly || !path) return
+    let dead = false
+    const dir = path.split('/').slice(0, -1).join('/')
+    ;(async () => {
+      try {
+        const j = await fetch(`/api/page?action=children&dir=${encodeURIComponent(dir)}`).then((r) => r.json())
+        const files = (j.entries || []).filter((e) => e.type === 'file' && e.path.endsWith('.media.json'))
+        // Lecture d'AFFICHAGE : ce parcours lit TOUS les media.json du dossier pour trouver les
+        // pistes soeurs. Sur un dossier d'album, c'est une requete par piste.
+        const metas = await Promise.all(files.map((f) => fetch(urlLectureAffichage(f.path))
+          .then((r) => r.json()).then((x) => { try { return { path: f.path, ...JSON.parse(x.markdown) } } catch { return null } }).catch(() => null)))
+        if (dead) return
+        const tracks = metas.filter((m) => m && m.type === 'youtube' && m.audioOnly === true && m.videoId).sort((a, b) => a.path.localeCompare(b.path))
+        setSiblings(tracks)
+      } catch {}
+    })()
+    return () => { dead = true }
+  }, [isAudioOnly, path])
+
+  const activeTrack = activeIdx >= 0 && siblings[activeIdx] ? siblings[activeIdx] : null
+  const playSibling = (idx) => {
+    if (idx < 0 || idx >= siblings.length) return
+    setActiveIdx(idx)
+    try { ytRef.current && ytRef.current.loadVideoById(siblings[idx].videoId) } catch {}
+  }
+  const currentSiblingIdx = () => (activeIdx >= 0 ? activeIdx : siblings.findIndex((s) => s.videoId === manifest.videoId))
+  const goNext = () => {
+    if (siblings.length < 2) return
+    const base = currentSiblingIdx()
+    const idx = shuffleOn ? Math.floor(Math.random() * siblings.length) : (base + 1 + siblings.length) % siblings.length
+    playSibling(idx)
+  }
+  const goPrev = () => {
+    if (siblings.length < 2) return
+    const base = currentSiblingIdx()
+    playSibling((base - 1 + siblings.length) % siblings.length)
+  }
+  useEffect(() => { trackEndRef.current = () => { if (repeatOn) { try { ytRef.current.seekTo(0, true); ytRef.current.playVideo() } catch {} } else goNext() } })
+
+  // ── contrôles custom (widget audio) : play/pause/seek pilotent l'API YouTube directement (fiable, même
+  // mécanisme que la synchro d'état ci-dessus — pas de <video> natif en mode youtube).
+  const ytTogglePlay = () => { const p = ytRef.current; if (!p) return; try { p.getPlayerState() === 1 ? p.pauseVideo() : p.playVideo() } catch {} }
+  const ytSeek = (e) => { const p = ytRef.current; if (!p || !dur) return; const bar = e.currentTarget; const r = bar.getBoundingClientRect(); p.seekTo(Math.min(dur, Math.max(0, (e.clientX - r.left) / r.width * dur)), true) }
+  // TÉLÉCHARGEMENT AUDIO : contrairement à la vidéo (qui vit sur YouTube, non téléchargeable), un lien audio
+  // YouTube PEUT être extrait via yt-dlp — mais SEULEMENT depuis le serveur local (scripts/local-server.mjs,
+  // route /api/ytdlp-download absente du déploiement Vercel par design, cf. docs/ytdlp-terminal-design.md :
+  // exécuter un process serveur depuis une requête web publique serait une vraie surface d'attaque). En prod,
+  // le bouton reste VISIBLE (jamais caché/oublié) mais explique pourquoi il ne peut pas encore agir.
+  const ytDownload = () => {
+    const vid = activeTrack ? activeTrack.videoId : manifest.videoId
+    const nm = activeTrack ? activeTrack.title : title
+    if (!isLocalHost) { alert(tr('player.downloadLocalOnly')); return }
+    window.open(`/api/ytdlp-download?videoId=${encodeURIComponent(vid)}&name=${encodeURIComponent(nm || 'audio')}`, '_blank')
+  }
+
+  // choisir une qualité : idx = -1 -> Auto (ABR), sinon force le niveau.
+  const setLevel = (idx) => {
+    setCurLevel(idx); setMenu(null)
+    const e = engineRef.current; if (!e) return
+    try {
+      if (e.kind === 'dash') {
+        if (idx < 0) e.api.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: true } } } })
+        else { e.api.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: false } } } }); e.api.setQualityFor('video', idx, true) }
+      } else if (e.kind === 'hls') { e.api.currentLevel = idx } // -1 = auto
+    } catch {}
+  }
+
+  // 14 October 2026: the quality chosen in the menu is saved as a height (0 = Auto); the next film starts at the closest level it has.
+  // FR : la qualite choisie se sauvegarde par sa hauteur (0 = Auto) ; le film suivant demarre au niveau le plus proche.
+  const chooseLevel = (level) => {
+    writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.qualityHeight, level.index < 0 ? 0 : (level.h || 0))
+    setLevel(level.index)
+  }
+  useEffect(() => {
+    if (!levels.length) return
+    const wanted = pickLevelByHeight(levels, readPlayerPrefs(playerStorage()).qualityHeight)
+    if (wanted) setLevel(wanted.index)
+  }, [levels]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── synchro <video> -> état UI ────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const v = videoRef.current; if (!v) return
+    const onTime = () => { setCur(v.currentTime); try { setBuffered(v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0) } catch {} }
+    const onDur = () => setDur(v.duration || dur)
+    const onPlay = () => setPlaying(true), onPause = () => setPlaying(false)
+    const onVol = () => { setMuted(v.muted); setVol(v.volume) }
+    const onWait = () => setBuffering(true), onPlaying = () => setBuffering(false)
+    v.addEventListener('timeupdate', onTime); v.addEventListener('durationchange', onDur)
+    v.addEventListener('play', onPlay); v.addEventListener('pause', onPause); v.addEventListener('volumechange', onVol)
+    v.addEventListener('waiting', onWait); v.addEventListener('playing', onPlaying); v.addEventListener('canplay', onPlaying)
+    return () => { v.removeEventListener('timeupdate', onTime); v.removeEventListener('durationchange', onDur); v.removeEventListener('play', onPlay); v.removeEventListener('pause', onPause); v.removeEventListener('volumechange', onVol); v.removeEventListener('waiting', onWait); v.removeEventListener('playing', onPlaying); v.removeEventListener('canplay', onPlaying) }
+  }, [])
+
+  // ── Scrubbing UI fluide (façon YouTube) ─────────────────────────────────────────────────────────────
+  // En cours de glissement, on met à jour uniquement l'affichage local sans solliciter le réseau ni la balise vidéo.
+  // Un seul saut réseau est émis au relâchement (pointerup/mouseup), éliminant les collisions de buffer et requêtes avortées.
+  const [scrubbing, setScrubbing] = useState(false)
+  const [scrubTime, setScrubTime] = useState(0)
+
+  const commitSeek = useCallback((targetTime) => {
+    const v = videoRef.current
+    if (!v || !dur) return
+    const clamped = Math.min(dur, Math.max(0, targetTime))
+    const e = engineRef.current
+    if (e && e.kind === 'dash' && typeof e.api?.seek === 'function') {
+      try { e.api.seek(clamped) } catch { v.currentTime = clamped }
+    } else {
+      v.currentTime = clamped
+    }
+    setCur(clamped)
+  }, [dur])
+
+  const seekBy = (seconds) => {
+    const v = videoRef.current
+    if (!v || !dur) return
+    commitSeek(v.currentTime + seconds)
+  }
+
+  const onSeekChange = (event) => {
+    if (!dur) return
+    const target = (Number(event.target.value) / 1000) * dur
+    if (scrubbing) {
+      setScrubTime(target)
+    } else {
+      commitSeek(target)
+    }
+  }
+
+  const onSeekPointerDown = () => {
+    if (!dur) return
+    setScrubbing(true)
+    setScrubTime(cur)
+  }
+
+  const onSeekPointerUp = (event) => {
+    if (!dur) return
+    setScrubbing(false)
+    const val = Number(event?.target?.value)
+    const target = !Number.isNaN(val) ? (val / 1000) * dur : scrubTime
+    commitSeek(target)
+  }
+
+  // ── Reprise automatique de position (façon YouTube) ────────────────────────────────────────────────
+  const resumeKey = manifest && (manifest.master || manifest.mpd || manifest.sourceVideo || manifest.name)
+    ? `zr-playback-${manifest.master || manifest.mpd || manifest.name}`
+    : null
+
+  useEffect(() => {
+    if (!resumeKey || !cur || !dur) return
+    if (cur > 10 && cur < dur - 30) {
+      try { localStorage.setItem(resumeKey, String(Math.floor(cur))) } catch {}
+    } else if (cur >= dur - 15) {
+      try { localStorage.removeItem(resumeKey) } catch {}
+    }
+  }, [resumeKey, Math.floor(cur / 5), dur])
+
+  const resumedRef = useRef(false)
+  useEffect(() => {
+    if (resumedRef.current || !resumeKey || !dur) return
+    resumedRef.current = true
+    try {
+      const saved = Number(localStorage.getItem(resumeKey))
+      if (saved > 10 && saved < dur - 30) {
+        commitSeek(saved)
+      }
+    } catch {}
+  }, [resumeKey, dur, commitSeek])
+
+  // RACCOURCIS CLAVIER (façon YouTube) quand le lecteur a le focus / la souris dessus : espace/k lecture,
+  // ←/→ ±5s, ↑/↓ volume, m muet, f plein écran, 0-9 saut en %. YOUTUBE EXCLU (2026-07-03) : ses propres
+  // contrôles natifs (controls:1) gèrent déjà le clavier quand l'iframe a le focus — dupliquer ces
+  // raccourcis au niveau du wrapper causerait des doubles actions (ex. double seek sur flèche).
+  useEffect(() => {
+    const w = wrapRef.current; if (!w || isYoutube) return
+    const onKey = (ev) => {
+      const v = videoRef.current; if (!v) return
+      const k = ev.key
+      if (k === ' ' || k === 'k') { ev.preventDefault(); togglePlay() }
+      else if (k === 'ArrowLeft') { ev.preventDefault(); commitSeek(v.currentTime - 5) }
+      else if (k === 'ArrowRight') { ev.preventDefault(); commitSeek(v.currentTime + 5) }
+      else if (k === 'ArrowUp') { ev.preventDefault(); v.volume = Math.min(1, v.volume + 0.1) }
+      else if (k === 'ArrowDown') { ev.preventDefault(); v.volume = Math.max(0, v.volume - 0.1) }
+      else if (k === 'm') { toggleMute() }
+      else if (k === 'f') { toggleFull() }
+      else if (/^[0-9]$/.test(k) && v.duration) { commitSeek((Number(k) / 10) * v.duration) }
+    }
+    w.addEventListener('keydown', onKey)
+    return () => w.removeEventListener('keydown', onKey)
+  }, [isYoutube, commitSeek])
+  const setRate = (r) => {
+    setSpeed(r); setMenu(null); writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.speed, r)
+    const v = videoRef.current; if (v) { v.defaultPlaybackRate = r; v.playbackRate = r }
+  }
+  // 14 October 2026: loading a new source resets the playback rate to the default one, so the saved speed is applied again each time.
+  // FR : charger une source remet la vitesse par defaut, on reapplique donc la vitesse sauvegardee.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const apply = () => { try { v.defaultPlaybackRate = speed; v.playbackRate = speed } catch {} }
+    apply()
+    v.addEventListener('loadedmetadata', apply); v.addEventListener('loadeddata', apply)
+    return () => { v.removeEventListener('loadedmetadata', apply); v.removeEventListener('loadeddata', apply) }
+  }, [speed, srcUrl, path])
+  useEffect(() => { const onFs = () => setFull(!!document.fullscreenElement); document.addEventListener('fullscreenchange', onFs); return () => document.removeEventListener('fullscreenchange', onFs) }, [])
+
+  // togglePlay/seek/toggleMute/showControls : plus de branche YouTube (2026-07-03) — YouTube pilote son
+  // propre état avec controls:1, ces handlers ne sont montés QUE sur les contrôles custom dash/hls/raw.
+  const togglePlay = useCallback(() => { const v = videoRef.current; if (!v) return; v.paused ? v.play() : v.pause() }, [])
+  const toggleMute = () => { const v = videoRef.current; if (v) v.muted = !v.muted }
+  // 11 October 2026: the Audio menu always lists the film's track(s), even when there is only one.
+  const audioMenuTracks = menuAudioTracks(playbackAudioTracks, manifest)
+  const pickAudioTrack = (index) => {
+    try {
+      selectAudioTrack(engineRef.current, videoRef.current, index)
+      setPlaybackAudioTracks(readAudioTracks(engineRef.current, videoRef.current))
+      const lang = trackLang(audioMenuTracks[index])
+      if (lang) writePlayerPref(playerStorage(), PLAYER_PREF_KEYS.audioLang, lang)
+    } catch (error) { setErr(error.message) }
+  }
+  // 14 October 2026: once per film, the audio track in the saved language is selected when the engine can switch tracks.
+  // FR : une fois par film, la piste audio de la langue sauvegardee est selectionnee quand le moteur sait changer de piste.
+  const audioAppliedRef = useRef('')
+  const audioSignature = audioMenuTracks.map((t) => `${t.label}:${t.fixed ? 1 : 0}`).join('|')
+  useEffect(() => {
+    if (playbackAudioTracks.length < 2) return
+    const key = `${path}|${audioSignature}`
+    if (audioAppliedRef.current === key) return
+    audioAppliedRef.current = key
+    const wanted = readPlayerPrefs(playerStorage()).audioLang
+    const match = findByLang(audioMenuTracks.filter((t) => !t.fixed), wanted)
+    if (!match || match.selected) return
+    try {
+      selectAudioTrack(engineRef.current, videoRef.current, match.index)
+      setPlaybackAudioTracks(readAudioTracks(engineRef.current, videoRef.current))
+    } catch { /* the engine keeps its default track */ }
+  }, [audioSignature, playbackAudioTracks.length, path]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video) return
+    let list
+    const update = () => setPlaybackAudioTracks(readAudioTracks(engineRef.current, video))
+    const bind = () => {
+      if (list) for (const event of ['addtrack', 'removetrack', 'change']) list.removeEventListener?.(event, update)
+      list = video.audioTracks
+      if (list) for (const event of ['addtrack', 'removetrack', 'change']) list.addEventListener?.(event, update)
+      update()
+    }
+    video.addEventListener('loadedmetadata', bind)
+    bind()
+    return () => {
+      video.removeEventListener('loadedmetadata', bind)
+      if (list) for (const event of ['addtrack', 'removetrack', 'change']) list.removeEventListener?.(event, update)
+    }
+  }, [srcUrl, isRaw, path])
+  const togglePip = async () => {
+    const v = videoRef.current
+    if (!v || !document.pictureInPictureEnabled) return
+    try { if (document.pictureInPictureElement) await document.exitPictureInPicture(); else await v.requestPictureInPicture() } catch {}
+  }
+
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const onEnter = () => setPip(true)
+    const onLeave = () => setPip(false)
+    v.addEventListener('enterpictureinpicture', onEnter)
+    v.addEventListener('leavepictureinpicture', onLeave)
+    return () => {
+      v.removeEventListener('enterpictureinpicture', onEnter)
+      v.removeEventListener('leavepictureinpicture', onLeave)
+    }
+  }, [])
+  // PLEIN ÉCRAN — 2 chemins (bug iPhone réel, 2026-07-06) : l'API Fullscreen standard (requestFullscreen)
+  // n'existe PAS sur iOS Safari pour un <div> — sur iPhone, SEULE la balise <video> sait passer plein écran,
+  // via l'API WebKit native webkitEnterFullscreen() (ouvre le lecteur plein écran iOS, contrôles natifs —
+  // même comportement que YouTube mobile ; c'est la SEULE option offerte par iOS, pas un choix).
+  // Desktop : comportement inchangé (fullscreen du conteneur, nos contrôles custom restent visibles).
+  const toggleFull = () => {
+    const w = wrapRef.current, v = videoRef.current
+    if (document.fullscreenElement) { document.exitFullscreen(); return }
+    if (w && typeof w.requestFullscreen === 'function') { w.requestFullscreen(); return }
+    if (v && typeof v.webkitEnterFullscreen === 'function') { try { v.webkitEnterFullscreen() } catch {} }
+  }
+  const showControls = () => { setHover(true); clearTimeout(hideTimer.current); hideTimer.current = setTimeout(() => { if (!videoRef.current?.paused) setHover(false) }, 2600) }
+
+  // ── titre / auteur éditables ──────────────────────────────────────────────────────────────────────────
+  const baseTitle = (manifest && (manifest.title || (manifest.name || '').replace(/\.[^.]+$/, ''))) || tr('player.untitled')
+  const baseAuthor = (manifest && manifest.author) || 'ZenRay'
+  const [title, setTitle] = useState(baseTitle)
+  const [author, setAuthor] = useState(baseAuthor)
+  const [editing, setEditing] = useState(false)
+  useEffect(() => { setTitle(baseTitle); setAuthor(baseAuthor); setEditing(false) }, [path])
+  const saveMeta = () => { setEditing(false); if (onSaveMeta && (title !== baseTitle || author !== baseAuthor)) onSaveMeta({ title, author }) }
+
+  // PARTAGE : jeton public opaque -> page « vidéo only » (pas d'accès au drive). Sheet natif sur mobile,
+  // sinon copie presse-papier + petit toast « Lien copié ».
+  const [copied, setCopied] = useState(false)
+  const share = async () => {
+    // Un visiteur repartage le lien courant. Dans Create, on émet un nouveau jeton opaque, expirant et
+    // révocable ; le chemin du manifeste ne quitte plus l'API.
+    let url = window.location.href
+    try { if (!shared) url = (await createShareLink(SHARE_KIND.video, path)).url } catch { return }
+    if (navigator.share) { try { await navigator.share({ title: title || 'Vidéo', url }); return } catch {} }
+    try { await navigator.clipboard.writeText(url); setCopied(true); setTimeout(() => setCopied(false), 2200) } catch {}
+  }
+  // TÉLÉCHARGEMENT : MP4 muxé (vidéo+audio) découpé en parts sur le CDN, recollé en streaming sur disque
+  // (fetchAsset, anti-saturation mémoire). manifest.download.parts est produit à l'encodage (remux -c copy).
+  const [dlPct, setDlPct] = useState(null)
+  // Files of a streamed film (14 October 2026). dlPlan = { files, problems, chosen: Set(index) } once the playlists are read.
+  const [dlPlan, setDlPlan] = useState(null)
+  const [dlNote, setDlNote] = useState('')
+  const openStreamDownload = async () => {
+    setDlPct(0); setDlNote('Lecture des playlists…')
+    try {
+      const read = async (p) => { const r = await fetch(`/api/hls?path=${encodeURIComponent(p)}`); if (!r.ok) throw new Error(`playlist ${r.status}`); return r.text() }
+      const masterText = await read(manifest.master)
+      const master = parseMaster(masterText)
+      const media = {}
+      await Promise.all([...master.videos, ...master.audios].map(async (item) => { try { media[item.uri] = await read(item.uri) } catch { /* reported in plan.problems */ } }))
+      const plan = planStreamFiles({ manifest, masterText, media })
+      const chosen = new Set(plan.files.map((f, i) => (f.kind === 'audio' && !f.default ? -1 : i)).filter((i) => i >= 0))
+      setDlPlan({ ...plan, chosen })
+    } catch (e) { alert(tr('player.downloadFailed') + ((e && e.message) || e)) }
+    finally { setDlPct(null); setDlNote('') }
+  }
+  const runStreamDownload = async () => {
+    if (!dlPlan) return
+    const picked = dlPlan.files.filter((_f, i) => dlPlan.chosen.has(i))
+    if (!picked.length) return
+    setDlPct(0)
+    try {
+      for (let i = 0; i < picked.length; i += 1) {
+        const f = picked[i]
+        const share = (p) => setDlPct((i + p) / picked.length)
+        setDlNote(`${i + 1}/${picked.length} · ${f.name}`)
+        if (f.kind === 'subtitle') {
+          const text = await decodeSubtitle(f.subtitle)
+          const url = URL.createObjectURL(new Blob([text], { type: f.mime }))
+          const a = document.createElement('a'); a.href = url; a.download = f.name; document.body.appendChild(a); a.click(); a.remove()
+          setTimeout(() => URL.revokeObjectURL(url), 30000)
+          share(1)
+        } else {
+          await streamDownload({ urls: f.urls, name: f.name, mime: f.mime, onProgress: share })
+        }
+      }
+    } catch (e) { alert(tr('player.downloadFailed') + ((e && e.message) || e)) }
+    finally { setDlPct(null); setDlNote('') }
+  }
+  const download = async () => {
+    // VIDÉO BRUTE : les parts SONT le fichier original (réassemblage = bit-exact). Sinon (DASH legacy) on
+    // utilise la piste download.mp4 muxée. Recollage streamé sur disque (fetchAsset, anti-saturation mémoire).
+    // 14 October 2026: the archive parts are the original whatever the playback mode ("both" films could not download before: isRaw is
+    // false when a master playlist exists). A STREAMED film (no archive) opens the file chooser: video, each audio language, subtitles.
+    // FR : les parts d'archive sont l'original quel que soit le mode de lecture ; un film streame ouvre le choix des fichiers.
+    const rawParts = Array.isArray(manifest?.parts) && manifest.parts.length ? manifest.parts : null
+    if (!rawParts && hasMaster && !(manifest.download && Array.isArray(manifest.download.parts))) { return openStreamDownload() }
+    if (!rawParts && (!manifest || !manifest.download || !Array.isArray(manifest.download.parts))) {
+      alert(tr('player.downloadUnavailable')); return
+    }
+    const name = (manifest && manifest.download && manifest.download.name) || manifest.name || `${title || 'video'}.mp4`
+    const mime = (manifest && manifest.mime) || 'video/mp4'
+    setDlPct(0)
+    try {
+      // Parts chiffrées (manifest.enc, depuis le 2026-07-05) : chaque part doit être déchiffrée AVANT
+      // d'être écrite sur disque, sinon le fichier reassemblé est du ciphertext illisible. streamDownloadChunks
+      // (déjà utilisé pour l'audio/PDF chiffré) accepte un getChunk() qui produit le clair morceau par morceau.
+      // fetchMaybePrivate : les repos zenrayshards non-img sont PRIVÉS -> lecture api.github.com + token.
+      if (rawParts && manifest.enc) {
+        await streamDownloadChunks({
+          count: rawParts.length,
+          getChunk: async (i) => {
+            const r = await fetchMaybePrivate(rawParts[i].url, manifest.private === true)
+            if (!r.ok) throw new Error(`part ${i} HTTP ${r.status}`)
+            return decryptBytes(await r.arrayBuffer(), rawParts[i].iv)
+          },
+          name, mime, onProgress: setDlPct,
+        })
+      } else {
+        const urls = rawParts ? rawParts.map((p) => p.url) : manifest.download.parts
+        await streamDownload({ urls, name, mime, onProgress: setDlPct })
+      }
+    }
+    catch (e) { alert(tr('player.downloadFailed') + ((e && e.message) || e)) }
+    finally { setDlPct(null) }
+  }
+
+  const activeCur = scrubbing ? scrubTime : cur
+  const pct = dur ? (activeCur / dur) * 100 : 0
+  const bufPct = dur ? (buffered / dur) * 100 : 0
+  // CURSEUR SOURIS (2026-07-05, demande explicite) : même minuteur d'inactivité que la barre (`hover`) —
+  // curseur ET barre disparaissent/réapparaissent ENSEMBLE, jamais l'un sans l'autre.
+  const idle = playing && !hover
+
+  // ── COMMENTAIRES (minimaliste, masqués par défaut) : mêmes SANS mot de passe en partage public (shared=true),
+  // car la route /api/video-comment est publique côté serveur (voir api/[...route].js). Un fetch = un fichier
+  // JSON dédié par vidéo (pages/_comments/<hash>.json), pas de base de données.
+  const [showComments, setShowComments] = useState(false)
+  const [comments, setComments] = useState([])
+  const [cName, setCName] = useState('')
+  const [cText, setCText] = useState('')
+  const [cSending, setCSending] = useState(false)
+  useEffect(() => {
+    if (!showComments || !path) return
+    let dead = false
+    fetch(`/api/video-comment?videoPath=${encodeURIComponent(path)}`).then((r) => r.json()).then((j) => { if (!dead) setComments(Array.isArray(j.comments) ? j.comments : []) }).catch(() => {})
+    return () => { dead = true }
+  }, [showComments, path])
+  const sendComment = async () => {
+    const name = cName.trim(), text = cText.trim()
+    if (!name || !text || cSending) return
+    setCSending(true)
+    try {
+      const r = await fetch('/api/video-comment', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ videoPath: path, name, text }) }).then((x) => x.json())
+      if (r && r.ok) { setComments((c) => [...c, r.comment]); setCText('') }
+    } catch {} finally { setCSending(false) }
+  }
+  const relTime = (iso) => {
+    const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
+    if (s < 60) return tr('player.justNow')
+    if (s < 3600) return tr('player.minutesAgo').replace('{n}', Math.floor(s / 60))
+    if (s < 86400) return tr('player.hoursAgo').replace('{n}', Math.floor(s / 3600))
+    return tr('player.daysAgo').replace('{n}', Math.floor(s / 86400))
+  }
+
+  // WIDGET AUDIO (2026-07-04, façon YouTube Music) : manifest.audioOnly === true. On NE MONTE PAS le grand
+  // cadre 16:9 — juste une barre compacte « now playing » (pochette carrée + titre/auteur) au-dessus du MÊME
+  // lecteur YouTube (id={ytDivId}, controls:1, moteur inchangé — voir l'effet de montage plus haut). Le petit
+  // cadre YouTube reste VISIBLE (96×96, coins arrondis) plutôt que planqué en 1px : un test manuel a confirmé
+  // que réduire l'iframe à 1×1px via un wrapper display:none/visibility:hidden coupe le son sur certains
+  // navigateurs (l'iframe YouTube n'est pas garantie de continuer à jouer hors écran) — donc on privilégie la
+  // solution FIABLE (mini-lecteur cliquable, jamais invisible) quitte à occuper un peu de place.
+  if (isAudioOnly) {
+    const dispTitle = activeTrack ? activeTrack.title : title
+    const dispAuthor = activeTrack ? activeTrack.author : author
+    const dispPoster = activeTrack ? activeTrack.poster : poster
+    const dispUrl = activeTrack ? activeTrack.url : manifest.url
+    return (
+      <div style={{ width: '100%', maxWidth: 1100, margin: '0 auto' }}>
+        {/* WIDGET "now playing" façon Spotify/YouTube Music, fond noir (2026-07-04, demande explicite de
+            Matthieu avec capture de référence) : pochette + titre/auteur, puis rangée de transport
+            (aléatoire/précédent/lecture/suivant/répétition), puis barre de progression + temps. Le petit
+            lecteur YouTube réel (id={ytDivId}) reste monté (controls:0) mais réduit et discret : c'est lui qui
+            décode le flux, nos boutons pilotent son API — jamais display:none (coupe le son sur certains
+            navigateurs, cf. commentaire de l'effet de montage plus haut). */}
+        <div ref={wrapRef} style={{ width: '100%', boxSizing: 'border-box', borderRadius: 16, backgroundColor: 'rgba(25,27,33,.56)', backgroundImage: GLASS_NOISE, backgroundBlendMode: 'overlay', border: 'none', boxShadow: GLASS_RIM_DARK, backdropFilter: GLASS_FILTER, WebkitBackdropFilter: GLASS_FILTER, padding: '18px 20px 16px', position: 'relative', overflow: 'hidden' }}>
+          <div style={{ position: 'absolute', width: 6, height: 4, opacity: 0.01, pointerEvents: 'none' }}>
+            <div id={ytDivId} style={{ width: '100%', height: '100%' }} />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <div style={{ flexShrink: 0, width: 56, height: 56, borderRadius: 10, overflow: 'hidden', background: '#1c1c1e' }}>
+              {dispPoster && <img src={dispPoster} alt="" draggable={false} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />}
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-xl)', fontWeight: 600, color: '#fff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{dispTitle}</div>
+              <div style={{ fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-sm)', color: 'rgba(255,255,255,0.55)', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{dispAuthor}</div>
+            </div>
+          </div>
+
+          {/* transport : aléatoire · précédent · lecture/pause · suivant · répétition */}
+          <div style={{ marginTop: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 22 }}>
+            <button onClick={() => setShuffleOn((v) => !v)} title={tr('player.shuffle')} style={{ ...spotifyBtn, position: 'relative' }}>
+              <Icon name="shuffle" size={18} color={shuffleOn ? '#1DB954' : 'rgba(255,255,255,0.75)'} weight={1.9} />
+              {shuffleOn && <span style={{ position: 'absolute', bottom: -6, left: '50%', transform: 'translateX(-50%)', width: 4, height: 4, borderRadius: 99, background: '#1DB954' }} />}
+            </button>
+            <button onClick={goPrev} disabled={siblings.length < 2} title={tr('player.previous')} style={{ ...spotifyBtn, opacity: siblings.length < 2 ? 0.35 : 1 }}>
+              <Icon name="backward.fill" size={20} color="#fff" />
+            </button>
+            <button onClick={ytTogglePlay} title={tr('player.play')} style={{ ...spotifyBtn, width: 46, height: 46, borderRadius: 99, background: 'rgba(255,255,255,.92)', boxShadow: GLASS_RIM_LIGHT }}>
+              <Icon name={playing ? 'pause' : 'play.fill'} size={19} color="#0b0b0c" />
+            </button>
+            <button onClick={goNext} disabled={siblings.length < 2} title={tr('player.next')} style={{ ...spotifyBtn, opacity: siblings.length < 2 ? 0.35 : 1 }}>
+              <Icon name="forward.fill" size={20} color="#fff" />
+            </button>
+            <button onClick={() => setRepeatOn((v) => !v)} title={tr('player.repeat')} style={spotifyBtn}>
+              <Icon name="repeat" size={18} color={repeatOn ? '#1DB954' : 'rgba(255,255,255,0.75)'} weight={1.9} />
+            </button>
+          </div>
+
+          {/* barre de progression + temps, style Spotify (temps aux deux extrémités) */}
+          <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span style={{ fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-xs)', color: 'rgba(255,255,255,0.5)', fontVariantNumeric: 'tabular-nums', minWidth: 32 }}>{fmt(cur)}</span>
+            <div onClick={ytSeek} style={{ flex: 1, height: 14, display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+              <div style={{ position: 'relative', width: '100%', height: 4, borderRadius: 99, background: 'rgba(255,255,255,0.2)' }}>
+                <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${pct}%`, background: '#fff', borderRadius: 99 }} />
+              </div>
+            </div>
+            <span style={{ fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-xs)', color: 'rgba(255,255,255,0.5)', fontVariantNumeric: 'tabular-nums', minWidth: 32, textAlign: 'right' }}>{fmt(dur)}</span>
+          </div>
+        </div>
+        {err && <div style={{ color: '#FF3B30', fontSize: 'var(--zr-ui-sm)', marginTop: 8 }}>{tr('player.playbackError')}{err}</div>}
+
+        {/* Actions : Éditer/Partager/Ouvrir sur YouTube (inchangées) + Télécharger (NOUVEAU — jamais absent,
+            même si l'extraction réelle ne marche qu'en local pour l'instant, cf. commentaire de ytDownload). */}
+        <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+          {!shared && (editing
+            ? <button onClick={saveMeta} style={chip(ACCENT, '#fff')}><Icon name="checkmark" size={14} color="#fff" weight={2} /> {tr('player.save')}</button>
+            : <button onClick={() => setEditing(true)} style={chip('transparent', t.textPrimary, t.border)}>{tr('player.edit')}</button>)}
+          <button onClick={share} style={chip('transparent', t.textPrimary, t.border)}><Icon name="arrow.up.right" size={14} weight={1.8} /> {copied ? tr('player.linkCopied') : tr('player.share')}</button>
+          <a href={dispUrl} target="_blank" rel="noreferrer" style={chip('transparent', t.textPrimary, t.border)}>
+            <Icon name="arrow.up.right" size={14} weight={1.8} /> {tr('player.openOnYoutube')}
+          </a>
+          <button onClick={ytDownload} style={chip('transparent', t.textPrimary, t.border)}>
+            <Icon name="arrow.down.right" size={14} weight={1.8} /> {tr('player.download')}
+          </button>
+        </div>
+
+        {editing && (
+          <input value={title} onChange={(e) => setTitle(e.target.value)} autoFocus onKeyDown={(e) => e.key === 'Enter' && saveMeta()}
+            style={{ marginTop: 10, width: '100%', fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-xl)', fontWeight: 600, color: t.textPrimary, background: 'transparent', border: `1px solid ${t.border}`, borderRadius: 8, padding: '4px 8px', outline: 'none' }} />
+        )}
+
+        <div style={{ marginTop: 18 }}>
+          <button onClick={() => setShowComments((v) => !v)} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: t.textSecondary, fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-sm)' }}>
+            <Icon name="bubble.left" size={14} weight={1.6} />
+            {tr('player.comments')}{comments.length > 0 ? ` (${comments.length})` : ''}
+            <Icon name={showComments ? 'chevron.up' : 'chevron.down'} size={11} weight={1.8} />
+          </button>
+          <div style={{ overflow: 'hidden', maxHeight: showComments ? 900 : 0, opacity: showComments ? 1 : 0, transition: 'max-height .2s ease, opacity .2s ease' }}>
+            <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 14, maxWidth: 560 }}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <input value={cName} onChange={(e) => setCName(e.target.value)} placeholder={tr('player.namePlaceholder')} maxLength={60}
+                  style={{ width: 140, fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-md)', color: t.textPrimary, background: 'transparent', border: `1px solid ${t.border}`, borderRadius: 8, padding: '7px 10px', outline: 'none' }} />
+                <textarea value={cText} onChange={(e) => setCText(e.target.value)} placeholder={tr('player.commentPlaceholder')} rows={1} maxLength={1000}
+                  style={{ flex: 1, minWidth: 220, fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-md)', color: t.textPrimary, background: 'transparent', border: `1px solid ${t.border}`, borderRadius: 8, padding: '7px 10px', outline: 'none', resize: 'vertical' }} />
+                <button onClick={sendComment} disabled={!cName.trim() || !cText.trim() || cSending} style={chip(ACCENT, '#fff')}>
+                  {cSending ? tr('player.sending') : tr('player.send')}
+                </button>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {comments.slice().reverse().map((c, i) => (
+                  <div key={i} style={{ fontSize: 'var(--zr-ui-md)', lineHeight: 1.45 }}>
+                    <span style={{ fontWeight: 700, color: t.textPrimary }}>{c.name}</span>{' '}
+                    <span style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-xs)' }}>{relTime(c.at)}</span>
+                    <div style={{ color: t.textPrimary, marginTop: 1 }}>{c.text}</div>
+                  </div>
+                ))}
+                {showComments && comments.length === 0 && <div style={{ fontSize: 'var(--zr-ui-sm)', color: t.textSecondary }}>{tr('player.noComments')}</div>}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ width: '100%', maxWidth: 1100, margin: '0 auto' }}>
+      {/* PLAYER 16:9 façon YouTube, contrôles custom. */}
+      <div ref={wrapRef} tabIndex={0} onMouseMove={showControls} onMouseLeave={() => playing && setHover(false)} onDoubleClick={toggleFull}
+        style={{ position: 'relative', width: '100%', aspectRatio: full ? 'auto' : '16 / 9', height: full ? '100%' : undefined, background: '#000', borderRadius: full ? 0 : 14, overflow: 'hidden', outline: 'none', cursor: idle ? 'none' : 'default', containerType: 'inline-size' }}>
+        {isYoutube ? (
+          // YouTube garde SES PROPRES contrôles (controls:1, cf. l'effet de montage) : pas de poster maison,
+          // pas de gros bouton play, pas de bandeau custom par-dessus — juste le cadre arrondi qui l'entoure.
+          // PAS DE BOUTON PLEIN ÉCRAN MAISON (retiré le 2026-07-04) : un ajout précédent fullscreenait le DIV
+          // conteneur depuis l'extérieur (Fullscreen API du site), mais ce n'est PAS la vraie logique plein
+          // écran de YouTube (le conteneur ne remplit pas fiablement tout l'écran selon les navigateurs, ce qui
+          // laissait apparaître le fond blanc du site autour de la vidéo — signalé par Matthieu). Le bouton
+          // plein écran RÉEL et FIABLE est déjà inclus nativement dans les contrôles YouTube eux-mêmes
+          // (controls:1) : c'est LUI qu'il faut utiliser, pas un substitut maison. Idem pour le skin (barre,
+          // icônes) : iframe cross-origin, aucun accès CSS à son rendu interne — repasser en contrôles custom
+          // (controls:0) recasserait le bug de pause déjà documenté plus haut. Contrainte réelle, pas un oubli.
+          <div id={ytDivId} style={{ width: '100%', height: '100%' }} />
+        ) : (
+          <>
+            <video ref={videoRef} poster={poster} playsInline preload="metadata" onClick={togglePlay}
+              style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000', display: 'block', cursor: idle ? 'none' : 'pointer' }} />
+            {currentSubTrack && subsOn && <SubtitleLayer videoRef={videoRef} track={currentSubTrack} controlsVisible={hover || !playing} sizePct={subPrefs.sizePct} background={subPrefs.background} font={subPrefs.font} />}
+
+            {/* spinner de chargement (buffering) */}
+            {buffering && playing && (
+              <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', pointerEvents: 'none' }}>
+                <span style={{ width: 46, height: 46, borderRadius: 99, border: '3px solid rgba(255,255,255,0.25)', borderTopColor: '#fff', animation: 'zr-spin 0.8s linear infinite' }} />
+              </div>
+            )}
+
+            {/* Même géométrie que liquidglass-components.html : volume haut, transport centré,
+                réglages à droite, timeline complète en bas. */}
+            <div className="zr-video-controls zr-minimal" style={{ opacity: hover || !playing ? 1 : 0, pointerEvents: hover || !playing ? 'auto' : 'none' }}>
+              {/* 14 October 2026 (Matthieu, design A "Minimal absolu"): ONE row at the top right, aligned: picture in picture, volume (icon then bar),
+                  subtitles, settings, full screen. No circle, no capsule: the icons carry a drop shadow (fonts.css, tokens --zr-player-*).
+                  FR : une seule rangee en haut a droite, alignee ; aucun cercle ni capsule, ombre portee, jetons --zr-player-*. */}
+              <div className="zr-video-top-row">
+                {typeof document !== 'undefined' && document.pictureInPictureEnabled && <button onClick={togglePip} className="zr-video-glass zr-video-control-sm" aria-label="Picture-in-Picture"><Icon name="pip" size={18} color={pip ? ACCENT : undefined} /></button>}
+              <div className="zr-video-volume-pill">
+                <button onClick={toggleMute} className="zr-video-volume-toggle" aria-label={muted ? 'Activer le son' : 'Couper le son'}><Icon name={muted || vol === 0 ? 'speaker.slash' : vol < 0.5 ? 'speaker.wave.1' : 'speaker.wave.2'} size={18} /></button>
+                <input className="zr-video-volume" aria-label="Volume" type="range" min="0" max="1" step="0.01" value={muted ? 0 : vol} style={{ '--zr-video-volume': `${Math.round((muted ? 0 : vol) * 100)}%` }} onChange={(e) => {
+                  const val = Number(e.target.value)
+                  const v = videoRef.current; if (v) { v.volume = val; v.muted = val === 0 }
+                }} />
+              </div>
+              <div className="zr-video-bottom-right">
+                  {/* Vitesse + plein écran : une seule capsule, comme la primitive canonique. */}
+                  <div className="zr-video-options-pill">
+                    {availableSubTracks.length > 0 && <button onClick={() => setSubtitlesVisible(!subsOn)} className="zr-video-option-button" title={subsOn ? 'Masquer les sous-titres' : 'Afficher les sous-titres'} aria-label="Sous-titres"><Icon name="captions" size={18} color={subsOn ? ACCENT : undefined} /></button>}
+                    <button onClick={() => setMenu(menu ? null : 'settings')} className="zr-video-option-button" title={`Qualité et vitesse${speed !== 1 ? ` · ${speed}×` : ''}`} aria-label="Qualité et vitesse">
+                      <Icon name="gear" size={18} />
+                    </button>
+                    <button onClick={toggleFull} className="zr-video-option-button" aria-label={full ? 'Quitter le plein écran' : 'Plein écran'}><Icon name={full ? 'fullscreen.exit' : 'fullscreen.enter'} size={18} /></button>
+                  </div>
+                  {menu === 'settings' && (
+                    <div className="zr-video-settings-menu">
+                      {subPanel === 'main' && audioMenuTracks.length > 0 && <>
+                        <div style={menuHdr}>Audio</div>
+                        {audioMenuTracks.map((track) => (
+                          <button key={track.index} onClick={() => { if (!track.fixed) pickAudioTrack(track.index) }} className="zr-ctrl-btn" style={menuItem} aria-pressed={track.selected}>
+                            <span style={{ width: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>{track.selected && <Icon name="checkmark" size={12} weight={2.2} color="#ffffff" />}</span>
+                            <span style={{ color: '#ffffff' }}>{track.label}</span>
+                          </button>
+                        ))}
+                      </>}
+                      {subPanel === 'main' && levels.length > 0 && <>
+                        <div style={menuHdr}>{tr('player.quality')}</div>
+                        {[{ label: tr('player.auto'), index: -1 }, ...levels].map((l) => (
+                          <button key={l.index} onClick={() => chooseLevel(l)} className="zr-ctrl-btn" style={menuItem}>
+                            <span style={{ width: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>{curLevel === l.index && <Icon name="checkmark" size={12} weight={2.2} color="#ffffff" />}</span>
+                            <span style={{ color: '#ffffff' }}>{l.label}</span>
+                          </button>
+                        ))}
+                      </>}
+                      {subPanel === 'main' && availableSubTracks.length > 0 && <>
+                        <div style={menuHdr}>{tr('player.subtitles')}</div>
+                        <button key="sub-off" onClick={() => setSubtitlesVisible(false)} className="zr-ctrl-btn" style={menuItem}>
+                          <span style={{ width: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>{!subsOn && <Icon name="checkmark" size={12} weight={2.2} color="#ffffff" />}</span>
+                          <span style={{ color: '#ffffff' }}>{tr('player.subtitlesOff')}</span>
+                        </button>
+                        {availableSubTracks.map((st) => (
+                          <button key={st.id} onClick={() => pickSubtitle(st)} className="zr-ctrl-btn" style={menuItem}>
+                            <span style={{ width: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>{subsOn && currentSubTrack?.id === st.id && <Icon name="checkmark" size={12} weight={2.2} color="#ffffff" />}</span>
+                            <span style={{ color: '#ffffff' }}>{st.label}</span>
+                          </button>
+                        ))}
+                      </>}
+                      {availableSubTracks.length > 0 && subsOn && subPanel === 'main' && <>
+                        <div style={menuHdr}>{tr('player.subtitleSize')}</div>
+                        {SUB_PERCENT.presets.map((pct) => (
+                          <button key={pct} onClick={() => setSubPref({ sizePct: pct })} className="zr-ctrl-btn" style={menuItem}>
+                            <span style={{ width: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>{subPrefs.sizePct === pct && <Icon name="checkmark" size={12} weight={2.2} color="#ffffff" />}</span>
+                            <span style={{ color: '#ffffff' }}>{pct} %</span>
+                          </button>
+                        ))}
+                        <button onClick={() => setSubPanel('size')} className="zr-ctrl-btn" style={menuItem}>
+                          <span style={{ width: 14 }}>{!SUB_PERCENT.presets.includes(subPrefs.sizePct) && <Icon name="checkmark" size={12} weight={2.2} color="#ffffff" />}</span>
+                          <span style={{ color: '#ffffff' }}>{SUB_PERCENT.presets.includes(subPrefs.sizePct) ? 'Personnalisé…' : `Personnalisé : ${subPrefs.sizePct} %`}</span>
+                          <Icon name="chevron.right" size={11} weight={1.8} color="rgba(255,255,255,.6)" />
+                        </button>
+                        <div style={menuHdr}>Police</div>
+                        {[{ id: 'sans', label: 'Sans serif (Inter)' }, { id: 'serif', label: 'Serif' }].map((f) => (
+                          <button key={f.id} onClick={() => setSubPref({ font: f.id })} className="zr-ctrl-btn" style={menuItem}>
+                            <span style={{ width: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>{subPrefs.font === f.id && <Icon name="checkmark" size={12} weight={2.2} color="#ffffff" />}</span>
+                            <span style={{ color: '#ffffff' }}>{f.label}</span>
+                          </button>
+                        ))}
+                        <div style={menuHdr}>Fond</div>
+                        <button onClick={() => setSubPref({ background: !subPrefs.background })} className="zr-ctrl-btn" style={menuItem}>
+                          <span style={{ width: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>{subPrefs.background && <Icon name="checkmark" size={12} weight={2.2} color="#ffffff" />}</span>
+                          <span style={{ color: '#ffffff' }}>Fond opaque arrondi</span>
+                        </button>
+                      </>}
+                      {availableSubTracks.length > 0 && subsOn && subPanel === 'size' && <>
+                        <button onClick={() => setSubPanel('main')} className="zr-ctrl-btn" style={menuItem}>
+                          <Icon name="chevron.left" size={12} weight={2} color="#ffffff" />
+                          <span style={{ color: '#ffffff' }}>{tr('player.subtitleSize')} : {subPrefs.sizePct} %</span>
+                        </button>
+                        <input type="range" min={SUB_PERCENT.min} max={SUB_PERCENT.max} step={SUB_PERCENT.step} value={subPrefs.sizePct}
+                          onChange={(e) => setSubPref({ sizePct: clampPercent(e.target.value) })}
+                          aria-label="Taille des sous-titres en pourcentage" style={{ width: 'calc(100% - 20px)', margin: '6px 10px' }} />
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4, padding: '4px 10px 8px' }}>
+                          {percentGrid().map((pct) => (
+                            <button key={pct} onClick={() => setSubPref({ sizePct: pct })} className="zr-ctrl-btn"
+                              style={{ ...menuItem, justifyContent: 'center', padding: '6px 0', width: 'auto', borderRadius: 8, background: subPrefs.sizePct === pct ? 'rgba(255,255,255,.22)' : 'transparent' }}>
+                              <span style={{ color: '#ffffff', fontVariantNumeric: 'tabular-nums' }}>{pct}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </>}
+                      {subPanel === 'main' && <>
+                      <div style={menuHdr}>{tr('player.speed')}</div>
+                      {SPEEDS.map((r) => (
+                        <button key={r} onClick={() => setRate(r)} className="zr-ctrl-btn" style={menuItem}>
+                          <span style={{ width: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>{speed === r && <Icon name="checkmark" size={12} weight={2.2} color="#ffffff" />}</span>
+                          <span style={{ color: '#ffffff' }}>{r === 1 ? tr('player.normalSpeed') : `${r}×`}</span>
+                        </button>
+                      ))}
+                      </>}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="zr-video-transport">
+                <button onClick={() => seekBy(-10)} disabled={!dur} className="zr-video-glass zr-video-control-md" title="Reculer de 10 secondes" aria-label="Reculer de 10 secondes"><Icon name="gobackward" size={24} /></button>
+                <button onClick={togglePlay} className="zr-video-glass zr-video-play-center" aria-label={playing ? 'Pause' : tr('player.play')}><PlayPauseGlyph playing={playing} size={34} pauseSize={32} /></button>
+                <button onClick={() => seekBy(10)} disabled={!dur} className="zr-video-glass zr-video-control-md" title="Avancer de 10 secondes" aria-label="Avancer de 10 secondes"><Icon name="goforward" size={24} /></button>
+              </div>
+              <div className="zr-video-bottom zr-video-seek-pill">
+                <span className="zr-video-time">{fmt(activeCur)}</span>
+                <input
+                  className="zr-video-seek"
+                  aria-label="Position de lecture"
+                  type="range"
+                  min="0"
+                  max="1000"
+                  step="1"
+                  value={Math.round(pct * 10)}
+                  disabled={!dur}
+                  onPointerDown={(e) => { try { e.target.setPointerCapture?.(e.pointerId) } catch {} onSeekPointerDown() }}
+                  onPointerUp={(e) => { try { e.target.releasePointerCapture?.(e.pointerId) } catch {} onSeekPointerUp(e) }}
+                  onPointerCancel={() => setScrubbing(false)}
+                  onInput={onSeekChange}
+                  onChange={onSeekChange}
+                  style={{ '--zr-video-played': `${pct}%`, '--zr-video-buffered': `${bufPct}%` }}
+                />
+                <span className="zr-video-time">−{fmt(Math.max(0, dur - activeCur))}</span>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+      {err && <div style={{ color: '#FF3B30', fontSize: 'var(--zr-ui-sm)', marginTop: 8 }}>{tr('player.playbackError')}{err}</div>}
+
+      {/* TITRE + LIGNE AUTEUR (façon YouTube). */}
+      <div style={{ marginTop: 14 }}>
+        {editing
+          ? <input value={title} onChange={(e) => setTitle(e.target.value)} autoFocus onKeyDown={(e) => e.key === 'Enter' && saveMeta()}
+              style={{ width: '100%', fontFamily: "var(--zr-police-sans)", fontSize: 21, fontWeight: 600, color: t.textPrimary, background: 'transparent', border: `1px solid ${t.border}`, borderRadius: 8, padding: '4px 8px', outline: 'none' }} />
+          : <div style={{ fontFamily: "var(--zr-police-sans)", fontSize: 21, fontWeight: 600, lineHeight: 1.25, color: t.textPrimary }}>{title}</div>}
+      </div>
+      <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+        {delivery && (
+          <button onClick={() => setShowDelivery((v) => !v)} aria-expanded={showDelivery} title={tr(`player.${DELIVERY_STYLE[delivery].hint}`)}
+            style={{ ...chip('transparent', t.textPrimary, t.border), marginRight: 'auto', gap: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 99, background: DELIVERY_STYLE[delivery].color, flexShrink: 0 }} />
+            {tr(`player.${DELIVERY_STYLE[delivery].label}`)}
+            <span style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-sm)', fontWeight: 400 }}>{showDelivery ? tr('player.detailsHide') : tr('player.detailsShow')}</span>
+            <Icon name={showDelivery ? 'chevron.up' : 'chevron.down'} size={11} weight={1.8} />
+          </button>
+        )}
+        {!shared && (editing
+          ? <button onClick={saveMeta} style={chip(ACCENT, '#fff')}><Icon name="checkmark" size={14} color="#fff" weight={2} /> {tr('player.save')}</button>
+          : <button onClick={() => setEditing(true)} style={chip('transparent', t.textPrimary, t.border)}>{tr('player.edit')}</button>)}
+        <button onClick={share} style={chip('transparent', t.textPrimary, t.border)}><Icon name="arrow.up.right" size={14} weight={1.8} /> {copied ? tr('player.linkCopied') : tr('player.share')}</button>
+        {/* YOUTUBE : pas de téléchargement (la vidéo vit sur YouTube, pas dans ZenRayShards) — remplacé par un
+            lien direct vers la source. Sinon (dash/hls/raw) : téléchargement MP4 streamé, inchangé. */}
+        {isYoutube ? (
+          <a href={manifest.url} target="_blank" rel="noreferrer" style={chip('transparent', t.textPrimary, t.border)}>
+            <Icon name="arrow.up.right" size={14} weight={1.8} /> {tr('player.openOnYoutube')}
+          </a>
+        ) : (
+          <>
+            {/* BARRE DE PROGRESSION par-dessus le bouton (remplace le %) : un remplissage accent grandit de gauche
+                à droite au fur et à mesure du téléchargement, le label reste lisible par-dessus. */}
+            <button onClick={download} disabled={dlPct != null} title={dlPct != null ? `${Math.round(dlPct * 100)} %` : ''} style={{ ...chip('transparent', t.textPrimary, t.border), position: 'relative', overflow: 'hidden', minWidth: 132 }}>
+              {dlPct != null && <span style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${Math.max(2, Math.round(dlPct * 100))}%`, background: ACCENT, opacity: 0.25, transition: 'width .2s ease', pointerEvents: 'none' }} />}
+              <span style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 6 }}><Icon name="arrow.down.right" size={14} weight={1.8} /> {dlPct != null ? tr('player.downloading') : tr('player.download')}</span>
+            </button>
+          </>
+        )}
+      </div>
+      {dlPlan && (
+        <div style={{ marginTop: 10, padding: '10px 14px', borderRadius: 12, border: `1px solid ${t.border}`, fontSize: 'var(--zr-ui-sm)', color: t.textSecondary }}>
+          <div style={{ fontWeight: 600, color: t.textPrimary, marginBottom: 6 }}>Fichiers à télécharger (séparés)</div>
+          {dlPlan.files.map((f, i) => (
+            <label key={f.name} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0', cursor: 'pointer', color: t.textPrimary }}>
+              <input type="checkbox" checked={dlPlan.chosen.has(i)}
+                onChange={() => setDlPlan((p) => { const c = new Set(p.chosen); c.has(i) ? c.delete(i) : c.add(i); return { ...p, chosen: c } })} />
+              <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={f.name}>{f.name}</span>
+              <span style={{ color: t.textSecondary }}>{f.kind === 'video' ? 'Vidéo' : f.kind === 'audio' ? 'Audio' : 'Sous-titres'}</span>
+            </label>
+          ))}
+          {dlPlan.problems.length > 0 && <div style={{ color: '#ff3b30', marginTop: 6 }}>Manque : {dlPlan.problems.join(' ; ')}</div>}
+          <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+            <button onClick={runStreamDownload} disabled={dlPct != null || dlPlan.chosen.size === 0} style={{ ...chip(ACCENT, '#fff'), opacity: dlPlan.chosen.size === 0 ? .5 : 1 }}>
+              <Icon name="arrow.down.right" size={14} color="#fff" weight={1.8} /> Télécharger {dlPlan.chosen.size} fichier{dlPlan.chosen.size > 1 ? 's' : ''}
+            </button>
+            <button onClick={() => setDlPlan(null)} style={chip('transparent', t.textPrimary, t.border)}>Fermer</button>
+            {dlNote && <span>{dlNote}{dlPct != null ? ` · ${Math.round(dlPct * 100)} %` : ''}</span>}
+          </div>
+        </div>
+      )}
+      {delivery && showDelivery && (
+        <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: 'max-content 1fr', gap: '4px 16px', padding: '10px 14px', borderRadius: 12, border: `1px solid ${t.border}`, color: t.textSecondary, fontSize: 'var(--zr-ui-sm)' }}>
+          {deliveryRows(manifest, delivery, tr, fmt).map(([k, v]) => (
+            <React.Fragment key={k}><span>{k}</span><span style={{ color: t.textPrimary, overflowWrap: 'anywhere' }}>{v}</span></React.Fragment>
+          ))}
+        </div>
+      )}
+
+      {/* TOGGLE COMMENTAIRES : discret, masqué par défaut, transition 0.2s. Fonctionne à l'identique dans le
+          lecteur normal et sur la page de partage /watch (shared=true) : aucun mot de passe requis. */}
+      <div style={{ marginTop: 18 }}>
+        <button onClick={() => setShowComments((v) => !v)} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: t.textSecondary, fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-sm)' }}>
+          <Icon name="bubble.left" size={14} weight={1.6} />
+          {tr('player.comments')}{comments.length > 0 ? ` (${comments.length})` : ''}
+          <Icon name={showComments ? 'chevron.up' : 'chevron.down'} size={11} weight={1.8} />
+        </button>
+        <div style={{ overflow: 'hidden', maxHeight: showComments ? 900 : 0, opacity: showComments ? 1 : 0, transition: 'max-height .2s ease, opacity .2s ease' }}>
+          <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 14, maxWidth: 560 }}>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <input value={cName} onChange={(e) => setCName(e.target.value)} placeholder={tr('player.namePlaceholder')} maxLength={60}
+                style={{ width: 140, fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-md)', color: t.textPrimary, background: 'transparent', border: `1px solid ${t.border}`, borderRadius: 8, padding: '7px 10px', outline: 'none' }} />
+              <textarea value={cText} onChange={(e) => setCText(e.target.value)} placeholder={tr('player.commentPlaceholder')} rows={1} maxLength={1000}
+                style={{ flex: 1, minWidth: 220, fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-md)', color: t.textPrimary, background: 'transparent', border: `1px solid ${t.border}`, borderRadius: 8, padding: '7px 10px', outline: 'none', resize: 'vertical' }} />
+              <button onClick={sendComment} disabled={!cName.trim() || !cText.trim() || cSending} style={chip(ACCENT, '#fff')}>
+                {cSending ? tr('player.sending') : tr('player.send')}
+              </button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {comments.slice().reverse().map((c, i) => (
+                <div key={i} style={{ fontSize: 'var(--zr-ui-md)', lineHeight: 1.45 }}>
+                  <span style={{ fontWeight: 700, color: t.textPrimary }}>{c.name}</span>{' '}
+                  <span style={{ color: t.textSecondary, fontSize: 'var(--zr-ui-xs)' }}>{relTime(c.at)}</span>
+                  <div style={{ color: t.textPrimary, marginTop: 1 }}>{c.text}</div>
+                </div>
+              ))}
+              {showComments && comments.length === 0 && <div style={{ fontSize: 'var(--zr-ui-sm)', color: t.textSecondary }}>{tr('player.noComments')}</div>}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Icônes du lecteur : toujours blanc pur + ombre portée légère (lisibles sur n'importe quel fond vidéo,
+// indépendamment du thème clair/sombre du reste du site).
+const ICON_SHADOW = { filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.5))' }
+// Recette V5 Liquid Glass, partagée avec ZenRay Audio : deux rims inset réels, pas de conic-gradient qui
+// donne un anneau métallique/sphérique sur les capsules longues et les rectangles.
+const GLASS_FILTER = 'blur(22px) saturate(70%) brightness(1.28)'
+const GLASS_RIM_DARK = 'inset 0 1px 0 rgba(255,255,255,.55), inset 0 -1px 0 rgba(255,255,255,.55), 0 8px 22px rgba(0,0,0,.26)'
+const GLASS_RIM_LIGHT = 'inset 0 1px 0 rgba(255,255,255,.55), inset 0 -1px 0 rgba(255,255,255,.55), 0 2px 10px rgba(0,0,0,.14)'
+const GLASS_NOISE = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.05'/%3E%3C/svg%3E")`
+const spotifyBtn = { backgroundColor: 'rgba(25,27,33,.42)', backgroundImage: GLASS_NOISE, backgroundBlendMode: 'overlay', border: 'none', boxShadow: GLASS_RIM_DARK, backdropFilter: GLASS_FILTER, WebkitBackdropFilter: GLASS_FILTER, cursor: 'pointer', padding: 6, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 999 }
+const menuHdr = { padding: '8px 10px 4px', fontSize: 'var(--zr-ui-xs)', color: 'rgba(255, 255, 255, 0.65)', fontFamily: "var(--zr-police-sans)", textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }
+const menuItem = { display: 'flex', width: '100%', alignItems: 'center', gap: 8, padding: '8px 10px', background: 'transparent', border: 'none', cursor: 'pointer', color: '#ffffff', fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-md)', borderRadius: 8, textAlign: 'left', transition: 'background-color 0.15s ease, color 0.15s ease' }
+const chip = (bg, color, border) => ({ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 14px', borderRadius: 99, background: bg, color, border: border ? `1px solid ${border}` : 'none', cursor: 'pointer', fontFamily: "var(--zr-police-sans)", fontSize: 'var(--zr-ui-md)', fontWeight: 500, textDecoration: 'none' })

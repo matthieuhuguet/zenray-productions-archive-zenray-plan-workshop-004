@@ -1,0 +1,313 @@
+// Transcodage HLS+AES-128 DANS LE NAVIGATEUR (ffmpeg.wasm), JUMEAU EXACT du pipeline local
+// scripts/video-hls-lib.mjs. Le but : qu'une vidéo transcodée ici soit lue par le lecteur unifié
+// (VideoPlayer2.jsx, sélectionné via mediaViewerRoute.js)
+// et servie par jsDelivr EXACTEMENT comme une vidéo transcodée par le worker local. Mêmes args ffmpeg, même
+// format de segment (MPEG-TS chiffré AES-128), même réécriture de playlists, même manifest .media.json.
+//
+// CONTRAINTES MÉMOIRE (verdict spike, plafond heap wasm 2 Go EN DUR) :
+//   - INPUT lu via WORKERFS (ff.mount) : ffmpeg lit le File en streaming, on NE copie PAS la vidéo dans le tas.
+//   - SORTIE évacuée segment par segment : on lit un .ts, on calcule son hash, on l'upload, on le SUPPRIME,
+//     avant de passer au suivant. On ne garde jamais tous les segments en mémoire.
+//
+// FLUX :
+//   1) ff.mount WORKERFS sur le File ; génère clé AES-128 (16o) + IV (16o) ; écrit le keyinfo 3 lignes.
+//   2) probe des pistes audio via `ffmpeg -i` (parse des logs) -> -map / -var_stream_map dynamiques.
+//   3) ff.exec avec les MÊMES args que video-hls-lib.mjs -> master.m3u8 + stream_*.m3u8 + seg_*.ts chiffrés.
+//   4) évacuation : chaque .ts -> sha256 -> POST /api/upload-vid vid-blob -> deleteFile. 1 commit vid-commit final.
+//   5) playlists réécrites À L'IDENTIQUE (segments -> jsDelivr@sha, EXT-X-KEY -> /api/hls-key, master -> /api/hls).
+//   6) clé brute + playlists + manifest committés sur le repo PRIVÉ via /api/upload-vid vid-content.
+//   Renvoie { manifestPath, manifest } pour que l'appelant écrive le nœud .media.json.
+//
+// SOUS-TITRES (décision documentée 2026-06-01) : l'extraction VTT en ffmpeg.wasm mono-thread est jugée
+// fragile par le spike (les sous-titres bitmap PGS/VobSub ne se convertissent PAS en VTT, et la
+// segmentation VTT en mpegts n'est pas testée en wasm). Pour NE PAS risquer de corrompre le transcode
+// vidéo+audio qui, lui, marche, les sous-titres restent EXPOSÉS via le pipeline LOCAL (scripts/video-hls-lib.mjs
+// buildSubsPlaylist/attachSubsGroup) : déposer une vidéo riche en sous-titres au-dessus du seuil (ou forcer
+// le mode « commande terminal ») la route vers le worker local qui, lui, embarque les sous-titres.
+// Côté wasm, manifest.subs reste []. Promesse tenue, pas de demi-extraction silencieuse.
+// Le master généré (buildMaster) accepterait un groupe SUBTITLES si subs étaient produits plus tard.
+
+import { getFFmpeg, withLogs, releaseFFmpeg } from './ffmpegCore.js'
+
+const OWNER = 'matthieuhuguet'
+const HLS_TIME = 6
+const KEY_URI_PLACEHOLDER = 'ZR_HLS_KEY_URI'
+const KEY_FILE = '.hlskey.bin'
+const enc = encodeURIComponent
+const noop = () => {}
+
+// --- helpers --------------------------------------------------------------
+const hex = (bytes) => { let s = ''; for (const b of bytes) s += b.toString(16).padStart(2, '0'); return s }
+async function sha256Hex(u8) {
+  const d = await crypto.subtle.digest('SHA-256', u8.buffer ? u8 : new Uint8Array(u8))
+  return hex(new Uint8Array(d))
+}
+function shardPathFor(hash, ext) { return `${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.${ext}` }
+function abToB64(u8) {
+  let bin = ''; const CH = 0x8000
+  for (let i = 0; i < u8.length; i += CH) bin += String.fromCharCode.apply(null, u8.subarray(i, i + CH))
+  return btoa(bin)
+}
+function sanitizeBase(name = '') {
+  return (name.replace(/\.[^.]+$/, '') || 'video').replace(/[/\\]/g, '_').replace(/[^\w.\- ]+/g, '').trim().slice(0, 80) || 'video'
+}
+async function vidApi(payload) {
+  const r = await fetch('/api/upload-vid', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+  }).then((x) => x.json()).catch(() => null)
+  if (!r || r.error || !r.ok) throw new Error('upload-vid ' + payload.action + ': ' + ((r && (r.detail || r.error)) || 'fail'))
+  return r
+}
+async function shardApi(payload) {
+  return fetch('/api/upload-shard', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+  }).then((x) => x.json()).catch(() => null)
+}
+
+// --- réécriture des playlists (PORTÉ À L'IDENTIQUE de video-hls-lib.mjs) ---
+function rewriteMediaPlaylist(text, map, keyUri) {
+  return text.split('\n').map((line) => {
+    if (line.startsWith('#EXT-X-KEY') && keyUri) return line.replace(/URI="([^"]*)"/, `URI="${keyUri}"`)
+    const mm = /^#EXT-X-MAP:URI="([^"]+)"(.*)$/.exec(line)
+    if (mm) { const url = map[mm[1].trim()]; return url ? `#EXT-X-MAP:URI="${url}"${mm[2]}` : line }
+    if (line && !line.startsWith('#')) { const url = map[line.trim()]; return url || line }
+    return line
+  }).join('\n')
+}
+// NB : on NE réécrit plus le master de ffmpeg.wasm (il sort vide). On le GÉNÈRE via buildMaster ci-dessous.
+
+// Construit un master.m3u8 COMPLET à la main (ffmpeg.wasm ne sérialise pas les variantes -> master vide).
+// mediaPlaylists = noms des playlists produites (stream_video.m3u8, stream_a0.m3u8, …).
+// hlsUrl(name) = URL gatée /api/hls?path=… vers la playlist. probe = { audio:[{lang}] } pour les EXT-X-MEDIA.
+// hls.js EXIGE un BANDWIDTH non nul + des CODECS plausibles sur EXT-X-STREAM-INF, sinon il ignore la variante.
+function buildMaster(mediaPlaylists, hlsUrl, probe) {
+  const videoPl = mediaPlaylists.find((n) => /stream_video\.m3u8$/i.test(n)) || mediaPlaylists.find((n) => !/stream_a\d+\.m3u8$/i.test(n))
+  const audioPls = mediaPlaylists.filter((n) => /stream_a\d+\.m3u8$/i.test(n))
+    .sort((a, b) => (parseInt((/a(\d+)/.exec(a) || [])[1] || 0, 10)) - (parseInt((/a(\d+)/.exec(b) || [])[1] || 0, 10)))
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:3']
+  const hasAudio = audioPls.length > 0
+  audioPls.forEach((pl, i) => {
+    const lang = (probe.audio[i] && probe.audio[i].lang) || 'und'
+    const flag = i === 0 ? 'YES' : 'NO'
+    lines.push(`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="${lang}",LANGUAGE="${lang}",DEFAULT=${flag},AUTOSELECT=${flag},URI="${hlsUrl(pl)}"`)
+  })
+  // BANDWIDTH estimé (plancher non nul) : ~250 kb/s vidéo + 160 kb/s par audio. CODECS = H.264 high + AAC-LC.
+  const bandwidth = 250000 + 160000 * Math.max(1, audioPls.length)
+  const codecs = 'avc1.640028' + (hasAudio ? ',mp4a.40.2' : '')
+  lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},CODECS="${codecs}"${hasAudio ? ',AUDIO="aud"' : ''}`)
+  lines.push(hlsUrl(videoPl))
+  return lines.join('\n') + '\n'
+}
+
+// Parse la durée + les pistes audio depuis les logs ffmpeg `-i`. Renvoie { duration, audio:[{lang}] }.
+function parseProbe(logs) {
+  let duration = 0
+  const audio = []
+  for (const l of logs) {
+    const dm = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(l)
+    if (dm) duration = (+dm[1]) * 3600 + (+dm[2]) * 60 + parseFloat(dm[3])
+    // ffmpeg ecrit l'audio sous des formes variees : "Stream #0:1(fre): Audio:", "Stream #0:1[0x2](und): Audio:",
+    // "Stream #0:1: Audio:". L'ancienne regex EXIGEAIT (lang) AVANT [hex] -> ratait le format reel [hex](lang),
+    // donc nAudio=0 -> audio JAMAIS mappe -> aucune piste sonore. Regex tolerante : tout sauf ':' avant ': Audio:'.
+    if (/Stream #\d+:\d+[^:]*:\s*Audio:/.test(l)) {
+      const head = l.split('Audio:')[0]
+      const lm = /\(([a-z]{2,3})\)/.exec(head)
+      audio.push({ lang: (lm && lm[1]) || 'und' })
+    }
+  }
+  return { duration, audio }
+}
+
+// --- TRANSCODE + UPLOAD COMPLET -------------------------------------------
+// file : File du navigateur ; dest : dossier Create cible (ex "pages/Mon Projet/Assets").
+// onProgress(stage, pct0..1) : 'transcode' pendant ffmpeg, 'upload' pendant l'évacuation des segments.
+// Renvoie { manifest, manifestPath }.
+export async function transcodeAndUploadHls(file, dest, onProgress = noop, onLog = noop) {
+  const ff = await getFFmpeg()
+  const log = (line) => { try { onLog(line) } catch { /* best-effort */ } }
+  const base = sanitizeBase(file.name)
+  const baseDirRel = `${String(dest || 'pages').replace(/\/$/, '')}/${base}`
+  const MNT = '/mnt'
+  const OUT = '/out'
+  const inName = 'input' + (/\.[a-z0-9]+$/i.test(file.name) ? file.name.slice(file.name.lastIndexOf('.')).toLowerCase() : '')
+
+  // clé/IV AES-128
+  const aesKey = crypto.getRandomValues(new Uint8Array(16))
+  const aesIv = crypto.getRandomValues(new Uint8Array(16))
+
+  let mounted = false
+  try {
+    // 1) WORKERFS pour l'input (anti-OOM) + dossier de sortie + clé/keyinfo en MEMFS.
+    await ff.createDir(MNT).catch(() => {})
+    await ff.createDir(OUT).catch(() => {})
+    // WORKERFS expose les File sous leur nom -> /mnt/<file.name>
+    await ff.mount('WORKERFS', { files: [file] }, MNT)
+    mounted = true
+    const inputPath = `${MNT}/${file.name}`
+    log(`Fichier monté (WORKERFS) : ${file.name} · ${(file.size / 1048576).toFixed(1)} Mo`)
+    log('Analyse des pistes (ffmpeg -i)…')
+
+    // IMPORTANT : ff.writeFile TRANSFÈRE (détache) l'ArrayBuffer vers le worker. Si on passait aesKey
+    // directement, plus tard abToB64(aesKey) lirait un buffer détaché -> clé VIDE -> vid-content rejette
+    // -> bascule Vercel. On écrit donc une COPIE (.slice()) et on garde aesKey intacte pour le commit privé.
+    await ff.writeFile('/enc.key', aesKey.slice())
+    // keyinfo 3 lignes : URI placeholder (réécrit ensuite) / chemin clé MEMFS / IV hex. Identique au pipeline local.
+    await ff.writeFile('/enc.keyinfo', new TextEncoder().encode(`${KEY_URI_PLACEHOLDER}\n/enc.key\n${hex(aesIv)}\n`))
+
+    // 2) probe audio + durée
+    const plog = await withLogs(ff, async () => { try { await ff.exec(['-i', inputPath]) } catch { /* ffmpeg -i sans sortie => exit non nul, normal */ } })
+    const probe = parseProbe(plog)
+    const nAudio = Math.max(0, probe.audio.length)
+    const outDuration = probe.duration || 0
+
+    // 3) -map + -var_stream_map dynamiques (1 vidéo + N audios), IDENTIQUE à video-hls-lib.mjs
+    const maps = ['-map', '0:v:0']
+    const varParts = ['v:0,agroup:aud,name:video']
+    for (let i = 0; i < nAudio; i++) {
+      const lang = probe.audio[i].lang || 'und'
+      maps.push('-map', `0:a:${i}`)
+      varParts.push(`a:${i},agroup:aud,language:${lang},name:a${i}${i === 0 ? ',default:yes' : ''}`)
+    }
+    const varStreamMap = varParts.join(' ')
+    log(`Pistes : 1 vidéo + ${nAudio} audio · durée ${Math.round(outDuration)}s`)
+
+    const ffArgs = [
+      '-y', '-i', inputPath,
+      ...maps,
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '21', '-pix_fmt', 'yuv420p',
+      '-g', '48', '-keyint_min', '48', '-sc_threshold', '0',
+      '-c:a', 'aac', '-ac', '2', '-b:a', '160k',
+      '-f', 'hls',
+      '-hls_time', String(HLS_TIME),
+      '-hls_playlist_type', 'vod',
+      '-hls_segment_type', 'mpegts',
+      '-hls_key_info_file', '/enc.keyinfo',
+      '-hls_segment_filename', `${OUT}/seg_%v_%03d.ts`,
+      '-master_pl_name', 'master.m3u8',
+      '-var_stream_map', varStreamMap,
+      `${OUT}/stream_%v.m3u8`,
+    ]
+    log('ffmpeg ' + ffArgs.join(' '))
+    log('Transcodage HLS + AES-128 (libx264, preset fast)…')
+    // progression : parse "time=HH:MM:SS" des logs ffmpeg pendant l'exec. On remonte aussi les lignes
+    // ffmpeg significatives (frame/time/erreurs) dans la notif pour que l'utilisateur voie la console live.
+    let lastLogT = 0
+    const onFfLog = ({ message }) => {
+      const m = /time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(message)
+      if (m && outDuration > 0) {
+        const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3])
+        onProgress('transcode', Math.max(0, Math.min(1, t / outDuration)))
+        // throttle l'affichage des lignes "frame= ... time=" à ~1/s pour ne pas inonder la notif.
+        if (t - lastLogT >= 1) { lastLogT = t; log(message.trim()) }
+      } else if (/error|Error|failed|Invalid|x264|Output #|Stream mapping/.test(message)) {
+        log(message.trim())
+      }
+    }
+    ff.on('log', onFfLog)
+    try { await ff.exec(ffArgs) } finally { ff.off('log', onFfLog) }
+    onProgress('transcode', 1)
+    log('Transcodage terminé. Évacuation des segments chiffrés…')
+
+    // inventaire de la sortie
+    const entries = await ff.listDir(OUT)
+    const names = entries.filter((e) => !e.isDir).map((e) => e.name)
+    if (!names.includes('master.m3u8')) throw new Error('master.m3u8 absent (transcodage échoué)')
+    const segments = names.filter((n) => /\.ts$/.test(n))
+    const mediaPlaylists = names.filter((n) => /^stream_.+\.m3u8$/.test(n))
+    if (!segments.length) throw new Error('aucun segment .ts produit')
+
+    // 4) ÉVACUATION segment par segment : hash -> upload blob -> deleteFile. 1 commit vid-commit final.
+    //    Pré-check rollover : on connaît la taille totale après lecture, mais active-vid-shard veut `need` AVANT.
+    //    On somme d'abord les tailles via stat-léger (readFile.length au moment de l'évacuation), donc on demande
+    //    le shard une 1re fois avec need=file.size (approximation prudente : le HLS pèse ~ la source à crf 21).
+    const sr = await shardApi({ action: 'active-vid-shard', need: file.size })
+    if (!sr || sr.error || !sr.repo) throw new Error('active-vid-shard: ' + ((sr && sr.error) || 'fail'))
+    const repoVid = sr.repo
+    log(`Dépôt public cible : ${repoVid} · ${segments.length} segments à pousser`)
+
+    const segHashPath = {}   // nom local -> ab/cd/<hash>.ts
+    const commitFiles = []   // {path, sha} pour le commit public
+    let totalSize = 0
+    let done = 0
+    for (const seg of segments) {
+      const data = await ff.readFile(`${OUT}/${seg}`)   // Uint8Array
+      const u8 = data instanceof Uint8Array ? data : new Uint8Array(data)
+      const h = await sha256Hex(u8)
+      const sp = shardPathFor(h, 'ts')
+      segHashPath[seg] = sp
+      totalSize += u8.length
+      const { sha } = await vidApi({ action: 'vid-blob', repoVid, b64: abToB64(u8) })
+      commitFiles.push({ path: sp, sha })
+      await ff.deleteFile(`${OUT}/${seg}`).catch(() => {})  // LIBÈRE le tas avant le segment suivant
+      done++
+      onProgress('upload', done / segments.length)
+      if (done === 1 || done === segments.length || done % 5 === 0) log(`Segment ${done}/${segments.length} chiffré + poussé (${(u8.length / 1024).toFixed(0)} Ko)`)
+    }
+    // commit atomique des segments sur le repo public -> SHA pour pinner jsDelivr
+    log('Commit des segments publics (jsDelivr)…')
+    const { commit: commitPublic } = await vidApi({ action: 'vid-commit', repoVid, files: commitFiles })
+    // compteur d'octets (rollover futur) — best-effort, réutilise l'action existante d'upload-shard
+    shardApi({ action: 'vid-commit-bytes', repo: repoVid, addBytes: totalSize }).catch(() => {})
+
+    // 5) réécriture des playlists, IDENTIQUE au pipeline local
+    const jsdelivr = (hp) => `https://cdn.jsdelivr.net/gh/${OWNER}/${repoVid}@${commitPublic}/${hp}`
+    const segMap = {}
+    for (const [name, hp] of Object.entries(segHashPath)) segMap[name] = jsdelivr(hp)
+    const keyUri = `/api/hls-key?v=${enc(`${baseDirRel}/${KEY_FILE}`)}`
+    const hlsUrl = (pl) => `/api/hls?path=${enc(`${baseDirRel}/${pl}`)}`
+
+    const contentFiles = [] // {path, utf8 | b64}
+    for (const pl of mediaPlaylists) {
+      const raw = new TextDecoder().decode(await ff.readFile(`${OUT}/${pl}`))
+      contentFiles.push({ path: `${baseDirRel}/${pl}`, utf8: rewriteMediaPlaylist(raw, segMap, keyUri) })
+    }
+    // MASTER GÉNÉRÉ À LA MAIN (cause racine du spike) : ffmpeg.wasm 0.12.x écrit un master.m3u8 VIDE
+    // (juste l'entête, aucune ligne EXT-X-STREAM-INF), donc hls.js n'y trouve aucune variante et ne lit
+    // jamais la playlist vidéo. Le pipeline local marche car ffmpeg-cli, lui, sérialise les variantes.
+    // On cesse donc de faire confiance au master de ffmpeg.wasm et on le construit nous-mêmes à partir
+    // des mediaPlaylists connues (1 EXT-X-STREAM-INF pour la vidéo + 1 EXT-X-MEDIA par piste audio).
+    const masterPath = `${baseDirRel}/master.m3u8`
+    contentFiles.push({ path: masterPath, utf8: buildMaster(mediaPlaylists, hlsUrl, probe) })
+
+    // 6) clé AES brute (binaire) -> repo PRIVÉ (jamais publique). manifest .media.json identique à pushHls.
+    const keyPath = `${baseDirRel}/${KEY_FILE}`
+    contentFiles.push({ path: keyPath, b64: abToB64(aesKey) })
+
+    const audioMeta = probe.audio.map((a, i) => ({ lang: a.lang || 'und', label: a.lang || 'und', default: i === 0 }))
+    const manifest = {
+      type: 'hls', v: 1, name: `${base}.mp4`, mime: 'application/vnd.apple.mpegurl',
+      duration: outDuration,
+      master: masterPath,
+      enc: 'AES-128',
+      keyUri,
+      keyPath,
+      iv: hex(aesIv),
+      publicRepo: repoVid,
+      commitPublic,
+      probe: { duration: outDuration },
+      audio: audioMeta,
+      subs: [],
+      size: totalSize,
+      count: segments.length,
+      segments: segments.length,
+      source: 'browser-wasm',
+      createdAt: new Date().toISOString(),
+    }
+    const manifestPath = `${baseDirRel}/${base}.mp4.media.json`
+    contentFiles.push({ path: manifestPath, utf8: JSON.stringify(manifest, null, 2) })
+
+    log('Écriture clé AES + playlists + manifeste (dépôt privé)…')
+    await vidApi({ action: 'vid-content', files: contentFiles })
+    log('Terminé ✓ vidéo HLS prête à lire.')
+
+    // nettoyage MEMFS
+    await ff.deleteFile('/enc.key').catch(() => {})
+    await ff.deleteFile('/enc.keyinfo').catch(() => {})
+    for (const pl of [...mediaPlaylists, 'master.m3u8']) await ff.deleteFile(`${OUT}/${pl}`).catch(() => {})
+
+    return { manifest, manifestPath }
+  } finally {
+    if (mounted) await ff.unmount(MNT).catch(() => {})
+    releaseFFmpeg()
+  }
+}

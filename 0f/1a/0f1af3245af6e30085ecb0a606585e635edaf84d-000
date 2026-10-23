@@ -1,0 +1,99 @@
+// Couche de persistance : serveur (/api/state, Redis Upstash) + cache localStorage.
+const KEY = 'zenrayprogress:v1'
+const EMPTY = { steps: {}, cards: [], theme: 'light', updatedAt: 0 }
+
+function readCache() {
+  try { return JSON.parse(localStorage.getItem(KEY) || 'null') } catch { return null }
+}
+function writeCache(state) {
+  try { localStorage.setItem(KEY, JSON.stringify(state)) } catch {}
+}
+
+export async function loadState() {
+  const cached = readCache()
+  try {
+    const r = await fetch('/api/state', { cache: 'no-store' })
+    if (r.ok) {
+      const j = await r.json()
+      const srv = j && j.state
+      if (srv && (!cached || (srv.updatedAt || 0) >= (cached.updatedAt || 0))) {
+        writeCache(srv)
+        return { state: srv, store: j.store || 'cloud' }
+      }
+      return { state: cached || EMPTY, store: j.store || 'local' }
+    }
+  } catch {}
+  return { state: cached || EMPTY, store: 'local' }
+}
+
+let timer = null
+export function saveState(state) {
+  state.updatedAt = Date.now()
+  writeCache(state)
+  clearTimeout(timer)
+  timer = setTimeout(() => {
+    fetch('/api/state', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ state }),
+    }).catch(() => {})
+  }, 600)
+}
+
+// Upload image (webp dataURL) -> hebergement GitHub si configure, sinon null (le client garde le dataURL).
+export async function uploadImage(dataUrl, name) {
+  try {
+    const r = await fetch('/api/upload', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dataUrl, name }),
+    })
+    if (r.ok) { const j = await r.json(); return j && j.url ? j.url : null }
+  } catch {}
+  return null
+}
+
+// SHELF — ingestion résiliente : télécharge une image (URL externe OU dataUrl) côté serveur et la stocke dans
+// le repo PUBLIC zenray-shelf-img, renvoie une URL jsDelivr épinglée au commit (immuable, CDN). Plus de
+// dépendance à l'hôte d'origine. Renvoie l'URL CDN, ou null si échec (l'appelant garde l'URL d'origine).
+export async function ingestShelfImage({ url, dataUrl, name, cat }) {
+  // Retry : Vercel/API source peuvent flancher ponctuellement. On garantit le stockage GitHub (-> plus d'image
+  // noire issue d'une URL externe non stockée). 3 tentatives avec petit backoff.
+  for (let i = 0; i < 3; i++) {
+    try {
+      const r = await fetch('/api/shelf-img', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url, dataUrl, name, cat }) })
+      if (r.ok) { const j = await r.json(); if (j && j.ok && j.url) return j.url }
+    } catch {}
+    if (i < 2) await new Promise((res) => setTimeout(res, 600 * (i + 1)))
+  }
+  return null
+}
+
+// SHELF — recherche de posters. mode='web' = recherche d'images web (Google-like, DuckDuckGo keyless) ;
+// sinon API média (RAWG/TMDB/AniList). Renvoie [{title, year, image, source}].
+export async function searchShelfPosters(q, cat, mode) {
+  try {
+    const r = await fetch(`/api/shelf-search?q=${encodeURIComponent(q)}&cat=${encodeURIComponent(cat || '')}${mode ? `&mode=${mode}` : ''}`, { cache: 'no-store' })
+    if (r.ok) { const j = await r.json(); return (j && j.results) || [] }
+  } catch {}
+  return []
+}
+
+// Compresse un fichier image en webp (qualite 0.95, max 1600px) -> dataURL.
+export async function fileToWebp(file, quality = 0.95, max = 1600) {
+  const bmp = await createImageBitmap(file)
+  let { width, height } = bmp
+  if (width > max || height > max) {
+    const r = Math.min(max / width, max / height)
+    width = Math.round(width * r); height = Math.round(height * r)
+  }
+  const canvas = document.createElement('canvas')
+  canvas.width = width; canvas.height = height
+  canvas.getContext('2d').drawImage(bmp, 0, 0, width, height)
+  return await new Promise((res) => {
+    canvas.toBlob((b) => {
+      if (!b) return res(null)
+      const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(b)
+    }, 'image/webp', quality)
+  })
+}

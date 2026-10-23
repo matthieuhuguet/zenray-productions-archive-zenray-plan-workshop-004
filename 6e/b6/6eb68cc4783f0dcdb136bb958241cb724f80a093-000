@@ -1,0 +1,2506 @@
+// GALERIE-POINTEUR GÉNÉRIQUE (2026-08-11). Design, Characters, Environments, Japan sont la MÊME vue,
+// paramétrée par `galleryKey` — voir `src/config/pointerGalleries.js`, la source unique éditable. Ne
+// jamais dupliquer ce fichier pour une nouvelle galerie : ajouter une entrée au registre suffit,
+// Sidebar/App/le menu contextuel s'y adaptent tout seuls.
+//
+// Le but, dans les mots de Matthieu (à propos de Design, la première des trois) : « réunir dans une
+// galerie toutes les images que je trouve intéressantes pour pouvoir composer rapidement, hyper
+// rapidement, des interfaces ». Une forme de drive, un pointeur — pas une page à lire, une grille à
+// scanner. Alimentée par clic droit sur une image OU un dossier de Create (« Ajouter à… », voir
+// App.jsx), même logique que « Envoyer vers Goals » sur une sélection de texte. Depuis le 2026-08-21,
+// alimentée AUSSI en direct : coller (⌘V) ou glisser un fichier fait un aller-retour /api/img, et deux
+// images glissées l'une sur l'autre forment un groupe, à la iOS.
+//
+// RÉFÉRENCE VISUELLE (collage IMG_5065-5067_collage.png) : grille Explore Instagram. Masonry écarté
+// au profit d'une vraie grille 4 par rangée (`repeat(4, 1fr)`, demande de Matthieu) ; les images 16:9
+// ou proches (`w/h >= 1.3`) prennent 2 colonnes pour ne pas être écrasées en hauteur, sans
+// `grid-auto-flow: dense` — si ça ne tient pas dans la rangée, ça redescend nativement à la ligne.
+import React from 'react'
+import './GalleryView.css'
+import { GALLERY_PRESENTATION, galleryPresentationStyle, galleryTheme } from '../config/galleryPresentation.js'
+import { createPortal } from 'react-dom'
+import { readJson, saveJsonWithRetry } from '../lib/saveJson.js'
+import { notify } from './Notifications.jsx'
+import { readImgManifestCached, resolveThumbUrl, resolveFullUrl } from './ImageNodeViewer.jsx'
+import Icon from './Icon.jsx'
+import { galleryByKey, POINTER_GALLERIES, getAllGalleries } from '../config/pointerGalleries.js'
+import LinkedAssetsGallery from './LinkedAssetsGallery.jsx'
+import { fileToWebp } from '../api.js'
+import { useClipboardTarget } from '../clipboard/ClipboardProvider.jsx'
+import { ActionColumnMenu, ActionColumnPopover } from './ActionColumnMenu.jsx'
+
+// 5 October 2026, 12:32 CEST: Keep editor glass settings in one place.
+const TILE_EDITOR_GLASS = { overlay: 'rgba(12,12,14,.28)', field: 'rgba(12,12,14,.16)', blur: 'blur(3px)' }
+
+const FONTS = { sans: "var(--zr-police-sans)", serif: "var(--zr-police-serif)" }
+
+// CHEMIN BRUT (uploads/…, posé par /api/img lors d'un collage ou d'un glisser direct) CONTRE
+// CHEMIN-MANIFESTE (posé depuis Create, un .img.json à déchiffrer). Deux origines, deux résolutions :
+// un chemin brut est déjà une image servable telle quelle, le faire passer par
+// `readImgManifestCached` tenterait de JSON.parse un binaire et échouerait en silence (vignette grise
+// à vie). `uploads/` est le seul préfixe que `/api/img` écrit pour ce cas, donc le seul test fiable.
+const isRawUpload = (p) => !!p && p.startsWith('uploads/')
+const isHttpUrl = (p) => !!p && (p.startsWith('http://') || p.startsWith('https://'))
+const rawUrl = (p) => `/api/img?path=${encodeURIComponent(p)}`
+
+// VIGNETTE. `Views.jsx` exporte bien un `MediaThumb`, mais il pointe l'<img> directement sur
+// `shardThumbUrl(m)` — l'URL jsDelivr de l'objet CHIFFRÉ. Correct pour les images publiques EN CLAIR
+// (ancien schéma), faux pour le schéma actuel (public mais chiffré AES-GCM) : le navigateur reçoit des
+// octets chiffrés, pas un WebP, et affiche l'icône cassée. `resolveThumbUrl`/`resolveFullUrl`
+// (ImageNodeViewer.jsx) sont les résolveurs ASYNC prévus pour ce cas hors-hook : ils déchiffrent et
+// rendent un objectURL affichable, avec repli automatique en clair si l'image ne l'est pas.
+function GalleryThumb({ path, alt, style }) {
+  const raw = isRawUpload(path)
+  const isHttp = isHttpUrl(path)
+  const [url, setUrl] = React.useState(null)
+  React.useEffect(() => {
+    if (raw || isHttp) return undefined // rien à résoudre, l'URL brute suffit déjà
+    let vivant = true
+    readImgManifestCached(path).then((m) => m && resolveThumbUrl(m)).then((u) => { if (vivant && u) setUrl(u) })
+    return () => { vivant = false }
+  }, [path, raw, isHttp])
+  if (isHttp) return <img src={path} alt={alt || ''} loading="lazy" style={style} />
+  if (raw) return <img src={rawUrl(path)} alt={alt || ''} loading="lazy" style={style} />
+  if (!url) return <div style={{ ...style, background: 'rgba(128,128,128,.10)' }} />
+  return <img src={url} alt={alt || ''} loading="lazy" style={style} />
+}
+
+// Tuile plein écran au clic : même manifeste en cache que la vignette (`readImgManifestCached`),
+// seule la résolution PLEINE (`resolveFullUrl`, elle aussi déchiffrée) diffère de la vignette WebP.
+// PORTÉ vers <body> : un `position: fixed` posé dans l'arbre de la page (sous le conteneur défilant
+// `overflowY: auto` de la zone de contenu, App.jsx) casse dès qu'un ancêtre gagne un
+// transform/filter/contain, retombant relatif à CET ancêtre au lieu du viewport réel — l'image
+// s'ouvre alors décalée par rapport à l'endroit cliqué. Même correctif que le popover de Plan.
+function Lightbox({ item, path: legacyPath, name: legacyName, onClose, onStep = null, position = null }) {
+  // 15 October 2026: Escape closes, the arrow keys step through the displayed references, the counter says where you are.
+  React.useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); onClose() }
+      else if (onStep && e.key === 'ArrowRight') { e.preventDefault(); onStep(1) }
+      else if (onStep && e.key === 'ArrowLeft') { e.preventDefault(); onStep(-1) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose, onStep])
+  const path = item?.path || legacyPath
+  const name = item?.name || item?.title || legacyName
+  const sourceUrl = item?.url
+  const raw = isRawUpload(path)
+  const isHttp = isHttpUrl(path)
+  const [url, setUrl] = React.useState(null)
+  React.useEffect(() => {
+    if (raw || isHttp) return undefined
+    let vivant = true
+    readImgManifestCached(path).then((m) => m && resolveFullUrl(m)).then((u) => { if (vivant && u) setUrl(u) })
+    return () => { vivant = false }
+  }, [path, raw, isHttp])
+  const shown = isHttp ? path : (raw ? rawUrl(path) : url)
+  return createPortal((
+    <div role="dialog" aria-modal="true" aria-label={item.title || name || 'Image'} onClick={onClose} style={{
+      position: 'fixed', inset: 0, zIndex: 4000, background: 'rgba(10,10,12,.88)',
+      display: 'grid', placeItems: 'center', padding: '5vh 5vw', cursor: 'zoom-out',
+    }}>
+      <div style={{ position: 'absolute', top: 18, right: 20, display: 'flex', alignItems: 'center', gap: 10 }}>
+        {sourceUrl && (
+          <a href={sourceUrl} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()}
+            title={`Ouvrir le lien source : ${sourceUrl}`}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 14px', borderRadius: 999,
+              background: 'rgba(255,255,255,.16)', color: '#fff', textDecoration: 'none',
+              font: '400 13px var(--zr-police-sans)', backdropFilter: 'blur(10px)',
+              transition: 'background .15s ease',
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,.28)' }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,.16)' }}>
+            <Icon name="arrow.up.right" size={13} color="#fff" />
+            <span>Ouvrir la source ({(() => { try { return new URL(sourceUrl).hostname.replace(/^www\./, '') } catch { return 'lien' } })()})</span>
+          </a>
+        )}
+        <button type="button" onClick={onClose} aria-label="Fermer" title="Fermer" style={{
+          width: 34, height: 34, borderRadius: 999,
+          border: 0, background: 'rgba(255,255,255,.14)', color: '#fff', display: 'grid', placeItems: 'center', cursor: 'pointer',
+        }}><Icon name="xmark" size={16} color="#fff" /></button>
+      </div>
+      {position && position.total > 1 && (
+        <div aria-live="polite" style={{ position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)', padding: '4px 12px', borderRadius: 999, background: 'rgba(255,255,255,.14)', color: '#fff', font: '400 12px var(--zr-police-serif)' }}>
+          {position.index + 1} / {position.total}
+        </div>
+      )}
+      {shown ? (
+        <img src={shown} alt={name || ''} style={{ maxWidth: '100%', maxHeight: '90vh', borderRadius: 3, boxShadow: '0 30px 90px -20px rgba(0,0,0,.7)' }} onClick={(e) => e.stopPropagation()} />
+      ) : (
+        <div style={{ color: 'rgba(255,255,255,.6)', font: "400 13px var(--zr-police-sans)" }}>chargement…</div>
+      )}
+    </div>
+  ), document.body)
+}
+
+// FONDU 0,35 s : le contenu est REMONTÉ (key=folderId côté appelant) donc React le traite comme un
+// nouvel arbre, qui démarre à opacité 0 et rejoint 1 au montage — un fondu d'entrée simple, sans
+// machine à états ni double-montage ancien/nouveau. L'ancien contenu, lui, disparaît instantanément
+// au démontage : à l'œil, la transition reste fluide (rien ne saute brutalement à pleine opacité).
+function FadeIn({ children }) {
+  const [on, setOn] = React.useState(false)
+  React.useEffect(() => { const r = requestAnimationFrame(() => setOn(true)); return () => cancelAnimationFrame(r) }, [])
+  return <div style={{ opacity: on ? 1 : 0, transition: 'opacity .35s ease' }}>{children}</div>
+}
+
+// 21 October 2026, 17:12 CEST: Gallery caption values now live in galleryPresentation.js.
+function TileCaption({ title, note, url, handle, isArtist, projectCount, onEdit, compte = null }) {
+  if (!title && !note && !url) return null
+  let hostname = ''
+  try { hostname = url ? new URL(url).hostname.replace(/^www\./, '') : '' } catch { hostname = 'source' }
+  if (hostname.includes('artstation.com')) hostname = 'ArtStation'
+  const count = isArtist ? projectCount : compte
+  const displayNote = /^\d+\s+projets?\s*$/i.test(note || '') ? null : note
+  return <div className="zr-gallery-caption">
+    {title && <h3 onClick={onEdit ? (event) => { event.stopPropagation(); onEdit() } : undefined}
+      style={{ pointerEvents: onEdit ? 'auto' : undefined, cursor: onEdit ? 'text' : undefined }}>{title}</h3>}
+    {url && <a href={url} target="_blank" rel="noopener noreferrer" onClick={(event) => event.stopPropagation()}>
+      {hostname}{handle ? ` · @${handle}` : ''} ↗
+    </a>}
+    {count != null && <span className="zr-gallery-count">{count} {isArtist ? (count === 1 ? 'projet' : 'projets') : 'références'}</span>}
+    {displayNote && <p onClick={onEdit ? (event) => { event.stopPropagation(); onEdit() } : undefined}
+      style={{ pointerEvents: onEdit ? 'auto' : undefined }}>{displayNote}</p>}
+  </div>
+}
+
+function TileEditor({ item, onSave, onCancel }) {
+  // Un GROUPE se nomme par `name` (son identité : fil d'Ariane, menu « Déplacer vers… »). Une IMAGE
+  // se légende par `title`, distinct de son `name` hérité du nom de fichier. Voir TileCaption.
+  const estGroupe = item.kind === 'folder'
+  const [title, setTitle] = React.useState((estGroupe ? item.name : item.title) || '')
+  const [url, setUrl] = React.useState(item.url || '')
+  const [note, setNote] = React.useState(item.note || '')
+  const champ = {
+    width: '100%', boxSizing: 'border-box', background: TILE_EDITOR_GLASS.field, color: '#fff',
+    border: '1px solid rgba(255,255,255,.22)', borderRadius: 5, padding: '5px 7px', outline: 'none',
+  }
+  return (
+    <div onClick={(e) => e.stopPropagation()} onDragStart={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') { e.stopPropagation(); onCancel() }
+        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.stopPropagation(); onSave({ name: title.trim(), url: url.trim(), note: note.trim() }) }
+      }}
+      onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) onSave({ name: title.trim(), url: url.trim(), note: note.trim() }) }}
+      style={{
+        position: 'absolute', inset: 0, zIndex: 5, display: 'flex', flexDirection: 'column', gap: 6,
+        padding: 10, borderRadius: 4, background: TILE_EDITOR_GLASS.overlay,
+        backdropFilter: TILE_EDITOR_GLASS.blur, WebkitBackdropFilter: TILE_EDITOR_GLASS.blur,
+      }}>
+      <input autoFocus value={title} onChange={(e) => setTitle(e.target.value)} placeholder={estGroupe ? 'Nom du groupe ou de l’artiste' : 'Titre (laisse vide pour n’afficher aucun titre)'}
+        aria-label="Titre" style={{ ...champ, font: '400 14px var(--zr-police-serif)' }} />
+      <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="Lien portfolio ou source (ArtStation, YouTube, web…)"
+        aria-label="Lien source" style={{ ...champ, font: '400 12px var(--zr-police-sans)' }} />
+      <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note : la description, ce que cette référence règle"
+        aria-label="Note" style={{ ...champ, flex: 1, resize: 'none', font: '400 12px/1.4 var(--zr-police-sans)' }} />
+      <div style={{ font: '400 10px var(--zr-police-sans)', color: 'rgba(255,255,255,.5)' }}>⌘↵ valider · Échap annuler</div>
+    </div>
+  )
+}
+
+// 08 October 2026: Utilitaires récursifs pour l'arborescence infinie de groupes et sous-groupes.
+function findFirstThumb(item) {
+  if (!item) return null
+  if (item.kind !== 'folder') return item.path || null
+  for (const child of item.items || []) {
+    const p = findFirstThumb(child)
+    if (p) return p
+  }
+  return null
+}
+
+function findFolderPath(items, targetId) {
+  if (!targetId) return []
+  function search(list, path) {
+    for (const it of list || []) {
+      if (it.kind === 'folder') {
+        const nextPath = [...path, it]
+        if (it.id === targetId) return nextPath
+        const found = search(it.items, nextPath)
+        if (found) return found
+      }
+    }
+    return null
+  }
+  return search(items, []) || []
+}
+
+function updateFolderInTree(list, targetId, updater) {
+  return (list || []).map((it) => {
+    if (it.kind !== 'folder') return it
+    if (it.id === targetId) return updater(it)
+    return { ...it, items: updateFolderInTree(it.items, targetId, updater) }
+  })
+}
+
+function getAllFolders(list, prefix = '') {
+  const res = []
+  for (const x of list || []) {
+    if (x.kind === 'folder') {
+      const fullLabel = prefix ? `${prefix} › ${x.name}` : x.name
+      res.push({ id: x.id, name: x.name, fullLabel })
+      res.push(...getAllFolders(x.items, fullLabel))
+    }
+  }
+  return res
+}
+
+function CrumbSep() {
+  return (
+    <svg viewBox="0 0 20 20" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"
+      style={{ color: 'var(--g9-soft)', margin: '0 2px', flexShrink: 0 }} aria-hidden="true">
+      <path d="m8 5 5 5-5 5" />
+    </svg>
+  )
+}
+
+function buildFolderTreeNodes(list, onSelect, currentId) {
+  const res = []
+  for (const it of list || []) {
+    if (it.kind === 'folder') {
+      const kids = buildFolderTreeNodes(it.items, onSelect, currentId)
+      const isSelected = currentId === it.id
+      res.push({
+        id: it.id,
+        label: it.name,
+        icon: <Icon name="folder" size={14} />,
+        selected: isSelected,
+        action: () => onSelect(it.id),
+        children: kids.length > 0 ? [
+          {
+            id: `open-${it.id}`,
+            label: `Ouvrir ${it.name}`,
+            icon: <Icon name="arrow.up.right" size={14} />,
+            action: () => onSelect(it.id),
+          },
+          ...kids,
+        ] : undefined,
+      })
+    }
+  }
+  return res
+}
+
+function FolderTile({ folder, editing, onOpen, onEdit, onSave, onCancel, dragProps, ratio = '4 / 5', isArtistsGallery = false }) {
+  const kids = (folder.items || []).slice(0, 4)
+  const n = (folder.items || []).length
+  const isArtist = Boolean(isArtistsGallery || folder.isArtist || (folder.projects && folder.projects.length > 0))
+  const projectCount = (folder.projects || []).length
+  const displayNote = isArtist && (folder.role || folder.studio)
+    ? `${folder.role || ''}${folder.role && folder.studio ? ' · ' : ''}${folder.studio || ''}${folder.note ? ` : ${folder.note}` : ''}`
+    : folder.note
+  const initials = (folder.name || 'A').split(/\s+/).slice(0, 2).map((w) => w[0] || '').join('').toUpperCase()
+  return (
+    <div {...dragProps} style={{ width: '100%', position: 'relative', ...(dragProps?.style || {}) }}>
+      <div className="zr-tap zr-ws-rim zr-gallery-visual" onClick={onOpen} role="button" tabIndex={0} aria-label={`Ouvrir ${folder.name || 'le groupe'}`}
+        onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); onOpen() } }} style={{
+        width: '100%', aspectRatio: ratio, cursor: 'pointer', position: 'relative',
+        borderRadius: 8, overflow: 'hidden',
+      }}>
+        {kids.length > 0 ? (
+          <GalleryThumb path={findFirstThumb(folder)} alt={folder.name || ''} style={{ width: '100%', height: '100%', objectFit: GALLERY_PRESENTATION.layout.imageFit, display: 'block' }} />
+        ) : (
+          <div style={{
+            width: '100%', height: '100%', display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center', gap: 6,
+            background: 'radial-gradient(circle at 30% 25%, rgba(10,132,255,.22), rgba(18,18,22,.92) 75%)',
+          }}>
+            <span style={{ font: '400 34px/1 var(--zr-police-serif)', color: 'rgba(255,255,255,.78)', letterSpacing: '.03em' }}>{initials}</span>
+            {folder.handle ? <span style={{ font: '400 11px var(--zr-police-mono)', color: 'rgba(255,255,255,.5)' }}>@{folder.handle}</span> : null}
+          </div>
+        )}
+        <TileCaption
+          title={folder.name}
+          note={displayNote}
+          url={folder.url}
+          handle={folder.handle}
+          isArtist={isArtist}
+          projectCount={projectCount}
+          onEdit={onEdit}
+          compte={n}
+        />
+        {editing ? <TileEditor item={folder} onSave={onSave} onCancel={onCancel} /> : null}
+      </div>
+    </div>
+  )
+}
+
+// 10 October 2026: Pop-up widget dépliable et agrandissable pour parcourir tous les projets ArtStation d'un artiste.
+// Porte les trois tailles préréglées (Normal, Large, Plein écran) + poignées de redimensionnement libre à la souris
+// (bord droit, bord bas, coin bas-droit), recherche instantanée, accordéon dépliable projet par projet ou tout d'un coup,
+// redirection directe vers le profil ArtStation et vers chaque projet ArtStation, et ajout direct de nouveaux projets.
+function ArtistProjectsPopover({ artist, t, onClose, onOpenImage, onOpenGrid, onAddProject }) {
+  const [sizeMode, setSizeMode] = React.useState('normal') // 'normal' | 'large' | 'max'
+  const [customSize, setCustomSize] = React.useState(null) // { w, h } | null
+  const [search, setSearch] = React.useState('')
+  const [addingProject, setAddingProject] = React.useState(false)
+  const [newProjTitle, setNewProjTitle] = React.useState('')
+  const [newProjUrl, setNewProjUrl] = React.useState('')
+  const [newProjCategory, setNewProjCategory] = React.useState('')
+  const [newProjNote, setNewProjNote] = React.useState('')
+
+  // 10 October 2026: Construit la liste des projets à partir de artist.projects, avec repli sur artist.items si un dossier a été créé à la main.
+  const allProjects = React.useMemo(() => {
+    if (Array.isArray(artist?.projects) && artist.projects.length > 0) {
+      return artist.projects
+    }
+    const items = artist?.items || []
+    if (items.length === 0) return []
+    return [{
+      id: `${artist.id}-default-proj`,
+      title: `${artist.name} : Références`,
+      category: artist.role || 'Portfolio ArtStation',
+      url: artist.url || '',
+      note: artist.note || '',
+      items,
+    }]
+  }, [artist])
+
+  // 10 October 2026: Par défaut, les 3 premiers projets sont dépliés à l'ouverture pour montrer immédiatement les planches.
+  const [expandedIds, setExpandedIds] = React.useState(() => {
+    const initial = new Set()
+    allProjects.slice(0, 3).forEach((p) => initial.add(p.id))
+    return initial
+  })
+
+  React.useEffect(() => {
+    const initial = new Set()
+    allProjects.slice(0, 3).forEach((p) => initial.add(p.id))
+    setExpandedIds(initial)
+  }, [artist?.id, allProjects])
+
+  React.useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const filteredProjects = React.useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return allProjects
+    return allProjects.filter((p) =>
+      (p.title || '').toLowerCase().includes(q) ||
+      (p.category || '').toLowerCase().includes(q) ||
+      (p.note || '').toLowerCase().includes(q)
+    )
+  }, [allProjects, search])
+
+  const allExpanded = filteredProjects.length > 0 && filteredProjects.every((p) => expandedIds.has(p.id))
+
+  const toggleProject = (id) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleAll = () => {
+    if (allExpanded) {
+      setExpandedIds(new Set())
+    } else {
+      const next = new Set(expandedIds)
+      filteredProjects.forEach((p) => next.add(p.id))
+      setExpandedIds(next)
+    }
+  }
+
+  const cycleSizeMode = () => {
+    setCustomSize(null)
+    setSizeMode((cur) => (cur === 'normal' ? 'large' : cur === 'large' ? 'max' : 'normal'))
+  }
+
+  // 10 October 2026: Redimensionnement libre à la souris par glisser sur le coin bas-droit, le bord droit ou le bord bas.
+  const startResize = (axis) => (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const box = e.currentTarget.parentElement?.getBoundingClientRect()
+    if (!box) return
+    const startX = e.clientX
+    const startY = e.clientY
+    const startW = box.width
+    const startH = box.height
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX
+      const dy = ev.clientY - startY
+      const maxW = window.innerWidth - 32
+      const maxH = window.innerHeight - 32
+      setCustomSize({
+        w: axis === 'y' ? startW : Math.max(520, Math.min(maxW, Math.round(startW + dx * 2))),
+        h: axis === 'x' ? startH : Math.max(380, Math.min(maxH, Math.round(startH + dy * 2))),
+      })
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  const presetDimensions = sizeMode === 'max'
+    ? { width: '95vw', height: '92vh' }
+    : sizeMode === 'large'
+      ? { width: 'min(1180px, 94vw)', height: 'min(820px, 88vh)' }
+      : { width: 'min(880px, 92vw)', height: 'min(660px, 84vh)' }
+
+  const boxDimensions = customSize
+    ? { width: `${customSize.w}px`, height: `${customSize.h}px` }
+    : presetDimensions
+
+  const totalImages = (artist?.items || []).length
+  const coverThumb = findFirstThumb(artist)
+
+  const handleCreateProject = async (e) => {
+    e.preventDefault()
+    if (!newProjTitle.trim()) return
+    await onAddProject({
+      id: `proj-${Date.now().toString(36)}`,
+      title: newProjTitle.trim(),
+      url: newProjUrl.trim() || artist.url || '',
+      category: newProjCategory.trim() || 'ArtStation Project',
+      note: newProjNote.trim() || '',
+      items: [],
+    })
+    setNewProjTitle('')
+    setNewProjUrl('')
+    setNewProjCategory('')
+    setNewProjNote('')
+    setAddingProject(false)
+  }
+
+  return createPortal((
+    <div
+      role="dialog"
+      className="zr-gallery-projects"
+      aria-modal="true"
+      aria-label={`Projets ArtStation de ${artist?.name || 'Artiste'}`}
+      onClick={onClose}
+      style={{
+        ...galleryPresentationStyle(),
+        position: 'fixed', inset: 0, zIndex: 3800,
+        background: 'rgba(8, 8, 12, .62)',
+        backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)',
+        display: 'grid', placeItems: 'center', padding: '2vh 2vw',
+      }}>
+      <div
+        className="zr-ws-rim"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          ...boxDimensions,
+          maxWidth: '96vw', maxHeight: '94vh',
+          position: 'relative',
+          display: 'flex', flexDirection: 'column',
+          borderRadius: 14, overflow: 'hidden',
+          background: t.cardBg || t.surface || 'rgba(22, 22, 26, .92)',
+          backdropFilter: 'blur(28px) saturate(160%)', WebkitBackdropFilter: 'blur(28px) saturate(160%)',
+          boxShadow: '0 32px 90px -18px rgba(0,0,0,.65)',
+          color: t.textPrimary,
+          transition: customSize ? 'none' : 'width .2s ease, height .2s ease',
+        }}>
+        {/* EN-TÊTE DU POP-UP WIDGET (double-clic pour maximiser/réduire) */}
+        <div
+          onDoubleClick={cycleSizeMode}
+          style={{
+            padding: '14px 18px 12px',
+            borderBottom: `1px solid ${t.border || 'rgba(128,128,128,.18)'}`,
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap',
+            background: 'rgba(128,128,128,.05)',
+            userSelect: 'none',
+          }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0, flex: '1 1 280px' }}>
+            <div style={{
+              width: 44, height: 44, borderRadius: 10, overflow: 'hidden', flexShrink: 0,
+              background: 'rgba(10,132,255,.18)', display: 'grid', placeItems: 'center',
+              border: '1px solid rgba(255,255,255,.14)',
+            }}>
+              {coverThumb ? (
+                <GalleryThumb path={coverThumb} alt={artist.name} style={{ width: '100%', height: '100%', objectFit: GALLERY_PRESENTATION.layout.imageFit, display: 'block' }} />
+              ) : (
+                <span style={{ font: '400 18px var(--zr-police-serif)', color: '#fff' }}>
+                  {(artist.name || 'A').slice(0, 2).toUpperCase()}
+                </span>
+              )}
+            </div>
+            <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <h2 style={{ margin: 0, font: '400 20px/1.2 var(--zr-police-serif)', color: t.textPrimary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {artist.name}
+                </h2>
+                {artist.handle && (
+                  <span style={{
+                    padding: '2px 8px', borderRadius: 999,
+                    background: 'rgba(128,128,128,.14)', color: t.textSecondary,
+                    font: '400 11px var(--zr-police-mono)',
+                  }}>
+                    @{artist.handle}
+                  </span>
+                )}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', font: '400 12px var(--zr-police-sans)', color: t.textSecondary }}>
+                {(artist.role || artist.studio) && (
+                  <span>
+                    {artist.role || ''}{artist.role && artist.studio ? ' · ' : ''}{artist.studio || ''}
+                  </span>
+                )}
+                <span>·</span>
+                <span>
+                  <strong style={{ font: '400 12px var(--zr-police-serif)', color: t.textPrimary }}>{allProjects.length}</strong>{' '}
+                  {allProjects.length > 1 ? 'projets' : 'projet'}
+                </span>
+                <span>·</span>
+                <span>
+                  <strong style={{ font: '400 12px var(--zr-police-serif)', color: t.textPrimary }}>{totalImages}</strong>{' '}
+                  {totalImages > 1 ? 'références locales' : 'référence locale'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* ACTIONS EN-TÊTE : Portfolio ArtStation direct, Vue grille, + Projet, Agrandir, Fermer */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
+            {artist.url && (
+              <a
+                href={artist.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={`Ouvrir le portfolio ArtStation (${artist.url})`}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  padding: '6px 13px', borderRadius: 999,
+                  background: '#0a84ff', color: '#fff', textDecoration: 'none',
+                  font: '400 12px var(--zr-police-sans)',
+                  boxShadow: '0 2px 8px rgba(10,132,255,.35)',
+                }}>
+                <span>Portfolio ArtStation</span>
+                <Icon name="arrow.up.right" size={12} color="#fff" />
+              </a>
+            )}
+            <button
+              type="button"
+              onClick={() => setAddingProject((v) => !v)}
+              title="Ajouter un projet ArtStation à cet artiste"
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 5,
+                padding: '6px 11px', borderRadius: 8,
+                border: `1px solid ${t.border || 'rgba(128,128,128,.22)'}`,
+                background: addingProject ? 'rgba(10,132,255,.16)' : 'rgba(128,128,128,.10)',
+                color: t.textPrimary, font: '400 12px var(--zr-police-sans)', cursor: 'pointer',
+              }}>
+              <Icon name="plus" size={12} color={t.textPrimary} />
+              <span>Projet</span>
+            </button>
+            <button
+              type="button"
+              onClick={onOpenGrid}
+              title="Ouvrir toutes les images de cet artiste dans la grille"
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 5,
+                padding: '6px 11px', borderRadius: 8,
+                border: `1px solid ${t.border || 'rgba(128,128,128,.22)'}`,
+                background: 'rgba(128,128,128,.10)',
+                color: t.textPrimary, font: '400 12px var(--zr-police-sans)', cursor: 'pointer',
+              }}>
+              <Icon name="square.grid.2x2" size={12} color={t.textPrimary} />
+              <span>Grille</span>
+            </button>
+            <button
+              type="button"
+              onClick={cycleSizeMode}
+              aria-label={sizeMode === 'max' ? 'Réduire le pop-up' : 'Agrandir le pop-up'}
+              title={`Taille : ${customSize ? `${customSize.w}×${customSize.h}` : sizeMode === 'normal' ? 'Normal (cliquer pour Large)' : sizeMode === 'large' ? 'Large (cliquer pour Plein écran)' : 'Plein écran (cliquer pour Normal)'}`}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 5,
+                padding: '6px 10px', borderRadius: 8,
+                border: `1px solid ${t.border || 'rgba(128,128,128,.22)'}`,
+                background: 'rgba(128,128,128,.10)',
+                color: t.textPrimary, font: '400 12px var(--zr-police-sans)', cursor: 'pointer',
+              }}>
+              <Icon name={sizeMode === 'max' ? 'fullscreen.exit' : 'fullscreen.enter'} size={13} color={t.textPrimary} />
+              <span>{sizeMode === 'normal' ? 'Agrandir' : sizeMode === 'large' ? 'Max' : 'Normal'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Fermer"
+              title="Fermer (Échap)"
+              style={{
+                width: 30, height: 30, borderRadius: 999,
+                border: `1px solid ${t.border || 'rgba(128,128,128,.22)'}`,
+                background: 'rgba(128,128,128,.12)', color: t.textPrimary,
+                display: 'grid', placeItems: 'center', cursor: 'pointer',
+              }}>
+              <Icon name="xmark" size={14} color={t.textPrimary} />
+            </button>
+          </div>
+        </div>
+
+        {/* BARRE DE RECHERCHE ET CONTRÔLE D'ACCORDÉON (Tout déplier / Tout replier) */}
+        <div style={{
+          padding: '8px 18px',
+          borderBottom: `1px solid ${t.border || 'rgba(128,128,128,.14)'}`,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap',
+        }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 7, flex: '1 1 220px',
+            padding: '5px 10px', borderRadius: 8,
+            background: 'rgba(128,128,128,.08)',
+            border: `1px solid ${t.border || 'rgba(128,128,128,.16)'}`,
+          }}>
+            <Icon name="magnifyingglass" size={13} color={t.textSecondary} />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={`Filtrer les projets de ${artist.name}…`}
+              style={{
+                flex: 1, background: 'transparent', border: 'none', outline: 'none',
+                color: t.textPrimary, font: '400 12px var(--zr-police-sans)',
+              }}
+            />
+            {search && (
+              <button type="button" onClick={() => setSearch('')} style={{ border: 0, background: 'transparent', color: t.textSecondary, cursor: 'pointer', padding: 0 }}>
+                <Icon name="xmark" size={11} color={t.textSecondary} />
+              </button>
+            )}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button
+              type="button"
+              onClick={toggleAll}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 5,
+                padding: '5px 11px', borderRadius: 7,
+                border: `1px solid ${t.border || 'rgba(128,128,128,.2)'}`,
+                background: 'rgba(128,128,128,.08)', color: t.textPrimary,
+                font: '400 12px var(--zr-police-sans)', cursor: 'pointer',
+              }}>
+              <Icon name={allExpanded ? 'chevron.up' : 'chevron.down'} size={11} color={t.textPrimary} />
+              <span>{allExpanded ? 'Tout replier' : 'Tout déplier'}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* FORMULAIRE D'AJOUT DE PROJET ARTSTATION */}
+        {addingProject && (
+          <form onSubmit={handleCreateProject} style={{
+            padding: '12px 18px',
+            borderBottom: `1px solid ${t.border || 'rgba(128,128,128,.18)'}`,
+            background: 'rgba(10,132,255,.06)',
+            display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8, alignItems: 'center',
+          }}>
+            <input
+              autoFocus
+              value={newProjTitle}
+              onChange={(e) => setNewProjTitle(e.target.value)}
+              placeholder="Titre du projet (ex. Ghost of Yōtei Foliage)"
+              style={{
+                padding: '6px 10px', borderRadius: 6,
+                border: `1px solid ${t.border || 'rgba(128,128,128,.25)'}`,
+                background: 'rgba(128,128,128,.1)', color: t.textPrimary,
+                font: '400 13px var(--zr-police-serif)', outline: 'none',
+              }}
+            />
+            <input
+              value={newProjUrl}
+              onChange={(e) => setNewProjUrl(e.target.value)}
+              placeholder="Lien ArtStation (https://www.artstation.com/artwork/...)"
+              style={{
+                padding: '6px 10px', borderRadius: 6,
+                border: `1px solid ${t.border || 'rgba(128,128,128,.25)'}`,
+                background: 'rgba(128,128,128,.1)', color: t.textPrimary,
+                font: '400 12px var(--zr-police-sans)', outline: 'none',
+              }}
+            />
+            <input
+              value={newProjCategory}
+              onChange={(e) => setNewProjCategory(e.target.value)}
+              placeholder="Catégorie (ex. Environment · UE5)"
+              style={{
+                padding: '6px 10px', borderRadius: 6,
+                border: `1px solid ${t.border || 'rgba(128,128,128,.25)'}`,
+                background: 'rgba(128,128,128,.1)', color: t.textPrimary,
+                font: '400 12px var(--zr-police-sans)', outline: 'none',
+              }}
+            />
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input
+                value={newProjNote}
+                onChange={(e) => setNewProjNote(e.target.value)}
+                placeholder="Note / breakdown…"
+                style={{
+                  flex: 1, padding: '6px 10px', borderRadius: 6,
+                  border: `1px solid ${t.border || 'rgba(128,128,128,.25)'}`,
+                  background: 'rgba(128,128,128,.1)', color: t.textPrimary,
+                  font: '400 12px var(--zr-police-sans)', outline: 'none',
+                }}
+              />
+              <button type="submit" style={{
+                padding: '6px 12px', borderRadius: 6, border: 0,
+                background: '#0a84ff', color: '#fff',
+                font: '400 12px var(--zr-police-sans)', cursor: 'pointer', whiteSpace: 'nowrap',
+              }}>
+                Ajouter
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* CORPS DÉFILANT : NOTE DE L'ARTISTE + VUE DÉPLIANTE SUR TOUS LES PROJETS */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '14px 18px 22px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {artist.note && (
+            <div style={{
+              padding: '9px 12px', borderRadius: 8,
+              background: 'rgba(128,128,128,.07)',
+              border: `1px solid ${t.border || 'rgba(128,128,128,.14)'}`,
+              font: '400 12px/1.45 var(--zr-police-sans)', color: t.textSecondary,
+            }}>
+              {artist.note}
+            </div>
+          )}
+
+          {filteredProjects.map((proj, idx) => {
+            const isExpanded = expandedIds.has(proj.id)
+            const projItems = proj.items || []
+            const projectUrl = proj.url || artist.url || ''
+            return (
+              <div
+                key={proj.id || idx}
+                className="zr-ws-rim"
+                style={{
+                  borderRadius: 10, overflow: 'hidden',
+                  background: isExpanded ? 'rgba(128,128,128,.07)' : 'rgba(128,128,128,.035)',
+                  border: `1px solid ${t.border || 'rgba(128,128,128,.16)'}`,
+                  transition: 'background .15s ease',
+                }}>
+                {/* BARRE DE PROJET CLIQUABLE POUR DÉPLIER / REPLIER */}
+                <div
+                  role="button"
+                  tabIndex={0}
+                  aria-expanded={isExpanded}
+                  onClick={() => toggleProject(proj.id)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleProject(proj.id) } }}
+                  style={{
+                    padding: '11px 14px',
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
+                    cursor: 'pointer', userSelect: 'none',
+                  }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0, flex: 1 }}>
+                    <span style={{
+                      display: 'inline-flex', transition: 'transform .18s ease',
+                      transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
+                      color: t.textSecondary, flexShrink: 0,
+                    }}>
+                      <Icon name="triangle.fill" size={10} color={t.textSecondary} />
+                    </span>
+                    <span style={{
+                      font: '400 12px var(--zr-police-serif)',
+                      color: t.textSecondary, minWidth: 20,
+                    }}>
+                      {String(idx + 1).padStart(2, '0')}
+                    </span>
+                    <span className="zr-gallery-title" style={{
+                      font: '400 16px/1.25 var(--zr-police-serif)',
+                      color: t.textPrimary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>
+                      {proj.title}
+                    </span>
+                    {proj.category && (
+                      <span style={{
+                        padding: '2px 8px', borderRadius: 999,
+                        background: 'rgba(128,128,128,.14)', color: t.textSecondary,
+                        font: '400 11px var(--zr-police-sans)', whiteSpace: 'nowrap',
+                      }}>
+                        {proj.category}
+                      </span>
+                    )}
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                    <span style={{
+                      padding: '2px 8px', borderRadius: 999,
+                      background: 'rgba(128,128,128,.12)', color: t.textSecondary,
+                      font: '400 11px var(--zr-police-sans)',
+                    }}>
+                      <strong style={{ font: '400 11px var(--zr-police-serif)', color: t.textPrimary }}>{projItems.length}</strong>{' '}
+                      {projItems.length > 1 ? 'planches' : 'planche'}
+                    </span>
+                    {projectUrl && (
+                      <a
+                        href={projectUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        title={`Ouvrir « ${proj.title} » sur ArtStation (${projectUrl})`}
+                        style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 4,
+                          padding: '4px 10px', borderRadius: 999,
+                          background: 'rgba(10,132,255,.16)', color: '#0a84ff',
+                          textDecoration: 'none', font: '400 11px var(--zr-police-sans)',
+                        }}>
+                        <span>ArtStation</span>
+                        <Icon name="arrow.up.right" size={10} color="#0a84ff" />
+                      </a>
+                    )}
+                  </div>
+                </div>
+
+                {/* CONTENU DÉPLIÉ DU PROJET */}
+                {isExpanded && (
+                  <div style={{
+                    padding: '0 14px 14px',
+                    borderTop: `1px solid ${t.border || 'rgba(128,128,128,.12)'}`,
+                    display: 'flex', flexDirection: 'column', gap: 10,
+                  }}>
+                    {proj.note && (
+                      <p style={{ margin: '10px 0 0', font: '400 12px/1.45 var(--zr-police-sans)', color: t.textSecondary }}>
+                        {proj.note}
+                      </p>
+                    )}
+                    {projItems.length > 0 ? (
+                      <div className="zr-gallery-project-images" style={{
+                        marginTop: proj.note ? 2 : 10,
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fill, minmax(175px, 1fr))',
+                        gap: 8,
+                      }}>
+                        {projItems.map((img) => (
+                          <div
+                            key={img.id || img.path}
+                            className="zr-gallery-project-image" role="button" tabIndex={0}
+                            onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onOpenImage({ ...img, url: img.url || projectUrl }) } }}
+                            onClick={() => onOpenImage({ ...img, url: img.url || projectUrl })}
+                            title={img.title || img.name || proj.title}
+                            style={{
+                              aspectRatio: '16 / 10', borderRadius: 6, overflow: 'hidden',
+                              position: 'relative', cursor: 'zoom-in',
+                              background: 'rgba(128,128,128,.1)',
+                              border: '1px solid rgba(255,255,255,.08)',
+                            }}>
+                            <GalleryThumb
+                              path={img.path}
+                              alt={img.title || img.name || proj.title}
+                              style={{ width: '100%', height: '100%', objectFit: GALLERY_PRESENTATION.layout.imageFit, display: 'block' }}
+                            />
+                            {(img.title || img.name) && (
+                              <div className="zr-gallery-project-image-label" style={{
+                                position: 'absolute', bottom: 4, left: 4, right: 4,
+                                padding: '2px 6px', borderRadius: 4,
+                                background: 'rgba(0,0,0,.58)', color: '#fff',
+                                font: '400 10px var(--zr-police-sans)',
+                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                              }}>
+                                {img.title || img.name}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '8px 12px', borderRadius: 8, background: 'rgba(128,128,128,.06)' }}>
+                        <span style={{ font: '400 12px var(--zr-police-sans)', color: t.textSecondary }}>
+                          Projet référencé sur ArtStation.
+                        </span>
+                        {projectUrl && (
+                          <a
+                            href={projectUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{
+                              display: 'inline-flex', alignItems: 'center', gap: 5,
+                              padding: '5px 11px', borderRadius: 999,
+                              background: '#0a84ff', color: '#fff', textDecoration: 'none',
+                              font: '400 11px var(--zr-police-sans)',
+                            }}>
+                            <span>Voir le projet sur ArtStation</span>
+                            <Icon name="arrow.up.right" size={10} color="#fff" />
+                          </a>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+
+        {/* POIGNÉES DE REDIMENSIONNEMENT LIBRE (bord droit, bord bas, coin bas-droit) */}
+        <div
+          onMouseDown={startResize('x')}
+          title="Glisser pour élargir le pop-up"
+          style={{ position: 'absolute', top: 0, right: 0, bottom: 16, width: 6, cursor: 'ew-resize', zIndex: 10 }}
+        />
+        <div
+          onMouseDown={startResize('y')}
+          title="Glisser pour agrandir en hauteur"
+          style={{ position: 'absolute', left: 0, right: 16, bottom: 0, height: 6, cursor: 'ns-resize', zIndex: 10 }}
+        />
+        <div
+          onMouseDown={startResize('xy')}
+          title="Glisser pour redimensionner librement le pop-up"
+          style={{
+            position: 'absolute', right: 2, bottom: 2, width: 16, height: 16,
+            cursor: 'nwse-resize', zIndex: 11, display: 'grid', placeItems: 'center', opacity: .55,
+          }}>
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+            <path d="M9 1L1 9M9 5L5 9" />
+          </svg>
+        </div>
+      </div>
+    </div>
+  ), document.body)
+}
+
+// 10 October 2026, 22:58 CEST: Chrome fills clipboardData.files, Safari only clipboardData.items; read both so a pasted screenshot always lands.
+// FR : Chrome remplit `files`, Safari seulement `items` ; on lit les deux pour qu'une capture arrive toujours.
+function clipboardImageFile(clipboardData) {
+  const fromFiles = [...(clipboardData?.files || [])]
+  const fromItems = [...(clipboardData?.items || [])].filter((item) => item.kind === 'file').map((item) => item.getAsFile())
+  return [...fromFiles, ...fromItems].find((file) => file && file.type && file.type.startsWith('image/')) || null
+}
+
+// ── CASE POUR COPIER DES LIENS AVEC APERÇU (2026-10-02, demande de Matthieu) ───────────────────────
+// Permet de coller une URL (ArtStation, YouTube, Pinterest, blog, etc.) avec aperçu automatique
+// de la miniature et des métadonnées, OU de glisser / coller (⌘V) directement une image copiée
+// (par exemple depuis ArtStation où le bot est bloqué par Cloudflare).
+
+// 10 October 2026, 22:58 CEST: forwardRef exposes acceptImage, so the gallery can hand a pasted image to an open card.
+const GalleryLinkBox = React.forwardRef(function GalleryLinkBox({ t, label, onAddReference }, linkRef) {
+  const [open, setOpen] = React.useState(false)
+  const [urlInput, setUrlInput] = React.useState('')
+  const [loading, setLoading] = React.useState(false)
+  const [preview, setPreview] = React.useState(null)
+  const [customImage, setCustomImage] = React.useState(null) // dataUrl
+  const [customFile, setCustomFile] = React.useState(null) // File / Blob
+  const [title, setTitle] = React.useState('')
+  const [note, setNote] = React.useState('')
+  const [dragOverDropzone, setDragOverDropzone] = React.useState(false)
+  const [submitting, setSubmitting] = React.useState(false)
+  const fileInputRef = React.useRef(null)
+  const cardRef = React.useRef(null)
+
+  const handleFetch = async (targetUrl) => {
+    const raw = (targetUrl || urlInput || '').trim()
+    if (!raw) return
+    let parsedUrl = raw
+    if (!/^https?:\/\//i.test(parsedUrl) && (parsedUrl.includes('.') || parsedUrl.includes('localhost'))) {
+      parsedUrl = 'https://' + parsedUrl
+    }
+    setLoading(true)
+    try {
+      // 10 October 2026, 22:58 CEST: a preview that never answers opens the card without an image instead of holding "Recherche…" forever.
+      const r = await fetch(`/api/unfurl?url=${encodeURIComponent(parsedUrl)}`, { signal: AbortSignal.timeout(20000) }).then((res) => res.json()).catch(() => null)
+      if (r && !r.error) {
+        setPreview(r)
+        if (r.title && !title) setTitle(r.title)
+        if (r.description && !note) setNote(r.description)
+        setOpen(true)
+      } else {
+        const host = (() => { try { return new URL(parsedUrl).hostname.replace(/^www\./, '') } catch { return 'Lien' } })()
+        setPreview({ url: parsedUrl, title: host, image: null, siteName: host })
+        if (!title) setTitle(host)
+        setOpen(true)
+      }
+    } catch {
+      const host = (() => { try { return new URL(parsedUrl).hostname.replace(/^www\./, '') } catch { return 'Lien' } })()
+      setPreview({ url: parsedUrl, title: host, image: null, siteName: host })
+      if (!title) setTitle(host)
+      setOpen(true)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // 10 October 2026, 22:58 CEST: an image that cannot be read says so instead of doing nothing.
+  const handleImageFile = async (file) => {
+    if (!file || !file.type || !file.type.startsWith('image/')) return
+    let dataUrl = null
+    if (file.type === 'image/gif' || file.name?.toLowerCase().endsWith('.gif')) {
+      dataUrl = await new Promise((res) => {
+        const fr = new FileReader()
+        fr.onload = () => res(fr.result)
+        fr.onerror = () => res(null)
+        fr.readAsDataURL(file)
+      })
+    } else {
+      dataUrl = await fileToWebp(file).catch(() => null)
+    }
+    if (!dataUrl) {
+      notify({ kind: 'error', label, title: 'Image illisible', body: 'Essaie un autre fichier (PNG, JPEG, WebP ou GIF).' })
+      return
+    }
+    setCustomFile(file)
+    setCustomImage(dataUrl)
+    setOpen(true)
+  }
+
+  // 10 October 2026, 22:58 CEST: any image on the clipboard goes to this card and stops here, never to the gallery as a loose tile.
+  const onCardPaste = (e) => {
+    const image = clipboardImageFile(e.clipboardData)
+    if (image) {
+      e.preventDefault()
+      e.stopPropagation()
+      handleImageFile(image)
+      return
+    }
+    const text = e.clipboardData?.getData('text')
+    if (text && /^https?:\/\//i.test(text.trim())) {
+      setUrlInput(text.trim())
+      handleFetch(text.trim())
+    }
+  }
+
+  const reset = () => {
+    setOpen(false)
+    setUrlInput('')
+    setLoading(false)
+    setPreview(null)
+    setCustomImage(null)
+    setCustomFile(null)
+    setTitle('')
+    setNote('')
+    setDragOverDropzone(false)
+  }
+
+  const handleSubmit = async () => {
+    const effectiveImage = customImage || preview?.image
+    const effectiveUrl = (preview?.url || urlInput || '').trim()
+    if (!effectiveImage && !effectiveUrl) {
+      notify({ kind: 'error', label, title: 'Données manquantes', body: 'Ajoute au moins une image ou un lien.' })
+      return
+    }
+    setSubmitting(true)
+    try {
+      const ok = await onAddReference({
+        title: title.trim() || preview?.title || 'Référence',
+        url: effectiveUrl,
+        note: note.trim() || '',
+        file: customFile,
+        dataUrl: customImage,
+        imageUrl: !customImage ? preview?.image : null,
+      })
+      if (ok) reset()
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  // 10 October 2026, 22:58 CEST: opening the card moves focus into it, so a ⌘V lands on the card and not on the page.
+  React.useEffect(() => {
+    if (open) cardRef.current?.focus({ preventScroll: true })
+  }, [open])
+
+  // 10 October 2026, 22:58 CEST: the gallery hands a pasted image to an open card through this handle.
+  React.useImperativeHandle(linkRef, () => ({
+    acceptImage: (file) => {
+      if (!open || !file || !file.type?.startsWith('image/')) return false
+      handleImageFile(file)
+      return true
+    },
+  }))
+
+  const displayedImg = customImage || preview?.image || null
+
+  return (
+    <div className="zr-gallery-linkbox" style={{ marginBottom: 14 }}>
+      {!open ? (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', borderRadius: 8,
+          background: 'rgba(128,128,128,.08)', border: '1px solid rgba(128,128,128,.16)',
+          transition: 'border-color .15s ease',
+        }}>
+          <Icon name="link" size={14} color={t.textSecondary} />
+          <input
+            value={urlInput}
+            onChange={(e) => setUrlInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                handleFetch(urlInput)
+              }
+            }}
+            onPaste={(e) => {
+              const image = clipboardImageFile(e.clipboardData)
+              if (image) {
+                e.preventDefault()
+                handleImageFile(image)
+                return
+              }
+              const text = e.clipboardData?.getData('text')
+              if (text && /^https?:\/\//i.test(text.trim())) {
+                setTimeout(() => handleFetch(text.trim()), 10)
+              }
+            }}
+            placeholder="Ajouter une référence : colle un lien (ArtStation, YouTube, web…) ou colle (⌘V) une image…"
+            style={{
+              flex: 1, background: 'transparent', border: 'none', outline: 'none',
+              color: t.textPrimary, font: '400 13px var(--zr-police-sans)',
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => handleFetch(urlInput)}
+            disabled={loading || !urlInput.trim()}
+            style={{
+              padding: '4px 12px', borderRadius: 6, border: 0,
+              background: urlInput.trim() ? (t.accent || '#0a84ff') : 'rgba(128,128,128,.14)',
+              color: urlInput.trim() ? '#fff' : t.textSecondary,
+              font: '500 12px var(--zr-police-sans)', cursor: urlInput.trim() ? 'pointer' : 'default',
+              display: 'inline-flex', alignItems: 'center', gap: 5,
+            }}>
+            {loading ? 'Recherche…' : 'Aperçu'}
+          </button>
+        </div>
+      ) : (
+        <div
+          ref={cardRef}
+          role="group"
+          tabIndex={-1}
+          aria-label="Ajouter une référence"
+          onPaste={onCardPaste}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') reset()
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault()
+              handleSubmit()
+            }
+          }}
+          style={{
+            padding: 14, borderRadius: 10, outline: 'none',
+            background: t.surface || 'rgba(255,255,255,.05)',
+            border: '1px solid rgba(128,128,128,.25)',
+            boxShadow: '0 8px 24px -6px rgba(0,0,0,.35)',
+            display: 'flex', flexDirection: 'column', gap: 12,
+          }}>
+          {/* Ligne URL source + actualiser + fermer */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Icon name="link" size={14} color={t.textSecondary} />
+            <input
+              value={urlInput}
+              onChange={(e) => setUrlInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleFetch(urlInput) }}
+              placeholder="https://..."
+              style={{
+                flex: 1, padding: '6px 10px', borderRadius: 6,
+                background: 'rgba(128,128,128,.10)', border: '1px solid rgba(128,128,128,.20)',
+                color: t.textPrimary, font: '400 12px var(--zr-police-sans)', outline: 'none',
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => handleFetch(urlInput)}
+              disabled={loading}
+              style={{
+                padding: '6px 12px', borderRadius: 6, border: 0,
+                background: 'rgba(128,128,128,.16)', color: t.textPrimary,
+                font: '500 12px var(--zr-police-sans)', cursor: 'pointer',
+              }}>
+              {loading ? 'Recherche…' : 'Actualiser'}
+            </button>
+            <button
+              type="button"
+              onClick={reset}
+              title="Fermer"
+              style={{
+                width: 28, height: 28, borderRadius: 999, border: 0,
+                background: 'rgba(128,128,128,.16)', color: t.textSecondary,
+                display: 'grid', placeItems: 'center', cursor: 'pointer',
+              }}>
+              <Icon name="xmark" size={12} color={t.textSecondary} />
+            </button>
+          </div>
+
+          {/* Grille 2 colonnes : miniature / dépôt à gauche + métadonnées à droite */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 260px) 1fr', gap: 14 }}>
+            {/* Colonne miniature / dépôt */}
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => { e.preventDefault(); setDragOverDropzone(true) }}
+              onDragLeave={() => setDragOverDropzone(false)}
+              onDrop={(e) => {
+                e.preventDefault(); setDragOverDropzone(false)
+                if (e.dataTransfer.files && e.dataTransfer.files[0]) handleImageFile(e.dataTransfer.files[0])
+              }}
+              style={{
+                width: '100%', minHeight: 160, borderRadius: 8, overflow: 'hidden',
+                position: 'relative', cursor: 'pointer',
+                background: 'rgba(128,128,128,.08)',
+                border: dragOverDropzone ? '2px dashed #0a84ff' : (displayedImg ? '1px solid rgba(128,128,128,.25)' : '2px dashed rgba(128,128,128,.3)'),
+                display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                transition: 'border-color .15s ease',
+              }}>
+              {displayedImg ? (
+                <>
+                  <img src={displayedImg} alt="" style={{ width: '100%', height: '100%', maxHeight: 200, objectFit: GALLERY_PRESENTATION.layout.imageFit, display: 'block' }} />
+                  <div style={{
+                    position: 'absolute', inset: 0, background: 'rgba(0,0,0,.55)',
+                    opacity: 0, transition: 'opacity .15s ease',
+                    display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 4,
+                    color: '#fff', font: '500 11px var(--zr-police-sans)', textAlign: 'center', padding: 8,
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.opacity = '1' }}
+                  onMouseLeave={(e) => { e.currentTarget.style.opacity = '0' }}>
+                    <Icon name="photo" size={18} color="#fff" />
+                    <span>Cliquer ou glisser pour remplacer</span>
+                    <span style={{ fontSize: 10, opacity: .8 }}>Coller (⌘V) marche aussi</span>
+                  </div>
+                </>
+              ) : (
+                <div style={{ padding: 16, textAlign: 'center', color: t.textSecondary }}>
+                  <Icon name="photo" size={28} color={t.textSecondary} />
+                  <div style={{ margin: '8px 0 2px', font: '500 12px var(--zr-police-sans)', color: t.textPrimary }}>
+                    Coller (⌘V) ou glisser l’image
+                  </div>
+                  <div style={{ font: '400 11px/1.3 var(--zr-police-sans)', opacity: .7 }}>
+                    depuis ArtStation, capture ou fichier
+                  </div>
+                </div>
+              )}
+              <input ref={fileInputRef} type="file" accept="image/*" style={{ display: 'none' }}
+                onChange={(e) => { if (e.target.files && e.target.files[0]) handleImageFile(e.target.files[0]) }} />
+            </div>
+
+            {/* Colonne droite : Titre, lien, note */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {preview?.siteName && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{
+                    padding: '2px 8px', borderRadius: 4, background: 'rgba(10,132,255,.16)',
+                    color: '#0a84ff', font: '500 11px var(--zr-police-sans)',
+                  }}>
+                    {preview.siteName}
+                  </span>
+                  {preview.url && (
+                    <a href={preview.url} target="_blank" rel="noopener noreferrer" style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 3,
+                      color: t.textSecondary, textDecoration: 'none', font: '400 11px var(--zr-police-sans)',
+                    }}>
+                      <span>{(() => { try { return new URL(preview.url).hostname } catch { return '' } })()}</span>
+                      <Icon name="arrow.up.right" size={9} color={t.textSecondary} />
+                    </a>
+                  )}
+                </div>
+              )}
+              <input
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="Titre de la référence (ex. Pampas Grass Pond)"
+                style={{
+                  width: '100%', boxSizing: 'border-box', padding: '7px 10px', borderRadius: 6,
+                  background: 'rgba(128,128,128,.10)', border: '1px solid rgba(128,128,128,.20)',
+                  color: t.textPrimary, font: '400 14px var(--zr-police-serif)', outline: 'none',
+                }}
+              />
+              <textarea
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                rows={3}
+                placeholder="Note / description (artiste, technique, éléments à reproduire…)"
+                style={{
+                  width: '100%', boxSizing: 'border-box', padding: '7px 10px', borderRadius: 6, resize: 'vertical',
+                  background: 'rgba(128,128,128,.10)', border: '1px solid rgba(128,128,128,.20)',
+                  color: t.textPrimary, font: '400 12px/1.4 var(--zr-police-sans)', outline: 'none',
+                }}
+              />
+              {/* Ligne inférieure : Statut + actions */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 'auto', paddingTop: 6 }}>
+                <span style={{ font: '400 11px var(--zr-police-sans)', color: displayedImg ? t.textSecondary : '#ff9f0a' }}>
+                  {displayedImg ? 'Miniature prête' : '⚠️ Colle (⌘V) ou glisse une image pour compléter'}
+                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <button
+                    type="button"
+                    onClick={reset}
+                    style={{
+                      padding: '6px 12px', borderRadius: 6, border: 0,
+                      background: 'transparent', color: t.textSecondary,
+                      font: '400 12px var(--zr-police-sans)', cursor: 'pointer',
+                    }}>
+                    Annuler
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSubmit}
+                    disabled={submitting || (!displayedImg && !urlInput.trim())}
+                    style={{
+                      padding: '6px 14px', borderRadius: 6, border: 0,
+                      background: '#0a84ff', color: '#fff',
+                      font: '500 12px var(--zr-police-sans)',
+                      cursor: submitting || (!displayedImg && !urlInput.trim()) ? 'default' : 'pointer',
+                      opacity: submitting || (!displayedImg && !urlInput.trim()) ? .5 : 1,
+                      display: 'inline-flex', alignItems: 'center', gap: 5,
+                      boxShadow: '0 1px 4px rgba(10,132,255,.3)',
+                    }}>
+                    {submitting ? 'Ajout en cours…' : `Ajouter à ${label}`}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+})
+
+export default function GalleryView({ t: incomingTheme, galleryKey, NodeThumb }) {
+  const t = galleryTheme(incomingTheme)
+  const gallery = galleryByKey(galleryKey)
+  const label = gallery ? gallery.label : galleryKey
+  const path = gallery && gallery.path
+  const changeEvent = `zr:gallery-changed:${galleryKey}`
+  const otherGalleries = getAllGalleries().filter((g) => g.key !== galleryKey)
+  const assetsProjects = gallery?.assetsProjects || []
+
+  // 23 October 2026: 3 and 4 column grid switcher persisted locally.
+  const [columns, setColumns] = React.useState(() => {
+    try {
+      const saved = localStorage.getItem('zr:gallery:cols')
+      if (saved === '3' || saved === '4') return Number(saved)
+    } catch {}
+    return 3
+  })
+  // 23 October 2026: Hideable customization controls to view pure photo galleries (default visible, toggleable).
+  const [showControls, setShowControls] = React.useState(() => {
+    try {
+      const saved = localStorage.getItem('zr:gallery:showControls')
+      return saved === null ? true : saved === 'true'
+    } catch { return true }
+  })
+
+  const [data, setData] = React.useState(null)
+  const [section, setSection] = React.useState('active')
+  const [ouvert, setOuvert] = React.useState(null) // item en lightbox, ou null
+  const [folderId, setFolderId] = React.useState(null) // dossier ouvert, ou null = racine
+  // 10 October 2026: Identifiant de l'artiste ouvert dans le pop-up widget dépliable des projets ArtStation.
+  const [artistPopoverId, setArtistPopoverId] = React.useState(null)
+  const [renamingId, setRenamingId] = React.useState(null)
+  const [overId, setOverId] = React.useState(null) // survol drag (surbrillance de la cible)
+  const [crumbDropId, setCrumbDropId] = React.useState(null) // survol drag fil d'ariane
+  const [dragOverGrid, setDragOverGrid] = React.useState(false) // fichier Finder survolant la grille
+  const [uploading, setUploading] = React.useState(0) // compte en cours, 0 = rien
+  const [menu, setMenu] = React.useState(null) // { x, y, it } | null
+  // DISPOSITION (2026-08-21). Deux vues du MÊME contenu, jamais deux stockages : « Grille » est la
+  // planche Explore d'origine, « Alignées » est la table lumineuse — tuiles au même gabarit, remises
+  // en ordre à la main. Le mode vit en local (localStorage), par galerie : c'est une préférence de
+  // regard, pas une donnée du drive, et l'écrire sur GitHub ferait un commit par clic de bouton.
+  const [layout, setLayout] = React.useState(() => {
+    try {
+      const saved = localStorage.getItem(`zr:gallery:layout:${galleryKey}`)
+      // 2026-09-10: ToDo-3D is an action board, so grouping must be its first visible gesture.
+      return saved === 'aligned' ? 'aligned' : 'grid'
+    } catch { return 'grid' }
+  })
+  React.useEffect(() => { try { localStorage.setItem(`zr:gallery:layout:${galleryKey}`, layout) } catch {} }, [layout, galleryKey])
+  // 9 October 2026, 01:51 CEST: Keep manually curated references apart from linked cloud files.
+  const [galleryMode, setGalleryMode] = React.useState(() => {
+    try { return localStorage.getItem(`zr:gallery:content:${galleryKey}`) === 'cloud' ? 'cloud' : 'references' }
+    catch { return 'references' }
+  })
+  const [cloudProjectId, setCloudProjectId] = React.useState(null)
+  React.useEffect(() => {
+    try { localStorage.setItem(`zr:gallery:content:${galleryKey}`, assetsProjects.length && galleryMode === 'cloud' ? 'cloud' : 'references') } catch {}
+    if (!assetsProjects.length && galleryMode === 'cloud') setGalleryMode('references')
+  }, [assetsProjects.length, galleryKey, galleryMode])
+  const activeCloudProject = assetsProjects.find((project) => project.id === cloudProjectId) || assetsProjects[0] || null
+  const [insert, setInsert] = React.useState(null) // { id, side } : barre d'insertion du mode aligné
+  const shaRef = React.useRef(null)
+  const fileUploadInputRef = React.useRef(null)
+
+  React.useEffect(() => {
+    if (!path) return undefined
+    let vivant = true
+    readJson(path).then(async ({ data: lu, sha }) => {
+      if (!vivant) return
+      shaRef.current = sha
+      if (lu && Array.isArray(lu.items) && lu.items.length > 0) {
+        setData(lu)
+        return
+      }
+      // 23 October 2026: Auto-seed from folderSource if empty (e.g. Mariage De Cléa).
+      if (gallery?.folderSource) {
+        try {
+          const j = await fetch(`/api/page?action=children&dir=${encodeURIComponent(gallery.folderSource)}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+          const rawEntries = (j && Array.isArray(j.entries)) ? j.entries : []
+          if (rawEntries.length > 0) {
+            const items = []
+            for (const item of rawEntries) {
+              const isDir = item.type === 'dir' || (!item.path.includes('.') && !item.path.endsWith('.json'))
+              if (isDir) {
+                const subDir = item.path.startsWith(gallery.folderSource) ? item.path : `${gallery.folderSource}/${item.name || item.path.split('/').pop()}`
+                const subName = item.name ? item.name.replace(/^[0-9]+[ _-]+/, '') : item.path.split('/').pop()
+                const subJ = await fetch(`/api/page?action=children&dir=${encodeURIComponent(subDir)}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+                const subRaw = (subJ && Array.isArray(subJ.entries)) ? subJ.entries : []
+                const subPhotos = []
+                for (const subItem of subRaw) {
+                  const subPath = subItem.path || `${subDir}/${subItem.name}`
+                  if (/\.(img|png|jpe?g|webp|gif)\.json$/.test(subPath) || /\.(png|jpe?g|webp|gif)$/i.test(subPath)) {
+                    subPhotos.push({
+                      id: `g-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+                      kind: 'image',
+                      path: subPath,
+                      name: subItem.name || subPath.split('/').pop().replace(/\.img\.json$/, ''),
+                      addedAt: new Date().toISOString(),
+                    })
+                  }
+                }
+                items.push({
+                  id: `f-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+                  kind: 'folder',
+                  name: subName,
+                  items: subPhotos,
+                  addedAt: new Date().toISOString(),
+                })
+              } else if (/\.(img|png|jpe?g|webp|gif)\.json$/.test(item.path) || /\.(png|jpe?g|webp|gif)$/i.test(item.path)) {
+                items.push({
+                  id: `g-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+                  kind: 'image',
+                  path: item.path,
+                  name: item.name || item.path.split('/').pop().replace(/\.img\.json$/, ''),
+                  addedAt: new Date().toISOString(),
+                })
+              }
+            }
+            if (items.length > 0) {
+              const seeded = { v: 1, title: label, folderSource: gallery.folderSource, items }
+              if (vivant) setData(seeded)
+              saveJsonWithRetry(path, () => seeded).then(({ sha: s }) => { if (s) shaRef.current = s }).catch(() => {})
+              return
+            }
+          }
+        } catch {}
+      }
+      if (vivant) setData(lu && typeof lu === 'object' ? lu : { v: 1, items: [] })
+    }).catch(() => { if (vivant) setData({ v: 1, items: [] }) })
+    return () => { vivant = false }
+  }, [path, gallery?.folderSource, label])
+
+  // Même convention événementielle que Goals (`zr:goals-changed`) : un ajout posé ailleurs (clic
+  // droit dans Create) doit apparaître ici sans recharger la page. Un canal PAR galerie (suffixe
+  // `galleryKey`) : un ajout à Characters ne doit jamais déclencher un rechargement sur Environments.
+  React.useEffect(() => {
+    if (!path) return undefined
+    const surAjout = () => {
+      readJson(path).then(({ data: lu, sha }) => { shaRef.current = sha; if (lu) setData(lu) }).catch(() => {})
+    }
+    window.addEventListener(changeEvent, surAjout)
+    return () => window.removeEventListener(changeEvent, surAjout)
+  }, [path, changeEvent])
+
+  const rootItems = data?.items || []
+  const breadcrumbs = React.useMemo(() => findFolderPath(rootItems, folderId), [rootItems, folderId])
+  const currentFolder = breadcrumbs.length > 0 ? breadcrumbs[breadcrumbs.length - 1] : null
+  // 10 October 2026: Artiste actif pour le pop-up widget dépliable des projets ArtStation.
+  const activeArtistPopover = React.useMemo(() => {
+    if (!artistPopoverId) return null
+    const pathNodes = findFolderPath(rootItems, artistPopoverId)
+    return pathNodes.length > 0 ? pathNodes[pathNodes.length - 1] : null
+  }, [rootItems, artistPopoverId])
+
+  const cs = React.useMemo(() => [
+    { id: null, label, name: label },
+    ...breadcrumbs.map((b) => ({ id: b.id, label: b.name, name: b.name })),
+  ], [label, breadcrumbs])
+
+  const pathMenuNodes = React.useMemo(() => [
+    {
+      id: 'gallery-root',
+      label: `${label} (Racine)`,
+      icon: <Icon name="photo.on.rectangle" size={14} />,
+      selected: folderId === null,
+      action: () => setFolderId(null),
+    },
+    ...buildFolderTreeNodes(rootItems, (id) => setFolderId(id), folderId),
+  ], [label, folderId, rootItems])
+  // Le dossier ouvert a pu être retiré ailleurs (autre onglet, sync) : on revient à la racine plutôt
+  // que d'afficher une vue fantôme sur un id qui n'existe plus.
+  React.useEffect(() => { if (folderId && data && !currentFolder) setFolderId(null) }, [folderId, data, currentFolder])
+  // 5 October 2026, 12:32 CEST: Completion belongs to the root project, preserving its references.
+  const hasDoneSection = galleryKey === 'todo3d'
+  const visibleRootItems = hasDoneSection ? rootItems.filter((item) => (item.status === 'done') === (section === 'done')) : rootItems
+  const items = currentFolder ? (currentFolder.items || []) : visibleRootItems
+  // 14 October 2026: a text filter over the displayed level. It only decides what is DRAWN; reordering, grouping and saving keep working on the
+  // full `items`, so a filter can never reorder or lose a reference. Every word must match the title, the note, the address or a group's name.
+  const [filterText, setFilterText] = React.useState('')
+  const filterWords = React.useMemo(() => filterText.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').split(/\s+/).filter(Boolean), [filterText])
+  const shownItems = React.useMemo(() => {
+    if (!filterWords.length) return items
+    const haystack = (it) => [it.name, it.title, it.note, it.url, ...(it.kind === 'folder' ? (it.items || []).flatMap((c) => [c.name, c.title, c.note]) : [])]
+      .filter(Boolean).join(' ').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    return items.filter((it) => { const text = haystack(it); return filterWords.every((word) => text.includes(word)) })
+  }, [items, filterWords])
+
+  // UN SEUL POINT DE PASSAGE pour toute mutation du niveau AFFICHÉ (racine, ou le tableau `items` d'un
+  // dossier ouvert récursivement) : jamais deux endroits qui doivent se souvenir séparément de l'état.
+  // 08 October 2026: updateInTree applique la fonction de mise à jour au niveau du dossier ciblé, peu importe sa profondeur.
+  const mutateLevel = (cur, f) => {
+    const root = (cur && cur.items) || []
+    if (!folderId) return { ...(cur || {}), v: 1, items: f(root) }
+    const updateInTree = (list) => (list || []).map((it) => {
+      if (it.kind !== 'folder') return it
+      if (it.id === folderId) {
+        return { ...it, items: f(it.items || []) }
+      }
+      return { ...it, items: updateInTree(it.items) }
+    })
+    return { ...(cur || {}), v: 1, items: updateInTree(root) }
+  }
+  const ecrire = async (f, erreurTitre) => {
+    const next = mutateLevel(data, f)
+    setData(next)
+    const res = await saveJsonWithRetry(path, (cur) => mutateLevel(cur, f), { sha: shaRef.current, data })
+    if (res.ok) shaRef.current = res.sha
+    else notify({ kind: 'error', label, title: erreurTitre, body: 'Réessaie, un conflit a empêché l’écriture.' })
+    return res.ok
+  }
+  // 08 October 2026: Renommage récursif quel que soit le niveau de profondeur du dossier.
+  const renommerDossier = async (id, name) => {
+    const appliquer = (cur) => ({
+      ...(cur || {}),
+      v: 1,
+      items: updateFolderInTree((cur && cur.items) || [], id, (it) => ({ ...it, name })),
+    })
+    setData(appliquer)
+    const res = await saveJsonWithRetry(path, appliquer, { sha: shaRef.current, data })
+    if (res.ok) shaRef.current = res.sha
+  }
+  const retirer = (id) => ecrire((list) => list.filter((it) => it.id !== id), 'Retrait non enregistré')
+
+  // TITRE + NOTE. 08 October 2026: Un dossier peut vivre à tout niveau de l'arbre ; mise à jour récursive.
+  const enregistrerTexte = async (it, { name, url, note }) => {
+    setRenamingId(null)
+    // Groupe : le champ saisi EST son nom. Image : c'est un titre facultatif, posé à côté du `name`
+    // technique, qu'on ne touche jamais, il sert au partage, au menu et au nom de fichier exporté.
+    const champs = it.kind === 'folder' ? { name: name || '', url: url || '', note: note || '' } : { title: name || '', url: url || '', note: note || '' }
+    if (it.kind === 'folder') {
+      const appliquer = (cur) => ({
+        ...(cur || {}),
+        v: 1,
+        items: updateFolderInTree((cur && cur.items) || [], it.id, (x) => ({ ...x, ...champs })),
+      })
+      setData(appliquer)
+      const res = await saveJsonWithRetry(path, appliquer, { sha: shaRef.current, data })
+      if (res.ok) shaRef.current = res.sha
+      else notify({ kind: 'error', label, title: 'Texte non enregistré', body: 'Réessaie, un conflit a empêché l’écriture.' })
+      return
+    }
+    await ecrire((list) => list.map((x) => x.id === it.id ? { ...x, ...champs } : x), 'Texte non enregistré')
+  }
+
+  // 10 October 2026: Ajoute un projet ArtStation directement dans la fiche d'un artiste depuis le pop-up widget.
+  const ajouterProjetArtiste = async (artistId, proj) => {
+    const appliquer = (cur) => ({
+      ...(cur || {}),
+      v: 1,
+      items: updateFolderInTree((cur && cur.items) || [], artistId, (x) => ({
+        ...x,
+        projects: [...(x.projects || []), proj],
+      })),
+    })
+    setData(appliquer)
+    const res = await saveJsonWithRetry(path, appliquer, { sha: shaRef.current, data })
+    if (res.ok) {
+      shaRef.current = res.sha
+      notify({ kind: 'success', label, title: 'Projet ajouté', body: proj.title })
+    } else {
+      notify({ kind: 'error', label, title: 'Projet non enregistré', body: 'Réessaie, un conflit a empêché l’écriture.' })
+    }
+  }
+
+  // ── REMISE EN ORDRE À LA MAIN (2026-08-21) ────────────────────────────────────────────────────────
+  // Mécanique reprise TELLE QUELLE du Shelf (src/components/Shelf.jsx, `dragApi.dropOn` et `sideOf`),
+  // qui la porte depuis des mois et qui marche : on retire l'élément de la liste, puis on le réinsère
+  // AVANT ou APRÈS la cible selon la moitié survolée. Retirer d'abord et chercher l'index ensuite
+  // n'est pas un détail de style : chercher l'index avant le retrait décale l'insertion d'un cran dès
+  // qu'on déplace un élément vers la droite, et le bug ne se voit que dans ce sens-là.
+  //
+  // POURQUOI UN MODE ET PAS UN GESTE DE PLUS. Dans la grille, lâcher une image sur une autre CRÉE UN
+  // GROUPE. Le même geste ne peut pas vouloir dire deux choses ; c'est la disposition qui tranche, et
+  // le mode est visible à l'écran, donc le geste n'est jamais ambigu.
+  const reordonner = async (fromId, targetId, after) => {
+    setInsert(null)
+    if (!fromId || fromId === targetId) return
+    await ecrire((list) => {
+      const a = [...list]
+      const fi = a.findIndex((x) => x.id === fromId)
+      if (fi < 0) return list
+      const [deplace] = a.splice(fi, 1)
+      const ti = a.findIndex((x) => x.id === targetId)
+      if (ti < 0) a.push(deplace); else a.splice(after ? ti + 1 : ti, 0, deplace)
+      return a
+    }, 'Ordre non enregistré')
+  }
+
+  // ── COLLER / GLISSER UN MÉDIA (2026-08-21) ────────────────────────────────────────────────────────
+  // Même chemin, prouvé ailleurs dans l'app (Articles, Shelf, Gallery.jsx) : conversion WebP CÔTÉ
+  // NAVIGATEUR (quasi instantanée via canvas.toBlob, contrairement à AVIF qui coûte cher à ENCODER),
+  // puis `/api/img` — déjà une route API qui écrit directement sur GitHub, jamais le pipeline CLI de
+  // l'archiveur ZenRayCloud. Encodage en parallèle par lots de 4 (CPU), envoi en SÉRIE (chaque
+  // /api/img = un commit GitHub, sérialiser évite des conflits de commit concurrents).
+  async function addFiles(fileList) {
+    const imgs = [...fileList].filter((f) => f.type && f.type.startsWith('image/'))
+    if (!imgs.length) return
+    setUploading((n) => n + imgs.length)
+    const added = []
+    const ENC = 4
+    for (let i = 0; i < imgs.length; i += ENC) {
+      const enc = await Promise.all(imgs.slice(i, i + ENC).map(async (f) => {
+        let w = 4, h = 3
+        try { const bmp = await createImageBitmap(f); w = bmp.width; h = bmp.height } catch {}
+        let dataUrl = null
+        if (f.type === 'image/gif' || f.name?.toLowerCase().endsWith('.gif')) {
+          dataUrl = await new Promise((res) => {
+            const fr = new FileReader()
+            fr.onload = () => res(fr.result)
+            fr.onerror = () => res(null)
+            fr.readAsDataURL(f)
+          })
+        } else {
+          dataUrl = await fileToWebp(f).catch(() => null)
+        }
+        return dataUrl ? { dataUrl, w, h, name: f.name } : null
+      }))
+      for (const e of enc) {
+        if (!e) continue
+        const j = await fetch('/api/img', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ dataUrl: e.dataUrl, dir: 'uploads' }) }).then((r) => r.json()).catch(() => null)
+        if (j && j.path) added.push({ id: `g-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, kind: 'image', path: j.path, name: e.name, w: e.w, h: e.h, addedAt: new Date().toISOString() })
+      }
+    }
+    setUploading((n) => Math.max(0, n - imgs.length))
+    if (!added.length) return
+    await ecrire((list) => [...list, ...added], 'Import non enregistré')
+  }
+
+  // The open link card, if any, receives pasted images (see acceptImage below the card).
+  const linkBoxRef = React.useRef(null)
+
+  // AJOUT D'UNE RÉFÉRENCE VIA LIEN OU COLLAGE MANUEL (02 October 2026, demande de Matthieu)
+  // Reçoit les données de GalleryLinkBox (titre, URL source, note, fichier ou dataUrl ou URL distante).
+  // Si une image est fournie en fichier ou dataUrl, elle est convertie en WebP puis déposée via /api/img.
+  // Si seule une URL distante d'image est fournie (ex. YouTube oEmbed), /api/img la télécharge côté serveur.
+  // En cas de blocage ou d'échec de téléchargement distant, l'URL de l'image sert directement de secours.
+  const ajouterReference = async ({ title, url, note, file, dataUrl, imageUrl }) => {
+    setUploading((n) => n + 1)
+    try {
+      let finalPath = ''
+      let w = 16, h = 9
+      if (file) {
+        try { const bmp = await createImageBitmap(file); w = bmp.width; h = bmp.height } catch {}
+        let payloadDataUrl = null
+        if (file.type === 'image/gif' || file.name?.toLowerCase().endsWith('.gif')) {
+          payloadDataUrl = await new Promise((res) => {
+            const fr = new FileReader()
+            fr.onload = () => res(fr.result)
+            fr.onerror = () => res(null)
+            fr.readAsDataURL(file)
+          })
+        } else {
+          payloadDataUrl = await fileToWebp(file).catch(() => null)
+        }
+        if (payloadDataUrl) {
+          const j = await fetch('/api/img', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ dataUrl: payloadDataUrl, dir: 'uploads' }) }).then((r) => r.json()).catch(() => null)
+          if (j && j.path) finalPath = j.path
+        }
+      } else if (dataUrl) {
+        try {
+          const img = new Image()
+          img.src = dataUrl
+          await img.decode()
+          w = img.naturalWidth || 16
+          h = img.naturalHeight || 9
+        } catch {}
+        const j = await fetch('/api/img', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ dataUrl, dir: 'uploads' }) }).then((r) => r.json()).catch(() => null)
+        if (j && j.path) finalPath = j.path
+      } else if (imageUrl) {
+        const j = await fetch('/api/img', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: imageUrl, dir: 'uploads' }) }).then((r) => r.json()).catch(() => null)
+        if (j && j.path) {
+          finalPath = j.path
+        } else {
+          finalPath = imageUrl
+        }
+      }
+
+      // 10 October 2026, 22:58 CEST: a chosen or pasted image that failed to upload must not become a reference without its picture.
+      if (!finalPath && (file || dataUrl)) {
+        notify({ kind: 'error', label, title: 'Image non enregistrée', body: 'Le téléversement a échoué. Le lien n’est pas ajouté : la carte reste ouverte, réessaie.' })
+        return false
+      }
+
+      const item = {
+        id: `g-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+        kind: 'image',
+        path: finalPath,
+        name: title || 'Référence',
+        title: title || '',
+        url: url || '',
+        note: note || '',
+        w,
+        h,
+        addedAt: new Date().toISOString(),
+      }
+
+      const ok = await ecrire((list) => [item, ...list], 'Référence non enregistrée')
+      if (ok) {
+        notify({ kind: 'success', label, title: 'Référence ajoutée', body: title || url || 'Nouvelle référence enregistrée' })
+      }
+      return ok
+    } catch (err) {
+      notify({ kind: 'error', label, title: 'Erreur ajout référence', body: String(err?.message || err) })
+      return false
+    } finally {
+      setUploading((n) => Math.max(0, n - 1))
+    }
+  }
+
+  // 10 October 2026, 22:58 CEST: an image pasted while a link card is open belongs to that card; only the remaining files reach the grid.
+  const routePastedImages = (files) => {
+    const [first, ...rest] = files
+    if (first && linkBoxRef.current?.acceptImage(first)) return rest.length ? addFiles(rest) : undefined
+    return addFiles(files)
+  }
+  useClipboardTarget('gallery:' + galleryKey, { onPasteImage: routePastedImages }, true)
+  const onGridDragOver = (e) => { if (![...e.dataTransfer.types].includes('Files')) return; e.preventDefault(); setDragOverGrid(true) }
+  const onGridDragLeave = () => setDragOverGrid(false)
+  const onGridDrop = (e) => {
+    if (!e.dataTransfer.files || !e.dataTransfer.files.length) return
+    e.preventDefault(); setDragOverGrid(false)
+    addFiles(e.dataTransfer.files)
+  }
+
+  // ── GROUPES PAR GLISSER-DÉPOSER (08 October 2026) ──────────────────────────────────────────────────
+  // Glisser une image sur une AUTRE image crée un groupe. Glisser sur un groupe (ou glisser un sous-groupe)
+  // l'y ajoute, fonctionnant récursivement à toute profondeur d'arborescence.
+  const DND_TYPE = 'application/zenray-gallery-item'
+  const onItemDragStart = (it) => (e) => { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData(DND_TYPE, it.id) }
+  const onItemDragOver = (it) => (e) => {
+    if (![...e.dataTransfer.types].includes(DND_TYPE)) return // laisse filer un glisser Finder externe
+    e.preventDefault(); e.stopPropagation(); setOverId(it.id)
+  }
+  const onItemDragLeave = (it) => () => setOverId((o) => (o === it.id ? null : o))
+  const onItemDrop = (target) => async (e) => {
+    const draggedId = e.dataTransfer.getData(DND_TYPE)
+    setOverId(null)
+    if (!draggedId || draggedId === target.id) return
+    e.preventDefault(); e.stopPropagation()
+    const dragged = items.find((x) => x.id === draggedId)
+    if (!dragged) return
+    // On ne peut pas lâcher un dossier sur une image simple
+    if (dragged.kind === 'folder' && target.kind !== 'folder') return
+    let nouveauId = null
+    const f = target.kind === 'folder'
+      ? (list) => list.filter((x) => x.id !== draggedId).map((x) => x.id === target.id ? { ...x, items: [...(x.items || []), dragged] } : x)
+      : (list) => {
+        nouveauId = `f-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+        return list.filter((x) => x.id !== draggedId).map((x) => x.id === target.id
+          ? { id: nouveauId, kind: 'folder', name: 'Nouveau groupe', items: [x, dragged], addedAt: new Date().toISOString() }
+          : x)
+      }
+    const ok = await ecrire(f, 'Regroupement non enregistré')
+    if (ok && nouveauId) setRenamingId(nouveauId) // le nom se propose tout de suite, prêt à taper
+  }
+
+  // ── DÉPLACER VERS… (menu, alternative au glisser, 08 October 2026: hiérarchique) ──────────────────
+  const deplacerVers = async (it, targetFolderId) => {
+    if (it.kind === 'folder' && targetFolderId) {
+      const isDescendant = (folder, target) => {
+        if (folder.id === target) return true
+        for (const kid of folder.items || []) {
+          if (kid.kind === 'folder' && isDescendant(kid, target)) return true
+        }
+        return false
+      }
+      if (isDescendant(it, targetFolderId)) return
+    }
+    const appliquer = (cur) => {
+      const root = (cur && cur.items) || []
+      const removeRecursive = (list) => (list || []).filter((x) => x.id !== it.id).map((x) => {
+        if (x.kind === 'folder') return { ...x, items: removeRecursive(x.items) }
+        return x
+      })
+      const cleaned = removeRecursive(root)
+      if (targetFolderId === null) {
+        return { ...(cur || {}), v: 1, items: [...cleaned, it] }
+      }
+      const addRecursive = (list) => (list || []).map((x) => {
+        if (x.kind === 'folder') {
+          if (x.id === targetFolderId) {
+            return { ...x, items: [...(x.items || []), it] }
+          }
+          return { ...x, items: addRecursive(x.items) }
+        }
+        return x
+      })
+      return { ...(cur || {}), v: 1, items: addRecursive(cleaned) }
+    }
+    setData(appliquer)
+    const res = await saveJsonWithRetry(path, appliquer, { sha: shaRef.current, data })
+    if (res.ok) shaRef.current = res.sha
+    else notify({ kind: 'error', label, title: 'Déplacement non enregistré', body: 'Réessaie, un conflit a empêché l’écriture.' })
+  }
+
+  // 08 October 2026: Lâcher un média ou groupe sur un segment du fil d'Ariane
+  const onCrumbDrop = (targetFolderId) => async (e) => {
+    const draggedId = e.dataTransfer.getData(DND_TYPE)
+    setCrumbDropId(null)
+    if (!draggedId || draggedId === targetFolderId) return
+    e.preventDefault()
+    e.stopPropagation()
+    const findItemRecursive = (list) => {
+      for (const it of list || []) {
+        if (it.id === draggedId) return it
+        if (it.kind === 'folder') {
+          const found = findItemRecursive(it.items)
+          if (found) return found
+        }
+      }
+      return null
+    }
+    const dragged = findItemRecursive(rootItems)
+    if (!dragged) return
+    await deplacerVers(dragged, targetFolderId)
+  }
+
+  // ── COPIER / COUPER / PARTAGER (2026-08-21) ───────────────────────────────────────────────────────
+  const blobOfItem = async (it) => {
+    const url = isRawUpload(it.path) ? rawUrl(it.path) : await (async () => {
+      const m = await readImgManifestCached(it.path)
+      return m ? await resolveFullUrl(m) : null
+    })()
+    if (!url) return null
+    return fetch(url).then((r) => (r.ok ? r.blob() : null)).catch(() => null)
+  }
+  const copier = async (it) => {
+    const blob = await blobOfItem(it)
+    if (!blob) return notify({ kind: 'error', label, title: 'Copie impossible', body: 'Image introuvable.' })
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type || 'image/webp']: blob })])
+      notify({ kind: 'info', label, title: 'Copié', body: it.name || 'Image copiée dans le presse-papiers.' })
+    } catch { notify({ kind: 'error', label, title: 'Copie impossible', body: 'Le navigateur a refusé l’accès au presse-papiers.' }) }
+  }
+  const couper = async (it) => { await copier(it); retirer(it.id) }
+  const partager = async (it) => {
+    const blob = await blobOfItem(it)
+    if (!blob) return notify({ kind: 'error', label, title: 'Partage impossible', body: 'Image introuvable.' })
+    const file = new File([blob], (it.name || 'image').replace(/\.[a-z0-9]+$/i, '') + '.' + (blob.type.split('/')[1] || 'webp'), { type: blob.type })
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file], title: it.name || label }); return } catch { return } // annulé : pas d'erreur à montrer
+    }
+    // Repli desktop : seul un chemin uploads/ (posé par /api/img) a un lien PUBLIC stable. Un
+    // manifeste Create est chiffré au repos — rien à lier, seule l'image elle-même se partage.
+    if (isRawUpload(it.path)) {
+      const shareUrl = `${location.origin}${rawUrl(it.path)}`
+      try { await navigator.clipboard.writeText(shareUrl); notify({ kind: 'info', label, title: 'Lien copié', body: shareUrl }) }
+      catch { notify({ kind: 'error', label, title: 'Partage impossible', body: 'Copie du lien refusée.' }) }
+      return
+    }
+    await copier(it)
+    notify({ kind: 'info', label, title: 'Copié (partage indisponible)', body: 'Colle l’image où tu veux la partager.' })
+  }
+
+  // ── PONT VERS CREATE (2026-08-21) ─────────────────────────────────────────────────────────────────
+  // GalleryView est un module séparé (lazy-chargé) sans accès aux fermetures d'App.jsx. Plutôt que
+  // dupliquer `trashPath` (move + sidecar + retry) ou `runCapture` (tout le pipeline d'ingestion), on
+  // les rappelle via un événement écouté là-bas — même geste que `zr:open-page`. `resolve` rend
+  // l'appel attendable sans construire un vrai bus RPC ; un filet de 8 s évite de rester bloqué si
+  // personne n'écoute.
+  const dispatchAndWait = (name, detail) => new Promise((resolve) => {
+    window.dispatchEvent(new CustomEvent(name, { detail: { ...detail, resolve } }))
+    setTimeout(() => resolve(false), 8000)
+  })
+  const envoyerVersCreate = async (it) => {
+    const blob = await blobOfItem(it)
+    if (!blob) return notify({ kind: 'error', label, title: 'Envoi impossible', body: 'Image introuvable.' })
+    const file = new File([blob], (it.name || 'image').replace(/\.[a-z0-9]+$/i, '') + '.' + (blob.type.split('/')[1] || 'webp'), { type: blob.type })
+    const ok = await dispatchAndWait('zr:gallery-send-to-create', { file })
+    if (ok) { retirer(it.id); notify({ label, title: 'Envoyé dans Create', body: it.name || '' }) }
+    else notify({ kind: 'error', label, title: 'Envoi échoué', body: 'Create n’a pas confirmé la réception.' })
+  }
+  const supprimerDeCreate = async (it) => {
+    if (!window.confirm(`Supprimer « ${it.name || 'cette image'} » de Create ? Elle ira dans Trash, récupérable.`)) return
+    const ok = await dispatchAndWait('zr:gallery-delete-from-create', { path: it.path })
+    if (ok) retirer(it.id)
+  }
+
+  // ── MENU CLIC DROIT (2026-08-21, demande Matthieu : l'ancien bouton « × » au survol était une seule
+  // option sans nom ni contexte — « pas logique »). Chaque action se montre ou se désactive selon ce
+  // qui a RÉELLEMENT un sens pour cet item précis, plutôt que d'exposer huit boutons dont la moitié ne
+  // font rien : un dossier ne se copie pas, un item posé par collage n'est « dans Create » nulle part
+  // à en retirer, un item déjà brut n'a rien à y envoyer une seconde fois.
+  const menuNodesFor = (it) => {
+    const isFolder = it.kind === 'folder'
+    const isArtistItem = isFolder && (galleryKey === 'artists' || it.isArtist || (it.projects && it.projects.length > 0))
+    const raw = !isFolder && isRawUpload(it.path)
+    const allFolders = getAllFolders(rootItems)
+    const cibles = []
+    if (folderId) cibles.push({ id: 'to-root', label: `${label} (racine)`, icon: <Icon name="chevron.left" size={14} />, action: () => deplacerVers(it, null) })
+    for (const f of allFolders) {
+      if (folderId === f.id || it.id === f.id) continue
+      cibles.push({ id: `to-${f.id}`, label: f.fullLabel, icon: <Icon name="folder" size={14} />, action: () => deplacerVers(it, f.id) })
+    }
+    return [
+      isArtistItem && { id: 'projects-popover', label: 'Projets ArtStation (vue dépliante)', icon: <Icon name="list.bullet" size={14} />, action: () => setArtistPopoverId(it.id) },
+      { id: 'open', label: isFolder ? (isArtistItem ? 'Ouvrir en grille' : 'Ouvrir') : 'Ouvrir en plein écran', icon: <Icon name="arrow.up.right" size={14} />, action: () => (isFolder ? setFolderId(it.id) : setOuvert(it)) },
+      it.url && { id: 'source', label: isArtistItem ? 'Portfolio ArtStation ↗' : 'Ouvrir la source web', icon: <Icon name="arrow.up.right" size={14} />, action: () => window.open(it.url, '_blank', 'noopener,noreferrer') },
+      hasDoneSection && !folderId && { id: 'completion', label: it.status === 'done' ? 'Remettre en cours' : 'Ranger dans Done', icon: <Icon name="checkmark" size={14} />, action: () => ecrire((list) => list.map((item) => item.id === it.id ? { ...item, status: it.status === 'done' ? 'active' : 'done' } : item), 'Statut non enregistré') },
+      { id: 'text', label: 'Titre et note…', icon: <Icon name="doc.text" size={14} />, action: () => setRenamingId(it.id) },
+      { id: 'move', label: 'Déplacer vers…', icon: <Icon name="folder" size={14} />, disabled: !cibles.length, children: cibles },
+      !isFolder && { id: 'copy', label: 'Copier', icon: <Icon name="doc.text" size={14} />, action: () => copier(it) },
+      !isFolder && { id: 'cut', label: 'Couper', icon: <Icon name="scissors" size={14} />, action: () => couper(it) },
+      !isFolder && { id: 'share', label: 'Partager…', icon: <Icon name="arrow.up.right" size={14} />, action: () => partager(it) },
+      { id: 'add-to', label: 'Ajouter à…', icon: <Icon name="photo" size={14} />, disabled: isFolder, children: isFolder ? [] : otherGalleries.map((g) => ({
+        id: `add-${g.key}`, label: g.label, action: () => ajouterAGalerie(g.key, [{ kind: it.kind, path: it.path, name: it.name, w: it.w, h: it.h }]),
+      })) },
+      !isFolder && { id: 'to-create', label: 'Déplacer dans Create', icon: <Icon name="arrow.up.right" size={14} />, disabled: !raw, action: () => envoyerVersCreate(it) },
+      { id: 'remove', label: `Retirer de ${label}`, icon: <Icon name="xmark" size={14} />, action: () => retirer(it.id) },
+      !isFolder && { id: 'delete-create', label: 'Supprimer de Create', icon: <Icon name="trash" size={14} />, danger: true, disabled: raw, action: () => supprimerDeCreate(it) },
+    ].filter(Boolean)
+  }
+
+  // ── UNE SEULE DÉFINITION DE TUILE, DEUX JEUX DE PARAMÈTRES (2026-08-21) ───────────────────────────
+  // Loi HDA appliquée au rendu : la grille et la table lumineuse ne diffèrent que par trois valeurs —
+  // le format de la tuile, la largeur qu'elle occupe, et ce que veut dire un lâcher dessus. Dupliquer
+  // le rendu pour ces trois-là aurait donné deux tuiles qui divergent dès le premier champ ajouté.
+  const rendreTuile = (it, aligne) => {
+    // 16:9 OU PROCHE, DONC 2 CASES en grille : une image horizontale écrasée dans une seule case
+    // devient trop petite. Seuil large (1,3) plutôt que 16:9 exact (1,78), pour capter le « proche »
+    // sans mordre sur le quasi-carré. En mode aligné, toutes les tuiles partagent le MÊME gabarit :
+    // c'est exactement ce qu'on demande à une table lumineuse, comparer des images entre elles.
+    const large = !aligne && it.kind === 'image' && it.w && it.h && it.w / it.h >= 1.3
+    const ratio = aligne ? '4 / 3' : (it.w && it.h ? `${it.w} / ${it.h}` : '4 / 5')
+    const surLigne = insert && insert.id === it.id ? insert.side : null
+    const editing = renamingId === it.id
+    const ouvrirEditeur = () => setRenamingId(it.id)
+    // 3 October 2026 10:36: Center groups items; aligned tile edges retain reordering.
+    const dropSide = (e) => {
+      const bounds = e.currentTarget.getBoundingClientRect()
+      const position = (e.clientX - bounds.left) / bounds.width
+      const edgeFraction = 0.25
+      return position < edgeFraction ? 'left' : position > 1 - edgeFraction ? 'right' : null
+    }
+    const dragProps = {
+      draggable: true,
+      onDragStart: onItemDragStart(it),
+      onDragEnd: () => { setInsert(null); setOverId(null) },
+      onDragOver: (e) => {
+        if (![...e.dataTransfer.types].includes(DND_TYPE)) return
+        const side = aligne ? dropSide(e) : null
+        setInsert(side ? { id: it.id, side } : null)
+        if (side) { e.preventDefault(); e.stopPropagation(); setOverId(null) }
+        else onItemDragOver(it)(e)
+      },
+      onDragLeave: () => { setInsert((v) => v?.id === it.id ? null : v); onItemDragLeave(it)() },
+      onDrop: (e) => {
+        const side = aligne ? dropSide(e) : null
+        setInsert(null)
+        if (!side) return onItemDrop(it)(e)
+        const from = e.dataTransfer.getData(DND_TYPE)
+        if (!from) return
+        e.preventDefault(); e.stopPropagation(); setOverId(null)
+        return reordonner(from, it.id, side === 'right')
+      },
+      onContextMenu: (e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, it }) },
+      style: overId === it.id ? { outline: '2px solid #0a84ff', outlineOffset: 2, borderRadius: 4 } : undefined,
+    }
+    const isArtistCard = it.kind === 'folder' && (galleryKey === 'artists' || it.isArtist || (it.projects && it.projects.length > 0))
+    return (
+      <div key={it.id} className="zr-tap zr-gallery-tile" style={{ position: 'relative', gridColumn: large ? 'span 2' : undefined }}>
+        {/* Barre d'insertion lumineuse, reprise du Shelf : elle montre OÙ la tuile va se poser avant
+            qu'on lâche. Décalée de 5 px dans la gouttière de 10 px, donc centrée entre deux tuiles. */}
+        {surLigne && <span aria-hidden style={{ position: 'absolute', top: 0, bottom: 0, [surLigne]: -5, width: 4, borderRadius: 4, background: t.accent, boxShadow: `0 0 12px 1px ${t.accent}`, zIndex: 6 }} />}
+        {it.kind === 'image' ? (
+          <div {...dragProps} className="zr-gallery-visual" role="button" tabIndex={0} aria-label={it.title || it.name || 'Ouvrir l’image'}
+            onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); if (!editing) setOuvert(it) } }}
+            style={{ width: '100%', aspectRatio: ratio, position: 'relative', borderRadius: 4, overflow: 'hidden', cursor: editing ? 'default' : 'zoom-in', ...(dragProps.style || {}) }}
+            onClick={() => { if (!editing) setOuvert(it) }}>
+            <GalleryThumb path={it.path} alt={it.name} style={{ width: '100%', height: '100%', objectFit: GALLERY_PRESENTATION.layout.imageFit, display: 'block' }} />
+            <TileCaption title={it.title} note={it.note} url={it.url} onEdit={ouvrirEditeur} />
+            {editing ? <TileEditor item={it} onSave={(v) => enregistrerTexte(it, v)} onCancel={() => setRenamingId(null)} /> : null}
+          </div>
+        ) : (
+          <FolderTile
+            folder={it}
+            isArtistsGallery={galleryKey === 'artists'}
+            ratio={aligne ? '4 / 3' : '4 / 5'}
+            editing={editing}
+            onOpen={() => {
+              if (editing) return
+              if (isArtistCard) setArtistPopoverId(it.id)
+              else setFolderId(it.id)
+            }}
+            onEdit={ouvrirEditeur}
+            onSave={(v) => enregistrerTexte(it, v)}
+            onCancel={() => setRenamingId(null)}
+            dragProps={dragProps}
+          />
+        )}
+        <button type="button" className="zr-gallery-remove" title={`Retirer de ${label}`} aria-label={`Retirer de ${label}`}
+          onClick={(e) => { e.stopPropagation(); retirer(it.id) }}
+          style={{
+            position: 'absolute', top: 6, right: 6, width: 24, height: 24, borderRadius: 999,
+            border: 0, background: 'rgba(0,0,0,.55)', color: '#fff', display: 'grid', placeItems: 'center',
+            cursor: 'pointer', opacity: 0, transition: 'opacity .15s ease', zIndex: 4,
+          }}
+          onMouseEnter={(e) => e.stopPropagation()}>
+          <Icon name="xmark" size={11} color="#fff" />
+        </button>
+      </div>
+    )
+  }
+
+  const inlineChars = cs.reduce((total, item) => total + item.label.length, 0)
+  const maxInline = 6
+  const countCollapsed = cs.length > maxInline
+  const collapsed = countCollapsed || inlineChars > 90
+  const tailN = countCollapsed && maxInline > 1 ? 2 : 1
+  const descendants = cs.slice(1)
+  const middle = collapsed ? descendants.slice(0, Math.max(0, descendants.length - tailN)) : []
+  const tail = collapsed ? descendants.slice(-tailN) : descendants
+
+  const renderCrumbButton = (c, last, first) => {
+    if (last) {
+      if (c.id && renamingId === c.id) {
+        return (
+          <span
+            key={c.id || 'root'}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              background: 'rgba(10,132,255,.13)',
+              padding: '4px 9px',
+              borderRadius: 999,
+              fontFamily: FONTS.sans,
+              fontSize: 'var(--zr-ui-md)',
+              fontWeight: 400,
+              color: '#0a84ff',
+              flexShrink: 0,
+            }}
+          >
+            <input
+              autoFocus
+              defaultValue={c.name}
+              title="Renommer"
+              onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+              onBlur={(e) => {
+                const v = e.target.value.trim()
+                setRenamingId(null)
+                if (v && v !== c.name) renommerDossier(c.id, v)
+              }}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#0a84ff',
+                font: 'inherit',
+                outline: 'none',
+                padding: 0,
+                minWidth: 40,
+              }}
+            />
+          </span>
+        )
+      }
+      return (
+        <button
+          key={c.id || 'root'}
+          type="button"
+          className="zr-treeitem"
+          onClick={() => { if (c.id) setRenamingId(c.id) }}
+          title={c.id ? "Cliquer pour renommer" : undefined}
+          style={{
+            position: 'relative',
+            zIndex: 1,
+            pointerEvents: 'auto',
+            background: 'rgba(10,132,255,.13)',
+            border: 'none',
+            cursor: c.id ? 'text' : 'default',
+            color: '#0a84ff',
+            fontFamily: FONTS.sans,
+            fontSize: 'var(--zr-ui-md)',
+            fontWeight: 400,
+            padding: '4px 9px',
+            borderRadius: 999,
+            whiteSpace: 'nowrap',
+            flexShrink: 0,
+            outline: 'none',
+          }}
+        >
+          {c.label}
+        </button>
+      )
+    }
+
+    const dropTargetKey = c.id || 'root'
+    const isDropActive = crumbDropId === dropTargetKey
+    return (
+      <button
+        key={c.id || 'root'}
+        type="button"
+        className="zr-treeitem"
+        onClick={() => setFolderId(c.id)}
+        title={c.id === null ? `Retour à ${label}` : `Aller à ${c.name}`}
+        onDragOver={(e) => {
+          if ([...e.dataTransfer.types].includes(DND_TYPE)) {
+            e.preventDefault()
+            e.stopPropagation()
+            e.dataTransfer.dropEffect = 'move'
+            setCrumbDropId(dropTargetKey)
+          }
+        }}
+        onDragLeave={() => setCrumbDropId((cur) => cur === dropTargetKey ? null : cur)}
+        onDrop={(e) => {
+          setCrumbDropId(null)
+          onCrumbDrop(c.id)(e)
+        }}
+        style={{
+          position: 'relative',
+          zIndex: 1,
+          pointerEvents: 'auto',
+          background: isDropActive ? 'rgba(10,132,255,.18)' : 'transparent',
+          border: 'none',
+          cursor: 'pointer',
+          color: first ? 'var(--g9-fg)' : 'var(--g9-muted)',
+          opacity: first ? 0.78 : 1,
+          fontFamily: FONTS.sans,
+          fontSize: 'var(--zr-ui-md)',
+          fontWeight: 400,
+          padding: '3px 9px',
+          borderRadius: 999,
+          whiteSpace: 'nowrap',
+          flexShrink: 0,
+          outline: isDropActive ? '2px solid #0a84ff' : 'none',
+          transition: 'background .12s ease, outline .12s ease',
+        }}
+        onMouseEnter={(e) => { if (!isDropActive) e.currentTarget.style.background = 'rgba(10,132,255,.12)' }}
+        onMouseLeave={(e) => { if (!isDropActive) e.currentTarget.style.background = 'transparent' }}
+      >
+        {c.label}
+      </button>
+    )
+  }
+
+  return (
+    <div className="zr-reference-gallery" data-caption-mode={GALLERY_PRESENTATION.interaction.captionMode} style={galleryPresentationStyle({ ...GALLERY_PRESENTATION, layout: { ...GALLERY_PRESENTATION.layout, columns } }, incomingTheme || t)}>
+      {assetsProjects.length > 0 && (
+        <div role="tablist" aria-label="Contenu de la galerie" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 8, marginBottom: 14 }}>
+          {/* 9 October 2026, 06:28 CEST: Distinguish hand-curated Gallery content from linked cloud images. */}
+          {/* 9 October 2026, 07:28 CEST: Clarify manually curated Gallery content versus backed-up local images. */}
+          {[
+            { key: 'references', title: 'Ma sélection', detail: 'Projets et images ajoutés ici à la main. Triage et groupes conservés.', icon: 'photo.on.rectangle' },
+            { key: 'cloud', title: 'Fichiers cloud', detail: 'Images de tes dossiers locaux, sauvegardées dans le cloud. Sans copie.', icon: 'externaldrive' },
+          ].map((mode) => {
+            const selected = galleryMode === mode.key
+            return (
+              <button key={mode.key} type="button" role="tab" aria-selected={selected} onClick={() => setGalleryMode(mode.key)}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0, padding: '10px 12px', border: `1px solid ${selected ? (t.accent || t.border) : t.border}`, borderRadius: 10, background: selected ? (t.surface || 'rgba(128,128,128,.12)') : (t.cardBg || 'transparent'), color: t.textPrimary, cursor: 'pointer', textAlign: 'left' }}>
+                <Icon name={mode.icon} size={17} color={selected ? (t.accent || t.textPrimary) : t.textSecondary} />
+                <span style={{ display: 'grid', gap: 3, minWidth: 0 }}>
+                  <span style={{ font: '400 13px var(--zr-police-sans)' }}>{mode.title}</span>
+                <span style={{ color: t.textSecondary, font: '400 12px/1.35 var(--zr-police-sans)' }}>{mode.detail}</span>
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      {galleryMode === 'cloud' && assetsProjects.length > 0 ? (
+        <div role="tabpanel" aria-label="Fichiers cloud sauvegardés">
+          {assetsProjects.length > 1 && (
+            <label style={{ display: 'grid', gap: 5, maxWidth: 360, margin: '2px 0 12px', color: t.textSecondary, font: '400 12px var(--zr-police-sans)' }}>
+              Projet lié à cette galerie
+              <select aria-label="Projet lié à cette galerie" value={activeCloudProject?.id || ''} onChange={(event) => setCloudProjectId(event.target.value)}
+                style={{ height: 34, padding: '0 10px', border: `1px solid ${t.border}`, borderRadius: 8, background: t.cardBg || 'transparent', color: t.textPrimary, font: '400 12px var(--zr-police-sans)' }}>
+                {assetsProjects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+              </select>
+            </label>
+          )}
+          {activeCloudProject && <LinkedAssetsGallery key={activeCloudProject.id} project={activeCloudProject} NodeThumb={NodeThumb} t={t} />}
+        </div>
+      ) : (
+        <>
+      <header className="zr-gallery-hero"><h1>{currentFolder?.name || label}</h1><p>{items.length} références</p></header>
+      {/* BARRE D'OUTILS ET FIL D'ARIANE V9 (08 October 2026).
+          Même présentation .zr-ws-path que dans les vues Create : coque Liquid Glass Tahoe,
+          boutons capsules, chevrons SVG, chip bleue active, menu Finder et cible de glisser-déposer. */}
+      <div style={{ marginBottom: 14, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, minWidth: 0, flexWrap: 'wrap' }}>
+        <nav className="zr-ws-path" aria-label="Chemin actif" style={{ overflow: 'hidden', minWidth: 0, flex: '0 1 auto' }}>
+          <div style={{ position: 'relative', zIndex: 2, display: 'flex', alignItems: 'center', gap: 2, width: '100%', minWidth: 0, flexWrap: 'nowrap', boxSizing: 'border-box' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 2, minWidth: 0, overflow: 'hidden', flex: 1 }}>
+              {renderCrumbButton(cs[0], cs.length === 1, true)}
+              {collapsed && middle.length > 0 && (
+                <React.Fragment key="crumb-ellipsis">
+                  <CrumbSep />
+                  <span
+                    title={middle.map((m) => m.label).join(' · ')}
+                    aria-hidden="true"
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      minWidth: 28,
+                      height: 24,
+                      padding: '0 8px',
+                      borderRadius: 999,
+                      color: 'var(--g9-muted)',
+                      fontFamily: FONTS.sans,
+                      fontSize: 'var(--zr-ui-md)',
+                      fontWeight: 400,
+                      lineHeight: 1,
+                      flexShrink: 0,
+                    }}
+                  >
+                    …
+                  </span>
+                </React.Fragment>
+              )}
+              {tail.map((c) => (
+                <React.Fragment key={c.id || 'root'}>
+                  <CrumbSep />
+                  {renderCrumbButton(c, c.id === cs[cs.length - 1].id, false)}
+                </React.Fragment>
+              ))}
+            </div>
+            <ActionColumnMenu
+              t={t}
+              align="left"
+              columnWidth={220}
+              maxHeight={360}
+              reserveColumns={2}
+              triggerClassName=""
+              showChevron={false}
+              title="Parcourir tous les groupes"
+              ariaLabel="Parcourir tous les groupes"
+              triggerStyle={{ display: 'inline-flex', alignItems: 'center', minHeight: 'unset', padding: '3px 7px', border: 'none', background: 'transparent' }}
+              trigger={
+                <span
+                  data-zr-pathmenu-trigger="true"
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    color: 'var(--g9-soft)',
+                    cursor: 'pointer',
+                    flexShrink: 0,
+                  }}
+                >
+                  <Icon name="chevron.down" size={12} weight={1.7} />
+                </span>
+              }
+              nodes={pathMenuNodes}
+            />
+          </div>
+        </nav>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto', flexShrink: 0, flexWrap: 'wrap' }}>
+          {/* 23 October 2026: Colonnes 3 ou 4 par rangée. */}
+          <div role="group" aria-label="Colonnes" style={{ display: 'inline-flex', gap: 2, padding: 2, borderRadius: 8, background: 'rgba(128,128,128,.12)' }}>
+            {[3, 4].map((colCount) => {
+              const on = columns === colCount
+              return (
+                <button key={colCount} type="button" onClick={() => { setColumns(colCount); try { localStorage.setItem('zr:gallery:cols', String(colCount)) } catch {} }} aria-pressed={on}
+                  title={`${colCount} colonnes par rangée`}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 28, height: 22, borderRadius: 6, border: 0, cursor: 'pointer',
+                    background: on ? t.surface : 'transparent', color: on ? t.textPrimary : t.textSecondary,
+                    font: '600 12px var(--zr-police-sans)', boxShadow: on ? '0 1px 3px rgba(0,0,0,.14)' : 'none',
+                  }}>
+                  {colCount}
+                </button>
+              )
+            })}
+          </div>
+
+          {/* 23 October 2026: Bouton Partager la galerie par lien direct. */}
+          <button type="button" onClick={() => {
+            const shareUrl = typeof window !== 'undefined' ? `${window.location.origin}/?view=${galleryKey}` : ''
+            if (shareUrl && navigator?.clipboard?.writeText) {
+              navigator.clipboard.writeText(shareUrl).then(() => {
+                notify({ label: 'Galerie photo', title: 'Lien copié', body: `Lien de la galerie « ${label} » copié.` })
+              }).catch(() => {})
+            }
+          }} aria-label="Partager cette galerie" title="Copier le lien direct vers cette galerie"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 9px', borderRadius: 8,
+              border: `1px solid ${t.border}`, background: 'rgba(128,128,128,.08)', color: t.textPrimary,
+              font: '500 12px var(--zr-police-sans)', cursor: 'pointer', transition: 'background .15s ease',
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(128,128,128,.16)' }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(128,128,128,.08)' }}
+          >
+            <Icon name="arrow.up.right" size={12} color={t.textPrimary} weight={1.8} />
+            <span>Partager</span>
+          </button>
+
+          {/* 23 October 2026: Bouton Options pour masquer ou afficher les options de customisation. */}
+          <button type="button" onClick={() => setShowControls((v) => { const next = !v; try { localStorage.setItem('zr:gallery:showControls', String(next)) } catch {} return next })} aria-pressed={showControls}
+            title={showControls ? 'Masquer les options de customisation' : 'Afficher les options de customisation'}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 9px', borderRadius: 8,
+              border: `1px solid ${showControls ? (t.accent || t.border) : t.border}`,
+              background: showControls ? (t.accentSoft || 'rgba(10,132,255,.12)') : 'rgba(128,128,128,.08)',
+              color: showControls ? (t.accent || t.textPrimary) : t.textSecondary,
+              font: '500 12px var(--zr-police-sans)', cursor: 'pointer', transition: 'all .15s ease',
+            }}
+          >
+            <Icon name="slider.horizontal.3" size={12} color={showControls ? (t.accent || t.textPrimary) : t.textSecondary} />
+            <span>{showControls ? 'Options actives' : 'Options'}</span>
+          </button>
+
+          {showControls && (
+            <>
+              {uploading > 0 && <span style={{ font: "400 12px var(--zr-police-sans)", color: t.textSecondary }}>· import {uploading}…</span>}
+              <button type="button" onClick={() => fileUploadInputRef.current?.click()} aria-label="Importer des images ou GIF" title="Importer des images ou GIF"
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 9px', borderRadius: 8,
+                  border: `1px solid ${t.border}`, background: 'rgba(128,128,128,.08)', color: t.textPrimary,
+                  font: '500 12px var(--zr-police-sans)', cursor: 'pointer', transition: 'background .15s ease',
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(128,128,128,.16)' }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(128,128,128,.08)' }}
+              >
+                <Icon name="arrow.up" size={12} color={t.textPrimary} weight={1.8} />
+                <span>Importer</span>
+              </button>
+              <input ref={fileUploadInputRef} type="file" multiple accept="image/*,image/gif" style={{ display: 'none' }}
+                onChange={(e) => { if (e.target.files && e.target.files.length) { addFiles(e.target.files); e.target.value = '' } }} />
+            </>
+          )}
+
+          {items.length > 6 && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <input type="search" value={filterText} onChange={(e) => setFilterText(e.target.value)} placeholder="Filtrer…" aria-label={`Filtrer ${label}`}
+                onKeyDown={(e) => { if (e.key === 'Escape') { setFilterText(''); e.currentTarget.blur() } }}
+                style={{ width: 140, padding: '4px 10px', borderRadius: 999, border: `1px solid ${t.border}`, background: 'transparent', color: t.textPrimary, font: '400 12px var(--zr-police-sans)', outline: 'none' }} />
+              {filterWords.length > 0 && <span style={{ font: '400 12px var(--zr-police-serif)', color: t.textSecondary }}>{shownItems.length} / {items.length}</span>}
+            </span>
+          )}
+
+          {showControls && (
+            <div role="group" aria-label="Disposition" style={{ display: 'inline-flex', gap: 2, padding: 2, borderRadius: 8, background: 'rgba(128,128,128,.12)' }}>
+              {[{ k: 'grid', l: 'Grille · grouper', i: 'square.grid.2x2' }, { k: 'aligned', l: 'Alignées', i: 'square.grid.3x3' }].map((m) => {
+                const on = layout === m.k
+                return (
+                  <button key={m.k} type="button" onClick={() => setLayout(m.k)} aria-pressed={on}
+                    title={m.k === 'grid' ? 'Grille : glisser une image sur une autre forme un groupe' : 'Alignées : déposer au centre pour grouper, sur les bords pour remettre en ordre'}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 9px', borderRadius: 6, border: 0, cursor: 'pointer',
+                      background: on ? t.surface : 'transparent', color: on ? t.textPrimary : t.textSecondary,
+                      font: '400 12px var(--zr-police-sans)', boxShadow: on ? '0 1px 3px rgba(0,0,0,.14)' : 'none',
+                    }}>
+                    <Icon name={m.i} size={12} color={on ? t.textPrimary : t.textSecondary} />{m.l}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {hasDoneSection && !currentFolder && (
+        <div role="group" aria-label="Projets ToDo-3D" style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+          {[{ key: 'active', label: 'En cours' }, { key: 'done', label: 'Done' }].map((tab) => (
+            <button key={tab.key} type="button" aria-pressed={section === tab.key} onClick={() => { setSection(tab.key); setRenamingId(null) }}
+              style={{ padding: '5px 12px', borderRadius: 8, border: 0, cursor: 'pointer', background: section === tab.key ? t.surface : 'transparent', color: section === tab.key ? t.textPrimary : t.textSecondary, font: '400 12px var(--zr-police-sans)' }}>
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {showControls && <GalleryLinkBox ref={linkBoxRef} t={t} label={label} onAddReference={ajouterReference} />}
+
+      {showControls && layout === 'aligned' && (
+        <p style={{ margin: '-5px 0 10px', font: '400 12px/1.4 var(--zr-police-sans)', color: t.textSecondary }}>
+          Glisse une image au centre d’une autre pour les grouper, ou sur ses bords pour changer l’ordre.
+        </p>
+      )}
+
+      <FadeIn key={folderId || 'root'}>
+        <div onDragOver={onGridDragOver} onDragLeave={onGridDragLeave} onDrop={onGridDrop}
+          style={{ borderRadius: 8, outline: dragOverGrid ? '2px dashed rgba(10,132,255,.6)' : 'none', outlineOffset: 4, transition: 'outline .12s ease' }}>
+          {data === null ? (
+            <p style={{ font: "400 13px var(--zr-police-sans)", color: t.textSecondary }}>lecture…</p>
+          ) : filterWords.length > 0 && shownItems.length === 0 ? (
+            <p style={{ font: "400 13px/1.6 var(--zr-police-sans)", color: t.textSecondary }}>Aucune référence ne correspond à « {filterText.trim()} ».</p>
+          ) : items.length === 0 ? (
+            <p style={{ font: "400 13px/1.6 var(--zr-police-sans)", color: t.textSecondary, maxWidth: '60ch' }}>
+              {currentFolder
+                ? 'Ce groupe est vide. Colle (⌘V) ou glisse une image ici.'
+                : hasDoneSection && section === 'done' ? 'Aucun projet terminé. Clic droit sur une carte → Ranger dans Done.'
+                : <>Rien pour l’instant. Colle (⌘V) une image, glisse-la depuis le Finder, ou clic droit sur une image dans Create → « Ajouter à {label} ».</>}
+            </p>
+          ) : (
+            // 4 PAR RANGÉE MAXIMUM en grille : une vraie grille, pas un masonry en colonnes CSS
+            // (celui-ci équilibre la hauteur des colonnes, jamais 4 par rangée strictement). En aligné,
+            // `auto-fill minmax(200px, 1fr)` : le nombre de colonnes suit la largeur réelle de la fenêtre
+            // au lieu d'être figé, ce qu'exige une planche de références qu'on regarde en grand.
+            <div className="zr-gallery-grid">
+              {shownItems.map((it) => rendreTuile(it, layout === 'aligned'))}
+            </div>
+          )}
+        </div>
+      </FadeIn>
+
+      {activeArtistPopover && (
+        <ArtistProjectsPopover
+          artist={activeArtistPopover}
+          t={t}
+          onClose={() => setArtistPopoverId(null)}
+          onOpenImage={(img) => setOuvert(img)}
+          onOpenGrid={() => { const id = activeArtistPopover.id; setArtistPopoverId(null); setFolderId(id) }}
+          onAddProject={(proj) => ajouterProjetArtiste(activeArtistPopover.id, proj)}
+        />
+      )}
+      {ouvert && (() => {
+        const stepList = shownItems.filter((entry) => entry.kind !== 'folder')
+        const at = stepList.findIndex((entry) => entry.id === ouvert.id)
+        const step = (direction) => { if (stepList.length > 1 && at >= 0) setOuvert(stepList[(at + direction + stepList.length) % stepList.length]) }
+        return <Lightbox key={ouvert.id} item={ouvert} onClose={() => setOuvert(null)} onStep={step} position={at >= 0 ? { index: at, total: stepList.length } : null} />
+      })()}
+      {menu && (
+        <ActionColumnPopover t={t} open anchor={{ left: menu.x, top: menu.y, triggerTop: menu.y }}
+          onClose={() => setMenu(null)} ariaLabel="Actions" columnWidth={228} maxHeight={420}
+          nodes={menuNodesFor(menu.it)} />
+      )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// Le survol montre le bouton retirer, sauf pendant un glisser (sinon le bouton clignote sous le
+// curseur qui traverse les tuiles voisines) — délégué en CSS globalement plutôt qu'en JS par tuile.
+if (typeof document !== 'undefined' && !document.getElementById('zr-gallery-hover-css')) {
+  const s = document.createElement('style')
+  s.id = 'zr-gallery-hover-css'
+  s.textContent = '.zr-tap:hover .zr-gallery-remove{opacity:1}'
+  document.head.appendChild(s)
+}
+
+// AJOUT DEPUIS LE MENU CONTEXTUEL DE CREATE (clic droit → « Ajouter à… » → une des galeries du
+// registre). Accepte plusieurs entrées à la fois (sélection multiple). `w`/`h` copiés depuis le
+// manifeste au moment de l'ajout, PAS relus dynamiquement ensuite : la grille doit rester stable même
+// si l'image d'origine est retaillée plus tard, exactement le même choix que les vignettes en cache.
+// Cible TOUJOURS la racine de la galerie visée (jamais un groupe précis) : depuis Create, il n'existe
+// aucune notion de groupe à choisir, exactement comme avant le 2026-08-21.
+export async function ajouterAGalerie(galleryKey, entrees) {
+  const gallery = galleryByKey(galleryKey)
+  if (!gallery) return false
+  const items = entrees.filter(Boolean).map((e) => ({
+    id: `g-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    kind: e.kind, path: e.path, name: e.name, w: e.w || null, h: e.h || null,
+    addedAt: new Date().toISOString(),
+  }))
+  if (!items.length) return false
+  const res = await saveJsonWithRetry(gallery.path, (cur) => ({
+    ...(cur || {}), v: 1, items: [...((cur && cur.items) || []), ...items],
+  }))
+  if (res.ok) {
+    window.dispatchEvent(new CustomEvent(`zr:gallery-changed:${galleryKey}`))
+    notify({ label: gallery.label, title: items.length > 1 ? `${items.length} éléments ajoutés` : `Ajouté à ${gallery.label}`, body: items.map((i) => i.name).slice(0, 3).join(', ') + (items.length > 3 ? '…' : '') })
+    return true
+  }
+  notify({ kind: 'error', label: gallery.label, title: 'Ajout non enregistré', body: String(res.error || 'échec de sauvegarde') })
+  return false
+}

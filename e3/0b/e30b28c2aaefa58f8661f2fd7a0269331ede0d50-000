@@ -1,0 +1,153 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+
+// ═══ UN LIEN TOUT JUSTE CRÉÉ N'EST PAS UN LIEN ABSENT (2026-09-05) ══════════════════════════════
+//
+// LE SYMPTÔME, signalé par Matthieu sur `tmp-img-selection1` : on trie une image, la barre d'état
+// annonce « 1 lien(s) créé(s) et indexé(s) ✓ », et la tuile reste BLANCHE, avec « Lien média
+// indisponible. » par-dessus. L'image existe pourtant, ses octets répondent 200 sur le CDN, et un
+// simple rechargement de la page la fait apparaître.
+//
+// LA CAUSE. `resolve-link` lit le placement et le registre par `raw.githubusercontent.com`, pour ne
+// rien coûter au quota REST — c'est le bon choix, et il tient. Mais raw sert derrière un cache CDN
+// qui met quelques minutes à voir un fichier neuf : pendant ce temps, il répond 404. Or `rawJsonAt`
+// traite un 404 comme une réponse définitive et rend `null` sans se replier sur l'API, si bien que
+// la route répondait `missing` ou `orphan-link`. Le client, lui, range ces deux mots dans les
+// ABSENCES RÉELLES et mémorise le vide pour toute la session : l'échec durait donc infiniment plus
+// longtemps que sa cause, exactement le piège documenté le 2026-08-31.
+//
+// CE QU'ON AVAIT CRU D'ABORD, et qui était faux : que le tri écrivait des liens corrompus, puisque
+// deux placements pointaient deux ressources différentes. Les deux registres étaient parfaitement
+// valides et la route les résolvait tous les deux quand on l'interrogeait à la main. Le doublon est
+// un second défaut, indépendant de la carte blanche.
+//
+// CE QUI CASSE SI L'ON RETIRE LE CORRECTIF : toute image triée redevient blanche pendant les
+// premières minutes de sa vie, c'est-à-dire précisément au moment où Matthieu la regarde.
+
+let appels
+let fetchOriginal
+
+// Faux GitHub à DEUX vitesses : raw ne connaît pas encore les fichiers neufs, l'API les connaît
+// déjà. C'est exactement l'état du drive dans les minutes qui suivent un tri.
+function installerReseauEnRetard({ fraisPourRaw = [], contenus = {} } = {}) {
+  appels = { raw: 0, api: 0 }
+  fetchOriginal = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    const u = String(url)
+    const parRaw = u.includes('raw.githubusercontent.com')
+    if (parRaw) appels.raw++
+    else if (u.includes('api.github.com')) appels.api++
+
+    const chemin = decodeURIComponent(parRaw ? (u.split('/main/')[1] || '') : (u.split('/contents/')[1] || '').split('?')[0])
+    const valeur = contenus[chemin]
+    if (!valeur) return new Response('Not Found', { status: 404 })
+    // Le cache CDN de raw n'a pas encore vu ces chemins : il répond 404 alors qu'ils existent.
+    if (parRaw && fraisPourRaw.includes(chemin)) return new Response('Not Found', { status: 404 })
+    if (parRaw) return new Response(JSON.stringify(valeur), { status: 200 })
+    return new Response(JSON.stringify({ content: Buffer.from(JSON.stringify(valeur)).toString('base64'), sha: 'sha-x' }), { status: 200 })
+  }
+}
+
+function fausseReponse() {
+  const r = { code: 0, corps: null }
+  r.status = (c) => { r.code = c; return r }
+  r.json = (j) => { r.corps = j; return r }
+  r.setHeader = () => r
+  r.end = (v) => { r.corps = v; return r }
+  return r
+}
+
+const CANONIQUE = 'pages/A/IMG_6454.3hdh7r.img.json'
+const LIEN = 'pages/A/tmp-img-selection1/IMG_6454.3hdh7r.img.json'
+const REGISTRE = 'pages/.zr-resources/zr_neuf.json'
+
+const CONTENUS = {
+  [LIEN]: { v: 1, type: 'zenray-eagle-link/v1', resourceId: 'zr_neuf', title: 'IMG_6454' },
+  [REGISTRE]: { v: 1, type: 'zenray-eagle-resource/v1', resourceId: 'zr_neuf', sourcePath: CANONIQUE, placements: [CANONIQUE, LIEN] },
+  [CANONIQUE]: { type: 'image', v: 1, name: 'IMG_6454.JPG', vis: 'public', cdnRepo: 'r', cdnCommit: 'c', cdnChunks: ['a'], resourceId: 'zr_neuf' },
+}
+
+beforeEach(() => { process.env.GITHUB_TOKEN = 'faux-jeton-de-test' })
+afterEach(() => { if (fetchOriginal) globalThis.fetch = fetchOriginal })
+
+const resoudre = async (path) => {
+  const { default: handler } = await import('./page.js')
+  const res = fausseReponse()
+  await handler({ method: 'GET', query: { action: 'resolve-link', path }, headers: { 'x-zr-auth': 'x' } }, res)
+  return res.corps
+}
+
+describe('un lien que raw ne voit pas encore se résout quand même', () => {
+  it('le PLACEMENT frais ne rend pas « missing »', async () => {
+    installerReseauEnRetard({ contenus: CONTENUS, fraisPourRaw: [LIEN] })
+    const corps = await resoudre(LIEN)
+    expect(corps, `resolve-link a rendu ${JSON.stringify(corps)} alors que le placement existe sur l'API`)
+      .toMatchObject({ ok: true, path: CANONIQUE })
+  })
+
+  it('le REGISTRE frais ne rend pas « orphan-link »', async () => {
+    installerReseauEnRetard({ contenus: CONTENUS, fraisPourRaw: [REGISTRE] })
+    const corps = await resoudre(LIEN)
+    expect(corps, `resolve-link a rendu ${JSON.stringify(corps)} alors que le registre existe sur l'API`)
+      .toMatchObject({ ok: true, path: CANONIQUE })
+  })
+
+  it('un lien réellement absent reste absent, et le repli ne le ressuscite pas', async () => {
+    installerReseauEnRetard({ contenus: {} })
+    const corps = await resoudre(LIEN)
+    expect(corps).toMatchObject({ ok: false, error: 'missing' })
+  })
+
+  it('un canonique PÉRIMÉ sur raw ne fait pas frapper une identité neuve', async () => {
+    // LE DOUBLON : trier deux fois la même image donnait « IMG_6454 » et « IMG_6454 2 », pointant
+    // deux ressources distinctes. Raw servait une copie d'avant le premier tri, donc sans identité,
+    // et le second tri en frappait une neuve qui écrasait celle du canonique.
+    appels = { raw: 0, api: 0 }
+    fetchOriginal = globalThis.fetch
+    const aJour = { type: 'image', v: 1, name: 'IMG_6454.JPG', vis: 'public', resourceId: 'zr_deja_la' }
+    const perime = { type: 'image', v: 1, name: 'IMG_6454.JPG', vis: 'public' } // pas encore d'identité
+    let ecrits = null
+    globalThis.fetch = async (url, init) => {
+      const u = String(url)
+      // Écriture d'arbre : on capture ce que le lot a réellement décidé d'écrire.
+      if (u.includes('git/trees') && init?.method === 'POST') { ecrits = JSON.parse(init.body).tree; return new Response(JSON.stringify({ sha: 'arbre' }), { status: 201 }) }
+      // Listings de dossier (git/trees/main:dir) : dossiers vides, donc aucune collision de nom.
+      if (u.includes('git/trees')) return new Response(JSON.stringify({ tree: [], truncated: false }), { status: 200 })
+      if (u.includes('git/blobs')) return new Response(JSON.stringify({ sha: 'blob' }), { status: 201 })
+      if (u.includes('git/ref')) return new Response(JSON.stringify({ object: { sha: 'parent' } }), { status: 200 })
+      // GET d'un commit : git y lit l'arbre de base. POST : il en crée un neuf.
+      if (u.includes('git/commits') && init?.method === 'POST') return new Response(JSON.stringify({ sha: 'commit-neuf' }), { status: 201 })
+      if (u.includes('git/commits')) return new Response(JSON.stringify({ tree: { sha: 'arbre-base' } }), { status: 200 })
+      if (u.includes('raw.githubusercontent.com')) {
+        appels.raw++
+        // Raw sert la copie D'AVANT le premier tri : le manifeste y est encore sans identité.
+        if (u.includes('IMG_6454')) return new Response(JSON.stringify(perime), { status: 200 })
+        return new Response('Not Found', { status: 404 })
+      }
+      appels.api++
+      if (u.includes('/contents/') && u.includes('IMG_6454')) {
+        return new Response(JSON.stringify({ content: Buffer.from(JSON.stringify(aJour)).toString('base64'), sha: 's' }), { status: 200 })
+      }
+      return new Response('Not Found', { status: 404 })
+    }
+    const { default: handler } = await import('./page.js')
+    const res = fausseReponse()
+    await handler({
+      method: 'POST', query: {}, headers: { 'x-zr-auth': 'x' },
+      body: {
+        action: 'create-eagle-links-batch',
+        items: [{ kind: 'leaf', sourcePath: 'pages/A/IMG_6454.img.json', targetPath: 'pages/A/tri/IMG_6454.img.json', title: 'IMG_6454' }],
+      },
+    }, res)
+    // Le dernier arbre écrit est celui de l'index de recherche ; l'identité retenue se lit donc dans
+    // la réponse du lot, qui est la décision elle-même.
+    const identite = res.corps?.results?.[0]?.resourceId
+    expect(identite, `le lot a retenu l'identité ${identite} au lieu de réutiliser zr_deja_la`).toBe('zr_deja_la')
+  })
+
+  it('quand raw répond, l’API n’est jamais sollicitée', async () => {
+    // Le gain de quota du 2026-08-31 ne doit pas être repayé : le repli ne s'ouvre que sur un 404.
+    installerReseauEnRetard({ contenus: CONTENUS })
+    await resoudre(LIEN)
+    expect(appels.api, `le chemin normal a coûté ${appels.api} requête(s) de quota`).toBe(0)
+  })
+})

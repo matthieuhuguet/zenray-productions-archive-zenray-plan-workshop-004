@@ -1,0 +1,143 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { PALETTE, RADII } from '../theme.js'
+import SheetGrid from '../table/SheetGrid.jsx'
+import { DatabaseBoardView, DatabaseFilterBar, DatabaseGalleryView } from '../table/DatabaseViews.jsx'
+import { selectDatabaseRows } from '../table/databaseViewModel.js'
+
+// C200 — base de données rangée dans Create (fichier pages/X.db.json), ouverte comme un tableur Excel.
+// Modèle : { name, columns:[{id,name,type,options?,w?}], rows:[{id,cells:{colId:val}}], ui:{filters,sort}, views:[{id,name,type,sort,filters,groupBy}], activeView }
+const FONTS = { serif: "var(--zr-police-serif)", sans: "var(--zr-police-sans)" }
+const uid = (p = 'x') => p + Math.random().toString(36).slice(2, 8)
+// Vues recentrées : la Grille (Excel) est LA vue de référence. On garde Board (kanban) + Galerie (cartes) comme
+// alternates utiles. Table (redondante avec la Grille) et Calendrier (peu utilisé) retirés pour épurer.
+const VIEW_TYPES = [['grid', 'Grille'], ['board', 'Board'], ['gallery', 'Galerie']]
+
+const rd = (p) => fetch(`/api/page?action=read&path=${encodeURIComponent(p)}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null)
+
+export default function DatabaseTable({ t, path, title, onOpenPage }) {
+  const [db, setDb] = useState(null)
+  const sha = useRef(null)
+  const timer = useRef(null)
+  const [status, setStatus] = useState('chargement…')
+  const [immersive, setImmersive] = useState(false) // vue immersive (tableau plein écran, chrome minimal)
+  const initImm = useRef(false)
+  useEffect(() => { initImm.current = false }, [path]) // re-init au changement de table
+  useEffect(() => { if (db && !initImm.current) { initImm.current = true; setImmersive(!!db.immersive) } }, [db]) // état par défaut = persisté
+  useEffect(() => { if (!immersive) return; const h = (e) => { if (e.key === 'Escape') setImmersive(false) }; window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h) }, [immersive])
+  // Signale à App de masquer la sidebar + l'en-tête de page (focus in-place : ne reste que le tableau + son titre).
+  useEffect(() => { window.dispatchEvent(new CustomEvent('zr:table-immersive', { detail: immersive })); return () => window.dispatchEvent(new CustomEvent('zr:table-immersive', { detail: false })) }, [immersive])
+  useEffect(() => { (async () => {
+    const j = await rd(path)
+    let d = { name: title || 'Table', columns: [{ id: uid('c'), name: 'Nom', type: 'text' }], rows: [] }
+    if (j && j.markdown && !j.missing) { try { d = JSON.parse(j.markdown) } catch {} sha.current = j.sha }
+    if (!d.views) d.views = []
+    setDb(d); setStatus('')
+  })() }, [path])
+
+  const persist = (next, immediate) => {
+    setDb(next); clearTimeout(timer.current)
+    const run = async () => {
+      setStatus('enregistrement…')
+      const j = await fetch('/api/page', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'save', path, markdown: JSON.stringify(next), sha: sha.current }) }).then((r) => r.json()).catch(() => null)
+      if (j && j.ok) { sha.current = j.sha; setStatus('enregistré ✓') } else setStatus('erreur')
+    }
+    if (immediate) run(); else timer.current = setTimeout(run, 700)
+  }
+
+  // ── vue active : la vue porte son propre sort/filters/groupBy/type ; sinon racine db.ui ──
+  const views = (db && db.views) || []
+  const activeId = db && db.activeView
+  const active = views.find((v) => v.id === activeId)
+  const rawViewType = active ? (active.type || 'grid') : (db && db.ui && db.ui.type) || 'grid'
+  // Types retirés (table/list/calendar) -> Grille, pour les vues sauvegardées avant l'épuration.
+  const viewType = ['grid', 'board', 'gallery'].includes(rawViewType) ? rawViewType : 'grid'
+  const sort = active ? active.sort : (db && db.ui && db.ui.sort) || null
+  const filters = (active ? active.filters : (db && db.ui && db.ui.filters)) || []
+  const groupBy = active ? active.groupBy : (db && db.ui && db.ui.groupBy)
+  const patchView = (fields) => {
+    if (active) persist({ ...db, views: views.map((v) => v.id === activeId ? { ...v, ...fields } : v) })
+    else persist({ ...db, ui: { ...(db.ui || {}), ...fields } })
+  }
+  const cols = db?.columns || []
+  const rows = useMemo(() => selectDatabaseRows({ rows: db?.rows || [], columns: cols, filters, sort }), [db, filters, sort])
+
+  if (!db) return <div style={{ color: t.textSecondary, padding: 20 }}>{status}</div>
+
+  // ── colonnes / lignes ──
+  const setCell = (rowId, colId, value) => persist({ ...db, rows: db.rows.map((r) => r.id === rowId ? { ...r, cells: { ...r.cells, [colId]: value } } : r) })
+
+  // ── filtres ──
+  const setFilters = (next) => patchView({ filters: next })
+
+  // ── vues nommées ──
+  const addView = () => { const name = (window.prompt('Nom de la vue ?', 'Vue') || '').trim(); if (!name) return; const v = { id: uid('v'), name, type: 'grid' }; persist({ ...db, views: [...views, v], activeView: v.id }, true) }
+  const delView = (id) => { if (!window.confirm('Supprimer cette vue ?')) return; persist({ ...db, views: views.filter((v) => v.id !== id), activeView: null }, true) }
+
+  const selectCols = cols.filter((c) => c.type === 'select')
+  const gb = groupBy || (selectCols[0] && selectCols[0].id)
+
+  return (
+    <div>
+      {/* En mode IMMERSIF : tout le chrome (onglets/vues/filtres) disparaît, ne reste qu'un titre minimal + sortie. */}
+      {immersive && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+          <span style={{ fontFamily: FONTS.serif, fontSize: 'var(--zr-ui-3xl)', fontWeight: 600, color: t.textPrimary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{db.name || title}</span>
+          <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>{rows.length} lignes</span>
+          <button onClick={() => { setImmersive(false); persist({ ...db, immersive: false }, false) }} title="Quitter le mode immersif (Échap)"
+            style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 6, background: 'transparent', color: t.textSecondary, border: `1px solid ${t.border}`, borderRadius: RADII.sm, padding: '5px 11px', fontSize: 'var(--zr-ui-sm)', fontFamily: FONTS.sans, fontWeight: 600, cursor: 'pointer' }}>⤡ Quitter</button>
+        </div>
+      )}
+      {!immersive && (<>
+      {/* barre d'onglets de vues */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 10, flexWrap: 'wrap' }}>
+        <button onClick={() => persist({ ...db, activeView: null }, true)} style={tab(t, !active)}>Toutes</button>
+        {views.map((v) => (
+          <span key={v.id} style={{ display: 'inline-flex', alignItems: 'center' }}>
+            <button onClick={() => persist({ ...db, activeView: v.id }, true)} style={tab(t, activeId === v.id)}>{v.name}</button>
+            {activeId === v.id && <button onClick={() => delView(v.id)} title="Supprimer la vue" style={{ background: 'transparent', border: 'none', color: t.textSecondary, cursor: 'pointer', fontSize: 'var(--zr-ui-sm)', marginLeft: -4 }}>×</button>}
+          </span>
+        ))}
+        <button onClick={addView} style={{ ...tab(t, false), color: t.textSecondary }}>+ Vue</button>
+        <span style={{ marginLeft: 'auto', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-2xs)', color: t.textSecondary }}>{status}</span>
+      </div>
+
+      {/* barre outils : type de vue + groupBy + compteur */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+        <div className="zr-segment">
+          {VIEW_TYPES.map(([v, l]) => <button key={v} onClick={() => patchView({ type: v })} data-on={viewType === v} className="zr-segment-item">{l}</button>)}
+        </div>
+        {/* Vue immersive : tableau plein écran, chrome minimal. État persisté (db.immersive) -> défaut au ré-ouverture. */}
+        {viewType === 'grid' && (
+          <button onClick={() => { const v = !immersive; setImmersive(v); persist({ ...db, immersive: v }, false) }} title={immersive ? 'Quitter le mode immersif (Échap)' : 'Vue immersive (tableau plein écran)'}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: immersive ? PALETTE.primary : 'transparent', color: immersive ? '#fff' : t.textSecondary, border: `1px solid ${immersive ? PALETTE.primary : t.border}`, borderRadius: RADII.sm, padding: '5px 11px', fontSize: 'var(--zr-ui-sm)', fontFamily: FONTS.sans, fontWeight: 600, cursor: 'pointer' }}>
+            ⤢ Immersif
+          </button>
+        )}
+        {viewType === 'board' && (
+          <select value={groupBy || ''} onChange={(e) => patchView({ groupBy: e.target.value || null })} style={{ background: t.surface, color: t.textPrimary, border: `1px solid ${t.border}`, borderRadius: RADII.sm, padding: '5px 8px', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-sm)' }}>
+            <option value="">grouper par…</option>
+            {selectCols.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        )}
+        <span style={{ fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-xs)', color: t.textSecondary }}>{rows.length}{filters.length ? `/${db.rows.length}` : ''} lignes</span>
+      </div>
+
+      {/* filtres (masqués en mode Grille : le tableur a ses propres tri/filtres) */}
+      <DatabaseFilterBar t={t} columns={cols} filters={filters} onChange={setFilters} hidden={viewType === 'grid'} />
+      </>)}
+
+      {/* ── GRILLE (clone Excel / Google Sheets) ── rendue EN PLACE ; en immersif elle masque tout son chrome. */}
+      {viewType === 'grid' && (
+        <SheetGrid t={t} db={db} onChange={(next) => persist(next)} onOpenPage={onOpenPage} immersive={immersive} />
+      )}
+
+      {/* ── BOARD ── */}
+      {viewType === 'board' && <DatabaseBoardView t={t} columns={cols} rows={rows} groupBy={gb} onSetCell={setCell} />}
+
+      {/* ── GALERIE ── */}
+      {viewType === 'gallery' && <DatabaseGalleryView t={t} columns={cols} rows={rows} />}
+    </div>
+  )
+}
+
+const tab = (t, on) => ({ background: on ? PALETTE.primarySoft : 'transparent', color: on ? PALETTE.primary : t.textPrimary, border: 'none', borderRadius: RADII.sm, padding: '4px 12px', cursor: 'pointer', fontFamily: FONTS.sans, fontSize: 'var(--zr-ui-md)', fontWeight: on ? 600 : 500 })

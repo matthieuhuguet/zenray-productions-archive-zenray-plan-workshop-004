@@ -1,0 +1,117 @@
+// 20 October 2026: Regenerate all project cover thumbnails to 720x406 at quality 85 for Retina 2x displays.
+import fs from 'node:fs/promises'
+import { spawn, execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { downloadUrls } from '../../src/lib/archiveChunks.js'
+
+const run = promisify(execFile)
+const GIT_DIR = '/Users/zenray/Library/Application Support/ZenRayAssets/repositories/matthieuhuguet_zenray-data'
+const COVERS_FILE = `${GIT_DIR}/pages/.zr-assets-covers.json`
+
+async function getToken() {
+  const { stdout } = await run('gh', ['auth', 'token'])
+  return stdout.trim()
+}
+
+async function resizeToRetinaWebp(inputBuffer) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('magick', [
+      '-',
+      '-auto-orient',
+      '-resize', '720x406^',
+      '-gravity', 'center',
+      '-extent', '720x406',
+      '-quality', '85',
+      'webp:-'
+    ])
+    const chunks = []
+    child.stdout.on('data', (chunk) => chunks.push(chunk))
+    child.on('error', reject)
+    child.on('exit', (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks))
+      else reject(new Error(`magick exit ${code}`))
+    })
+    child.stdin.on('error', () => {})
+    child.stdin.end(inputBuffer)
+  })
+}
+
+async function downloadManifestBytes(manifest, token) {
+  const urls = downloadUrls(manifest)
+  if (!urls?.length) return null
+  const headers = token ? { Authorization: `token ${token}`, 'User-Agent': 'ZenRay-Assets-Retina' } : {}
+  const parts = []
+  for (const url of urls) {
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(60000) })
+    if (!res.ok) throw new Error(`HTTP ${res.status} fetching chunk ${url}`)
+    parts.push(Buffer.from(await res.arrayBuffer()))
+  }
+  return Buffer.concat(parts)
+}
+
+async function main() {
+  const token = await getToken()
+  const raw = await fs.readFile(COVERS_FILE, 'utf8')
+  const data = JSON.parse(raw)
+  const covers = data.covers || {}
+  const projectIds = Object.keys(covers)
+  console.log(`Processing ${projectIds.length} project covers...`)
+
+  let updatedCount = 0
+  let failedCount = 0
+
+  for (const projectId of projectIds) {
+    const entry = covers[projectId]
+    const file = entry.file || {}
+    const contentPath = file.contentPath || file.cloudPath
+    if (!contentPath) {
+      console.log(`- ${projectId}: no contentPath, skipping`)
+      continue
+    }
+
+    try {
+      console.log(`- ${projectId}: reading manifest ${contentPath}`)
+      const { stdout: manifestRaw } = await run('git', ['-C', GIT_DIR, 'show', `HEAD:${contentPath}`])
+      const manifest = JSON.parse(manifestRaw)
+
+      let originalBytes = null
+      if (contentPath.endsWith('.file.json')) {
+        originalBytes = await downloadManifestBytes(manifest, token)
+      } else if (contentPath.endsWith('.img.json')) {
+        const repo = manifest.cdnRepo
+        const commit = manifest.cdnCommit
+        const p = manifest.cdnPath || manifest.path
+        if (repo && commit && p) {
+          const url = `https://raw.githubusercontent.com/matthieuhuguet/${repo}/${commit}/${p}`
+          const res = await fetch(url, { headers: { Authorization: `token ${token}` } })
+          if (res.ok) originalBytes = Buffer.from(await res.arrayBuffer())
+        }
+      }
+
+      if (!originalBytes || !originalBytes.length) {
+        console.warn(`  Warning: could not resolve original bytes for ${projectId}`)
+        failedCount++
+        continue
+      }
+
+      const webpBytes = await resizeToRetinaWebp(originalBytes)
+      const dataUri = `data:image/webp;base64,${webpBytes.toString('base64')}`
+      file.thumbnailUrl = dataUri
+      entry.at = new Date().toISOString()
+      updatedCount++
+      console.log(`  OK: generated 720x406 WebP (${webpBytes.length} bytes)`)
+    } catch (err) {
+      console.error(`  Error processing ${projectId}:`, err.message)
+      failedCount++
+    }
+  }
+
+  console.log(`Writing updated covers to ${COVERS_FILE}... (updated: ${updatedCount}, failed: ${failedCount})`)
+  await fs.writeFile(COVERS_FILE, JSON.stringify(data, null, 1) + '\n', 'utf8')
+  console.log('Done.')
+}
+
+main().catch((err) => {
+  console.error('Fatal error:', err)
+  process.exit(1)
+})

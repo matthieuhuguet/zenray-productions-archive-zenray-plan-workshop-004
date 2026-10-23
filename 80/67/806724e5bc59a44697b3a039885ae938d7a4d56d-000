@@ -1,0 +1,114 @@
+#!/usr/bin/env node
+// RenameCloudMedia.mjs (12 October 2026): renames the film manifests that are ALREADY in the cloud with the same clean-name
+// rules as the pre-upload rename phase, and files series as <Title>/Saison NN/. Nothing is uploaded: only manifests and their
+// small stream playlists move (Git), the video bytes in the shards never change.
+// FR : renomme proprement les films deja dans le cloud (memes regles que la phase prealable) et les range en sous-dossiers.
+//   node scripts/RenameCloudMedia.mjs --manifests <clone zenray-data> --base pages/Anime_Movies_Series_Documentaries/Anime [--receipts <dir>] [--alias "A=B"] [--folder-alias "RawFolder=CleanFolder"] [--dry]
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { planRename, retargetFolder } from './lib/media-rename.mjs'
+import { FILM_BASE } from './lib/film-categories.mjs'
+
+const argv = process.argv.slice(2)
+const value = (flag, fallback = '') => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : fallback }
+const values = (flag) => argv.flatMap((a, i) => (a === flag ? [argv[i + 1]] : []))
+const dry = argv.includes('--dry')
+const root = path.resolve(value('--manifests'))
+const base = value('--base', FILM_BASE)
+const baseAbs = path.join(root, base)
+const receiptsDir = value('--receipts') ? path.resolve(value('--receipts')) : ''
+const aliases = Object.fromEntries(values('--alias').map((pair) => pair.split('=').map((s) => s.trim())))
+const folderAliases = Object.fromEntries(values('--folder-alias').map((pair) => pair.split('=').map((s) => s.trim())))
+if (!value('--manifests') || !fs.existsSync(baseAbs)) { console.error('--manifests <clone> and --base <pages/...> must exist'); process.exit(2) }
+
+// 1. mirror the manifests as empty media files, so the pre-upload planner decides the names
+const mirror = fs.mkdtempSync(path.join(os.tmpdir(), 'cloud-rename-'))
+const manifests = []
+const walk = (dir) => {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) { if (entry.name !== '.streams' && entry.name !== '.git') walk(full) }
+    else if (entry.name.endsWith('.media.json')) {
+      const rel = path.relative(baseAbs, full)
+      manifests.push(rel)
+      const stub = path.join(mirror, rel.replace(/\.media\.json$/, ''))
+      fs.mkdirSync(path.dirname(stub), { recursive: true }); fs.writeFileSync(stub, '')
+    }
+  }
+}
+walk(baseAbs)
+const plan = planRename(mirror, { aliases, subfolders: true })
+const moves = plan.items.map((i) => ({ from: `${i.fromRel}.media.json`, to: `${retargetFolder(i.toRel, folderAliases)}.media.json`, reasons: i.reasons }))
+  .filter((m) => m.from !== m.to)
+fs.rmSync(mirror, { recursive: true, force: true })
+console.log(`manifests: ${manifests.length}, to rename: ${moves.length}`)
+if (dry) { for (const m of moves) console.log(`  ${m.from}  =>  ${m.to}`); process.exit(0) }
+
+// 2. move manifest + stream directory, rewrite the references that carry the old path
+const encode = encodeURIComponent
+const git = (...a) => { const r = spawnSync('git', ['-C', root, ...a], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }); if (r.status !== 0) throw new Error(`git ${a[0]}: ${r.stderr || r.stdout}`); return r.stdout }
+const oldToNew = new Map()
+for (const move of moves) {
+  const oldRel = path.posix.join(base, move.from.split(path.sep).join('/'))
+  const newRel = path.posix.join(base, move.to.split(path.sep).join('/'))
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, oldRel), 'utf8'))
+  const newName = path.posix.basename(newRel).replace(/\.media\.json$/, '')
+  const oldName = path.posix.basename(oldRel).replace(/\.media\.json$/, '')
+  // stream directory follows the manifest: <dir>/.streams/<vidId>
+  for (const key of ['master', 'mpd']) {
+    if (!manifest[key]) continue
+    const oldStream = path.posix.dirname(manifest[key])
+    // only a real <dir>/.streams/<vidId> folder moves; sibling-style files (<name>.master.m3u8 next to the manifest) stay where they are
+    if (path.posix.basename(path.posix.dirname(oldStream)) !== '.streams') continue
+    const vidId = path.posix.basename(oldStream)
+    const newStream = path.posix.join(path.posix.dirname(newRel), '.streams', vidId)
+    if (oldStream === newStream) continue
+    if (fs.existsSync(path.join(root, oldStream)) && !fs.existsSync(path.join(root, newStream))) {
+      fs.mkdirSync(path.join(root, path.posix.dirname(newStream)), { recursive: true })
+      git('mv', oldStream, newStream)
+      for (const f of fs.readdirSync(path.join(root, newStream)).filter((n) => n.endsWith('.m3u8'))) {
+        const file = path.join(root, newStream, f)
+        const text = fs.readFileSync(file, 'utf8')
+        const next = text.split(encode(oldStream)).join(encode(newStream))
+        if (next !== text) fs.writeFileSync(file, next)
+      }
+    }
+    manifest[key] = path.posix.join(newStream, path.posix.basename(manifest[key]))
+  }
+  if (manifest.name === oldName) manifest.name = newName
+  if (manifest.title === oldName) manifest.title = newName
+  fs.mkdirSync(path.join(root, path.posix.dirname(newRel)), { recursive: true })
+  git('mv', oldRel, newRel)
+  fs.writeFileSync(path.join(root, newRel), JSON.stringify(manifest, null, 2) + '\n')
+  oldToNew.set(oldRel, newRel)
+}
+
+// 3. recovery receipts keep pointing at the manifest, wherever the worker's clone has it
+let receiptsUpdated = 0
+if (receiptsDir) {
+  for (const name of fs.readdirSync(receiptsDir).filter((n) => n.endsWith('.recovery.json'))) {
+    const file = path.join(receiptsDir, name)
+    const receipt = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const at = String(receipt.manifestPath || '').indexOf(`${path.sep}ManifestClone${path.sep}`)
+    if (at < 0) continue
+    const rel = receipt.manifestPath.slice(at + '/ManifestClone/'.length)
+    const target = oldToNew.get(rel)
+    if (!target) continue
+    receipt.manifestPath = `${receipt.manifestPath.slice(0, at)}/ManifestClone/${target}`
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify(receipt, null, 2) + '\n'); fs.renameSync(`${file}.tmp`, file)
+    receiptsUpdated += 1
+  }
+}
+
+// 4. one commit, push with rebase
+git('add', '-A', '--', base)
+git('-c', 'user.email=bot@zenray', '-c', 'user.name=zenray-bot', 'commit', '-q', '-m', `clean names: ${moves.length} films renamed and filed by series (12 October 2026)`)
+for (let attempt = 0; attempt < 4; attempt += 1) {
+  const push = spawnSync('git', ['-C', root, 'push', 'origin', 'HEAD:main'], { encoding: 'utf8' })
+  if (push.status === 0) break
+  if (attempt === 3) throw new Error(`push failed: ${push.stderr}`)
+  git('pull', '--rebase', 'origin', 'main')
+}
+console.log(JSON.stringify({ ok: true, renamed: moves.length, receiptsUpdated }))
